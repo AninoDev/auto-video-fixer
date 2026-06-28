@@ -1,0 +1,73 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+.venv/
+.venv*
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Testing
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+htmlcov/
+.tox/
+.nox/
+coverage.xml
+*.cover
+.hypothesis/
+*.egg-info/
+dist/
+build/
+eggs/
+*.egg
+
+# FFmpeg temp files
+.avf_*.mp4
+.avf_*.mkv
+.avf_*.avi
+transforms.trf
+*.trf
+
+# Session logs (conversation history)
+session-ses_*.md
+
+# OS files
+Thumbs.db
+.DS_Store
+
+# Config files that may contain sensitive data
+# User config is in ~/.config/auto-video-fixer/ and shouldn't be tracked
+# Only track default config templates if needed
+
+# Environment variables
+.env
+.env.local
+.env.*.local
+
+# Logs
+*.log
+logs/
+
+# Jupyter Notebook
+.ipynb_checkpoints/
+
+# Misc
+*.bak
+*.backup
+*.tmp
+*.temp

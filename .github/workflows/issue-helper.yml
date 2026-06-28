@@ -1,0 +1,40 @@
+name: Issue Helper
+
+on:
+  issues:
+    types: [opened]
+
+jobs:
+  label:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Label issues
+      uses: actions/github-script@v7
+      with:
+        script: |
+          const body = context.payload.issue.body || '';
+          const labels = [];
+          
+          if (body.includes('bug') || body.includes('Bug') || body.includes('BUG')) {
+            labels.push('bug');
+          }
+          if (body.includes('feature') || body.includes('Feature') || body.includes('enhancement')) {
+            labels.push('enhancement');
+          }
+          if (body.includes('documentation') || body.includes('Documentation')) {
+            labels.push('documentation');
+          }
+          if (body.includes('good first issue')) {
+            labels.push('good first issue');
+          }
+          
+          if (labels.length > 0) {
+            github.rest.issues.addLabels({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.payload.issue.number,
+              labels: labels
+            });
+          }
