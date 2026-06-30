@@ -2,13 +2,11 @@
 
 import os
 import tempfile
-from pathlib import Path
-from unittest.mock import MagicMock, patch
 
 import pytest
 
 from autovideofixer.config import Config
-from autovideofixer.core.pipeline import Pipeline, Job, JobResult, PipelineStatus
+from autovideofixer.core.pipeline import JobResult, Pipeline, PipelineStatus
 from autovideofixer.core.stages.base import StageResult, StageStatus
 
 
@@ -30,9 +28,9 @@ class TestPipeline:
         """Test adding a job to the pipeline."""
         test_file = tmp_path / "test.mp4"
         test_file.write_text("fake video content")
-        
+
         job = self.pipeline.add_job(str(test_file))
-        
+
         assert len(self.pipeline.jobs) == 1
         assert job.input_path == str(test_file)
         assert job.status == PipelineStatus.IDLE
@@ -43,9 +41,9 @@ class TestPipeline:
         test_file = tmp_path / "test.mp4"
         test_file.write_text("fake video content")
         output_file = tmp_path / "output.mp4"
-        
+
         job = self.pipeline.add_job(str(test_file), str(output_file))
-        
+
         assert job.output_path == str(output_file)
 
     def test_add_job_nonexistent_file(self):
@@ -60,9 +58,9 @@ class TestPipeline:
             f = tmp_path / f"test_{i}.mp4"
             f.write_text(f"fake video {i}")
             files.append(str(f))
-        
+
         jobs = self.pipeline.add_files(files)
-        
+
         assert len(jobs) == 3
         assert len(self.pipeline.jobs) == 3
 
@@ -71,12 +69,12 @@ class TestPipeline:
         # Create video files
         for i in range(3):
             (tmp_path / f"video_{i}.mp4").write_text(f"video {i}")
-        
+
         # Create non-video file
         (tmp_path / "readme.txt").write_text("not a video")
-        
+
         jobs = self.pipeline.add_files([str(tmp_path)])
-        
+
         assert len(jobs) == 3
 
     def test_clear_queue(self):
@@ -85,12 +83,12 @@ class TestPipeline:
         with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as f:
             f.write(b"fake")
             test_file = f.name
-        
+
         try:
             self.pipeline.add_job(test_file)
             self.pipeline.add_job(test_file)
             assert len(self.pipeline.jobs) == 2
-            
+
             self.pipeline.clear_queue()
             assert len(self.pipeline.jobs) == 0
         finally:
@@ -104,22 +102,38 @@ class TestPipeline:
     def test_auto_determine_stages(self, tmp_path):
         """Test automatic stage determination."""
         import subprocess
-        
+
         test_file = tmp_path / "test.mp4"
-        subprocess.run([
-            "ffmpeg", "-y", "-f", "lavfi", "-i", "testsrc=duration=1:size=320x240:rate=24",
-            "-f", "lavfi", "-i", "sine=frequency=440:duration=1",
-            "-c:v", "libx264", "-c:a", "aac", str(test_file)
-        ], capture_output=True, check=True)
-        
+        subprocess.run(
+            [
+                "ffmpeg",
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc=duration=1:size=320x240:rate=24",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=440:duration=1",
+                "-c:v",
+                "libx264",
+                "-c:a",
+                "aac",
+                str(test_file),
+            ],
+            capture_output=True,
+            check=True,
+        )
+
         job = self.pipeline.add_job(str(test_file))
-        
+
         # Configure quality targets
         self.config.set([3840, 2160], "quality", "quality_target", "target_resolution")
         self.config.set(60.0, "quality", "quality_target", "target_framerate")
-        
+
         stages = self.pipeline.auto_determine_stages(job)
-        
+
         assert isinstance(stages, list)
         assert "detect" in stages
         assert "encode" in stages
@@ -128,12 +142,14 @@ class TestPipeline:
         """Test stage ordering optimization."""
         stages = ["encode", "upscale", "stabilize", "denoise_video"]
         ordered = self.pipeline.optimize_stage_order(stages)
-        
+
         # Check ordering constraints
-        assert ordered.index("stabilize") < ordered.index("upscale"), \
+        assert ordered.index("stabilize") < ordered.index("upscale"), (
             "Stabilize should come before upscale"
-        assert ordered.index("denoise_video") < ordered.index("upscale"), \
+        )
+        assert ordered.index("denoise_video") < ordered.index("upscale"), (
             "Denoise should come before upscale"
+        )
         assert ordered[-1] == "encode", "Encode should be last"
 
     def test_job_result_creation(self):
@@ -143,7 +159,7 @@ class TestPipeline:
             output_path="/output.mp4",
             success=True,
         )
-        
+
         assert result.success is True
         assert result.all_stages_passed is True
         assert result.output_size == 0  # File doesn't exist in test
@@ -159,7 +175,7 @@ class TestPipeline:
             errors=["encode: Test error"],
             success=False,
         )
-        
+
         assert result.success is False
         assert result.all_stages_passed is False
 
@@ -178,20 +194,32 @@ class TestPipelineExecution:
         # Create a simple test video using FFmpeg
         test_file = tmp_path / "test.mp4"
         output_file = tmp_path / "output.mp4"
-        
+
         # Use ffmpeg to create a simple test video
         import subprocess
-        subprocess.run([
-            "ffmpeg", "-y", "-f", "lavfi", "-i", "testsrc=duration=1:size=320x240:rate=24",
-            "-c:v", "libx264", str(test_file)
-        ], capture_output=True, check=True)
-        
+
+        subprocess.run(
+            [
+                "ffmpeg",
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc=duration=1:size=320x240:rate=24",
+                "-c:v",
+                "libx264",
+                str(test_file),
+            ],
+            capture_output=True,
+            check=True,
+        )
+
         job = self.pipeline.add_job(str(test_file), str(output_file))
-        
+
         # Run with minimal stages
         job.stages = ["detect", "encode"]
         result = self.pipeline.execute_job(job)
-        
+
         assert result is not None
         assert result.success is True
         assert os.path.exists(output_file)
@@ -204,17 +232,30 @@ class TestPipelineExecution:
         for i in range(2):
             test_file = tmp_path / f"test_{i}.mp4"
             import subprocess
-            subprocess.run([
-                "ffmpeg", "-y", "-f", "lavfi", "-i", f"testsrc=duration=1:size=320x240:rate=24",
-                "-c:v", "libx264", str(test_file)
-            ], capture_output=True, check=True)
+
+            subprocess.run(
+                [
+                    "ffmpeg",
+                    "-y",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    "testsrc=duration=1:size=320x240:rate=24",
+                    "-c:v",
+                    "libx264",
+                    str(test_file),
+                ],
+                capture_output=True,
+                check=True,
+            )
             files.append(str(test_file))
-        
-        for f in files:
-            self.pipeline.add_job(f, f.replace(".mp4", "_out.mp4"))
-        
+
+        for i, f in enumerate(files):
+            job = self.pipeline.add_job(f, f.replace(".mp4", "_out.mp4"))
+            job.stages = ["detect", "stabilize", "deblock", "denoise_video", "encode"]
+
         results = self.pipeline.execute_all()
-        
+
         assert len(results) == 2
         for result in results:
             assert result.success is True

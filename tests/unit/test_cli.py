@@ -1,6 +1,5 @@
 """Tests for CLI interface."""
 
-import pytest
 from click.testing import CliRunner
 
 from autovideofixer.cli.cli import main
@@ -46,21 +45,17 @@ class TestCLI:
         """Test dry run mode."""
         test_file = tmp_path / "test.mp4"
         test_file.write_text("fake video")
-        
-        result = self.runner.invoke(main, [
-            "process", str(test_file), "--dry-run"
-        ])
-        
+
+        result = self.runner.invoke(main, ["process", str(test_file), "--dry-run"])
+
         assert result.exit_code == 0
         assert "DRY RUN" in result.output
         assert "test.mp4" in result.output
 
     def test_process_no_files(self):
         """Test processing with no video files."""
-        result = self.runner.invoke(main, [
-            "process", "/nonexistent/path"
-        ])
-        
+        result = self.runner.invoke(main, ["process", "/nonexistent/path"])
+
         assert result.exit_code != 0
         assert "No video files found" in result.output
 
@@ -68,11 +63,9 @@ class TestCLI:
         """Test processing with invalid preset."""
         test_file = tmp_path / "test.mp4"
         test_file.write_text("fake video")
-        
-        result = self.runner.invoke(main, [
-            "process", str(test_file), "-p", "invalid_preset"
-        ])
-        
+
+        result = self.runner.invoke(main, ["process", str(test_file), "-p", "invalid_preset"])
+
         assert result.exit_code != 0
         assert "Unknown preset" in result.output
 
@@ -87,3 +80,22 @@ class TestCLI:
         result = self.runner.invoke(main, ["find-duplicates", "--help"])
         assert result.exit_code == 0
         assert "--threshold" in result.output
+
+    def test_model_info_command(self):
+        """Test model-info command."""
+        result = self.runner.invoke(main, ["model-info"])
+        assert result.exit_code == 0
+        assert "RealESRGAN_x4plus" in result.output
+        assert "rife_v4.6" in result.output
+
+    def test_model_download_unknown_model(self):
+        """Test model-download with unknown model."""
+        result = self.runner.invoke(main, ["model-download", "--model", "nonexistent_model"])
+        assert result.exit_code != 0
+        assert "Unknown model" in result.output
+
+    def test_model_download_help(self):
+        """Test model-download help."""
+        result = self.runner.invoke(main, ["model-download", "--help"])
+        assert result.exit_code == 0
+        assert "--model" in result.output

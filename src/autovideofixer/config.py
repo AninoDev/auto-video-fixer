@@ -86,6 +86,8 @@ class Config:
                 "enabled": True,
                 "ai_model": "RealESRGAN_x4plus",
                 "traditional_method": "superres",
+                "scale_factor": 4,
+                "tta_mode": 0,
             },
             "interpolate": {
                 "enabled": True,
@@ -94,8 +96,8 @@ class Config:
             },
             "denoise_video": {
                 "enabled": True,
-                "ai_model": "none",
-                "traditional_method": "nlmeans",
+                "ai_model": "RealESRGAN_x4plus",
+                "traditional_method": "hqdn3d",
             },
             "denoise_audio": {
                 "enabled": True,
@@ -109,7 +111,14 @@ class Config:
             "stabilize": {
                 "enabled": True,
                 "threshold": 2.0,  # stabilize if shake > this value
-                "smoothness": 10,
+                "smoothness": 40,  # frames for lowpass filtering (higher = smoother)
+                "maxshift": 20,  # max pixels to shift per frame (limits overcorrection)
+                "optalgo": "gauss",  # optimization algorithm (opt, gauss, avg)
+                "shakiness": 10,  # motion detection sensitivity (1-10, higher = more sensitive)
+                "zoom_enabled": True,  # auto zoom-out for very shaky video
+                "zoom_threshold": 50.0,  # min movement (px) to trigger zoom
+                "zoom_mode": "black",  # black or keep
+                "sharpen_enabled": True,  # auto sharpen after stabilization
             },
             "normalize_volume": {
                 "enabled": True,

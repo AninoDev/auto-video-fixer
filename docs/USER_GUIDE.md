@@ -23,6 +23,7 @@ Before installing Auto Video Fixer, ensure you have:
 - **Python 3.10 or higher**
 - **FFmpeg** (must be installed and in your PATH)
 - **Git** (for cloning the repository)
+- **PyTorch** (optional, for AI upscaling/interpolation) - install with `uv pip install "auto-video-fixer[ai]"`
 
 ### Installing FFmpeg
 
@@ -72,6 +73,9 @@ uv pip install -e ".[all]"
 
 # Install Auto Video Fixer
 pip install auto-video-fixer
+
+# With AI support (optional, requires PyTorch):
+pip install "auto-video-fixer[ai]"
 ```
 
 ### Verifying Installation
@@ -85,7 +89,25 @@ avf --help
 
 # Check GPU support (optional)
 avf gpu-info
+
+# Check AI models (requires PyTorch)
+avf model-info
 ```
+
+### Installing AI Models
+
+AI models are downloaded automatically on first use. To pre-download models:
+
+```bash
+# Download models manually
+avf model-download --model real-esrgan-x4plus
+avf model-download --model rife-v4.6
+```
+
+Models are stored in the data directory:
+- **Linux**: `~/.local/share/auto-video-fixer/models/`
+- **macOS**: `~/Library/Application Support/auto-video-fixer/models/`
+- **Windows**: `%APPDATA%\auto-video-fixer\models\`
 
 ---
 
@@ -146,7 +168,32 @@ Commands:
   find-duplicates   Find similar/duplicate videos
   presets           List available presets
   gpu-info          Show GPU information
+  model-info        Show AI model information and download status
+  model-download    Download an AI model
 ```
+
+### Model Management Commands
+
+```bash
+# Show available AI models and their status
+avf model-info
+
+# Download a specific model
+avf model-download --model real-esrgan-x4plus
+
+# Download with custom URL
+avf model-download --model my-custom-model --url https://example.com/model.pth
+
+# Force re-download (overwrite existing)
+avf model-download --model rife-v4.6 --force
+```
+
+Available models:
+- `real-esrgan-x4plus` - General upscaling (4x)
+- `real-esrgan-x2plus` - General upscaling (2x)
+- `real-esrgan-x4plus-anime-6b` - Anime/cartoon upscaling
+- `rife-v4.6` - Frame interpolation (default)
+- `rife-v4.11` - Frame interpolation (higher quality, slower)
 
 ### Process Command
 
@@ -258,6 +305,12 @@ Access via **File → Settings...**
 #### Encoding Tab
 - Video codec (libx264, libx265, libvpx-vp9, copy)
 - CRF quality (0-51, lower = better quality)
+
+#### AI Tab
+- AI Upscaler model (Real-ESRGAN x2plus, x4plus, anime 6B)
+- AI Interpolator model (RIFE v4.6, v4.11)
+- TTA mode for upscaling (0-7, higher = better quality but slower)
+- Model cache management (view, clear cached models)
 
 ---
 
@@ -439,12 +492,18 @@ quality:
 stages:
   upscale:
     enabled: true
-    ai_model: RealESRGAN_x4plus
+    ai_model: RealESRGAN_x4plus  # RealESRGAN_x4plus, RealESRGAN_x2plus, RealESRGAN_x4plus_anime_6B
     traditional_method: superres
+    scale_factor: 4
+    tta_mode: 0  # Test-time augmentation mode (0=off, 1-7)
   interpolate:
     enabled: true
-    ai_model: rife_v4.6
+    ai_model: rife_v4.6  # rife_v4.6, rife_v4.11
     traditional_method: minterpolate
+  denoise_video:
+    enabled: true
+    ai_model: RealESRGAN_x4plus  # Use Real-ESRGAN in denoise mode
+    traditional_method: hqdn3d
   # ... other stages
 ```
 
@@ -524,14 +583,20 @@ avf process normal.mp4 --priority 0
 
 Enable debug logging:
 ```bash
-# Set in config
-log_level: DEBUG
+# Use verbose flag
+avf --verbose process video.mp4
+
+# Or set log level
+avf --log-level DEBUG process video.mp4
+
+# Or log to file
+avf --log-file /tmp/avf.log process video.mp4
 ```
 
-Or use environment variable:
-```bash
-export AVF_LOG_LEVEL=DEBUG
-avf process video.mp4
+Or set in config:
+```yaml
+general:
+  log_level: DEBUG
 ```
 
 ### API and VLM Integration

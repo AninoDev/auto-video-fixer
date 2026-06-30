@@ -71,3 +71,11 @@ logs/
 *.backup
 *.tmp
 *.temp
+
+# Local Test Videos
+/local_test_videos/
+/test-video*
+
+# Test frames
+frame_*.png
+frame_*.jpg

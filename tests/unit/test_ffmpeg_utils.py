@@ -2,19 +2,18 @@
 
 import os
 import subprocess
-from pathlib import Path
 
 import pytest
 
 from autovideofixer.core.ffmpeg_utils import (
-    get_ffmpeg_path,
-    get_ffprobe_path,
-    probe,
     ProbeResult,
     StreamInfo,
     detect_hardware_acceleration,
-    resolve_hwaccel,
     generate_temp_path,
+    get_ffmpeg_path,
+    get_ffprobe_path,
+    probe,
+    resolve_hwaccel,
 )
 
 
@@ -48,16 +47,32 @@ class TestProbe:
     def test_probe_valid_video(self, tmp_path):
         """Test probing a valid video file (integration test)."""
         import subprocess
-        
+
         test_file = tmp_path / "test.mp4"
-        subprocess.run([
-            "ffmpeg", "-y", "-f", "lavfi", "-i", "testsrc=duration=1:size=320x240:rate=24",
-            "-f", "lavfi", "-i", "sine=frequency=440:duration=1",
-            "-c:v", "libx264", "-c:a", "aac", str(test_file)
-        ], capture_output=True, check=True)
-        
+        subprocess.run(
+            [
+                "ffmpeg",
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc=duration=1:size=320x240:rate=24",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=440:duration=1",
+                "-c:v",
+                "libx264",
+                "-c:a",
+                "aac",
+                str(test_file),
+            ],
+            capture_output=True,
+            check=True,
+        )
+
         result = probe(str(test_file))
-        
+
         assert isinstance(result, ProbeResult)
         assert result.filename == "test.mp4"
         assert result.duration > 0
@@ -70,15 +85,28 @@ class TestProbe:
     def test_probe_video_info(self, tmp_path):
         """Test extracting video information (integration test)."""
         import subprocess
-        
+
         test_file = tmp_path / "test.mp4"
-        subprocess.run([
-            "ffmpeg", "-y", "-f", "lavfi", "-i", "testsrc=duration=2:size=640x480:rate=30",
-            "-c:v", "libx264", "-c:a", "aac", str(test_file)
-        ], capture_output=True, check=True)
-        
+        subprocess.run(
+            [
+                "ffmpeg",
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc=duration=2:size=640x480:rate=30",
+                "-c:v",
+                "libx264",
+                "-c:a",
+                "aac",
+                str(test_file),
+            ],
+            capture_output=True,
+            check=True,
+        )
+
         result = probe(str(test_file))
-        
+
         assert result.resolution == (640, 480)
         assert abs(result.framerate - 30.0) < 1.0
         assert result.format_name == "mov,mp4,m4a,3gp,3g2,mj2"
@@ -102,7 +130,7 @@ class TestStreamInfo:
             height=1080,
             fps=30.0,
         )
-        
+
         assert stream.is_video is True
         assert stream.is_audio is False
         assert stream.codec_name == "h264"
@@ -116,7 +144,7 @@ class TestStreamInfo:
             channels=2,
             sample_rate=48000,
         )
-        
+
         assert stream.is_audio is True
         assert stream.is_video is False
 
@@ -150,9 +178,9 @@ class TestPathGeneration:
     def test_generate_temp_path(self, tmp_path):
         """Test generating temporary file paths."""
         input_path = str(tmp_path / "input.mp4")
-        
+
         temp_path = generate_temp_path(str(tmp_path), input_path, suffix="_test")
-        
+
         assert temp_path.endswith("_test.mp4")
         assert str(tmp_path) in temp_path
         assert ".avf_" in temp_path
@@ -160,10 +188,10 @@ class TestPathGeneration:
     def test_generate_temp_path_uniqueness(self, tmp_path):
         """Test that generated paths are unique."""
         input_path = str(tmp_path / "input.mp4")
-        
+
         paths = set()
         for _ in range(10):
             temp_path = generate_temp_path(str(tmp_path), input_path)
             paths.add(temp_path)
-        
+
         assert len(paths) == 10  # All paths should be unique

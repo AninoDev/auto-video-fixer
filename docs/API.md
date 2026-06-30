@@ -373,10 +373,15 @@ StageStatus.CANCELLED    # Cancelled by user
 ```python
 from autovideofixer.core.stages.base import register_stage, create_stage, list_stages
 
-# Register a stage
+# Register a stage (can use decorator or bare function call)
 @register_stage
 class MyStage(BaseStage):
     # ...
+
+# Or without decorator:
+# class MyStage(BaseStage):
+#     # ...
+# register_stage(MyStage)
 
 # Get all stages
 stages = list_stages()
@@ -695,7 +700,6 @@ if result.output_path:
 ```python
 from autovideofixer.core.stages.base import BaseStage, StageResult, StageStatus, register_stage
 
-@register_stage
 class MyFilterStage(BaseStage):
     name = "my_filter"
     display_name = "My Filter"
@@ -716,6 +720,10 @@ class MyFilterStage(BaseStage):
         # ...
         
         self._report_progress(1.0, "Done", progress_callback)
+
+# Register the stage
+register_stage(MyFilterStage)
+```
         
         return StageResult(
             status=StageStatus.COMPLETED,

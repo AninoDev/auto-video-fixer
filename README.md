@@ -126,16 +126,20 @@ src/autovideofixer/
 
 1. Create a new file in `src/autovideofixer/core/stages/`
 2. Subclass `BaseStage`
-3. Implement `execute()` method
-4. Register with the `@register_stage` decorator
-5. Add to the default pipeline order in `Config.DEFAULTS`
+3. Set class attributes: `name`, `display_name`, `description`, `category`, `priority`, `supports_gpu`
+4. Implement `should_run()` and `execute()` methods
+5. **Register** in `src/autovideofixer/core/stages/__init__.py`: import the class and call `register_stage(MyStage)` at module level. Can use either decorator syntax (`@register_stage`) or bare function call (`register_stage(MyStage)`).
+6. Add config to `DEFAULTS["stages"][<name>]` in `src/autovideofixer/config.py`
+
+**CRITICAL - Stage ordering**: The pipeline does **not** use `DEFAULTS["pipeline"]["default_order"]` from config.py. The actual ordering is hardcoded in `Pipeline.optimize_stage_order()` in `pipeline.py:232`. Changing `DEFAULTS["pipeline"]["default_order"]` has **no effect** on execution order. To change order, modify `pipeline.py:optimize_stage_order()`.
+
+**`remux` is not in the default pipeline**. It is only added by `auto_determine_stages()` when the input is MKV (detected by the `detect` stage).
 
 Example:
 
 ```python
-from autovideofixer.core.stages.base import BaseStage, StageResult, StageStatus, register_stage
+from autovideofixer.core.stages.base import BaseStage, StageResult, StageStatus
 
-@register_stage
 class MyNewStage(BaseStage):
     name = "my_stage"
     display_name = "My New Stage"

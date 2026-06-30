@@ -79,9 +79,8 @@ The optimal processing order is:
 
 ```python
 # src/autovideofixer/core/stages/my_stage.py
-from autovideofixer.core.stages.base import BaseStage, StageResult, StageStatus, register_stage
+from autovideofixer.core.stages.base import BaseStage, StageResult, StageStatus
 
-@register_stage
 class MyStage(BaseStage):
     name = "my_stage"
     display_name = "My Custom Stage"
@@ -89,11 +88,20 @@ class MyStage(BaseStage):
     category = "enhancement"
     priority = 25
     supports_gpu = True
+    
+    def __init__(self, config):
+        super().__init__(config)
+        self._stage_config = config.get("stages", self.name, default={})
 ```
 
 ### Step 2: Implement Logic
 
 ```python
+def should_run(self, input_info):
+    if not self.is_enabled():
+        return False, "Disabled"
+    return True, None
+
 def execute(self, input_path, output_path, progress_callback, **kwargs):
     import time
     start = time.time()
@@ -114,11 +122,33 @@ def execute(self, input_path, output_path, progress_callback, **kwargs):
 
 ### Step 3: Register Stage
 
-The `@register_stage` decorator automatically registers the stage. No additional registration needed.
+Add to `src/autovideofixer/core/stages/__init__.py`:
 
-### Step 4: Add to Default Pipeline
+```python
+from autovideofixer.core.stages.my_stage import MyStage
 
-Edit `src/autovideofixer/config.py` in `DEFAULTS["pipeline"]["default_order"]` to include your stage name.
+# Register as a bare function call (NOT a decorator)
+register_stage(MyStage)
+```
+
+**Note**: `register_stage()` works as both a decorator (`@register_stage`) and a bare function call (`register_stage(MyStage)`). Both are valid.
+
+### Step 4: Add Stage Config
+
+Add to `DEFAULTS["stages"]` in `src/autovideofixer/config.py`:
+
+```python
+"stages": {
+    "my_stage": {
+        "enabled": True,
+        # ... stage-specific settings
+    },
+}
+```
+
+### Step 5: Set Stage Order
+
+**CRITICAL**: The pipeline does **not** use `DEFAULTS["pipeline"]["default_order"]`. The actual ordering is hardcoded in `Pipeline.optimize_stage_order()` in `pipeline.py:232`. To change order, modify that method.
 
 ## GPU Integration
 
@@ -195,7 +225,9 @@ setup_logging("DEBUG")
 Or via CLI:
 
 ```bash
-avf process video.mp4 --debug
+avf --verbose process video.mp4
+# or
+avf --log-level DEBUG process video.mp4
 ```
 
 ## Performance Tips
@@ -244,10 +276,17 @@ src/autovideofixer/
 - **FFmpeg**: Video processing backend
 - **PyYAML**: Configuration file parsing
 
-### AI/ML
-- **PyTorch**: Deep learning inference
-- **OpenCV**: Computer vision operations
-- **NumPy**: Array operations
+### AI/ML (`ai/`)
+
+The AI package provides PyTorch-based AI processing with graceful fallback to traditional FFmpeg methods:
+
+- **`torch_utils.py`** - PyTorch device detection, tensor conversion, TTA, batch inference
+- **`model_cache.py`** - Model registry, download with SHA256 verification, cache management
+- **`frame_processor.py`** - OpenCV frame extraction/conversion utilities
+- **`wrappers/upscale.py`** - Real-ESRGAN (RRDBNet architecture) for AI upscaling
+- **`wrappers/interpolate.py`** - RIFE (IFNet + EMD) for AI frame interpolation
+
+Stages with AI implementations (upscale, interpolate, denoise_video) automatically fall back to FFmpeg when PyTorch or models are unavailable.
 
 ### GUI
 - **PySide6**: Qt for Python (cross-platform GUI)
@@ -258,11 +297,13 @@ src/autovideofixer/
 
 ## Future Enhancements
 
-- [ ] Real-ESRGAN integration for AI upscaling
-- [ ] RIFE model for frame interpolation
+- [x] Real-ESRGAN integration for AI upscaling
+- [x] RIFE model for frame interpolation
+- [x] AI denoising via Real-ESRGAN (denoise mode)
+- [x] AI model cache and download system
+- [x] SSIM/PSNR quality metrics (via FFmpeg)
 - [ ] Ollama/OpenAI integration for VLM analysis
 - [ ] Web-based UI (optional)
 - [ ] Plugin system for community stages
 - [ ] Batch processing with job scheduling
-- [ ] Advanced quality metrics (SSIM, PSNR, MS-SSIM)
 - [ ] Hardware encoding optimization (NVENC, QSV, VAAPI)

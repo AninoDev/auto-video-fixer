@@ -1,15 +1,12 @@
 """Tests for quality estimation."""
 
-import os
-from pathlib import Path
-
 import pytest
 
 from autovideofixer.core.quality import (
-    QualityResult,
     QualityMode,
-    estimate_quality_vmaf,
+    QualityResult,
     estimate_quality_loss,
+    estimate_quality_vmaf,
 )
 
 
@@ -25,7 +22,7 @@ class TestQualityResult:
             mode=QualityMode.TARGET,
             target=90.0,
         )
-        
+
         assert result.vmaf_score == 95.0
         assert result.psnr == 40.0
         assert result.ssim == 0.95
@@ -37,7 +34,7 @@ class TestQualityResult:
             vmaf_score=85.0,
             mode=QualityMode.NONE,
         )
-        
+
         assert result.score == 85.0
 
     def test_quality_result_score_target_mode(self):
@@ -47,7 +44,7 @@ class TestQualityResult:
             mode=QualityMode.TARGET,
             target=90.0,
         )
-        
+
         assert result.score == 92.0
         assert result.meets_target() is True
 
@@ -58,7 +55,7 @@ class TestQualityResult:
             mode=QualityMode.TARGET,
             target=90.0,
         )
-        
+
         assert result.meets_target() is False
 
     def test_quality_result_min_mode(self):
@@ -68,7 +65,7 @@ class TestQualityResult:
             details={"vmaf_min": 85.0, "vmaf": 90.0, "vmaf_max": 95.0},
             mode=QualityMode.MIN,
         )
-        
+
         assert result.score == 85.0
 
     def test_quality_result_avg_mode(self):
@@ -78,7 +75,7 @@ class TestQualityResult:
             details={"vmaf": 90.0},
             mode=QualityMode.AVG,
         )
-        
+
         assert result.score == 90.0
 
     def test_quality_result_max_mode(self):
@@ -88,7 +85,7 @@ class TestQualityResult:
             details={"vmaf_max": 95.0},
             mode=QualityMode.MAX,
         )
-        
+
         assert result.score == 95.0
 
 
@@ -103,7 +100,7 @@ class TestQualityEstimation:
             quality=QualityResult(vmaf_score=95.0, mode=QualityMode.NONE),
             max_loss_pct=10.0,
         )
-        
+
         assert acceptable is True
 
     def test_quality_loss_unacceptable(self):
@@ -114,7 +111,7 @@ class TestQualityEstimation:
             quality=QualityResult(vmaf_score=70.0, mode=QualityMode.TARGET, target=90.0),
             max_loss_pct=10.0,
         )
-        
+
         assert acceptable is False
         assert "exceeds" in reason
 
@@ -126,7 +123,7 @@ class TestQualityEstimation:
             quality=None,
             max_loss_pct=10.0,
         )
-        
+
         assert acceptable is True
 
     def test_quality_loss_zero_original_size(self):
@@ -135,7 +132,7 @@ class TestQualityEstimation:
             original_size=0,
             new_size=500000,
         )
-        
+
         assert acceptable is False
         assert "zero" in reason
 
@@ -143,22 +140,48 @@ class TestQualityEstimation:
     def test_estimate_vmaf_quality(self, tmp_path):
         """Test VMAF quality estimation (integration test, requires FFmpeg)."""
         import subprocess
-        
+
         # Create two test videos with different quality
         ref_file = tmp_path / "ref.mp4"
         dist_file = tmp_path / "dist.mp4"
-        
-        subprocess.run([
-            "ffmpeg", "-y", "-f", "lavfi", "-i", "testsrc=duration=1:size=320x240:rate=24",
-            "-c:v", "libx264", "-crf", "10", str(ref_file)
-        ], capture_output=True, check=True)
-        
-        subprocess.run([
-            "ffmpeg", "-y", "-f", "lavfi", "-i", "testsrc=duration=1:size=320x240:rate=24",
-            "-c:v", "libx264", "-crf", "28", str(dist_file)
-        ], capture_output=True, check=True)
-        
+
+        subprocess.run(
+            [
+                "ffmpeg",
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc=duration=1:size=320x240:rate=24",
+                "-c:v",
+                "libx264",
+                "-crf",
+                "10",
+                str(ref_file),
+            ],
+            capture_output=True,
+            check=True,
+        )
+
+        subprocess.run(
+            [
+                "ffmpeg",
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc=duration=1:size=320x240:rate=24",
+                "-c:v",
+                "libx264",
+                "-crf",
+                "28",
+                str(dist_file),
+            ],
+            capture_output=True,
+            check=True,
+        )
+
         result = estimate_quality_vmaf(str(ref_file), str(dist_file))
-        
+
         # VMAF should return a score between 0 and 100
         assert 0 <= result.vmaf_score <= 100

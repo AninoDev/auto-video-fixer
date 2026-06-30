@@ -1,10 +1,5 @@
 """Tests for Auto Video Fixer core functionality."""
 
-import os
-import tempfile
-
-import pytest
-
 from autovideofixer.config import Config
 from autovideofixer.core.analysis import is_video_file, scan_directory
 from autovideofixer.core.pipeline import Pipeline
@@ -127,7 +122,7 @@ class TestQuality:
     """Test quality estimation (basic structure tests)."""
 
     def test_quality_result_creation(self):
-        from autovideofixer.core.quality import QualityResult, QualityMode
+        from autovideofixer.core.quality import QualityMode, QualityResult
 
         result = QualityResult(
             vmaf_score=95.0,
@@ -141,7 +136,7 @@ class TestQuality:
         assert result.meets_target()
 
     def test_quality_not_met(self):
-        from autovideofixer.core.quality import QualityResult, QualityMode
+        from autovideofixer.core.quality import QualityMode, QualityResult
 
         result = QualityResult(
             vmaf_score=85.0,

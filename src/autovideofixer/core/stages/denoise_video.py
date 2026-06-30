@@ -106,14 +106,155 @@ class DenoiseVideoStage(BaseStage):
         output_path: str,
         progress_callback,
         start: float,
+        **kwargs,
     ) -> StageResult:
-        """AI-based denoising using PyTorch models."""
-        # Placeholder for actual AI denoising model execution
-        # Would use models like Noise2Void, BM3D-DnCNN, etc.
-        self._report_progress(1.0, "AI denoising complete", progress_callback)
-        return StageResult(
-            status=StageStatus.COMPLETED,
-            output_path=output_path,
-            metadata={"method": "ai", "model": "placeholder"},
-            duration_sec=time.time() - start,
+        """AI-based denoising using Real-ESRGAN in denoise mode.
+
+        Falls back to traditional FFmpeg method if PyTorch or model
+        files are not available.
+        """
+        try:
+            from autovideofixer.ai.frame_processor import FrameProcessor
+            from autovideofixer.ai.torch_utils import is_torch_available
+            from autovideofixer.ai.wrappers.upscale import RealESRGANUpscaler
+        except ImportError:
+            self.logger.warning("PyTorch not available, falling back to traditional denoising")
+            return self._execute_traditional(
+                input_path, output_path, progress_callback, start, strength="medium"
+            )
+
+        if not is_torch_available():
+            self.logger.warning("PyTorch not installed, falling back to traditional denoising")
+            return self._execute_traditional(
+                input_path, output_path, progress_callback, start, strength="medium"
+            )
+
+        try:
+            from autovideofixer.ai.model_cache import ensure_model_available
+
+            success, msg = ensure_model_available(
+                self._stage_config.get("ai_model", "RealESRGAN_x4plus")
+            )
+            if not success:
+                self.logger.warning(f"Model not available ({msg}), falling back")
+                return self._execute_traditional(
+                    input_path, output_path, progress_callback, start, strength="medium"
+                )
+
+        except Exception as e:
+            self.logger.warning(f"Model check failed ({e}), falling back to traditional")
+            return self._execute_traditional(
+                input_path, output_path, progress_callback, start, strength="medium"
+            )
+
+        # Use Real-ESRGAN at scale=1 (denoise mode - no upscaling)
+        upscaler = RealESRGANUpscaler(
+            scale=1,
+            model_name=self._stage_config.get("ai_model", "RealESRGAN_x4plus"),
+            tta_mode=self._stage_config.get("tta_mode", 0),
         )
+
+        if not upscaler.load_model():
+            self.logger.warning("Failed to load model for denoising, falling back")
+            return self._execute_traditional(
+                input_path, output_path, progress_callback, start, strength="medium"
+            )
+
+        try:
+            import os as _os
+
+            proc = FrameProcessor()
+            frames = proc.extract_frames(input_path)
+
+            if not frames:
+                return StageResult(
+                    status=StageStatus.FAILED,
+                    error="No frames extracted from input video",
+                    duration_sec=time.time() - start,
+                )
+
+            def cb(current, total, msg):
+                self._report_progress(0.1 + (current / total) * 0.9, msg, progress_callback)
+
+            denoised = upscaler.upscale_video(frames, progress_callback=cb)
+            proc.close()
+
+            if not denoised:
+                return StageResult(
+                    status=StageStatus.FAILED,
+                    error="No frames produced by denoiser",
+                    duration_sec=time.time() - start,
+                )
+
+            # Write denoised frames to temp file, then use FFmpeg to finalize
+            temp_path = _os.path.join(
+                _os.path.dirname(input_path) or ".",
+                f".avf_denoise_{_os.path.basename(input_path)}",
+            )
+            from autovideofixer.core.ffmpeg_utils import probe as _probe
+
+            try:
+                fps = _probe(input_path).framerate or 30.0
+            except Exception:
+                fps = 30.0
+
+            proc2 = FrameProcessor()
+            if not proc2.frames_to_video(denoised, temp_path, fps=fps):
+                proc2.close()
+                return StageResult(
+                    status=StageStatus.FAILED,
+                    error="Failed to write denoised frames to temp file",
+                    duration_sec=time.time() - start,
+                )
+            proc2.close()
+
+            # Copy audio from original to denoised temp file
+            from autovideofixer.core.ffmpeg_utils import run_ffmpeg as _run_ffmpeg
+
+            _run_ffmpeg(
+                [
+                    "-i",
+                    input_path,
+                    "-i",
+                    temp_path,
+                    "-map",
+                    "0:a:0",
+                    "-map",
+                    "1:v:0",
+                    "-c:v",
+                    "libx264",
+                    "-crf",
+                    "18",
+                    "-c:a",
+                    "copy",
+                    "-y",
+                    output_path,
+                ],
+                timeout=600,
+            )
+
+            # Clean up temp file
+            if _os.path.exists(temp_path):
+                _os.unlink(temp_path)
+
+            self._report_progress(1.0, "AI denoising complete", progress_callback)
+            return StageResult(
+                status=StageStatus.COMPLETED,
+                output_path=output_path,
+                metadata={
+                    "method": "ai",
+                    "model": self._stage_config.get("ai_model", "RealESRGAN_x4plus"),
+                    "frames_processed": len(denoised),
+                },
+                duration_sec=time.time() - start,
+            )
+
+        except Exception as e:
+            self.logger.error(f"AI denoising failed: {e}")
+            return StageResult(
+                status=StageStatus.FAILED,
+                error=f"AI denoising failed: {e}",
+                duration_sec=time.time() - start,
+            )
+        finally:
+            upscaler.unload()

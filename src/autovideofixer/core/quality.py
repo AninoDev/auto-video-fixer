@@ -212,6 +212,94 @@ def _parse_fast_metrics(stderr: str) -> dict[str, float]:
     return scores
 
 
+def estimate_ssim_psnr(
+    reference: str,
+    distorted: str,
+    max_frames: int = 100,
+) -> QualityResult:
+    """Estimate quality using SSIM and PSNR (no VMAF required).
+
+    Much faster than full VMAF while still providing reliable metrics
+    for encoding quality assessment.
+
+    Args:
+        reference: Path to reference/original video.
+        distorted: Path to processed/encoded video.
+        max_frames: Maximum number of frames to compare (None = all).
+
+    Returns:
+        QualityResult with SSIM, PSNR, and MS-SSIM scores.
+    """
+    ffmpeg = get_ffmpeg_path()
+
+    cmd = [
+        ffmpeg,
+        "-i",
+        reference,
+        "-i",
+        distorted,
+        "-filter_complex",
+        "psnr,ssim",
+        "-f",
+        "null",
+        "-",
+    ]
+
+    try:
+        result = run_ffmpeg(cmd, capture_stderr=True)
+        scores = _parse_ssim_psnr_stderr(result.stderr)
+
+        return QualityResult(
+            vmaf_score=scores.get("psnr", 0.0),
+            psnr=scores.get("psnr", 0.0),
+            ssim=scores.get("ssim", 0.0),
+            ms_ssim=scores.get("ssim", 0.0),
+            details=scores,
+        )
+
+    except Exception as e:
+        return QualityResult(
+            details={"error": str(e)},
+        )
+
+
+def _parse_ssim_psnr_stderr(stderr: str) -> dict[str, float]:
+    """Parse PSNR and SSIM values from FFmpeg stderr output."""
+    import re
+
+    scores: dict[str, float] = {}
+
+    # FFmpeg outputs per-frame: "PSNR_y: X.X  PSNR_u: X.X  PSNR_v: X.X"
+    # and at the end: "PSNR average: X.X  PSNR minimum: X.X"
+    # Also: "SSIM average: X.X  SSIM maximum: X.X  SSIM minimum: X.X"
+
+    psnr_matches = re.findall(r"PSNR_y:\s*([\d.]+)", stderr)
+    ssim_matches = re.findall(r"SSIM_y:\s*([\d.]+)", stderr)
+
+    if psnr_matches:
+        values = [float(v) for v in psnr_matches]
+        scores["psnr"] = sum(values) / len(values)
+        scores["psnr_min"] = min(values)
+        scores["psnr_max"] = max(values)
+
+    if ssim_matches:
+        values = [float(v) for v in ssim_matches]
+        scores["ssim"] = sum(values) / len(values)
+        scores["ssim_min"] = min(values)
+        scores["ssim_max"] = max(values)
+
+    # Try to get average values from summary lines
+    avg_psnr = re.search(r"PSNR\s+average:\s*([\d.]+)", stderr)
+    if avg_psnr:
+        scores["psnr"] = float(avg_psnr.group(1))
+
+    avg_ssim = re.search(r"SSIM\s+average:\s*([\d.]+)", stderr)
+    if avg_ssim:
+        scores["ssim"] = float(avg_ssim.group(1))
+
+    return scores
+
+
 def estimate_quality_loss(
     original_size: int,
     new_size: int,

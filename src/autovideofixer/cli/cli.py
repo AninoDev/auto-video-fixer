@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import logging
 import os
 import sys
 
@@ -15,20 +16,47 @@ from autovideofixer.config import Config
 from autovideofixer.core.analysis import is_video_file, scan_directory
 from autovideofixer.core.pipeline import Pipeline
 from autovideofixer.core.presets import get_preset, list_presets
+from autovideofixer.logger import setup_logging
 
 console = Console()
 
 
 @click.group()
 @click.version_option(version=__version__, prog_name="avf")
+@click.option("--verbose", "-v", is_flag=True, help="Enable verbose logging (DEBUG level)")
+@click.option("--log-level", type=click.Choice(["DEBUG", "INFO", "WARNING", "ERROR"], case_sensitive=False), default=None, help="Set logging level")
+@click.option("--log-file", type=click.Path(), default=None, help="Log to file in addition to console")
 @click.pass_context
-def main(ctx: click.Context) -> None:
+def main(ctx: click.Context, verbose: bool, log_level: str | None, log_file: str | None) -> None:
     """Auto Video Fixer - Automated video enhancement and processing.
 
     Process one or more video files with AI-powered upscaling,
     frame interpolation, denoising, and more.
+    
+    Logging:
+      --verbose, -v          Enable DEBUG level logging
+      --log-level LEVEL      Set logging level (DEBUG, INFO, WARNING, ERROR)
+      --log-file PATH        Log to file (in addition to console)
     """
     ctx.ensure_object(dict)
+    
+    # Setup logging
+    if verbose:
+        setup_logging("DEBUG")
+    elif log_level:
+        setup_logging(log_level)
+    else:
+        setup_logging("INFO")
+    
+    # Add file handler if requested
+    if log_file:
+        from autovideofixer.logger import get_logger
+        logger = get_logger("autovideofixer")
+        import logging
+        file_handler = logging.FileHandler(log_file)
+        file_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s"))
+        logger.addHandler(file_handler)
+    
     ctx.obj["config"] = Config()
 
 
@@ -201,6 +229,95 @@ def gpu_info() -> None:
         console.print("  No hardware acceleration detected.")
 
 
+@main.command()
+@click.option("--model", default=None, help="Specific model to show info for")
+def model_info(model: str | None) -> None:
+    """Show AI model information and download status."""
+    from autovideofixer.ai.model_cache import (
+        MODEL_REGISTRY,
+        list_cached_models,
+    )
+
+    console.print("[bold]Available AI Models:[/bold]\n")
+
+    table = Table(title="Models")
+    table.add_column("Name", style="cyan")
+    table.add_column("Type")
+    table.add_column("Description")
+    table.add_column("Size")
+    table.add_column("Cached")
+    table.add_column("SHA256")
+
+    cached = set(list_cached_models())
+
+    for key, meta in MODEL_REGISTRY.items():
+        if model and key != model:
+            continue
+
+        is_cached = key in cached
+        sha = meta.get("sha256", "N/A")
+        if isinstance(sha, bytes):
+            sha = sha.hex()
+        sha_str = str(sha)[:12] + "..."
+
+        table.add_row(
+            key,
+            meta.get("type", "model"),
+            meta.get("description", ""),
+            f"{meta.get('size_mb', 0):.1f} MB",
+            "[green]Yes[/green]" if is_cached else "[yellow]No[/yellow]",
+            sha_str,
+        )
+
+    console.print(table)
+
+    if cached:
+        console.print(f"\n[Cyan]Cached models: {', '.join(cached)}[/cyan]")
+    else:
+        console.print(
+            "[red]No models cached. Download with: avf model-download --model <name>[/red]"
+        )
+
+
+@main.command()
+@click.option("--model", required=True, help="Model name to download")
+@click.option("--url", default=None, help="Custom download URL")
+@click.option("--force", is_flag=True, help="Force re-download even if cached")
+def model_download(model: str, url: str | None, force: bool) -> None:
+    """Download an AI model for processing."""
+    from autovideofixer.ai.model_cache import (
+        MODEL_REGISTRY,
+        ensure_model_available,
+    )
+    from autovideofixer.ai.torch_utils import is_torch_available
+
+    if not is_torch_available():
+        console.print("[red]PyTorch is not installed. Install with: pip install torch[/red]")
+        sys.exit(1)
+
+    if url:
+        try:
+            path = ensure_model_available(model, url=url, force=force)
+            console.print(f"[green]Model downloaded to: {path}[/green]")
+        except Exception as e:
+            console.print(f"[red]Download failed: {e}[/red]")
+            sys.exit(1)
+    elif model in MODEL_REGISTRY:
+        try:
+            path = ensure_model_available(model, force=force)
+            meta = MODEL_REGISTRY[model]
+            console.print("[green]Model downloaded:[/green]")
+            console.print(f"  Name: {meta.get('description', model)}")
+            console.print(f"  Path: {path}")
+        except Exception as e:
+            console.print(f"[red]Download failed: {e}[/red]")
+            sys.exit(1)
+    else:
+        console.print(f"[red]Unknown model: {model}[/red]")
+        console.print(f"Available models: {', '.join(MODEL_REGISTRY.keys())}")
+        sys.exit(1)
+
+
 # ─── Helpers ───────────────────────────────────────────────────────
 
 
@@ -223,12 +340,22 @@ def _merge_config(config: Config, data: dict) -> None:
         if isinstance(value, dict):
             current = config.get(key, default={})
             if isinstance(current, dict):
-                current.update(value)
+                # Recursively merge nested dicts
+                _merge_config_helper(current, value)
                 config.set(current, key)
             else:
                 config.set(value, key)
         else:
             config.set(value, key)
+
+
+def _merge_config_helper(target: dict, source: dict) -> None:
+    """Recursively merge source dict into target dict."""
+    for key, value in source.items():
+        if isinstance(value, dict) and key in target and isinstance(target[key], dict):
+            _merge_config_helper(target[key], value)
+        else:
+            target[key] = value
 
 
 def _on_job_complete(job, result) -> None:

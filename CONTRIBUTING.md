@@ -135,6 +135,7 @@ class MyCustomStage(BaseStage):
     def __init__(self, config):
         super().__init__(config)
         # Load stage-specific config
+        self._stage_config = config.get("stages", self.name, default={})
         self._param = self._stage_config.get("param", "default")
     
     def should_run(self, input_info: dict[str, Any]) -> tuple[bool, str | None]:
@@ -228,28 +229,27 @@ Add your stage to `src/autovideofixer/core/stages/__init__.py`:
 ```python
 from autovideofixer.core.stages.my_stage import MyCustomStage
 
-# Register
+# Register as a bare function call (NOT a decorator)
 register_stage(MyCustomStage)
 ```
 
-### Step 3: Add to Pipeline Order
+**Note**: `register_stage()` works as both a decorator (`@register_stage`) and a bare function call (`register_stage(MyStage)`). Both are valid.
 
-Edit `src/autovideofixer/config.py` in `DEFAULTS["pipeline"]["default_order"]`:
+### Step 3: Add Stage Config
+
+Add stage configuration to `DEFAULTS["stages"]` in `src/autovideofixer/config.py`:
 
 ```python
-"default_order": [
-    "detect",
-    "stabilize",
-    "deblock",
-    "denoise_video",
-    "upscale",
-    "interpolate",
-    "my_custom",  # Add your stage here
-    "normalize_volume",
-    "normalize_audio",
-    "encode",
-],
+"stages": {
+    "my_custom": {
+        "enabled": True,
+        "param": "default_value",
+    },
+    # ... other stages
+}
 ```
+
+**CRITICAL - Stage ordering**: The pipeline does **not** use `DEFAULTS["pipeline"]["default_order"]` from config.py. The actual ordering is hardcoded in `Pipeline.optimize_stage_order()` in `pipeline.py:232`. Changing `DEFAULTS["pipeline"]["default_order"]` has **no effect** on execution order. To change order, modify `pipeline.py:optimize_stage_order()`.
 
 ### Step 4: Add Configuration
 

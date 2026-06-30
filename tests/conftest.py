@@ -1,9 +1,6 @@
 """Auto Video Fixer - Test fixtures and helpers."""
 
-import os
 import subprocess
-import tempfile
-from pathlib import Path
 
 import pytest
 
@@ -12,16 +9,25 @@ import pytest
 def tmp_video_file(tmp_path):
     """Create a temporary test video file using FFmpeg."""
     video_path = tmp_path / "test_video.mp4"
-    
-    subprocess.run([
-        "ffmpeg", "-y",
-        "-f", "lavfi",
-        "-i", "testsrc=duration=2:size=320x240:rate=24",
-        "-c:v", "libx264",
-        "-c:a", "aac",
-        str(video_path)
-    ], capture_output=True, check=True)
-    
+
+    subprocess.run(
+        [
+            "ffmpeg",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc=duration=2:size=320x240:rate=24",
+            "-c:v",
+            "libx264",
+            "-c:a",
+            "aac",
+            str(video_path),
+        ],
+        capture_output=True,
+        check=True,
+    )
+
     return str(video_path)
 
 
@@ -31,15 +37,23 @@ def tmp_video_directory(tmp_path):
     videos = []
     for i in range(3):
         video_path = tmp_path / f"video_{i}.mp4"
-        subprocess.run([
-            "ffmpeg", "-y",
-            "-f", "lavfi",
-            "-i", f"testsrc=duration=1:size=320x240:rate=24",
-            "-c:v", "libx264",
-            str(video_path)
-        ], capture_output=True, check=True)
+        subprocess.run(
+            [
+                "ffmpeg",
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc=duration=1:size=320x240:rate=24",
+                "-c:v",
+                "libx264",
+                str(video_path),
+            ],
+            capture_output=True,
+            check=True,
+        )
         videos.append(str(video_path))
-    
+
     return tmp_path, videos
 
 
@@ -47,7 +61,7 @@ def tmp_video_directory(tmp_path):
 def sample_config():
     """Provide a sample configuration for testing."""
     from autovideofixer.config import Config
-    
+
     config = Config()
     config.set(1, "general", "max_concurrent_jobs")
     config.set(18, "encoding", "crf")

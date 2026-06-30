@@ -1,15 +1,14 @@
 """Tests for video analysis utilities."""
 
 import os
-from pathlib import Path
 
 import pytest
 
 from autovideofixer.config import Config
 from autovideofixer.core.analysis import (
     VideoAnalyzer,
-    is_video_file,
     is_image_file,
+    is_video_file,
     scan_directory,
 )
 
@@ -21,14 +20,14 @@ class TestFileDetection:
         """Test detecting valid video files."""
         video = tmp_path / "test.mp4"
         video.write_text("fake video")
-        
+
         assert is_video_file(str(video)) is True
 
     def test_is_video_file_invalid_extension(self, tmp_path):
         """Test rejecting non-video extensions."""
         file = tmp_path / "test.txt"
         file.write_text("not a video")
-        
+
         assert is_video_file(str(file)) is False
 
     def test_is_video_file_nonexistent(self):
@@ -39,20 +38,20 @@ class TestFileDetection:
         """Test detecting valid image files."""
         image = tmp_path / "test.jpg"
         image.write_text("fake image")
-        
+
         assert is_image_file(str(image)) is True
 
     def test_is_image_file_invalid(self, tmp_path):
         """Test rejecting non-image files."""
         file = tmp_path / "test.mp4"
         file.write_text("not an image")
-        
+
         assert is_image_file(str(file)) is False
 
     def test_video_extensions(self):
         """Test all supported video extensions."""
         from autovideofixer.core.analysis import VIDEO_EXTENSIONS
-        
+
         expected = {".mp4", ".mkv", ".avi", ".mov", ".wmv", ".flv", ".webm"}
         assert expected.issubset(VIDEO_EXTENSIONS)
 
@@ -71,13 +70,13 @@ class TestDirectoryScanning:
         (tmp_path / "video1.mp4").write_text("")
         (tmp_path / "video2.mkv").write_text("")
         (tmp_path / "video3.avi").write_text("")
-        
+
         # Create non-video files
         (tmp_path / "readme.txt").write_text("")
         (tmp_path / "image.jpg").write_text("")
-        
+
         videos = scan_directory(str(tmp_path))
-        
+
         assert len(videos) == 3
         video_names = [os.path.basename(v) for v in videos]
         assert "video1.mp4" in video_names
@@ -90,14 +89,14 @@ class TestDirectoryScanning:
         subdir = tmp_path / "subdir"
         subdir.mkdir()
         (subdir / "sub_video.mp4").write_text("")
-        
+
         # Create video in root
         (tmp_path / "root_video.mp4").write_text("")
-        
+
         # Scan recursively
         videos = scan_directory(str(tmp_path), recursive=True)
         assert len(videos) == 2
-        
+
         # Scan non-recursively
         videos = scan_directory(str(tmp_path), recursive=False)
         assert len(videos) == 1
@@ -130,7 +129,7 @@ class TestVideoAnalyzer:
         """Test clearing the analysis cache."""
         self.analyzer._analysis_cache["test"] = "data"
         assert len(self.analyzer._analysis_cache) == 1
-        
+
         self.analyzer.clear_cache()
         assert len(self.analyzer._analysis_cache) == 0
 
@@ -138,15 +137,26 @@ class TestVideoAnalyzer:
     def test_analyze_real_video(self, tmp_path):
         """Test analyzing a real video file (integration test)."""
         import subprocess
-        
+
         test_file = tmp_path / "test.mp4"
-        subprocess.run([
-            "ffmpeg", "-y", "-f", "lavfi", "-i", "testsrc=duration=1:size=320x240:rate=24",
-            "-c:v", "libx264", str(test_file)
-        ], capture_output=True, check=True)
-        
+        subprocess.run(
+            [
+                "ffmpeg",
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc=duration=1:size=320x240:rate=24",
+                "-c:v",
+                "libx264",
+                str(test_file),
+            ],
+            capture_output=True,
+            check=True,
+        )
+
         analysis = self.analyzer.analyze(str(test_file))
-        
+
         assert analysis.filename == "test.mp4"
         assert analysis.duration > 0
         assert analysis.has_video is True

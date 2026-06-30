@@ -15,8 +15,10 @@ def get_logger(name: str, level: Optional[int] = None) -> logging.Logger:
 
     if level is not None:
         logger.setLevel(level)
-    elif not logger.handlers:
-        logger.setLevel(logging.INFO)
+    elif logger.level == logging.NOTSET:
+        # Inherit from root or default to INFO
+        root_level = logging.root.level
+        logger.setLevel(root_level if root_level != logging.NOTSET else logging.INFO)
 
     if not logger.handlers:
         console = Console(stderr=True)
@@ -30,6 +32,11 @@ def get_logger(name: str, level: Optional[int] = None) -> logging.Logger:
         handler.setFormatter(logging.Formatter("%(message)s"))
         logger.addHandler(handler)
         logger.propagate = False
+    else:
+        # Update level for existing handlers
+        for handler in logger.handlers:
+            if logger.level != logging.NOTSET:
+                handler.setLevel(logger.level)
 
     return logger
 
@@ -42,3 +49,4 @@ def setup_logging(level: str = "INFO") -> None:
         format="%(message)s",
         handlers=[RichHandler(rich_tracebacks=True)],
     )
+    logging.root.setLevel(numeric_level)

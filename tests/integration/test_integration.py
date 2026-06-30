@@ -5,8 +5,6 @@ Run with: pytest tests/integration/ -v -m integration
 """
 
 import os
-import shutil
-import tempfile
 from pathlib import Path
 
 import pytest
@@ -18,8 +16,8 @@ class TestPipelineIntegration:
 
     def test_pipeline_single_file(self, tmp_video_file, tmp_path):
         """Test processing a single video file through the pipeline."""
-        from autovideofixer.core.pipeline import Pipeline
         from autovideofixer.config import Config
+        from autovideofixer.core.pipeline import Pipeline
 
         # Use a temporary config to avoid modifying user config
         config_path = tmp_path / "test_config.yaml"
@@ -28,7 +26,7 @@ class TestPipelineIntegration:
         pipeline = Pipeline(config)
         output_path = str(tmp_path / "output.mp4")
 
-        job = pipeline.add_job(tmp_video_file, output_path)
+        pipeline.add_job(tmp_video_file, output_path)
 
         results = pipeline.execute_all()
 
@@ -38,8 +36,8 @@ class TestPipelineIntegration:
 
     def test_pipeline_multiple_files(self, tmp_video_directory, tmp_path):
         """Test processing multiple video files."""
-        from autovideofixer.core.pipeline import Pipeline
         from autovideofixer.config import Config
+        from autovideofixer.core.pipeline import Pipeline
 
         _, video_files = tmp_video_directory
         config_path = tmp_path / "test_config.yaml"
@@ -60,8 +58,8 @@ class TestPipelineIntegration:
 
     def test_pipeline_with_presets(self, tmp_video_file, tmp_path):
         """Test processing with preset overrides."""
-        from autovideofixer.core.pipeline import Pipeline
         from autovideofixer.config import Config
+        from autovideofixer.core.pipeline import Pipeline
         from autovideofixer.core.presets import get_preset
 
         config_path = tmp_path / "test_config.yaml"
@@ -72,7 +70,7 @@ class TestPipelineIntegration:
         pipeline = Pipeline(config)
         output_path = str(tmp_path / "output.mp4")
 
-        job = pipeline.add_job(
+        pipeline.add_job(
             tmp_video_file,
             output_path,
             overrides=preset.stage_overrides,
@@ -84,8 +82,8 @@ class TestPipelineIntegration:
 
     def test_pipeline_with_progress_callback(self, tmp_video_file, tmp_path):
         """Test processing with progress reporting."""
-        from autovideofixer.core.pipeline import Pipeline
         from autovideofixer.config import Config
+        from autovideofixer.core.pipeline import Pipeline
 
         config_path = tmp_path / "test_config.yaml"
         config = Config(config_path)
@@ -98,7 +96,7 @@ class TestPipelineIntegration:
         def progress_callback(job, result):
             progress_updates.append((job.input_path, result.success))
 
-        job = pipeline.add_job(tmp_video_file, output_path)
+        pipeline.add_job(tmp_video_file, output_path)
         results = pipeline.execute_all(callback=progress_callback)
 
         assert len(results) >= 1
@@ -112,8 +110,8 @@ class TestStageIntegration:
 
     def test_detect_stage(self, tmp_video_file):
         """Test video detection/analysis stage."""
-        from autovideofixer.core.analysis import VideoAnalyzer
         from autovideofixer.config import Config
+        from autovideofixer.core.analysis import VideoAnalyzer
 
         config_path = tmp_video_file + "_config.yaml"
         config = Config(Path(config_path))
@@ -127,8 +125,8 @@ class TestStageIntegration:
 
     def test_stabilize_stage(self, tmp_video_file, tmp_path):
         """Test video stabilization stage."""
-        from autovideofixer.core.stages.stabilize import StabilizeStage
         from autovideofixer.config import Config
+        from autovideofixer.core.stages.stabilize import StabilizeStage
 
         config_path = tmp_path / "test_config.yaml"
         config = Config(config_path)
@@ -142,8 +140,8 @@ class TestStageIntegration:
 
     def test_denoise_stage(self, tmp_video_file, tmp_path):
         """Test video denoising stage."""
-        from autovideofixer.core.stages.denoise_video import DenoiseVideoStage
         from autovideofixer.config import Config
+        from autovideofixer.core.stages.denoise_video import DenoiseVideoStage
 
         config_path = tmp_path / "test_config.yaml"
         config = Config(config_path)
@@ -157,8 +155,8 @@ class TestStageIntegration:
 
     def test_deblock_stage(self, tmp_video_file, tmp_path):
         """Test video deblocking stage."""
-        from autovideofixer.core.stages.deblock import DeblockStage
         from autovideofixer.config import Config
+        from autovideofixer.core.stages.deblock import DeblockStage
 
         config_path = tmp_path / "test_config.yaml"
         config = Config(config_path)
@@ -172,8 +170,8 @@ class TestStageIntegration:
 
     def test_normalize_audio_stage(self, tmp_video_file, tmp_path):
         """Test audio normalization stage."""
-        from autovideofixer.core.stages.normalize_audio import NormalizeAudioStage
         from autovideofixer.config import Config
+        from autovideofixer.core.stages.normalize_audio import NormalizeAudioStage
 
         config_path = tmp_path / "test_config.yaml"
         config = Config(config_path)
@@ -189,8 +187,8 @@ class TestStageIntegration:
 
     def test_encode_stage(self, tmp_video_file, tmp_path):
         """Test video encoding stage."""
-        from autovideofixer.core.stages.encode import EncodeStage
         from autovideofixer.config import Config
+        from autovideofixer.core.stages.encode import EncodeStage
 
         config_path = tmp_path / "test_config.yaml"
         config = Config(config_path)
@@ -204,8 +202,8 @@ class TestStageIntegration:
 
     def test_remux_stage(self, tmp_video_file, tmp_path):
         """Test video remuxing stage."""
-        from autovideofixer.core.stages.remux import RemuxStage
         from autovideofixer.config import Config
+        from autovideofixer.core.stages.remux import RemuxStage
 
         config_path = tmp_path / "test_config.yaml"
         config = Config(config_path)
@@ -219,8 +217,8 @@ class TestStageIntegration:
 
     def test_speed_stage(self, tmp_video_file, tmp_path):
         """Test video speed adjustment stage."""
-        from autovideofixer.core.stages.speed import SpeedStage
         from autovideofixer.config import Config
+        from autovideofixer.core.stages.speed import SpeedStage
 
         config_path = tmp_path / "test_config.yaml"
         config = Config(config_path)
@@ -267,7 +265,8 @@ class TestConfigIntegration:
     def test_preset_persistence(self, tmp_path):
         """Test that presets can be saved and loaded."""
         from dataclasses import replace
-        from autovideofixer.core.presets import get_preset, save_preset, load_preset
+
+        from autovideofixer.core.presets import get_preset, load_preset, save_preset
 
         # Create a custom preset (make a copy to avoid modifying the global preset)
         original = get_preset("4k60")
@@ -289,8 +288,8 @@ class TestAnalysisIntegration:
 
     def test_analyze_video_file(self, tmp_video_file):
         """Test analyzing a real video file."""
-        from autovideofixer.core.analysis import VideoAnalyzer
         from autovideofixer.config import Config
+        from autovideofixer.core.analysis import VideoAnalyzer
 
         config_path = tmp_video_file + "_config.yaml"
         config = Config(Path(config_path))
