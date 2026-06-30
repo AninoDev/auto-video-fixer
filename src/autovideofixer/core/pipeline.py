@@ -140,8 +140,14 @@ class Pipeline:
             raise FileNotFoundError(f"Input file not found: {input_path}")
 
         if output_path is None:
-            base, ext = os.path.splitext(input_path)
-            output_path = f"{base}_enhanced{ext}"
+            output_dir = self.config.get("general", "output_dir", default=None)
+            base_name = os.path.basename(input_path)
+            stem, ext = os.path.splitext(base_name)
+            output_filename = f"{stem}_enhanced{ext}"
+            if output_dir:
+                output_path = os.path.join(output_dir, output_filename)
+            else:
+                output_path = os.path.join(os.path.dirname(input_path), output_filename)
 
         job = Job(
             input_path=input_path,

@@ -29,6 +29,9 @@ class UpscaleStage(BaseStage):
         self._ai_model = self._stage_config.get("ai_model", "RealESRGAN_x4plus")
         self._tt_mode = self._stage_config.get("tta_mode", 0)
         self._scale_factor = self._stage_config.get("scale_factor", 4)
+        self._keep_aspect_ratio = self.config.get(
+            "quality", "quality_target", "keep_aspect_ratio", default=True
+        )
 
     def should_run(self, input_info: dict[str, Any]) -> tuple[bool, str | None]:
         if not self.is_enabled():
@@ -74,6 +77,13 @@ class UpscaleStage(BaseStage):
             else:
                 method = "traditional"
 
+        # Apply global AI override from CLI/config
+        use_ai = self.config.get("general", "use_ai", default=None)
+        if use_ai is True:
+            method = "ai"
+        elif use_ai is False:
+            method = "traditional"
+
         try:
             if method == "ai":
                 return self._execute_ai(
@@ -111,9 +121,15 @@ class UpscaleStage(BaseStage):
         target_height: int | None = None,
     ) -> StageResult:
         """Traditional upscaling using FFmpeg scale filter (lanczos)."""
-        # Determine scale parameters (use lanczos scaling algorithm)
+        # Get input dimensions
+        input_w, input_h = self._get_input_resolution(input_path)
+
+        # Calculate target dimensions (preserving aspect ratio if configured)
         if target_width and target_height:
-            scale_expr = f"scale={target_width}:{target_height}:flags=lanczos"
+            final_w, final_h = self._calculate_target_dimensions(
+                input_w, input_h, target_width, target_height
+            )
+            scale_expr = f"scale={final_w}:{final_h}:flags=lanczos"
         else:
             scale_expr = "scale=iw*2:ih*2:flags=lanczos"  # Default 2x
 
@@ -166,19 +182,32 @@ class UpscaleStage(BaseStage):
         # Real-ESRGAN max scale factor per pass
         max_ai_scale = 4
 
-        # Calculate how many AI passes we need
-        if target_width and target_height:
-            input_w, input_h = self._get_input_resolution(input_path) if input_path else (0, 0)
-            if input_w > 0 and input_h > 0:
-                # Calculate total scale needed
-                scale_w = target_width / input_w
-                scale_h = target_height / input_h
-                total_scale = max(scale_w, scale_h)
+        # Get input dimensions
+        input_w, input_h = (
+            self._get_input_resolution(input_path) if input_path else (0, 0)
+        )
 
-                # Calculate number of passes needed (each pass scales by up to max_ai_scale)
-                num_passes = math.ceil(math.log(total_scale) / math.log(max_ai_scale)) if total_scale > 1 else 1
-            else:
-                num_passes = 1
+        # Calculate target dimensions (preserving aspect ratio if configured)
+        if target_width and target_height and input_w > 0 and input_h > 0:
+            final_target_w, final_target_h = self._calculate_target_dimensions(
+                input_w, input_h, target_width, target_height
+            )
+        else:
+            final_target_w, final_target_h = target_width, target_height
+
+        # Calculate how many AI passes we need
+        if final_target_w and final_target_h and input_w > 0 and input_h > 0:
+            # Calculate total scale needed (based on longest side)
+            scale_w = final_target_w / input_w
+            scale_h = final_target_h / input_h
+            total_scale = max(scale_w, scale_h)
+
+            # Calculate number of passes needed (each pass scales by up to max_ai_scale)
+            num_passes = (
+                math.ceil(math.log(total_scale) / math.log(max_ai_scale))
+                if total_scale > 1
+                else 1
+            )
         else:
             num_passes = 1
 
@@ -197,8 +226,9 @@ class UpscaleStage(BaseStage):
                     # Calculate exact scale needed for final pass
                     current_info = self._get_input_resolution(current_input)
                     if current_info and current_info[0] > 0:
-                        scale_w = target_width / current_info[0]
-                        scale_h = target_height / current_info[1]
+                        current_w, current_h = current_info
+                        scale_w = final_target_w / current_w
+                        scale_h = final_target_h / current_h
                         sf = max(scale_w, scale_h)
                         # Round to nearest power of 2 for AI
                         sf = 2 ** round(math.log2(sf)) if sf > 1 else 2
@@ -545,6 +575,53 @@ class UpscaleStage(BaseStage):
             return info.resolution
         except Exception:
             return (1920, 1080)
+
+    def _calculate_target_dimensions(
+        self,
+        input_width: int,
+        input_height: int,
+        target_width: int | None,
+        target_height: int | None,
+    ) -> tuple[int, int]:
+        """Calculate target dimensions preserving aspect ratio if configured.
+
+        If keep_aspect_ratio is True, rotates the preset bounding box to match
+        the input's orientation (portrait presets swap w/h, landscape keeps it)
+        so total pixel count stays consistent regardless of aspect ratio.
+        If False, scales to the exact target dimensions.
+
+        Returns:
+            (width, height) tuple with even values (required by H.264).
+        """
+        if target_width is None or target_height is None:
+            return (input_width, input_height)
+
+        if not self._keep_aspect_ratio:
+            return self._round_to_even(target_width, target_height)
+
+        # Rotate preset bounding box to match input orientation
+        if input_height > input_width:  # Portrait input
+            bound_w, bound_h = target_height, target_width
+        elif input_width > input_height:  # Landscape input
+            bound_w, bound_h = target_width, target_height
+        else:  # Square input
+            bound_w = bound_h = min(target_width, target_height)
+
+        # Scale to fit within the (possibly rotated) bounding box
+        scale_w = bound_w / input_width if input_width > 0 else 1.0
+        scale_h = bound_h / input_height if input_height > 0 else 1.0
+        scale_factor = min(scale_w, scale_h)
+
+        new_width = int(input_width * scale_factor)
+        new_height = int(input_height * scale_factor)
+
+        return self._round_to_even(new_width, new_height)
+
+    @staticmethod
+    def _round_to_even(width: int, height: int) -> tuple[int, int]:
+        """Round dimensions to even values (required by H.264/YUV420p)."""
+        return (width if width % 2 == 0 else width + 1,
+                height if height % 2 == 0 else height + 1)
 
     def _get_input_fps(self, path: str) -> float:
         """Get input video framerate."""

@@ -46,6 +46,13 @@ class DenoiseVideoStage(BaseStage):
         start = time.time()
         self._report_progress(0.0, "Running video denoising...", progress_callback)
 
+        # Apply global AI override from CLI/config
+        use_ai = self.config.get("general", "use_ai", default=None)
+        if use_ai is True:
+            method = "ai"
+        elif use_ai is False:
+            method = "traditional"
+
         try:
             if method == "ai":
                 return self._execute_ai(input_path, output_path, progress_callback, start)

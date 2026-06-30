@@ -150,7 +150,9 @@ PRESETS: dict[str, Preset] = {
         enable_stages={
             "detect": True,
             "stabilize": True,
+            "deblock": True,
             "denoise_video": True,
+            "upscale": True,
             "interpolate": True,
             "normalize_volume": True,
             "normalize_audio": True,

@@ -69,6 +69,8 @@ def main(ctx: click.Context, verbose: bool, log_level: str | None, log_file: str
 @click.option("--list-presets", "list_presets_flag", is_flag=True, help="List available presets")
 @click.option("--stage", "stages", multiple=True, help="Specific stages to run (can repeat)")
 @click.option("--threads", type=int, default=None, help="Number of processing threads")
+@click.option("--ai", "use_ai", flag_value=True, default=None, help="Force AI-based processing")
+@click.option("--no-ai", "use_ai", flag_value=False, help="Disable AI-based processing (use traditional methods)")
 @click.pass_context
 def process(
     ctx: click.Context,
@@ -80,6 +82,7 @@ def process(
     list_presets_flag: bool,
     stages: tuple[str, ...],
     threads: int | None,
+    use_ai: bool | None,
 ) -> None:
     """Process video files with the specified settings."""
     if list_presets_flag:
@@ -105,6 +108,10 @@ def process(
     # Resolve output directory
     if output:
         config.set(output, "general", "output_dir")
+
+    # Resolve AI override
+    if use_ai is not None:
+        config.set(use_ai, "general", "use_ai")
 
     # Collect input files
     input_files = []

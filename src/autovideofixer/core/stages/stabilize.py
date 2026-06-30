@@ -99,7 +99,7 @@ class StabilizeStage(BaseStage):
                 "-show_entries", "stream=width,height",
                 "-of", "csv=p=0",
                 input_path
-            ], stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL, text=True)
+            ], stderr=subprocess.DEVNULL, stdout=subprocess.PIPE, text=True)
 
             if result.stdout and "," in result.stdout:
                 parts = result.stdout.strip().split(",")
@@ -118,7 +118,7 @@ class StabilizeStage(BaseStage):
                 "-show_entries", "stream=r_frame_rate",
                 "-of", "csv=p=0",
                 input_path
-            ], stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL, text=True)
+            ], stderr=subprocess.DEVNULL, stdout=subprocess.PIPE, text=True)
 
             if result.stdout and "/" in result.stdout:
                 num, den = result.stdout.strip().split("/")
@@ -472,10 +472,13 @@ class StabilizeStage(BaseStage):
             ffmpeg_bin = get_ffmpeg_path()
             
             # Decode process: outputs raw video (no audio) to stdout
+            # NOTE: -s explicitly sets output size to match transform's -s input
+            # This prevents corruption when ffprobe returns incorrect dimensions
             decode_proc = sp.Popen(
                 [ffmpeg_bin, "-hide_banner", "-i", input_path,
                  "-vf", f"format={pixel_format}", "-c:v", "rawvideo",
-                 "-f", "rawvideo", "-bufsize", "10M", "-"],
+                 "-f", "rawvideo", "-s", f"{video_width}x{video_height}",
+                 "-bufsize", "10M", "-"],
                 stdout=sp.PIPE,
                 stderr=sp.PIPE,
             )

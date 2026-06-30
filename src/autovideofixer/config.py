@@ -47,6 +47,7 @@ class Config:
             "max_concurrent_jobs": 1,
             "log_level": "INFO",
             "overwrite": False,
+            "use_ai": None,  # None=auto (preset/config), True=force AI, False=force traditional
         },
         "gpu": {
             "auto_detect": True,
@@ -65,6 +66,9 @@ class Config:
                 "mode": "none",  # none, min, avg, max
                 "target": 95.0,
                 "max_loss_pct": 5.0,
+                "target_resolution": None,  # (width, height) or None
+                "target_framerate": None,
+                "keep_aspect_ratio": True,  # preserve original video aspect ratio
             },
         },
         "pipeline": {
