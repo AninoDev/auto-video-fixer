@@ -14,6 +14,14 @@ class NormalizeAudioStage(BaseStage):
     """Normalize audio volume to target level (EBU R128 / LUFS).
 
     Uses FFmpeg's loudnorm filter for two-pass normalization.
+
+    NOTE: this performs the exact same operation as NormalizeVolumeStage below
+    (same loudnorm filter, same algorithm) -- the two names/config sections exist
+    for backward-compatible --stage/config addressing, not because they do
+    different things. Built-in presets only enable "normalize_volume" to avoid
+    running loudnorm twice on the same audio; enable "normalize_audio" instead
+    (or in addition) only if you specifically want to address it by that name,
+    e.g. via `--stage normalize_audio` with different target_db/true_peak kwargs.
     """
 
     name = "normalize_audio"
@@ -154,17 +162,24 @@ class NormalizeAudioStage(BaseStage):
 
 
 class NormalizeVolumeStage(BaseStage):
-    """Normalize video volume (alias for audio normalization with different config)."""
+    """Normalize audio volume to target level -- identical operation to
+    NormalizeAudioStage above (same loudnorm filter), just addressed under a
+    separate stage name/config section (stages.normalize_volume in config.py's
+    DEFAULTS) for backward compatibility. This is the one enabled by default in
+    built-in presets; see NormalizeAudioStage's docstring for why both exist.
+    """
 
     name = "normalize_volume"
     display_name = "Volume Normalization"
-    description = "Normalize video volume"
+    description = "Normalize audio volume to target loudness"
     category = "enhancement"
     priority = 40
     supports_gpu = False
 
     def __init__(self, config):
         super().__init__(config)
+        self._target_db = self._stage_config.get("target_db", -23.0)
+        self._true_peak = self._stage_config.get("true_peak_db", -2.0)
 
     def should_run(self, input_info: dict[str, Any]) -> tuple[bool, str | None]:
         if not self.is_enabled():
@@ -178,11 +193,25 @@ class NormalizeVolumeStage(BaseStage):
         input_path: str,
         output_path: str | None = None,
         progress_callback=None,
+        target_db: float | None = None,
+        true_peak: float | None = None,
         **kwargs,
     ) -> StageResult:
-        # Reuse audio normalization logic
+        # Reuse NormalizeAudioStage's implementation, but resolve target_db/
+        # true_peak from THIS stage's own config section (stages.normalize_volume)
+        # first -- constructing a bare NormalizeAudioStage(self.config) here would
+        # read stages.normalize_audio instead (a different, unrelated config
+        # section that isn't even in DEFAULTS), silently ignoring whatever the
+        # user configured under stages.normalize_volume.
         normalizer = NormalizeAudioStage(self.config)
-        return normalizer.execute(input_path, output_path, progress_callback, **kwargs)
+        return normalizer.execute(
+            input_path,
+            output_path,
+            progress_callback,
+            target_db=target_db if target_db is not None else self._target_db,
+            true_peak=true_peak if true_peak is not None else self._true_peak,
+            **kwargs,
+        )
 
 
 def _extract_loudnorm_json(output: str) -> dict[str, Any]:

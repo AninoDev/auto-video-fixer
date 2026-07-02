@@ -294,8 +294,9 @@ class RIFEInterpolator:
         result = interpolator.interpolate(frame_a, frame_b, timestep=0.5)
     """
 
-    def __init__(self, model_name: str = "rife_v4.6"):
+    def __init__(self, model_name: str = "rife_v4.6", device_preference: str = "auto"):
         self.model_name = model_name
+        self.device_preference = device_preference
         self._model: IFNet | None = None
         self._device: Any = None
         self._half = False
@@ -336,7 +337,11 @@ class RIFEInterpolator:
             _get_logger().error(f"Failed to prepare RIFE checkpoint: {e}")
             return False
 
-        self._device = get_device("auto")
+        self._device = get_device(self.device_preference)
+        if self._device.type == "cuda":
+            import torch
+
+            torch.backends.cudnn.benchmark = True
         model = IFNet()
         try:
             model = _load_rife_state_dict(model, checkpoint_path)

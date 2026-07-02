@@ -358,19 +358,23 @@ def list_cached_models() -> list[dict[str, Any]]:
                 }
             )
 
-    # Also check project-level models/ directory
-    project_models = Path("models")
-    if project_models.is_dir():
-        for item in project_models.iterdir():
-            if item.is_file():
-                cached.append(
-                    {
-                        "name": item.stem,
-                        "path": str(item),
-                        "size_mb": round(item.stat().st_size / (1024 * 1024), 1),
-                        "description": "Custom model",
-                    }
-                )
+    # Also check project-level models/ directory -- gated the same way as
+    # get_model_path()'s dev fallback, since these are unverified/unhashed and
+    # listing them here without the gate would surface (and implicitly lend
+    # trust to) unverified dev models even when AVF_ALLOW_DEV_MODELS is unset.
+    if os.environ.get("AVF_ALLOW_DEV_MODELS"):
+        project_models = Path("models")
+        if project_models.is_dir():
+            for item in project_models.iterdir():
+                if item.is_file():
+                    cached.append(
+                        {
+                            "name": item.stem,
+                            "path": str(item),
+                            "size_mb": round(item.stat().st_size / (1024 * 1024), 1),
+                            "description": "Custom model (unverified, dev)",
+                        }
+                    )
 
     return cached
 

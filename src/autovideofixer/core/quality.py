@@ -247,19 +247,42 @@ def estimate_ssim_psnr(
         QualityResult with SSIM and PSNR scores populated (ms_ssim mirrors ssim,
         since this path does not compute a true multi-scale SSIM).
     """
+    mode = QualityMode.TARGET if target is not None else QualityMode.NONE
+
+    # ffmpeg's psnr/ssim filters require matching frame dimensions. Most presets
+    # that would trigger a quality_target check also upscale/interpolate, so
+    # reference and distorted are almost never the same resolution -- without
+    # scaling one to match, ffmpeg errors out on every such run and the caller
+    # (Pipeline.execute_job) silently swallows it as "quality check failed",
+    # meaning the gate never actually ran for the presets it matters most for.
+    from autovideofixer.core.ffmpeg_utils import probe
+
+    try:
+        dist_info = probe(distorted)
+        dist_w = dist_info.streams[0].width if dist_info.streams else 0
+        dist_h = dist_info.streams[0].height if dist_info.streams else 0
+    except Exception:
+        dist_w = dist_h = 0
+
+    if dist_w and dist_h:
+        filter_complex = (
+            f"[0:v]scale={dist_w}:{dist_h}:flags=lanczos,split[a][b];"
+            "[1:v]split[c][d];[a][c]psnr;[b][d]ssim"
+        )
+    else:
+        filter_complex = "[0:v]split[a][b];[1:v]split[c][d];[a][c]psnr;[b][d]ssim"
+
     cmd = [
         "-i",
         reference,
         "-i",
         distorted,
         "-filter_complex",
-        "[0:v]split[a][b];[1:v]split[c][d];[a][c]psnr;[b][d]ssim",
+        filter_complex,
         "-f",
         "null",
         "-",
     ]
-
-    mode = QualityMode.TARGET if target is not None else QualityMode.NONE
 
     try:
         result = run_ffmpeg(cmd, capture_stderr=True)

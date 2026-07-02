@@ -436,6 +436,9 @@ class SettingsDialog(QtWidgets.QDialog):
 
 def run() -> None:
     """Entry point for the GUI application."""
+    from autovideofixer.logger import setup_logging
+
+    setup_logging("INFO")
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication(sys.argv)
     window = MainWindow()
     window.show()

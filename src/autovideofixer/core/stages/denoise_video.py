@@ -165,6 +165,7 @@ class DenoiseVideoStage(BaseStage):
             scale=1,
             model_name=ai_model_name,
             tta_mode=self._stage_config.get("tta_mode", 0),
+            device_preference=self.config.get("gpu", "preferred_device", default="auto"),
         )
 
         if not upscaler.load_model():

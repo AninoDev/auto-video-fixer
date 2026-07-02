@@ -32,39 +32,37 @@ console = Console()
 @click.option(
     "--log-file", type=click.Path(), default=None, help="Log to file in addition to console"
 )
+@click.option(
+    "--file-log-level",
+    type=click.Choice(["DEBUG", "INFO", "WARNING", "ERROR"], case_sensitive=False),
+    default=None,
+    help="Log level for --log-file, if different from the console level "
+    "(e.g. keep the console at INFO but capture DEBUG detail, including full "
+    "ffmpeg commands, to the file)",
+)
 @click.pass_context
-def main(ctx: click.Context, verbose: bool, log_level: str | None, log_file: str | None) -> None:
+def main(
+    ctx: click.Context,
+    verbose: bool,
+    log_level: str | None,
+    log_file: str | None,
+    file_log_level: str | None,
+) -> None:
     """Auto Video Fixer - Automated video enhancement and processing.
 
     Process one or more video files with AI-powered upscaling,
     frame interpolation, denoising, and more.
 
     Logging:
-      --verbose, -v          Enable DEBUG level logging
-      --log-level LEVEL      Set logging level (DEBUG, INFO, WARNING, ERROR)
+      --verbose, -v          Enable DEBUG level logging (console and file)
+      --log-level LEVEL      Set console logging level (DEBUG, INFO, WARNING, ERROR)
       --log-file PATH        Log to file (in addition to console)
+      --file-log-level LEVEL Set file-only logging level, if different from console
     """
     ctx.ensure_object(dict)
 
-    # Setup logging
-    if verbose:
-        setup_logging("DEBUG")
-    elif log_level:
-        setup_logging(log_level)
-    else:
-        setup_logging("INFO")
-
-    # Add file handler if requested
-    if log_file:
-        import logging
-
-        file_handler = logging.FileHandler(log_file)
-        file_handler.setFormatter(
-            logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s")
-        )
-        logging.getLogger("autovideofixer").addHandler(file_handler)
-        logging.getLogger("autovideofixer.ai").addHandler(file_handler)
-        logging.getLogger("autovideofixer.stages").addHandler(file_handler)
+    console_level = "DEBUG" if verbose else (log_level or "INFO")
+    setup_logging(console_level, log_file=log_file, file_level=file_log_level)
 
     ctx.obj["config"] = Config()
 
@@ -73,10 +71,33 @@ def main(ctx: click.Context, verbose: bool, log_level: str | None, log_file: str
 @click.argument("paths", nargs=-1, required=True)
 @click.option("--preset", "-p", default=None, help="Processing preset name")
 @click.option("--output", "-o", default=None, help="Output directory")
+@click.option(
+    "--output-name",
+    default=None,
+    help="Explicit output filename (only valid with exactly one input file)",
+)
 @click.option("--recursive", "-r", is_flag=True, help="Scan directories recursively")
 @click.option("--dry-run", is_flag=True, help="Show what would be done without processing")
 @click.option("--list-presets", "list_presets_flag", is_flag=True, help="List available presets")
-@click.option("--stage", "stages", multiple=True, help="Specific stages to run (can repeat)")
+@click.option(
+    "--stage",
+    "stages",
+    multiple=True,
+    help="Run only these stages, replacing the preset/auto-determined list (can repeat)",
+)
+@click.option(
+    "--enable-stage",
+    "enable_stages",
+    multiple=True,
+    help="Force-enable a stage on top of the preset/default set, e.g. --enable-stage hdr "
+    "(can repeat)",
+)
+@click.option(
+    "--disable-stage",
+    "disable_stages",
+    multiple=True,
+    help="Force-disable a stage even if the preset/default set would run it (can repeat)",
+)
 @click.option("--threads", type=int, default=None, help="Number of processing threads")
 @click.option("--ai", "use_ai", flag_value=True, default=None, help="Force AI-based processing")
 @click.option(
@@ -85,18 +106,81 @@ def main(ctx: click.Context, verbose: bool, log_level: str | None, log_file: str
     flag_value=False,
     help="Disable AI (use traditional methods)",
 )
+@click.option(
+    "--overwrite/--no-overwrite",
+    default=None,
+    help="Allow overwriting an existing output file (overrides general.overwrite in config)",
+)
+@click.option(
+    "--fps",
+    type=float,
+    default=None,
+    help="Target output framerate (overrides quality.quality_target.target_framerate)",
+)
+@click.option(
+    "--resolution",
+    default=None,
+    help="Target output resolution as WIDTHxHEIGHT, e.g. 3840x2160 "
+    "(overrides quality.quality_target.target_resolution)",
+)
+@click.option(
+    "--codec",
+    default=None,
+    help="Video codec, e.g. libx264, libx265, libvpx-vp9 (overrides encoding.video_codec)",
+)
+@click.option(
+    "--audio-codec",
+    default=None,
+    help="Audio codec, e.g. aac, copy (overrides encoding.audio_codec)",
+)
+@click.option(
+    "--crf", type=int, default=None, help="Constant rate factor / quality (overrides encoding.crf)"
+)
+@click.option(
+    "--encoder-preset",
+    default=None,
+    help="Encoder speed/quality preset (e.g. medium, slow, veryfast) -- NOT the same as "
+    "--preset, which selects a named avf processing bundle (overrides encoding.preset)",
+)
+@click.option(
+    "--hwaccel",
+    default=None,
+    type=click.Choice(["auto", "none", "cuda", "vaapi", "qsv", "vulkan", "videotoolbox"]),
+    help="FFmpeg hardware acceleration method for encode/decode stages "
+    "(overrides ffmpeg.hwaccel). Run `avf gpu-info` to see what's available.",
+)
+@click.option(
+    "--gpu-device",
+    default=None,
+    type=click.Choice(["auto", "cpu", "cuda", "mps"]),
+    help="PyTorch device for AI stages (upscale/interpolate/denoise), separate from "
+    "--hwaccel (overrides gpu.preferred_device). Run `avf gpu-info` to check what "
+    "PyTorch actually sees.",
+)
 @click.pass_context
 def process(
     ctx: click.Context,
     paths: tuple[str, ...],
     preset: str | None,
     output: str | None,
+    output_name: str | None,
     recursive: bool,
     dry_run: bool,
     list_presets_flag: bool,
     stages: tuple[str, ...],
+    enable_stages: tuple[str, ...],
+    disable_stages: tuple[str, ...],
     threads: int | None,
     use_ai: bool | None,
+    overwrite: bool | None,
+    fps: float | None,
+    resolution: str | None,
+    codec: str | None,
+    audio_codec: str | None,
+    crf: int | None,
+    encoder_preset: str | None,
+    hwaccel: str | None,
+    gpu_device: str | None,
 ) -> None:
     """Process video files with the specified settings."""
     if list_presets_flag:
@@ -127,6 +211,52 @@ def process(
     if use_ai is not None:
         config.set(use_ai, "general", "use_ai")
 
+    if overwrite is not None:
+        config.set(overwrite, "general", "overwrite")
+
+    if fps is not None:
+        config.set(fps, "quality", "quality_target", "target_framerate")
+
+    if resolution is not None:
+        try:
+            w_str, h_str = resolution.lower().split("x")
+            config.set([int(w_str), int(h_str)], "quality", "quality_target", "target_resolution")
+        except ValueError:
+            console.print(
+                f"[red]Invalid --resolution {resolution!r}: expected WIDTHxHEIGHT[/red] "
+                "(e.g. 3840x2160)"
+            )
+            sys.exit(1)
+
+    # Encoder settings feed the same "encoding" config key that
+    # Preset.to_config() writes, which Pipeline.execute_job() merges into
+    # job.stage_overrides["encode"] -- explicit flags here are applied after
+    # the preset merge above, so they take priority over the preset's values.
+    encoding_overrides = {}
+    if codec is not None:
+        encoding_overrides["video_codec"] = codec
+    if audio_codec is not None:
+        encoding_overrides["audio_codec"] = audio_codec
+    if crf is not None:
+        encoding_overrides["crf"] = crf
+    if encoder_preset is not None:
+        encoding_overrides["preset"] = encoder_preset
+    if encoding_overrides:
+        merged = dict(config.get("encoding", default={}) or {})
+        merged.update(encoding_overrides)
+        config.set(merged, "encoding")
+
+    if hwaccel is not None:
+        config.set(hwaccel, "ffmpeg", "hwaccel")
+
+    if gpu_device is not None:
+        config.set(gpu_device, "gpu", "preferred_device")
+
+    for stage_name in enable_stages:
+        config.set(True, "stages", stage_name, "enabled")
+    for stage_name in disable_stages:
+        config.set(False, "stages", stage_name, "enabled")
+
     # Collect input files
     input_files = []
     for path in paths:
@@ -141,6 +271,12 @@ def process(
         console.print("[red]No video files found.[/red]")
         sys.exit(1)
 
+    if output_name and len(input_files) != 1:
+        console.print(
+            f"[red]--output-name requires exactly one input file, got {len(input_files)}[/red]"
+        )
+        sys.exit(1)
+
     console.print(f"Found {len(input_files)} video file(s)")
 
     if dry_run:
@@ -151,7 +287,13 @@ def process(
 
     # Create pipeline and process
     pipeline = Pipeline(config)
-    jobs = pipeline.add_files(input_files)
+    if output_name:
+        output_dir = config.get("general", "output_dir", default=None) or os.path.dirname(
+            input_files[0]
+        )
+        jobs = [pipeline.add_job(input_files[0], output_path=os.path.join(output_dir, output_name))]
+    else:
+        jobs = pipeline.add_files(input_files)
 
     # Override stages if specified
     if stages:
@@ -305,16 +447,63 @@ def presets_cmd() -> None:
 
 @main.command()
 def gpu_info() -> None:
-    """Show GPU and hardware acceleration information."""
+    """Show GPU and hardware acceleration information.
+
+    Covers two independent GPU paths that are easy to conflate: FFmpeg
+    hwaccel (used by the encode/decode stages) and PyTorch/CUDA (used by the
+    AI upscale/interpolate/denoise stages). A system can have one without the
+    other -- e.g. ffmpeg hwaccel working fine while PyTorch silently falls
+    back to CPU for AI stages, which looks like "processing is just slow"
+    with no other symptom.
+    """
     from autovideofixer.core.ffmpeg_utils import detect_hardware_acceleration
 
     hwaccels = detect_hardware_acceleration()
-    console.print("Available hardware accelerations:")
+    console.print("[bold]FFmpeg hardware acceleration[/bold] (encode/decode stages):")
     for hw in hwaccels:
         console.print(f"  - {hw}")
-
     if not hwaccels:
         console.print("  No hardware acceleration detected.")
+
+    console.print("\n[bold]PyTorch / CUDA[/bold] (AI upscale/interpolate/denoise stages):")
+    try:
+        import torch
+    except ImportError:
+        console.print(
+            "  [yellow]PyTorch not installed[/yellow] -- AI stages will fall back to "
+            "traditional methods. Install the 'ai' extra: uv sync --extra ai"
+        )
+        return
+
+    console.print(f"  torch version: {torch.__version__}")
+    cuda_available = torch.cuda.is_available()
+    console.print(f"  CUDA available: {cuda_available}")
+    if cuda_available:
+        console.print(f"  CUDA build version: {torch.version.cuda}")
+        for i in range(torch.cuda.device_count()):
+            props = torch.cuda.get_device_properties(i)
+            vram_gb = props.total_memory / (1024**3)
+            console.print(
+                f"  [green]GPU {i}: {props.name} (sm_{props.major}{props.minor}, "
+                f"{vram_gb:.1f} GB)[/green]"
+            )
+    else:
+        console.print(
+            "  [red]No CUDA GPU detected by PyTorch.[/red] AI stages will run on CPU, "
+            "which is 1-2 orders of magnitude slower. Common causes: (1) a CPU-only "
+            "torch build was installed (plain `pip install torch` on some platforms "
+            "does not include CUDA support -- check https://pytorch.org for the "
+            "correct install command for your CUDA version), or (2) the installed "
+            "torch build predates support for this GPU's compute capability (very "
+            "new GPUs need a recent-enough torch/CUDA release)."
+        )
+
+    mps_available = hasattr(torch.backends, "mps") and torch.backends.mps.is_available()
+    console.print(f"  MPS (Apple Silicon) available: {mps_available}")
+
+    from autovideofixer.ai.torch_utils import get_device
+
+    console.print(f"\n  get_device('auto') currently selects: {get_device('auto')}")
 
 
 @main.command()

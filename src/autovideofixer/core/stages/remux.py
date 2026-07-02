@@ -53,9 +53,13 @@ class RemuxStage(BaseStage):
             from autovideofixer.core.ffmpeg_utils import run_ffmpeg
 
             # See normalize_audio.py: don't read and -y-truncate the same path
-            # simultaneously when no explicit output_path is given.
+            # simultaneously when no explicit output_path is given. The temp
+            # filename's extension must match target_format -- ffmpeg infers the
+            # output muxer from it, so a hardcoded ".mp4" here would silently mux
+            # into the wrong container whenever target_format is anything else
+            # (e.g. mkv/webm), even though the file gets renamed back correctly.
             in_place = output_path is None
-            dest = f"{input_path}.remux_tmp.mp4" if in_place else output_path
+            dest = f"{input_path}.remux_tmp.{target_format}" if in_place else output_path
 
             args = [
                 "-i",

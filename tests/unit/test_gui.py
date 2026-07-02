@@ -91,7 +91,15 @@ class TestJobQueue:
 
         # Avoid actually spinning up ffmpeg/probing a fake file in a background
         # thread; only the synchronous button-state transition is under test.
-        monkeypatch.setattr(window.pipeline, "execute_all", lambda callback=None: [])
+        # Must accept progress_callback too, matching Pipeline.execute_all()'s
+        # real signature -- a mock with a narrower signature than what
+        # ProcessingThread.run() actually calls raises TypeError inside the
+        # thread, which gets caught and turned into an `error` signal whose
+        # handler pops a blocking QMessageBox that hangs the whole test run
+        # once Qt's event loop next processes the queued signal.
+        monkeypatch.setattr(
+            window.pipeline, "execute_all", lambda callback=None, progress_callback=None: []
+        )
 
         window._on_start()
         try:

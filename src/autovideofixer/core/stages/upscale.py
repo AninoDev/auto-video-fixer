@@ -371,6 +371,7 @@ class UpscaleStage(BaseStage):
                 scale=int(scale_factor),
                 model_name=self._ai_model,
                 tta_mode=self._tt_mode,
+                device_preference=self.config.get("gpu", "preferred_device", default="auto"),
             )
 
             if not upscaler.load_model():

@@ -60,7 +60,15 @@ class EncodeStage(BaseStage):
             )
 
             actual_hwaccel = resolve_hwaccel(hwaccel)
-            hw_args = build_hwaccel_args(actual_hwaccel)
+            # We only have hardware *encoders* mapped for cuda/vaapi/qsv/videotoolbox
+            # (hw_codec_map below); d3d11/vulkan have no encoder mapping, so falling
+            # through to a software encoder. Requesting `-hwaccel d3d11`/`-hwaccel
+            # vulkan` for decode while encoding in software feeds hw-decoded frames to
+            # a sw encoder with no hwdownload/format filter -- treat these as "none"
+            # for hwaccel arg-building so decode stays consistent with the encoder.
+            hw_args = build_hwaccel_args(
+                actual_hwaccel if actual_hwaccel not in ("d3d11", "vulkan") else "none"
+            )
 
             # Map software codec to hardware codec for hwaccel
             hw_codec_map = {

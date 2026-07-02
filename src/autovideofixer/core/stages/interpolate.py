@@ -31,7 +31,18 @@ class InterpolateStage(BaseStage):
     def should_run(self, input_info: dict[str, Any]) -> tuple[bool, str | None]:
         if not self.is_enabled():
             return False, "Stage disabled"
+        # input_info is the probed INPUT file's own properties (from
+        # get_video_info), not the preset's target -- it never contains
+        # "target_framerate" unless something explicitly injects it. Fall back
+        # to config.quality.quality_target.target_framerate, matching
+        # UpscaleStage.should_run()'s equivalent fallback for target_resolution.
+        # Without this the stage always reported "No target framerate
+        # specified" and silently skipped, even when a preset like 1080p60
+        # requested 60fps.
         target_fps = input_info.get("target_framerate")
+        if not target_fps:
+            quality_target = self.config.get("quality", "quality_target", default={})
+            target_fps = quality_target.get("target_framerate")
         if not target_fps:
             return False, "No target framerate specified"
         current_fps = input_info.get("framerate", 0)
@@ -50,6 +61,10 @@ class InterpolateStage(BaseStage):
     ) -> StageResult:
         start = time.time()
         self._report_progress(0.0, "Running frame interpolation...", progress_callback)
+
+        if target_fps is None:
+            quality_target = self.config.get("quality", "quality_target", default={})
+            target_fps = quality_target.get("target_framerate")
 
         # Apply global AI override from CLI/config
         use_ai = self.config.get("general", "use_ai", default=None)
@@ -230,7 +245,10 @@ class InterpolateStage(BaseStage):
             )
 
         # Load and run RIFE
-        interpolator = RIFEInterpolator(model_name=self._ai_model)
+        interpolator = RIFEInterpolator(
+            model_name=self._ai_model,
+            device_preference=self.config.get("gpu", "preferred_device", default="auto"),
+        )
 
         if not interpolator.load_model():
             self.logger.warning("Failed to load RIFE model, falling back")

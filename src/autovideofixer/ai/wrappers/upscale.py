@@ -141,11 +141,13 @@ class RealESRGANUpscaler:
         model_name: str = "RealESRGAN_x4plus",
         tta_mode: int = 0,
         batch_size: int = 1,
+        device_preference: str = "auto",
     ):
         self.scale = scale
         self.model_name = model_name
         self.tta_mode = tta_mode
         self.batch_size = batch_size
+        self.device_preference = device_preference
         self._model: Any = None
         self._device: Any = None
         self._loaded = False
@@ -189,7 +191,17 @@ class RealESRGANUpscaler:
             _get_logger().error(f"Model file not found: {model_path}")
             return False
 
-        self._device = get_device("auto")
+        self._device = get_device(self.device_preference)
+
+        if self._device.type == "cuda":
+            import torch
+
+            # cudnn.benchmark profiles and caches the fastest conv algorithm for
+            # a given input shape on first use -- a meaningful speedup here since
+            # every frame in a video is the same fixed shape (repeated identical
+            # forward passes), unlike typical training workloads with varying
+            # batch/input sizes where this flag can hurt instead of help.
+            torch.backends.cudnn.benchmark = True
 
         # Determine num_block based on model name
         num_block = 6 if "6B" in self.model_name else 23

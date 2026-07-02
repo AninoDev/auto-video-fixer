@@ -50,6 +50,20 @@ def get_device(preferred: str = "auto") -> Any:
             return torch.device("cuda")
         if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
             return torch.device("mps")
+        # This was previously silent, which made "AI upscaling is unexpectedly
+        # slow" hard to self-diagnose: a GPU that torch doesn't see (e.g. a
+        # PyTorch build with no kernels for the installed GPU's compute
+        # capability, or CPU-only torch installed via plain `pip/uv install
+        # torch` without a CUDA index URL) means every AI stage silently runs
+        # a many-block CNN on CPU, ~1-2 orders of magnitude slower than GPU,
+        # with no indication anything is wrong short of the job taking forever.
+        # `avf gpu-info` now also surfaces this proactively (see cli.py).
+        _get_logger().warning(
+            "No CUDA or MPS GPU detected by PyTorch -- AI stages (upscale, "
+            "interpolate, AI denoise) will run on CPU, which is dramatically "
+            "slower. Run `avf gpu-info` to check what PyTorch sees, or pass "
+            "--no-ai to use traditional (non-AI) methods instead."
+        )
         return torch.device("cpu")
 
     if preferred == "cuda":

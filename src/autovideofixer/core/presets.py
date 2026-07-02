@@ -54,11 +54,22 @@ class Preset:
         stages = {}
         for name, enabled in self.enable_stages.items():
             stages[name] = {"enabled": enabled}
-        config["stages"] = stages
 
         if self.stage_overrides:
-            config["stages"] = config.get("stages", {})
-            config["stages"].update(self.stage_overrides)
+            # Must merge per-key, not `stages.update(self.stage_overrides)` -- a
+            # plain dict.update() replaces the whole per-stage value, silently
+            # dropping "enabled" whenever a stage appears in BOTH enable_stages
+            # and stage_overrides (true for upscale/interpolate/denoise_video in
+            # max_quality). Downstream, Config._deep_update() then merges this
+            # preset dict into the user's persisted config -- since "enabled" is
+            # missing here, the user's existing (possibly disabled) value for
+            # that stage survives untouched, so a preset that means to force AI
+            # upscaling/interpolation/denoising back on silently fails to if the
+            # user had previously disabled that stage in config.yaml or the GUI.
+            for name, overrides in self.stage_overrides.items():
+                stages[name] = {**stages.get(name, {}), **overrides}
+
+        config["stages"] = stages
 
         # Encoding settings -- consumed by Pipeline.execute_job(), which merges
         # this into job.stage_overrides["encode"] (see pipeline.py).
@@ -97,7 +108,7 @@ PRESETS: dict[str, Preset] = {
             "upscale": True,
             "interpolate": True,
             "normalize_volume": True,
-            "normalize_audio": True,
+            "normalize_audio": False,  # duplicate of normalize_volume, see that stage's docstring
             "encode": True,
         },
         stage_overrides={
@@ -124,7 +135,7 @@ PRESETS: dict[str, Preset] = {
             "upscale": True,
             "interpolate": True,
             "normalize_volume": True,
-            "normalize_audio": True,
+            "normalize_audio": False,  # duplicate of normalize_volume, see that stage's docstring
             "encode": True,
         },
     ),
@@ -145,7 +156,7 @@ PRESETS: dict[str, Preset] = {
             "denoise_video": True,
             "upscale": True,
             "normalize_volume": True,
-            "normalize_audio": True,
+            "normalize_audio": False,  # duplicate of normalize_volume, see that stage's docstring
             "encode": True,
         },
     ),
@@ -167,7 +178,7 @@ PRESETS: dict[str, Preset] = {
             "upscale": True,
             "interpolate": True,
             "normalize_volume": True,
-            "normalize_audio": True,
+            "normalize_audio": False,  # duplicate of normalize_volume, see that stage's docstring
             "encode": True,
         },
     ),
@@ -187,7 +198,7 @@ PRESETS: dict[str, Preset] = {
             "upscale": False,
             "interpolate": False,
             "normalize_volume": True,
-            "normalize_audio": True,
+            "normalize_audio": False,  # duplicate of normalize_volume, see that stage's docstring
             "encode": True,
         },
         quality_target={
@@ -227,7 +238,7 @@ PRESETS: dict[str, Preset] = {
             "stabilize": True,
             "denoise_video": True,
             "normalize_volume": True,
-            "normalize_audio": True,
+            "normalize_audio": False,  # duplicate of normalize_volume, see that stage's docstring
             "encode": True,
         },
     ),

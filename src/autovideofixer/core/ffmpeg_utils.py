@@ -326,10 +326,22 @@ def run_ffmpeg(
     Returns:
         CompletedProcess result
     """
+    import shlex
     import threading
+
+    from autovideofixer.logger import get_logger
+
+    logger = get_logger("autovideofixer.ffmpeg")
 
     ffmpeg = get_ffmpeg_path()
     cmd = [ffmpeg, "-hide_banner"] + args
+
+    # Always logged at DEBUG (not gated on failure) so `--log-file` with
+    # `--file-log-level DEBUG` captures every command run in a job, including
+    # ones from stages that ran and succeeded *before* a later stage failed --
+    # essential for diagnosing a failure that was actually caused by an
+    # earlier stage's output, not the stage that visibly errored.
+    logger.debug("ffmpeg command: %s", shlex.join(cmd))
 
     proc = subprocess.Popen(
         cmd,
@@ -363,12 +375,26 @@ def run_ffmpeg(
         raise
 
     stderr_thread.join(timeout=5)
+    full_stderr = "".join(stderr_lines)
+
+    if proc.returncode != 0:
+        # StageResult.error truncates stderr to 200-500 chars, which is often not
+        # enough to see the actual ffmpeg error (it's usually near the end, e.g.
+        # "Unrecognized option" or a codec/filter error a few lines from EOF).
+        # Log the full command + stderr here, once, centrally, regardless of
+        # which stage called us or how much of the error message it kept.
+        logger.error(
+            "ffmpeg failed (exit %s): %s\n--- full stderr ---\n%s",
+            proc.returncode,
+            shlex.join(cmd),
+            full_stderr,
+        )
 
     return subprocess.CompletedProcess(
         args=cmd,
         returncode=proc.returncode,
         stdout="",
-        stderr="".join(stderr_lines),
+        stderr=full_stderr,
     )
 
 
