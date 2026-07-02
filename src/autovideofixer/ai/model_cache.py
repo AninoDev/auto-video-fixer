@@ -9,12 +9,46 @@ from __future__ import annotations
 import hashlib
 import logging
 import os
+import re
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 from autovideofixer.config import get_data_dir
 
 _logger: logging.Logger | None = None
+
+# Model names and custom filenames become path components on disk; restrict
+# them to a safe charset so a crafted "../../.." name (or one embedding an
+# absolute path) can't escape the model cache directory (see download_model).
+_SAFE_NAME_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
+
+
+class ModelPathError(ValueError):
+    """Raised when a model name/filename/URL fails safety validation."""
+
+
+def _validate_safe_name(name: str, what: str) -> None:
+    if not name or not _SAFE_NAME_RE.fullmatch(name):
+        raise ModelPathError(
+            f"Invalid {what} {name!r}: must match {_SAFE_NAME_RE.pattern} "
+            "(no path separators or '..')"
+        )
+
+
+def _validate_dest_containment(dest: Path, model_dir: Path) -> None:
+    resolved_dest = dest.resolve()
+    resolved_dir = model_dir.resolve()
+    if not resolved_dest.is_relative_to(resolved_dir):
+        raise ModelPathError(
+            f"Refusing to write outside model directory: {resolved_dest} not under {resolved_dir}"
+        )
+
+
+def _validate_https_url(url: str) -> None:
+    scheme = urlparse(url).scheme.lower()
+    if scheme != "https":
+        raise ModelPathError(f"Refusing non-https model URL (scheme={scheme!r}): {url}")
 
 
 def _get_logger() -> logging.Logger:
@@ -94,12 +128,30 @@ def get_model_path(model_name: str) -> Path | None:
     model_dir = get_model_dir()
     candidate = model_dir / meta["filename"]
     if candidate.exists():
+        expected_sha256 = meta.get("sha256")
+        if expected_sha256:
+            actual = get_model_hash(str(candidate))
+            if actual is None or actual.lower() != expected_sha256.lower():
+                _get_logger().warning(
+                    f"Cached model {model_name} at {candidate} failed hash "
+                    f"re-verification (expected {expected_sha256}, got {actual}); "
+                    "treating as not cached, it will be re-downloaded"
+                )
+                return None
         return candidate
 
-    # Also check models/ directory at project root (for development)
-    project_models = Path("models") / model_name
-    if project_models.exists():
-        return project_models
+    # Also check models/ directory at project root, for local development
+    # only. This bypasses hash verification entirely, so it's opt-in via
+    # AVF_ALLOW_DEV_MODELS to avoid silently trusting whatever happens to be
+    # in the current working directory's models/ folder.
+    if os.environ.get("AVF_ALLOW_DEV_MODELS"):
+        project_models = Path("models") / model_name
+        if project_models.exists():
+            _get_logger().warning(
+                f"Loading model {model_name} from unverified dev path "
+                f"{project_models} (AVF_ALLOW_DEV_MODELS set)"
+            )
+            return project_models
 
     return None
 
@@ -150,19 +202,37 @@ def download_model(
     if meta is None and url is None:
         return False, f"Unknown model: {model_name}. Available: {list_available_models()}"
 
-    expected_sha256: str | None = None
-    if url is not None:
-        filename = custom_path or f"{model_name}.pth"
-    elif meta:
-        filename = meta["filename"]
-        url = url or meta["url"]
-        expected_sha256 = meta.get("sha256")
-    else:
-        return False, "Must provide URL for custom models"
+    try:
+        _validate_safe_name(model_name, "model name")
 
-    model_dir = get_model_dir()
-    model_dir.mkdir(parents=True, exist_ok=True)
-    dest = model_dir / filename
+        expected_sha256: str | None = None
+        if url is not None:
+            _validate_https_url(url)
+            filename = custom_path or f"{model_name}.pth"
+            if custom_path:
+                _validate_safe_name(custom_path, "custom_path")
+        elif meta:
+            filename = meta["filename"]
+            url = url or meta["url"]
+            _validate_https_url(url)
+            expected_sha256 = meta.get("sha256")
+        else:
+            return False, "Must provide URL for custom models"
+
+        model_dir = get_model_dir()
+        model_dir.mkdir(parents=True, exist_ok=True)
+        dest = model_dir / filename
+        _validate_dest_containment(dest, model_dir)
+    except ModelPathError as e:
+        _get_logger().error(f"Rejected model download request: {e}")
+        return False, str(e)
+
+    if expected_sha256 is None:
+        _get_logger().warning(
+            f"No sha256 pinned for model {model_name!r} in the registry; "
+            "downloaded weights will NOT be integrity-verified. Tampered or "
+            "corrupted weights would be silently accepted."
+        )
 
     _get_logger().info(f"Downloading {model_name} from {url}")
 
@@ -210,39 +280,55 @@ def _download_file(
                 pass
 
 
+_DOWNLOAD_TIMEOUT_SEC = 60
+
+
 def _fetch_to(url: str, dest: str, chunk_size: int = 8192) -> None:
     """Fetch `url` to `dest`, trying urllib, then requests, then curl."""
+    _validate_https_url(url)
+    errors: list[str] = []
+
     try:
         import urllib.request
 
-        urllib.request.urlretrieve(url, dest)
+        with (
+            urllib.request.urlopen(url, timeout=_DOWNLOAD_TIMEOUT_SEC) as resp,
+            open(dest, "wb") as f,
+        ):
+            while chunk := resp.read(chunk_size):
+                f.write(chunk)
         return
-    except Exception:
-        pass
+    except Exception as e:
+        errors.append(f"urllib: {e}")
+        _get_logger().warning(f"Download via urllib failed for {url}: {e}")
 
     try:
         import requests
 
-        resp = requests.get(url, stream=True, timeout=30)
+        resp = requests.get(url, stream=True, timeout=_DOWNLOAD_TIMEOUT_SEC)
         resp.raise_for_status()
         with open(dest, "wb") as f:
             for chunk in resp.iter_content(chunk_size=chunk_size):
                 if chunk:
                     f.write(chunk)
         return
-    except Exception:
+    except ImportError:
         pass
+    except Exception as e:
+        errors.append(f"requests: {e}")
+        _get_logger().warning(f"Download via requests failed for {url}: {e}")
 
     import subprocess
 
     result = subprocess.run(
-        ["curl", "-fsSL", "-o", dest, url],
+        ["curl", "-fsSL", "--max-time", "300", "-o", dest, url],
         capture_output=True,
         text=True,
         timeout=300,
     )
     if result.returncode != 0:
-        raise RuntimeError(f"curl download failed: {result.stderr}")
+        errors.append(f"curl: {result.stderr}")
+        raise RuntimeError(f"All download methods failed for {url}: {'; '.join(errors)}")
 
 
 def list_available_models() -> list[str]:

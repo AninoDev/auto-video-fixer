@@ -66,6 +66,8 @@ class JobResult:
     input_info: dict[str, Any] = field(default_factory=dict)
     output_info: dict[str, Any] = field(default_factory=dict)
     success: bool = False
+    quality_meets_target: bool | None = None  # None = not checked (quality_target.mode="none")
+    quality_score: float | None = None
 
     @property
     def all_stages_passed(self) -> bool:
@@ -236,6 +238,29 @@ class Pipeline:
 
         return stages
 
+    def _apply_config_encoding_overrides(self, job: Job) -> None:
+        """Merge config["encoding"] (from a preset or user config) into
+        job.stage_overrides["encode"], without clobbering any override the
+        job already set explicitly.
+
+        Preset.to_config() writes video_codec/audio_codec/crf/preset under
+        "encoding", but EncodeStage.execute() reads codec/audio_codec/crf/preset
+        kwargs -- video_codec is remapped to codec here.
+        """
+        encoding_cfg = self.config.get("encoding", default={})
+        if not encoding_cfg:
+            return
+        encode_overrides = job.stage_overrides.setdefault("encode", {})
+        key_map = {
+            "video_codec": "codec",
+            "audio_codec": "audio_codec",
+            "crf": "crf",
+            "preset": "preset",
+        }
+        for cfg_key, stage_kwarg in key_map.items():
+            if cfg_key in encoding_cfg and stage_kwarg not in encode_overrides:
+                encode_overrides[stage_kwarg] = encoding_cfg[cfg_key]
+
     def optimize_stage_order(self, stages: list[str]) -> list[str]:
         """Reorder stages for optimal quality and performance.
 
@@ -273,8 +298,16 @@ class Pipeline:
 
         return ordered
 
-    def execute_job(self, job: Job) -> JobResult:
+    def execute_job(
+        self,
+        job: Job,
+        progress_callback: Callable[[Job, float, str], None] | None = None,
+    ) -> JobResult:
         """Execute a single job through all determined stages.
+
+        progress_callback, if given, is invoked as (job, overall_progress, message)
+        on every per-stage progress update -- lets callers (e.g. the GUI) show live
+        progress instead of only a start/finish transition.
 
         Returns JobResult with details of each stage outcome.
         """
@@ -296,10 +329,42 @@ class Pipeline:
             else:
                 stage_names.append(name)
 
+        max_stages = self.config.get("pipeline", "max_stages", default=None)
+        if max_stages is not None and len(stage_names) > max_stages:
+            # Not truncated: the always-last "encode" stage must not be dropped, and
+            # naive slicing would drop it whenever a full default pipeline (11 stages)
+            # exceeds the default max_stages=10. Surface it as an explicit failure
+            # instead of silently either truncating output-producing stages or
+            # ignoring the configured cap outright.
+            msg = (
+                f"Requested {len(stage_names)} stages exceeds pipeline.max_stages="
+                f"{max_stages}: {stage_names}"
+            )
+            self.logger.error(msg)
+            job_result = JobResult(
+                input_path=job.input_path,
+                output_path=None,
+                errors=[msg],
+                success=False,
+            )
+            job.status = PipelineStatus.FAILED
+            job.result = job_result
+            job.progress = 1.0
+            return job_result
+
         self.logger.info(f"Processing {os.path.basename(job.input_path)}: stages={stage_names}")
 
         input_info = get_video_info(job.input_path)
         job.input_info = input_info
+
+        # Surface preset/config-level "encoding" and "general.target_format" settings
+        # (set via Preset.to_config()) into the per-stage machinery. Config values are
+        # a floor: an explicit job.stage_overrides entry always wins over them.
+        self._apply_config_encoding_overrides(job)
+        target_format = self.config.get("general", "target_format", default=None)
+        if target_format:
+            input_info["target_format"] = target_format
+            job.stage_overrides.setdefault("remux", {}).setdefault("target_format", target_format)
         current_path = job.input_path
         stage_results: dict[str, StageResult] = {}
         errors: list[str] = []
@@ -377,6 +442,8 @@ class Pipeline:
                 # Execute stage with progress
                 def progress_cb(prog, msg, _i=i, _n=len(stage_names)):
                     job.progress = (_i + prog) / _n
+                    if progress_callback:
+                        progress_callback(job, job.progress, msg)
 
                 try:
                     result = stage.execute(
@@ -448,6 +515,32 @@ class Pipeline:
             success=len(errors) == 0,
         )
 
+        # Quality gate: quality_target.mode/target were previously accepted from
+        # presets/config but nothing ever ran estimate_ssim_psnr()/meets_target()
+        # against them -- size_reduction's advertised "acceptable quality loss"
+        # bound had no effect. This is best-effort and non-fatal (an expensive
+        # extra ffmpeg pass failing shouldn't fail an otherwise-successful job);
+        # it only records the result for callers/reports to act on.
+        quality_target = self.config.get("quality", "quality_target", default={})
+        quality_mode = quality_target.get("mode", "none")
+        if job_result.success and quality_mode != "none" and final_output_path:
+            try:
+                from autovideofixer.core.quality import estimate_ssim_psnr
+
+                target = quality_target.get("target")
+                quality_result = estimate_ssim_psnr(
+                    job.input_path, final_output_path, target=target
+                )
+                job_result.quality_score = quality_result.score
+                job_result.quality_meets_target = quality_result.meets_target()
+                if not job_result.quality_meets_target:
+                    self.logger.warning(
+                        f"Output quality {quality_result.score:.1f} below target "
+                        f"{target} for {job.input_path}"
+                    )
+            except Exception as e:
+                self.logger.warning(f"Quality check failed for {job.input_path}: {e}")
+
         job.status = (
             PipelineStatus.CANCELLED
             if self._cancel_requested
@@ -459,7 +552,9 @@ class Pipeline:
         return job_result
 
     def execute_all(
-        self, callback: Callable[[Job, JobResult], None] | None = None
+        self,
+        callback: Callable[[Job, JobResult], None] | None = None,
+        progress_callback: Callable[[Job, float, str], None] | None = None,
     ) -> list[JobResult]:
         """Execute all jobs in the queue.
 
@@ -471,6 +566,9 @@ class Pipeline:
         max_concurrent_jobs on a GPU-constrained machine may see contention/OOM
         across concurrently-running AI stages, same as running multiple avf
         processes by hand would.
+
+        progress_callback, if given, is forwarded to execute_job() for live
+        per-stage progress reporting (e.g. for a GUI progress bar).
         """
         self._running = True
         results: list[JobResult] = []
@@ -481,7 +579,7 @@ class Pipeline:
 
         def _run(job: Job) -> JobResult:
             try:
-                return self.execute_job(job)
+                return self.execute_job(job, progress_callback=progress_callback)
             except Exception as e:
                 self.logger.exception(f"Job failed: {job.input_path}")
                 return JobResult(input_path=job.input_path, errors=[str(e)], success=False)

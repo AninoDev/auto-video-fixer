@@ -60,13 +60,18 @@ class Preset:
             config["stages"] = config.get("stages", {})
             config["stages"].update(self.stage_overrides)
 
-        # Encoding settings
+        # Encoding settings -- consumed by Pipeline.execute_job(), which merges
+        # this into job.stage_overrides["encode"] (see pipeline.py).
         config["encoding"] = {
             "video_codec": self.video_codec,
             "audio_codec": self.audio_codec,
             "crf": self.crf,
             "preset": self.preset,
         }
+
+        # Target container format -- consumed by Pipeline.execute_job(), which
+        # injects it into input_info so RemuxStage.should_run() can see it.
+        config["general"] = {"target_format": self.target_format}
 
         return config
 
@@ -186,8 +191,13 @@ PRESETS: dict[str, Preset] = {
             "encode": True,
         },
         quality_target={
-            "mode": "max_loss_pct",
-            "target": 28,
+            # "max_loss_pct" is not a recognized QualityMode (only
+            # none/min/avg/max/target exist) and `target` was previously set to
+            # 28 -- the CRF value, not a quality score -- so this never gated
+            # anything. "target" mode with an SSIM*100-scale threshold is what
+            # Pipeline.execute_job()'s quality gate actually checks against.
+            "mode": "target",
+            "target": 85.0,
             "max_loss_pct": 10.0,
         },
     ),

@@ -237,11 +237,17 @@ class UpscaleStage(BaseStage):
             if is_last_pass:
                 pass_output = output_path
             else:
-                # Use a consistent temp directory for intermediate files
+                # Unique per invocation (uuid), not just input stem + pass number --
+                # two jobs with same-named inputs running concurrently (or a second
+                # run before the first job's cleanup completes) would otherwise
+                # read/write the same shared-tempdir path and corrupt each other's
+                # intermediate frames.
+                import uuid
+
                 input_stem = os.path.splitext(os.path.basename(input_path))[0]
                 pass_output = os.path.join(
                     tempfile.gettempdir(),
-                    f".avf_ai_pass{pass_num + 1}_{input_stem}.mp4",
+                    f".avf_ai_pass{pass_num + 1}_{input_stem}_{uuid.uuid4().hex[:8]}.mp4",
                 )
                 intermediate_files.append(pass_output)
 
@@ -268,12 +274,60 @@ class UpscaleStage(BaseStage):
             if os.path.exists(f):
                 os.unlink(f)
 
+        # Each AI pass's scale factor is rounded to a power of 2 (models only support
+        # discrete scales), so the chained result can land on a different resolution
+        # than final_target_w/h. Correct it with one cheap ffmpeg resize rather than
+        # silently shipping an off-spec resolution.
+        if final_target_w and final_target_h:
+            actual = self._get_input_resolution(output_path)
+            if (
+                actual
+                and actual[0] > 0
+                and (actual[0], actual[1])
+                != (
+                    final_target_w,
+                    final_target_h,
+                )
+            ):
+                fix_result = self._resize_to_exact(
+                    output_path, final_target_w, final_target_h, start
+                )
+                if fix_result.status != StageStatus.COMPLETED:
+                    return fix_result
+
         return StageResult(
             status=StageStatus.COMPLETED,
             output_path=output_path,
             metadata={"method": "ai", "model": self._ai_model, "passes": num_passes},
             duration_sec=time.time() - start,
         )
+
+    def _resize_to_exact(
+        self, video_path: str, target_w: int, target_h: int, start: float
+    ) -> StageResult:
+        """Resize `video_path` in place to exactly target_w x target_h."""
+        tmp_path = f"{video_path}.resize_tmp.mp4"
+        args = [
+            "-i",
+            video_path,
+            "-vf",
+            f"scale={target_w}:{target_h}",
+            "-c:a",
+            "copy",
+            "-y",
+            tmp_path,
+        ]
+        result = run_ffmpeg(args, timeout=600)
+        if result.returncode != 0:
+            if os.path.exists(tmp_path):
+                os.unlink(tmp_path)
+            return StageResult(
+                status=StageStatus.FAILED,
+                error=f"Final resize to {target_w}x{target_h} failed: {result.stderr[:300]}",
+                duration_sec=time.time() - start,
+            )
+        os.replace(tmp_path, video_path)
+        return StageResult(status=StageStatus.COMPLETED, output_path=video_path)
 
     def _run_single_ai_pass(
         self,

@@ -32,6 +32,10 @@ class QualityResult:
     target: float = 0.0
     acceptable: bool = True
     details: dict[str, float] = None  # type: ignore[assignment]
+    # Set by estimate_ssim_psnr() (which has no VMAF score to report) so `.score`
+    # has something meaningful to compare against `target` in TARGET mode --
+    # without this, `.score` would fall back to vmaf_score=0.0 for that path.
+    score_override: float | None = None
 
     def __post_init__(self):
         if self.details is None:
@@ -40,6 +44,8 @@ class QualityResult:
     @property
     def score(self) -> float:
         """Return the score based on the quality mode."""
+        if self.score_override is not None:
+            return self.score_override
         if self.mode == QualityMode.NONE:
             return self.vmaf_score
         elif self.mode == QualityMode.MIN:
@@ -218,6 +224,7 @@ def estimate_ssim_psnr(
     reference: str,
     distorted: str,
     max_frames: int = 100,
+    target: float | None = None,
 ) -> QualityResult:
     """Estimate quality using SSIM and PSNR (no VMAF required).
 
@@ -230,6 +237,11 @@ def estimate_ssim_psnr(
         distorted: Path to processed/encoded video.
         max_frames: Maximum number of frames to compare (currently unused;
             reserved for future frame-limited comparison).
+        target: If given, sets mode=QualityMode.TARGET with this target so
+            meets_target() actually gates on the measured score instead of
+            trivially returning True (the QualityMode.NONE default). The
+            comparison score is SSIM scaled to 0-100 to match VMAF/config's
+            0-100 convention (see quality_target.target in config.py).
 
     Returns:
         QualityResult with SSIM and PSNR scores populated (ms_ssim mirrors ssim,
@@ -247,26 +259,40 @@ def estimate_ssim_psnr(
         "-",
     ]
 
+    mode = QualityMode.TARGET if target is not None else QualityMode.NONE
+
     try:
         result = run_ffmpeg(cmd, capture_stderr=True)
         if result.returncode != 0:
             return QualityResult(
-                details={"error": "PSNR/SSIM computation failed", "stderr": result.stderr[-2000:]}
+                mode=mode,
+                target=target or 0.0,
+                details={"error": "PSNR/SSIM computation failed", "stderr": result.stderr[-2000:]},
             )
 
         scores = _parse_ssim_psnr_stderr(result.stderr)
         if not scores:
-            return QualityResult(details={"error": "Could not parse PSNR/SSIM output"})
+            return QualityResult(
+                mode=mode,
+                target=target or 0.0,
+                details={"error": "Could not parse PSNR/SSIM output"},
+            )
 
+        ssim = scores.get("ssim", 0.0)
         return QualityResult(
             psnr=scores.get("psnr", 0.0),
-            ssim=scores.get("ssim", 0.0),
-            ms_ssim=scores.get("ssim", 0.0),
+            ssim=ssim,
+            ms_ssim=ssim,
+            mode=mode,
+            target=target or 0.0,
+            score_override=ssim * 100 if target is not None else None,
             details=scores,
         )
 
     except Exception as e:
         return QualityResult(
+            mode=mode,
+            target=target or 0.0,
             details={"error": str(e)},
         )
 

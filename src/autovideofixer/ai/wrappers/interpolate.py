@@ -263,12 +263,24 @@ def _resolve_checkpoint_path(path: str) -> str:
     if extracted.is_file():
         return str(extracted)
 
+    # Cap the extracted member size -- a malicious/corrupted zip (reachable via
+    # model_cache.py's --url override) could otherwise claim an oversized entry
+    # and exhaust memory on a single unbounded member.read().
+    max_extract_bytes = 512 * 1024 * 1024  # 512MB, generous for a flownet.pkl
+
     with zipfile.ZipFile(src) as zf:
         candidates = [n for n in zf.namelist() if n.endswith("flownet.pkl")]
         if not candidates:
             raise RuntimeError(f"No flownet.pkl found inside RIFE archive: {path}")
+        info = zf.getinfo(candidates[0])
+        if info.file_size > max_extract_bytes:
+            raise RuntimeError(
+                f"flownet.pkl entry in {path} is {info.file_size} bytes, "
+                f"exceeds the {max_extract_bytes} byte safety limit"
+            )
         with zf.open(candidates[0]) as member, open(extracted, "wb") as out:
-            out.write(member.read())
+            while chunk := member.read(1024 * 1024):
+                out.write(chunk)
 
     return str(extracted)
 
@@ -381,12 +393,30 @@ class RIFEInterpolator:
             t0 = F.pad(t0, (0, pad_w, 0, pad_h))
             t1 = F.pad(t1, (0, pad_w, 0, pad_h))
 
-        with torch.no_grad():
-            output = self._model(t0, t1, timestep=timestep)
-            if pad_h or pad_w:
-                output = output[:, :, :h, :w]
-            if dtype is not None:
-                output = output.float()
+        def _infer() -> Any:
+            with torch.no_grad():
+                out = self._model(t0, t1, timestep=timestep)
+                if pad_h or pad_w:
+                    out = out[:, :, :h, :w]
+                if dtype is not None:
+                    out = out.float()
+                return out
+
+        try:
+            output = _infer()
+        except torch.cuda.OutOfMemoryError:
+            _get_logger().warning(
+                "CUDA OOM interpolating a frame pair; clearing cache and retrying once"
+            )
+            torch.cuda.empty_cache()
+            try:
+                output = _infer()
+            except torch.cuda.OutOfMemoryError:
+                torch.cuda.empty_cache()
+                raise RuntimeError(
+                    "CUDA out of memory interpolating frames even after cache clear "
+                    "+ retry; try --no-ai"
+                ) from None
 
         return frame_from_tensor(output)
 

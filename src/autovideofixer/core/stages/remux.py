@@ -48,7 +48,14 @@ class RemuxStage(BaseStage):
         self._report_progress(0.0, "Remuxing...", progress_callback)
 
         try:
+            import os
+
             from autovideofixer.core.ffmpeg_utils import run_ffmpeg
+
+            # See normalize_audio.py: don't read and -y-truncate the same path
+            # simultaneously when no explicit output_path is given.
+            in_place = output_path is None
+            dest = f"{input_path}.remux_tmp.mp4" if in_place else output_path
 
             args = [
                 "-i",
@@ -58,7 +65,7 @@ class RemuxStage(BaseStage):
                 "-map",
                 "0",  # Map all streams
                 "-y",
-                output_path or input_path,
+                dest,
             ]
 
             def cb(p, m):
@@ -67,16 +74,22 @@ class RemuxStage(BaseStage):
             result = run_ffmpeg(args, progress_callback=cb, timeout=300)
 
             if result.returncode != 0:
+                if in_place and os.path.exists(dest):
+                    os.unlink(dest)
                 return StageResult(
                     status=StageStatus.FAILED,
                     error=f"Remuxing failed: {result.stderr[:200]}",
                     duration_sec=time.time() - start,
                 )
 
+            if in_place:
+                os.replace(dest, input_path)
+                dest = input_path
+
             self._report_progress(1.0, "Remux complete", progress_callback)
             return StageResult(
                 status=StageStatus.COMPLETED,
-                output_path=output_path or input_path,
+                output_path=dest,
                 metadata={"format": target_format},
                 duration_sec=time.time() - start,
             )

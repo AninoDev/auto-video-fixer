@@ -95,6 +95,15 @@ class NormalizeAudioStage(BaseStage):
             # Apply normalization
             self._report_progress(0.5, "Applying normalization...", progress_callback)
 
+            import os
+
+            # ffmpeg reading and -y-truncating the same path (when no explicit
+            # output_path is given) races reading input against writing output on
+            # the same file. Write to a distinct temp path and only replace
+            # input_path with it after a successful encode.
+            in_place = output_path is None
+            dest = f"{input_path}.normalize_tmp.mp4" if in_place else output_path
+
             args = [
                 "-i",
                 input_path,
@@ -107,7 +116,7 @@ class NormalizeAudioStage(BaseStage):
                 "-b:a",
                 "192k",
                 "-y",
-                output_path or input_path,
+                dest,
             ]
 
             def cb(p, m):
@@ -116,16 +125,22 @@ class NormalizeAudioStage(BaseStage):
             norm_result = run_ffmpeg(args, progress_callback=cb, timeout=600)
 
             if norm_result.returncode != 0:
+                if in_place and os.path.exists(dest):
+                    os.unlink(dest)
                 return StageResult(
                     status=StageStatus.FAILED,
                     error=f"Normalization failed: {norm_result.stderr[:200]}",
                     duration_sec=time.time() - start,
                 )
 
+            if in_place:
+                os.replace(dest, input_path)
+                dest = input_path
+
             self._report_progress(1.0, "Audio normalization complete", progress_callback)
             return StageResult(
                 status=StageStatus.COMPLETED,
-                output_path=output_path or input_path,
+                output_path=dest,
                 metadata={"target_db": target, "true_peak": peak},
                 duration_sec=time.time() - start,
             )

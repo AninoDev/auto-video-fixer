@@ -87,7 +87,10 @@ class Config:
                 "hdr",
                 "encode",
             ],
-            "max_stages": 10,
+            # Must stay >= len(default_order) above (11) since a full default run
+            # legitimately uses every stage; this only guards against pathological
+            # --stage repetition, not normal preset/auto-determined pipelines.
+            "max_stages": 15,
             "skip_stage_on_error": True,
         },
         "stages": {

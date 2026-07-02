@@ -89,11 +89,17 @@ class DeblockStage(BaseStage):
             "high": "7:7:0.8:7:7:0.5",
         }.get(str(strength), "5:5:0.5:5:5:0.3")
 
+        # msize_x/y (kernel radius) fields were previously computed into `params`
+        # but discarded -- the filter hardcoded 5:5 regardless of strength, so
+        # "high" strength only changed amount, not kernel size, making it barely
+        # different from "low". Use all six fields now.
+        lmx, lmy, lamount, cmx, cmy, camount = params.split(":")
         args = [
             "-i",
             input_path,
             "-vf",
-            f"unsharp=luma_msize_x=5:luma_msize_y=5:luma_amount={params.split(':')[2]}:chroma_msize_x=5:chroma_msize_y=5:chroma_amount={params.split(':')[5]}",
+            f"unsharp=luma_msize_x={lmx}:luma_msize_y={lmy}:luma_amount={lamount}:"
+            f"chroma_msize_x={cmx}:chroma_msize_y={cmy}:chroma_amount={camount}",
             "-c:a",
             "copy",
             "-y",

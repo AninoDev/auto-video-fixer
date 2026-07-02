@@ -667,6 +667,17 @@ def _call_custom_api(
         Response text from the API
     """
     import json
+    from urllib.parse import urlparse
+
+    # api_url is config-supplied (trusted-input trust model: it comes from the
+    # user's own config.yaml or a preset they chose to apply, not from network
+    # input). Still, require https except for loopback so a shared/untrusted
+    # config/preset can't silently point frame uploads + credentials at an
+    # arbitrary internal address over plaintext.
+    parsed = urlparse(api_url)
+    if parsed.scheme != "https" and parsed.hostname not in ("localhost", "127.0.0.1", "::1"):
+        logger.warning("Refusing non-https custom VLM API URL for non-loopback host: %s", api_url)
+        return ""
 
     content: list[dict[str, Any]] = [{"type": "text", "text": user_prompt}]
     for b64 in image_b64_list:

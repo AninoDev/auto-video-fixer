@@ -86,27 +86,46 @@ class EncodeStage(BaseStage):
             }
 
             codec_for_args = codec
-            if actual_hwaccel != "none" and codec in hw_codec_map:
+            if actual_hwaccel not in ("none", "d3d11", "vulkan") and codec in hw_codec_map:
                 codec_for_args = hw_codec_map[codec].get(actual_hwaccel, codec)
 
             # Build filter chain
             vf = kwargs.get("filter_complex") or ""
 
+            # Rate-control flags differ per encoder family: libx264/libx265/libvpx
+            # accept -preset/-crf, but the hardware encoders above don't (nvenc uses
+            # -cq, vaapi uses -qp with no -preset at all, qsv uses -global_quality with
+            # no -preset, videotoolbox has neither and falls back to bitrate control).
+            # Passing -preset/-crf unconditionally makes ffmpeg reject the command
+            # outright on every hwaccel path.
+            if codec_for_args.endswith("_nvenc"):
+                rate_args = ["-preset", preset, "-cq", str(crf)]
+            elif codec_for_args.endswith("_vaapi"):
+                rate_args = ["-qp", str(crf)]
+            elif codec_for_args.endswith("_qsv"):
+                rate_args = ["-global_quality", str(crf)]
+            elif codec_for_args.endswith("_videotoolbox"):
+                rate_args = []
+            else:
+                rate_args = ["-preset", preset, "-crf", str(crf)]
+
             # Build command
-            args = hw_args + [
-                "-i",
-                input_path,
-                "-c:v",
-                codec_for_args,
-                "-preset",
-                preset,
-                "-crf",
-                str(crf),
-                "-c:a",
-                audio_codec,
-                "-b:a",
-                audio_bitrate,
-            ]
+            args = (
+                hw_args
+                + [
+                    "-i",
+                    input_path,
+                    "-c:v",
+                    codec_for_args,
+                ]
+                + rate_args
+                + [
+                    "-c:a",
+                    audio_codec,
+                    "-b:a",
+                    audio_bitrate,
+                ]
+            )
 
             if vf:
                 args.extend(["-vf", vf])

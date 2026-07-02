@@ -326,29 +326,48 @@ def run_ffmpeg(
     Returns:
         CompletedProcess result
     """
+    import threading
+
     ffmpeg = get_ffmpeg_path()
     cmd = [ffmpeg, "-hide_banner"] + args
 
     proc = subprocess.Popen(
         cmd,
-        stdout=subprocess.PIPE,
+        stdout=subprocess.DEVNULL,
         stderr=subprocess.PIPE if capture_stderr else subprocess.DEVNULL,
         text=True,
     )
 
-    stderr_lines = []
-    if capture_stderr and proc.stderr:
-        for line in proc.stderr:
-            stderr_lines.append(line)
-            if progress_callback:
-                _parse_ffmpeg_progress(line, progress_callback)
+    # Drain stderr on a background thread so a stalled/hung ffmpeg (no more output,
+    # but not exited) doesn't block forever on the blocking `for line in proc.stderr`
+    # iterator before ever reaching a timeout-aware wait call below. This mirrors the
+    # pattern stabilize.py already uses for its manual decode/transform pipe.
+    stderr_lines: list[str] = []
 
-    stdout, _ = proc.communicate(timeout=timeout)
+    def _drain_stderr() -> None:
+        if capture_stderr and proc.stderr:
+            for line in proc.stderr:
+                stderr_lines.append(line)
+                if progress_callback:
+                    _parse_ffmpeg_progress(line, progress_callback)
+
+    stderr_thread = threading.Thread(target=_drain_stderr, daemon=True)
+    stderr_thread.start()
+
+    try:
+        proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait()
+        stderr_thread.join(timeout=5)
+        raise
+
+    stderr_thread.join(timeout=5)
 
     return subprocess.CompletedProcess(
         args=cmd,
         returncode=proc.returncode,
-        stdout=stdout,
+        stdout="",
         stderr="".join(stderr_lines),
     )
 

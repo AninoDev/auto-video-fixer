@@ -74,7 +74,10 @@ class ProcessingThread(QThread):
             def on_job(job, result):
                 self.job_complete.emit(job, result)
 
-            self.pipeline.execute_all(callback=on_job)
+            def on_progress(job, prog, msg):
+                self.progress.emit(f"{os.path.basename(job.input_path)}: {msg}", prog)
+
+            self.pipeline.execute_all(callback=on_job, progress_callback=on_progress)
             self.finished.emit()
         except Exception as e:
             self.error.emit(str(e))
@@ -209,10 +212,12 @@ class MainWindow(QMainWindow):
             "*.flv *.webm *.m4v *.mpg *.mpeg);;All Files (*)",
         )
         if files:
+            added = 0
             for f in files:
                 if is_video_file(f):
                     self._add_job_to_table(f)
-            self.gui_status.setText(f"Added {len(files)} file(s)")
+                    added += 1
+            self.gui_status.setText(f"Added {added} file(s)")
 
     def _on_add_directory(self) -> None:
         """Open directory dialog and scan for videos."""
@@ -324,9 +329,9 @@ class MainWindow(QMainWindow):
 
     def _on_settings(self) -> None:
         """Open settings dialog."""
+        # SettingsDialog.exec() already applies settings on accept.
         dialog = SettingsDialog(self.config, self)
-        if dialog.exec():
-            dialog.apply_settings()
+        dialog.exec()
 
     def _on_about(self) -> None:
         """Show about dialog."""
@@ -388,11 +393,15 @@ class SettingsDialog(QtWidgets.QDialog):
         enc_layout.addWidget(QLabel("Video codec:"))
         self.codec_combo = QtWidgets.QComboBox()
         self.codec_combo.addItems(["libx264", "libx265", "libvpx-vp9", "copy"])
+        current_codec = self.config.get("encoding", "video_codec", default="libx264")
+        idx = self.codec_combo.findText(current_codec)
+        if idx >= 0:
+            self.codec_combo.setCurrentIndex(idx)
         enc_layout.addWidget(self.codec_combo)
         enc_layout.addWidget(QLabel("CRF (lower = better quality):"))
         self.crf_spin = QtWidgets.QSpinBox()
         self.crf_spin.setRange(0, 51)
-        self.crf_spin.setValue(18)
+        self.crf_spin.setValue(self.config.get("encoding", "crf", default=18))
         enc_layout.addWidget(self.crf_spin)
         tabs.addTab(encoding, "Encoding")
 
@@ -413,8 +422,12 @@ class SettingsDialog(QtWidgets.QDialog):
         self.config.set(self.output_dir_edit.text(), "general", "output_dir")
         self.config.set(self.threads_spin.value(), "general", "max_concurrent_jobs")
         self.config.set(self.gpu_combo.currentText(), "gpu", "preferred_device")
+        self.config.set(self.codec_combo.currentText(), "encoding", "video_codec")
+        self.config.set(self.crf_spin.value(), "encoding", "crf")
 
     def exec(self) -> int:
+        # Applies settings itself on accept -- callers must not also call
+        # apply_settings() after exec() returns, or settings get applied twice.
         result = super().exec()
         if result == QtWidgets.QDialog.Accepted:
             self.apply_settings()

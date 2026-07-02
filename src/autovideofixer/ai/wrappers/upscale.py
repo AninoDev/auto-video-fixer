@@ -253,11 +253,28 @@ class RealESRGANUpscaler:
         if self._use_fp16:
             tensor = tensor.half()
 
-        with torch.no_grad():
-            if tta_mode and tta_mode >= 1:
-                output = apply_tta(self._model, tensor, mode=tta_mode)
-            else:
-                output = self._model(tensor)
+        def _infer() -> Any:
+            with torch.no_grad():
+                if tta_mode and tta_mode >= 1:
+                    return apply_tta(self._model, tensor, mode=tta_mode)
+                return self._model(tensor)
+
+        try:
+            output = _infer()
+        except torch.cuda.OutOfMemoryError:
+            # A single oversized/high-res frame can exceed VRAM even though prior
+            # frames fit; clear the allocator cache and retry once instead of
+            # aborting the whole video on one frame.
+            _get_logger().warning("CUDA OOM upscaling a frame; clearing cache and retrying once")
+            torch.cuda.empty_cache()
+            try:
+                output = _infer()
+            except torch.cuda.OutOfMemoryError:
+                torch.cuda.empty_cache()
+                raise RuntimeError(
+                    "CUDA out of memory upscaling frame even after cache clear + "
+                    "retry; try a smaller scale_factor or --no-ai"
+                ) from None
 
         if self._use_fp16:
             output = output.float()
