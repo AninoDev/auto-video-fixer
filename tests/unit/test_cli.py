@@ -84,7 +84,7 @@ class TestCLI:
     def test_model_info_command(self):
         """Test model-info command."""
         result = self.runner.invoke(main, ["model-info"])
-        assert result.exit_code == 0
+        assert result.exit_code == 0, f"CLI failed: {result.output}\nException: {result.exception}"
         assert "RealESRGAN_x4plus" in result.output
         assert "rife_v4.6" in result.output
 

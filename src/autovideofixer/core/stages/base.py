@@ -121,14 +121,6 @@ class BaseStage(ABC):
         """Build FFmpeg filter complex string. Default no filters."""
         return None
 
-    def cleanup(self, path: str | None = None) -> None:
-        """Clean up temporary files created by this stage."""
-        import os
-
-        p = path or self._tmp_path
-        if p and os.path.exists(p):
-            os.remove(p)
-
     def _report_progress(
         self,
         progress: float,

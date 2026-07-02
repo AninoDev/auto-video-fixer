@@ -4,7 +4,7 @@
 
 Auto Video Fixer aims to be the most intelligent, automated video enhancement tool available. It combines AI-powered processing with traditional techniques to deliver professional-quality results with minimal user effort.
 
-## Current Status: v0.2.0 (Alpha)
+## Current Status: v0.3.0 (Alpha)
 
 **Completed:**
 - ✅ Core pipeline architecture
@@ -46,18 +46,19 @@ Auto Video Fixer aims to be the most intelligent, automated video enhancement to
   - Per-frame and aggregate metrics
 
 #### v0.3.0 - Intelligence & Analysis
-- [ ] VLM (Vision Language Model) integration
-  - Ollama support (local models)
-  - OpenAI Vision API support
-  - Custom API endpoint support
-- [ ] Automated scene detection
-  - Scene change detection
-  - Event highlighting
-  - Automatic clip extraction
-- [ ] Duplicate detection improvements
-  - Perceptual hashing
-  - Similarity scoring
-  - Batch deduplication
+- [x] VLM (Vision Language Model) integration
+  - Ollama support (local models, localhost:11434)
+  - OpenAI Vision API support (GPT-4o)
+  - Custom API endpoint support (OpenAI-compatible)
+  - JSON response parsing with fallback
+- [x] Automated scene detection
+  - Frame differencing scene change detection
+  - Event highlighting (talking_head, action, landscape, text_overlay, transition)
+  - Clip extraction via FFmpeg (`--clip` flag)
+- [x] Duplicate detection improvements
+  - Perceptual hashing (ahash + dhash)
+  - Similarity scoring (Hamming distance)
+  - Batch deduplication (`find_duplicates`)
 - [ ] Smart quality adjustment
   - Auto-tune parameters based on content
   - Quality vs. performance balancing

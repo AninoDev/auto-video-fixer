@@ -21,6 +21,7 @@ from autovideofixer.core.stages.base import (
     StageResult,
     StageStatus,
     create_stage,
+    get_stage,
 )
 
 
@@ -283,8 +284,18 @@ class Pipeline:
         if not job.stages:
             job.stages = self.auto_determine_stages(job)
 
-        # Optimize order
-        stage_names = self.optimize_stage_order(job.stages)
+        # Optimize order, then drop anything that isn't a registered stage up front so
+        # progress accounting and cleanup only ever deal with stages that actually run.
+        requested_names = self.optimize_stage_order(job.stages)
+        stage_names: list[str] = []
+        skipped: list[str] = []
+        for name in requested_names:
+            if get_stage(name) is None:
+                self.logger.warning(f"Unknown stage: {name}")
+                skipped.append(name)
+            else:
+                stage_names.append(name)
+
         self.logger.info(f"Processing {os.path.basename(job.input_path)}: stages={stage_names}")
 
         input_info = get_video_info(job.input_path)
@@ -292,96 +303,143 @@ class Pipeline:
         current_path = job.input_path
         stage_results: dict[str, StageResult] = {}
         errors: list[str] = []
-        skipped: list[str] = []
         start_time = __import__("time").time()
+
+        overwrite = self.config.get("general", "overwrite", default=False)
+        if (
+            not overwrite
+            and job.output_path
+            and os.path.exists(job.output_path)
+            and os.path.abspath(job.output_path) != os.path.abspath(job.input_path)
+        ):
+            msg = f"Output already exists and general.overwrite is False: {job.output_path}"
+            self.logger.error(msg)
+            job_result = JobResult(
+                input_path=job.input_path,
+                output_path=None,
+                errors=[msg],
+                input_info=input_info,
+                success=False,
+            )
+            job.status = PipelineStatus.FAILED
+            job.result = job_result
+            job.progress = 1.0
+            return job_result
 
         # Create output directory
         output_dir = os.path.dirname(job.output_path)
         if output_dir:
             os.makedirs(output_dir, exist_ok=True)
 
-        for i, stage_name in enumerate(stage_names):
-            if self._cancel_requested:
-                job.status = PipelineStatus.CANCELLED
-                break
+        temp_dir = self.config.get("general", "temp_dir", default=None)
 
-            stage = create_stage(stage_name, self.config)
-            if stage is None:
-                msg = f"Unknown stage: {stage_name}"
-                self.logger.warning(msg)
-                skipped.append(stage_name)
-                continue
-
-            # Check if stage should run
-            should_run, reason = stage.should_run(input_info)
-            if not should_run:
-                self.logger.info(f"Skipping {stage_name}: {reason}")
-                skipped.append(stage_name)
-                stage_results[stage_name] = StageResult(
-                    status=StageStatus.SKIPPED,
-                    skipped_reason=reason,
-                )
-                continue
-
-            # Apply per-stage overrides
-            overrides = job.stage_overrides.get(stage_name, {})
-
-            # Determine output path for this stage
-            is_last = i == len(stage_names) - 1
-            if is_last:
-                stage_output = job.output_path
-            else:
-                stage_output = generate_temp_path(
-                    os.path.dirname(job.input_path),
-                    job.input_path,
-                    suffix=f"_{stage_name}",
-                )
-
-            job.current_stage = stage_name
-            self.logger.info(f"Running stage: {stage_name}")
-
-            # Execute stage with progress
-            def progress_cb(prog, msg):
-                overall = (i + prog) / len(stage_names)
-                job.progress = overall
-
-            result = stage.execute(
-                current_path,
-                stage_output,
-                progress_callback=progress_cb,
-                **overrides,
-            )
-
-            stage_results[stage_name] = result
-
-            if result.status == StageStatus.FAILED:
-                errors.append(f"{stage_name}: {result.error}")
-                self.logger.error(f"Stage {stage_name} failed: {result.error}")
-                if self.config.get("pipeline", "skip_stage_on_error", default=True):
-                    # Continue with next stage using original input
-                    self.logger.info(f"Continuing pipeline after {stage_name} failure")
-                else:
-                    self.logger.error(f"Stopping pipeline: {stage_name} failed")
+        try:
+            for i, stage_name in enumerate(stage_names):
+                if self._cancel_requested:
+                    job.status = PipelineStatus.CANCELLED
                     break
-            else:
-                # Only update current_path on success
-                if result.output_path:
-                    current_path = result.output_path
 
-        total_time = __import__("time").time() - start_time
+                stage = create_stage(stage_name, self.config)
+                if stage is None:
+                    # Already filtered above; defensive only.
+                    skipped.append(stage_name)
+                    continue
 
-        # Clean up temp files
-        if not self._cancel_requested:
-            self._cleanup_temp_files(stage_names, stage_results, job)
+                # Check if stage should run
+                should_run, reason = stage.should_run(input_info)
+                if not should_run:
+                    self.logger.info(f"Skipping {stage_name}: {reason}")
+                    skipped.append(stage_name)
+                    stage_results[stage_name] = StageResult(
+                        status=StageStatus.SKIPPED,
+                        skipped_reason=reason,
+                    )
+                    continue
+
+                # Apply per-stage overrides
+                overrides = job.stage_overrides.get(stage_name, {})
+
+                # Determine output path for this stage
+                is_last = i == len(stage_names) - 1
+                if is_last:
+                    stage_output = job.output_path
+                else:
+                    stage_output = generate_temp_path(
+                        os.path.dirname(job.input_path),
+                        job.input_path,
+                        suffix=f"_{stage_name}",
+                        temp_dir=temp_dir,
+                    )
+
+                job.current_stage = stage_name
+                self.logger.info(f"Running stage: {stage_name}")
+
+                # Execute stage with progress
+                def progress_cb(prog, msg, _i=i, _n=len(stage_names)):
+                    job.progress = (_i + prog) / _n
+
+                try:
+                    result = stage.execute(
+                        current_path,
+                        stage_output,
+                        progress_callback=progress_cb,
+                        **overrides,
+                    )
+                except Exception as e:
+                    self.logger.exception(f"Stage {stage_name} raised an unexpected exception")
+                    result = StageResult(status=StageStatus.FAILED, error=str(e))
+
+                stage_results[stage_name] = result
+
+                if result.status == StageStatus.FAILED:
+                    errors.append(f"{stage_name}: {result.error}")
+                    self.logger.error(f"Stage {stage_name} failed: {result.error}")
+                    if self.config.get("pipeline", "skip_stage_on_error", default=True):
+                        # Continue with next stage using original input
+                        self.logger.info(f"Continuing pipeline after {stage_name} failure")
+                    else:
+                        self.logger.error(f"Stopping pipeline: {stage_name} failed")
+                        break
+                else:
+                    if result.output_path:
+                        current_path = result.output_path
+                    elif result.status == StageStatus.COMPLETED and stage.produces_output:
+                        self.logger.warning(
+                            f"Stage {stage_name} reported COMPLETED with no output_path; "
+                            "treating as failed"
+                        )
+                        result.status = StageStatus.FAILED
+                        result.error = result.error or "Stage completed without an output_path"
+                        errors.append(f"{stage_name}: {result.error}")
+        finally:
+            total_time = __import__("time").time() - start_time
+            # Clean up temp files regardless of how the loop above exited.
+            if not self._cancel_requested:
+                self._cleanup_temp_files(stage_names, stage_results, job)
+
+        # Resolve the job's output path: the terminal stage's output, or if that stage
+        # was skipped/failed, fall back to the last successfully-produced path so a
+        # "success" JobResult never carries a None output_path.
+        final_output_path: str | None = None
+        if stage_names:
+            final_result = stage_results.get(stage_names[-1])
+            final_stage = create_stage(stage_names[-1], self.config)
+            if final_result is not None and final_result.output_path:
+                final_output_path = final_result.output_path
+            elif final_result is not None and (
+                final_result.status == StageStatus.SKIPPED
+                or (
+                    final_result.status == StageStatus.COMPLETED
+                    and final_stage is not None
+                    and not final_stage.produces_output
+                )
+            ):
+                final_output_path = current_path
 
         # Build result
         job_result = JobResult(
             input_path=job.input_path,
-            output_path=stage_results.get(
-                stage_names[-1], StageResult(status=StageStatus.FAILED)
-            ).output_path
-            if stage_names
-            else None,
+            output_path=final_output_path,
             stage_results=stage_results,
             total_duration=total_time,
             errors=errors,
@@ -403,29 +461,55 @@ class Pipeline:
     def execute_all(
         self, callback: Callable[[Job, JobResult], None] | None = None
     ) -> list[JobResult]:
-        """Execute all jobs in the queue."""
+        """Execute all jobs in the queue.
+
+        Runs strictly sequentially when general.max_concurrent_jobs <= 1 (the
+        default). When set higher, runs up to that many jobs concurrently via a
+        thread pool -- safe because each job reads/writes distinct files and
+        Config is read-mostly during processing. Note this does not attempt to
+        serialize GPU-bound AI stages against each other; users who raise
+        max_concurrent_jobs on a GPU-constrained machine may see contention/OOM
+        across concurrently-running AI stages, same as running multiple avf
+        processes by hand would.
+        """
         self._running = True
-        results = []
+        results: list[JobResult] = []
 
         # Sort by priority (higher priority first)
         sorted_jobs = sorted(self._jobs, key=lambda j: -j.priority)
+        max_workers = max(1, self._max_concurrent)
 
-        for job in sorted_jobs:
-            if not self._running:
-                break
+        def _run(job: Job) -> JobResult:
             try:
-                result = self.execute_job(job)
+                return self.execute_job(job)
+            except Exception as e:
+                self.logger.exception(f"Job failed: {job.input_path}")
+                return JobResult(input_path=job.input_path, errors=[str(e)], success=False)
+
+        if max_workers <= 1:
+            for job in sorted_jobs:
+                if not self._running:
+                    break
+                result = _run(job)
                 results.append(result)
                 if callback:
                     callback(job, result)
-            except Exception as e:
-                self.logger.exception(f"Job failed: {job.input_path}")
-                error_result = JobResult(
-                    input_path=job.input_path,
-                    errors=[str(e)],
-                    success=False,
-                )
-                results.append(error_result)
+        else:
+            from concurrent.futures import ThreadPoolExecutor, as_completed
+
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                future_to_job = {}
+                for job in sorted_jobs:
+                    if not self._running:
+                        break
+                    future_to_job[executor.submit(_run, job)] = job
+
+                for future in as_completed(future_to_job):
+                    job = future_to_job[future]
+                    result = future.result()
+                    results.append(result)
+                    if callback:
+                        callback(job, result)
 
         self._running = False
         return results
@@ -445,9 +529,15 @@ class Pipeline:
         stage_results: dict[str, StageResult],
         job: Job,
     ) -> None:
-        """Remove intermediate temp files, keep only final output."""
+        """Remove intermediate temp files, keep only final output.
+
+        Runs for both COMPLETED and FAILED stages -- a failed stage can still have
+        written a partial/temp output file before erroring, and with the default
+        skip_stage_on_error=True those would otherwise be orphaned permanently next
+        to the user's source video.
+        """
         for name, result in stage_results.items():
-            if result.status == StageStatus.COMPLETED and result.output_path:
+            if result.status in (StageStatus.COMPLETED, StageStatus.FAILED) and result.output_path:
                 if result.output_path != job.output_path:
                     if os.path.exists(result.output_path):
                         try:

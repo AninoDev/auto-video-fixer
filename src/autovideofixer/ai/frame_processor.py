@@ -2,13 +2,17 @@
 
 Handles extracting frames from video files, converting between
 numpy arrays and PyTorch tensors, and managing frame buffers.
+Supports both full-memory extraction (for small clips) and
+chunked/streaming extraction (for long videos).
 """
 
 from __future__ import annotations
 
 import os
 import tempfile
-from typing import Any
+from typing import Any, Generator, Iterator
+
+import cv2
 
 _logger: Any = None
 
@@ -27,7 +31,8 @@ class FrameProcessor:
 
     Handles frame extraction from video files, color space conversion,
     and tensor creation. Frames are returned as numpy arrays that can
-    be directly converted to PyTorch tensors.
+    be directly converted to PyTorch tensors. Supports both full-memory
+    extraction (for small clips) and chunked/streaming extraction.
     """
 
     def __init__(self, batch_size: int = 1, keep_open: bool = False):
@@ -42,7 +47,7 @@ class FrameProcessor:
         end_sec: float | None = None,
         max_frames: int | None = None,
     ) -> list[Any]:
-        """Extract frames from a video file as numpy arrays.
+        """Extract frames from a video file as numpy arrays (full memory).
 
         Args:
             video_path: Path to video file.
@@ -53,42 +58,96 @@ class FrameProcessor:
         Returns:
             List of numpy arrays (H, W, 3) in BGR, uint8.
         """
+        frames: list[Any] = []
+        for chunk in self._stream_frames(video_path, start_sec, end_sec, max_frames):
+            frames.extend(chunk)
+        return frames
+
+    def stream_frames(
+        self,
+        video_path: str,
+        start_sec: float = 0.0,
+        end_sec: float | None = None,
+        max_frames: int | None = None,
+        chunk_size: int | None = None,
+    ) -> Iterator[list[Any]]:
+        """Yield frame chunks as a generator, avoiding loading all frames into memory.
+
+        Args:
+            video_path: Path to video file.
+            start_sec: Start time in seconds.
+            end_sec: End time in seconds (None = to end).
+            max_frames: Maximum number of frames to extract (for the whole video).
+            chunk_size: Frames per chunk (default: 25).
+
+        Yields:
+            Each call yields a list of numpy arrays (chunk of frames).
+        """
+        yield from self._stream_frames(
+            video_path, start_sec, end_sec, max_frames, chunk_size=chunk_size
+        )
+
+    def _stream_frames(
+        self,
+        video_path: str,
+        start_sec: float = 0.0,
+        end_sec: float | None = None,
+        max_frames: int | None = None,
+        chunk_size: int | None = None,
+    ) -> Generator[list[Any], None, None]:
+        """Internal frame-reading generator. Always yields chunks of frames.
+
+        Note: a function is a generator if it contains ANY `yield` in its body,
+        regardless of which branch executes - a `return value` on some other
+        branch would NOT hand `value` to the caller, it would just end
+        iteration early. So this always yields lists; callers that want a
+        flat list (extract_frames) or a fixed chunk size (stream_frames) do
+        their own reshaping on top of this.
+        """
         import cv2
 
         cap = cv2.VideoCapture(video_path)
         if not cap.isOpened():
             raise RuntimeError(f"Cannot open video: {video_path}")
 
-        fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
-        if fps <= 0:
-            fps = 30.0
+        try:
+            fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+            if fps <= 0:
+                fps = 30.0
 
-        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
 
-        # Calculate start frame
-        start_frame = int(start_sec * fps)
-        start_frame = max(0, min(start_frame, total_frames - 1))
-        cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
+            start_frame = int(start_sec * fps)
+            start_frame = max(0, min(start_frame, max(total_frames - 1, 0)))
+            cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
 
-        if end_sec is not None:
-            max_frames = min(max_frames or total_frames, int((end_sec - start_sec) * fps))
+            if end_sec is not None:
+                max_frames = min(max_frames or total_frames, int((end_sec - start_sec) * fps))
 
-        frames: list[Any] = []
-        frame_idx = start_frame
+            # Internal read-batch granularity. Not tied to self.batch_size
+            # (that's a separate, caller-facing inference-batching knob) -
+            # reusing it here previously caused extract_frames() to silently
+            # return frames wrapped in singleton lists whenever batch_size
+            # defaulted to 1.
+            effective_chunk = chunk_size if chunk_size and chunk_size > 0 else 500
 
-        while True:
-            if max_frames is not None and len(frames) >= max_frames:
-                break
-
-            ret, frame = cap.read()
-            if not ret:
-                break
-
-            frames.append(frame)
-            frame_idx += 1
-
-        cap.release()
-        return frames
+            chunk: list[Any] = []
+            total_yielded = 0
+            while True:
+                if max_frames is not None and total_yielded >= max_frames:
+                    break
+                ret, frame = cap.read()
+                if not ret:
+                    break
+                chunk.append(frame)
+                total_yielded += 1
+                if len(chunk) >= effective_chunk:
+                    yield chunk
+                    chunk = []
+            if chunk:
+                yield chunk
+        finally:
+            cap.release()
 
     def extract_frame_pairs(
         self,
@@ -104,14 +163,12 @@ class FrameProcessor:
         Returns:
             List of (prev_frame, next_frame) tuples as numpy arrays.
         """
-        import cv2
+        pairs: list[tuple[Any, Any]] = []
+        prev_frame = None
 
         cap = cv2.VideoCapture(video_path)
         if not cap.isOpened():
             raise RuntimeError(f"Cannot open video: {video_path}")
-
-        pairs: list[tuple[Any, Any]] = []
-        prev_frame = None
 
         ret, frame = cap.read()
         if not ret:
@@ -160,21 +217,29 @@ class FrameProcessor:
 
         h, w = frames[0].shape[:2]
 
-        # Build FFmpeg command
         cmd = [
             "ffmpeg",
             "-y",
-            "-f", "rawvideo",
-            "-vcodec", "rawvideo",
-            "-s", f"{w}x{h}",
-            "-r", str(fps),
-            "-pix_fmt", "bgr24",
-            "-i", "-",
-            "-c:v", codec,
-            "-pix_fmt", "yuv420p",
+            "-f",
+            "rawvideo",
+            "-vcodec",
+            "rawvideo",
+            "-s",
+            f"{w}x{h}",
+            "-r",
+            str(fps),
+            "-pix_fmt",
+            "bgr24",
+            "-i",
+            "-",
+            "-c:v",
+            codec,
+            "-pix_fmt",
+            "yuv420p",
             output_path,
         ]
 
+        proc = None
         try:
             proc = subprocess.Popen(cmd, stdin=subprocess.PIPE)
             for frame in frames:
@@ -184,6 +249,16 @@ class FrameProcessor:
             return proc.returncode == 0
         except Exception:
             return False
+        finally:
+            # If the write loop raised (e.g. broken pipe because ffmpeg
+            # already exited), the subprocess would otherwise never be
+            # reaped and would leak as a zombie.
+            if proc is not None and proc.poll() is None:
+                try:
+                    proc.kill()
+                    proc.wait()
+                except Exception:
+                    pass
 
     def frames_to_temp_video(
         self,
@@ -245,3 +320,106 @@ class FrameProcessor:
 
     def __exit__(self, *args):
         self.close()
+
+
+class StreamingVideoWriter:
+    """Incrementally writes frame chunks to a video file via an ffmpeg pipe.
+
+    Unlike ``FrameProcessor.frames_to_video()``, which requires every frame
+    to be buffered in memory before a single write call, this lets a caller
+    push chunks as they're produced (e.g. from a chunked AI-processing loop)
+    without ever holding the whole video's frames in memory at once.
+
+    Usage:
+        writer = StreamingVideoWriter(output_path, fps=30.0)
+        for chunk in produce_chunks():
+            writer.write(chunk)
+        ok = writer.close()
+    """
+
+    def __init__(self, output_path: str, fps: float = 30.0, codec: str = "libx264"):
+        self._output_path = output_path
+        self._fps = fps
+        self._codec = codec
+        self._proc: Any = None
+        self._failed = False
+
+    def write(self, frames: list[Any]) -> None:
+        """Write a chunk of frames (numpy arrays, BGR uint8) to the stream."""
+        import subprocess
+
+        if not frames or self._failed:
+            return
+
+        if self._proc is None:
+            h, w = frames[0].shape[:2]
+            cmd = [
+                "ffmpeg",
+                "-y",
+                "-f",
+                "rawvideo",
+                "-vcodec",
+                "rawvideo",
+                "-s",
+                f"{w}x{h}",
+                "-r",
+                str(self._fps),
+                "-pix_fmt",
+                "bgr24",
+                "-i",
+                "-",
+                "-c:v",
+                self._codec,
+                "-pix_fmt",
+                "yuv420p",
+                self._output_path,
+            ]
+            self._proc = subprocess.Popen(cmd, stdin=subprocess.PIPE)
+
+        try:
+            for frame in frames:
+                self._proc.stdin.write(frame.tobytes())
+        except Exception:
+            self._failed = True
+            if self._proc.poll() is None:
+                try:
+                    self._proc.kill()
+                    self._proc.wait()
+                except Exception:
+                    pass
+            raise
+
+    def close(self) -> bool:
+        """Finalize the video file. Returns True on success.
+
+        Safe to call even if no frames were ever written (returns False).
+        """
+        if self._proc is None or self._failed:
+            return False
+        try:
+            if self._proc.stdin and not self._proc.stdin.closed:
+                self._proc.stdin.close()
+            self._proc.wait()
+            return self._proc.returncode == 0
+        except Exception:
+            return False
+        finally:
+            if self._proc.poll() is None:
+                try:
+                    self._proc.kill()
+                    self._proc.wait()
+                except Exception:
+                    pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        if exc_type is not None and self._proc is not None and self._proc.poll() is None:
+            try:
+                self._proc.kill()
+                self._proc.wait()
+            except Exception:
+                pass
+        else:
+            self.close()

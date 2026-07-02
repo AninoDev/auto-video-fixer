@@ -59,9 +59,9 @@ class TestStageBase:
         assert "test_stage" in stages
         assert stages["test_stage"] is TestStage
 
-    def test_create_stage(self):
+    def test_create_stage(self, tmp_path):
         """Test creating a stage instance."""
-        config = Config()
+        config = Config(tmp_path / "nonexistent.yaml")
 
         # Register a test stage
         @register_stage
@@ -77,15 +77,15 @@ class TestStageBase:
         assert stage is not None
         assert isinstance(stage, CreateTestStage)
 
-    def test_create_nonexistent_stage(self):
+    def test_create_nonexistent_stage(self, tmp_path):
         """Test creating a stage that doesn't exist."""
-        config = Config()
+        config = Config(tmp_path / "nonexistent.yaml")
         stage = create_stage("nonexistent_stage", config)
         assert stage is None
 
-    def test_stage_should_run_default(self):
+    def test_stage_should_run_default(self, tmp_path):
         """Test default should_run behavior."""
-        config = Config()
+        config = Config(tmp_path / "nonexistent.yaml")
 
         @register_stage
         class DefaultShouldRunStage(BaseStage):
@@ -101,9 +101,9 @@ class TestStageBase:
         assert should_run is True
         assert reason is None
 
-    def test_stage_is_enabled(self):
+    def test_stage_is_enabled(self, tmp_path):
         """Test stage enabled/disabled status."""
-        config = Config()
+        config = Config(tmp_path / "nonexistent.yaml")
 
         @register_stage
         class EnabledStage(BaseStage):
@@ -122,9 +122,9 @@ class TestStageBase:
         stage2 = create_stage("enabled_test", config)
         assert stage2.is_enabled() is False
 
-    def test_stage_estimates_complexity(self):
+    def test_stage_estimates_complexity(self, tmp_path):
         """Test complexity estimation."""
-        config = Config()
+        config = Config(tmp_path / "nonexistent.yaml")
 
         @register_stage
         class ComplexityStage(BaseStage):

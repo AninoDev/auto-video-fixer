@@ -1,20 +1,31 @@
 """Auto Video Fixer - RIFE frame interpolation model wrapper.
 
-Implements the RIFE (Real-Time Intermediate Flow Estimation) architecture
-for video frame interpolation using bidirectional optical flow.
+Implements the real RIFE (Real-Time Intermediate Flow Estimation) IFNet
+architecture, ported line-for-line from the official hzwer/Practical-RIFE
+inference code (IFNet_HDv3.py / RIFE_HDv3.py, model version 4.25/4.26) so
+that downloaded `flownet.pkl` checkpoints load with zero missing/unexpected
+keys. Verified against a real checkpoint: state_dict loads with strict
+matching (module-prefix stripped) aside from the training-only `teacher`/
+`caltime` submodules the upstream loader also discards, and a forward pass
+at two different timesteps produces genuinely different output (proving
+timestep conditioning works, unlike a fixed-midpoint interpolator).
 """
 
 from __future__ import annotations
 
 import logging
+import zipfile
 from pathlib import Path
 from typing import Any
 
 import torch
+import torch.nn.functional as F
 
 from autovideofixer.ai.model_cache import get_model_path
 
 _logger: logging.Logger | None = None
+
+_backwarp_grids: dict[tuple[str, str, str], torch.Tensor] = {}
 
 
 def _get_logger() -> logging.Logger:
@@ -24,395 +35,258 @@ def _get_logger() -> logging.Logger:
     return _logger
 
 
-class ConvBlock(torch.nn.Module):
-    """Convolutional block with LeakyReLU."""
+def warp(tensor_input: torch.Tensor, tensor_flow: torch.Tensor) -> torch.Tensor:
+    """Backward-warp `tensor_input` by the optical flow field `tensor_flow`.
 
-    def __init__(
-        self, in_ch: int, out_ch: int, kernel_size: int = 3, stride: int = 1, padding: int = 1
-    ):
-        super().__init__()
-        self.conv = torch.nn.Conv2d(in_ch, out_ch, kernel_size, stride, padding)
-        self.leaky_relu = torch.nn.LeakyReLU(0.2, inplace=True)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.leaky_relu(self.conv(x))
-
-
-class DownBlock(torch.nn.Module):
-    """Downsampling block with strided convolutions."""
-
-    def __init__(self, in_ch: int, out_ch: int):
-        super().__init__()
-        self.conv1 = ConvBlock(in_ch, out_ch, stride=2, padding=1)
-        self.conv2 = ConvBlock(out_ch, out_ch, padding=1)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.conv2(self.conv1(x))
-
-
-class UpBlock(torch.nn.Module):
-    """Upsampling block with bilinear interpolation."""
-
-    def __init__(self, in_ch: int, skip_ch: int, out_ch: int):
-        super().__init__()
-        self.conv_skip = ConvBlock(skip_ch, out_ch, padding=1)
-        self.conv_in = ConvBlock(in_ch, out_ch * 2, padding=1)
-        self.conv_out = ConvBlock(out_ch * 2, out_ch, padding=1)
-
-    def forward(self, x: torch.Tensor, skip: torch.Tensor) -> torch.Tensor:
-        x = torch.nn.functional.interpolate(x, scale_factor=2, mode="bilinear", align_corners=False)
-        skip = self.conv_skip(skip)
-        x = torch.cat([x, skip], dim=1)
-        return self.conv_out(self.conv_in(x))
-
-
-class CNet(torch.nn.Module):
-    """Context network for multi-scale feature extraction.
-
-    Extracts hierarchical features at 5 scales for flow estimation.
+    Ported from the official RIFE `model/warplayer.py::warp`. Grids are
+    cached by (device, shape) like upstream, but built directly on
+    `tensor_flow.device` rather than a module-level global device, so this
+    also works correctly on MPS/multi-GPU instead of only the single device
+    active at import time.
     """
-
-    def __init__(self, in_ch: int = 3, base_ch: int = 10):
-        super().__init__()
-        self.block1 = torch.nn.Sequential(
-            ConvBlock(in_ch, base_ch, padding=1),
-            ConvBlock(base_ch, base_ch, padding=1),
-        )
-        self.block2 = DownBlock(base_ch, base_ch * 2)
-        self.block3 = DownBlock(base_ch * 2, base_ch * 4)
-        self.block4 = DownBlock(base_ch * 4, base_ch * 8)
-        self.block5 = DownBlock(base_ch * 8, base_ch * 16)
-        self.block6 = DownBlock(base_ch * 16, base_ch * 32)
-
-        self.output_channels = [
-            base_ch,
-            base_ch * 2,
-            base_ch * 4,
-            base_ch * 8,
-            base_ch * 16,
-            base_ch * 32,
-        ]
-
-    def forward(self, x: torch.Tensor) -> list[torch.Tensor]:
-        features = []
-        h = self.block1(x)
-        features.append(h)
-        h = self.block2(h)
-        features.append(h)
-        h = self.block3(h)
-        features.append(h)
-        h = self.block4(h)
-        features.append(h)
-        h = self.block5(h)
-        features.append(h)
-        h = self.block6(h)
-        features.append(h)
-        return features
-
-
-class IFNet(torch.nn.Module):
-    """Intermediate Flow Network for estimating optical flow.
-
-    Uses multi-scale feature pyramid from CNet to estimate
-    bidirectional flow fields at multiple resolutions.
-    """
-
-    def __init__(self, cnet: CNet):
-        super().__init__()
-        self.cnet = cnet
-        ch_list = cnet.output_channels
-
-        # Flow estimation at each scale
-        self.flow_conv1 = torch.nn.Sequential(
-            ConvBlock(ch_list[0] * 2, ch_list[0], padding=1),
-            ConvBlock(ch_list[0], 2, kernel_size=3, padding=1),  # 2 channels: flow (dx, dy)
-        )
-        self.flow_conv2 = torch.nn.Sequential(
-            ConvBlock(ch_list[1] * 2 + 2, ch_list[1], padding=1),
-            ConvBlock(ch_list[1], 2, kernel_size=3, padding=1),
-        )
-        self.flow_conv3 = torch.nn.Sequential(
-            ConvBlock(ch_list[2] * 2 + 2, ch_list[2], padding=1),
-            ConvBlock(ch_list[2], 2, kernel_size=3, padding=1),
-        )
-        self.flow_conv4 = torch.nn.Sequential(
-            ConvBlock(ch_list[3] * 2 + 2, ch_list[3], padding=1),
-            ConvBlock(ch_list[3], 2, kernel_size=3, padding=1),
-        )
-        self.flow_conv5 = torch.nn.Sequential(
-            ConvBlock(ch_list[4] * 2 + 2, ch_list[4], padding=1),
-            ConvBlock(ch_list[4], 2, kernel_size=3, padding=1),
-        )
-
-    def forward(self, img0: torch.Tensor, img1: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """Estimate bidirectional flow fields.
-
-        Returns:
-            (flow01, flow10): Forward (img0->img1) and backward (img1->img0) flow fields.
-        """
-        feats0 = self.cnet(img0)
-        feats1 = self.cnet(img1)
-
-        # Top-scale flow estimation
-        flow01 = self._est_flow(feats0[0], feats1[0], self.flow_conv1)
-        flow10 = self._est_flow(feats1[0], feats0[0], self.flow_conv1)
-
-        # Propagate flow to lower scales
-        up_flow01 = (
-            torch.nn.functional.interpolate(
-                flow01, scale_factor=2, mode="bilinear", align_corners=False
+    # Cache key includes dtype: a fp16 call after a fp32 call (or vice
+    # versa) must not reuse a grid of the wrong dtype, which errors out of
+    # grid_sample ("expected scalar type Half but found Float").
+    key = (str(tensor_flow.device), str(tensor_flow.dtype), str(tensor_flow.size()))
+    if key not in _backwarp_grids:
+        horizontal = (
+            torch.linspace(
+                -1.0, 1.0, tensor_flow.shape[3], device=tensor_flow.device, dtype=tensor_flow.dtype
             )
-            * 2
+            .view(1, 1, 1, tensor_flow.shape[3])
+            .expand(tensor_flow.shape[0], -1, tensor_flow.shape[2], -1)
         )
-        up_flow10 = (
-            torch.nn.functional.interpolate(
-                flow10, scale_factor=2, mode="bilinear", align_corners=False
+        vertical = (
+            torch.linspace(
+                -1.0, 1.0, tensor_flow.shape[2], device=tensor_flow.device, dtype=tensor_flow.dtype
             )
-            * 2
+            .view(1, 1, tensor_flow.shape[2], 1)
+            .expand(tensor_flow.shape[0], -1, -1, tensor_flow.shape[3])
         )
+        _backwarp_grids[key] = torch.cat([horizontal, vertical], 1)
 
-        flow01 = flow01 + self._est_flow(
-            feats0[1], feats1[1], self.flow_conv2, up_flow01, up_flow10
-        )
-        flow10 = flow10 + self._est_flow(
-            feats1[1], feats0[1], self.flow_conv2, up_flow10, up_flow01
-        )
-
-        up_flow01 = (
-            torch.nn.functional.interpolate(
-                flow01, scale_factor=2, mode="bilinear", align_corners=False
-            )
-            * 2
-        )
-        up_flow10 = (
-            torch.nn.functional.interpolate(
-                flow10, scale_factor=2, mode="bilinear", align_corners=False
-            )
-            * 2
-        )
-
-        flow01 = flow01 + self._est_flow(
-            feats0[2], feats1[2], self.flow_conv3, up_flow01, up_flow10
-        )
-        flow10 = flow10 + self._est_flow(
-            feats1[2], feats0[2], self.flow_conv3, up_flow10, up_flow01
-        )
-
-        up_flow01 = (
-            torch.nn.functional.interpolate(
-                flow01, scale_factor=2, mode="bilinear", align_corners=False
-            )
-            * 2
-        )
-        up_flow10 = (
-            torch.nn.functional.interpolate(
-                flow10, scale_factor=2, mode="bilinear", align_corners=False
-            )
-            * 2
-        )
-
-        flow01 = flow01 + self._est_flow(
-            feats0[3], feats1[3], self.flow_conv4, up_flow01, up_flow10
-        )
-        flow10 = flow10 + self._est_flow(
-            feats1[3], feats0[3], self.flow_conv4, up_flow10, up_flow01
-        )
-
-        up_flow01 = (
-            torch.nn.functional.interpolate(
-                flow01, scale_factor=2, mode="bilinear", align_corners=False
-            )
-            * 2
-        )
-        up_flow10 = (
-            torch.nn.functional.interpolate(
-                flow10, scale_factor=2, mode="bilinear", align_corners=False
-            )
-            * 2
-        )
-
-        flow01 = flow01 + self._est_flow(
-            feats0[4], feats1[4], self.flow_conv5, up_flow01, up_flow10
-        )
-        flow10 = flow10 + self._est_flow(
-            feats1[4], feats0[4], self.flow_conv5, up_flow10, up_flow01
-        )
-
-        return flow01, flow10
-
-    def _est_flow(
-        self,
-        conv: torch.nn.Module,
-        f0: torch.Tensor,
-        f1: torch.Tensor,
-        flow_conv: torch.nn.Module,
-        prev_flow01: torch.Tensor | None = None,
-        prev_flow10: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        if prev_flow01 is not None and prev_flow10 is not None:
-            input_tensor = torch.cat([f0, f1, prev_flow01, prev_flow10], dim=1)
-        else:
-            input_tensor = torch.cat([f0, f1], dim=1)
-        return flow_conv(input_tensor)
-
-
-class EMD(torch.nn.Module):
-    """Error Minimization Network for refining interpolated frames.
-
-    Takes warped features and flow fields, then refines the output
-    by minimizing reconstruction error.
-    """
-
-    def __init__(self, cnet: CNet):
-        super().__init__()
-        ch_list = cnet.output_channels
-        self.block1 = torch.nn.Sequential(
-            ConvBlock(ch_list[0] * 2 + 4, ch_list[0], padding=1),
-            ConvBlock(ch_list[0], ch_list[0], padding=1),
-        )
-        self.block2 = torch.nn.Sequential(
-            ConvBlock(ch_list[1] * 2 + 4, ch_list[1] * 2, padding=1),
-            ConvBlock(ch_list[1] * 2, ch_list[1] * 2, padding=1),
-        )
-        self.up1 = UpBlock(ch_list[0], ch_list[1] * 2, ch_list[0])
-        self.up2 = UpBlock(ch_list[0], ch_list[2] * 4, ch_list[0])
-        self.conv_out = torch.nn.Sequential(
-            ConvBlock(ch_list[0], ch_list[0], padding=1),
-            torch.nn.Conv2d(ch_list[0], 3, 3, 1, 1),
-        )
-
-    def forward(
-        self,
-        feats0: list[torch.Tensor],
-        feats1: list[torch.Tensor],
-        flow01: torch.Tensor,
-        flow10: torch.Tensor,
-        img0: torch.Tensor,
-        img1: torch.Tensor,
-    ) -> torch.Tensor:
-        """Refine the interpolated frame.
-
-        Args:
-            feats0, feats1: Multi-scale features from CNet.
-            flow01, flow10: Bidirectional flow fields.
-            img0, img1: Original input images.
-
-        Returns:
-            Refined output frame tensor.
-        """
-        # Warp features using flow
-        warped0 = self._warp(feats0[0], flow01)
-        warped1 = self._warp(feats1[0], flow10)
-
-        # Top-scale processing
-        h = self.block1(torch.cat([warped0, warped1, flow01, flow10], dim=1))
-        h = self.up1(
-            h,
-            self.block2(
-                torch.cat(
-                    [
-                        self._warp(feats1[1], _scale_flow(flow10, 2)),
-                        self._warp(feats0[1], _scale_flow(flow01, 2)),
-                        _scale_flow(flow01, 2),
-                        _scale_flow(flow10, 2),
-                    ],
-                    dim=1,
-                )
-            ),
-        )
-        h = self.up2(
-            h,
-            torch.cat(
-                [
-                    self._warp(feats0[2], _scale_flow(flow01, 4)),
-                    self._warp(feats1[2], _scale_flow(flow10, 4)),
-                ],
-                dim=1,
-            ),
-        )
-
-        return torch.sigmoid(self.conv_out(h))
-
-    def _warp(self, feats: torch.Tensor, flow: torch.Tensor) -> torch.Tensor:
-        """Warp features using optical flow (grid_sample)."""
-        return torch.nn.functional.grid_sample(
-            feats,
-            flow.permute(0, 2, 3, 1),
-            mode="bilinear",
-            padding_mode="border",
-            align_corners=False,
-        )
-
-
-def _scale_flow(flow: torch.Tensor, scale: float) -> torch.Tensor:
-    """Scale a flow field by a factor."""
-    return (
-        torch.nn.functional.interpolate(
-            flow, scale_factor=scale, mode="bilinear", align_corners=False
-        )
-        * scale
+    flow = torch.cat(
+        [
+            tensor_flow[:, 0:1, :, :] / ((tensor_input.shape[3] - 1.0) / 2.0),
+            tensor_flow[:, 1:2, :, :] / ((tensor_input.shape[2] - 1.0) / 2.0),
+        ],
+        1,
+    )
+    grid = (_backwarp_grids[key] + flow).permute(0, 2, 3, 1)
+    return F.grid_sample(
+        input=tensor_input, grid=grid, mode="bilinear", padding_mode="border", align_corners=True
     )
 
 
-class RIFEModule(torch.nn.Module):
-    """RIFE interpolation module combining IFNet + EMD.
+def _conv(in_planes: int, out_planes: int, kernel_size: int = 3, stride: int = 1, padding: int = 1):
+    return torch.nn.Sequential(
+        torch.nn.Conv2d(in_planes, out_planes, kernel_size, stride, padding, bias=True),
+        torch.nn.LeakyReLU(0.2, True),
+    )
 
-    Takes two input frames and produces an interpolated frame.
+
+class Head(torch.nn.Module):
+    """Shallow per-frame feature encoder (state_dict key: `encode`)."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.cnn0 = torch.nn.Conv2d(3, 16, 3, 2, 1)
+        self.cnn1 = torch.nn.Conv2d(16, 16, 3, 1, 1)
+        self.cnn2 = torch.nn.Conv2d(16, 16, 3, 1, 1)
+        self.cnn3 = torch.nn.ConvTranspose2d(16, 4, 4, 2, 1)
+        self.relu = torch.nn.LeakyReLU(0.2, True)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.relu(self.cnn0(x))
+        x = self.relu(self.cnn1(x))
+        x = self.relu(self.cnn2(x))
+        return self.cnn3(x)
+
+
+class ResConv(torch.nn.Module):
+    """Residual conv block with a learnable per-channel scale (`beta`)."""
+
+    def __init__(self, channels: int, dilation: int = 1) -> None:
+        super().__init__()
+        self.conv = torch.nn.Conv2d(channels, channels, 3, 1, dilation, dilation=dilation, groups=1)
+        self.beta = torch.nn.Parameter(torch.ones((1, channels, 1, 1)), requires_grad=True)
+        self.relu = torch.nn.LeakyReLU(0.2, True)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.relu(self.conv(x) * self.beta + x)
+
+
+class IFBlock(torch.nn.Module):
+    """One resolution stage of the coarse-to-fine flow estimator."""
+
+    def __init__(self, in_planes: int, c: int = 64) -> None:
+        super().__init__()
+        self.conv0 = torch.nn.Sequential(
+            _conv(in_planes, c // 2, 3, 2, 1),
+            _conv(c // 2, c, 3, 2, 1),
+        )
+        self.convblock = torch.nn.Sequential(*[ResConv(c) for _ in range(8)])
+        self.lastconv = torch.nn.Sequential(
+            torch.nn.ConvTranspose2d(c, 4 * 13, 4, 2, 1),
+            torch.nn.PixelShuffle(2),
+        )
+
+    def forward(
+        self, x: torch.Tensor, flow: torch.Tensor | None, scale: float
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        x = F.interpolate(x, scale_factor=1.0 / scale, mode="bilinear", align_corners=False)
+        if flow is not None:
+            flow = (
+                F.interpolate(flow, scale_factor=1.0 / scale, mode="bilinear", align_corners=False)
+                * 1.0
+                / scale
+            )
+            x = torch.cat((x, flow), 1)
+        feat = self.conv0(x)
+        feat = self.convblock(feat)
+        tmp = self.lastconv(feat)
+        tmp = F.interpolate(tmp, scale_factor=scale, mode="bilinear", align_corners=False)
+        out_flow = tmp[:, :4] * scale
+        mask = tmp[:, 4:5]
+        out_feat = tmp[:, 5:]
+        return out_flow, mask, out_feat
+
+
+class IFNet(torch.nn.Module):
+    """Real RIFE v4.25/4.26 Intermediate Flow Network.
+
+    Five coarse-to-fine `IFBlock` stages iteratively refine a bidirectional
+    flow field and blend mask, conditioned on an explicit `timestep` channel
+    so distinct timesteps (not just t=0.5) produce genuinely different
+    interpolated frames.
     """
 
-    def __init__(self, cnet: CNet | None = None):
+    def __init__(self) -> None:
         super().__init__()
-        if cnet is None:
-            cnet = CNet()
-        self.ifnet = IFNet(cnet)
-        self.emd = EMD(cnet)
+        self.block0 = IFBlock(7 + 8, c=192)
+        self.block1 = IFBlock(8 + 4 + 8 + 8, c=128)
+        self.block2 = IFBlock(8 + 4 + 8 + 8, c=96)
+        self.block3 = IFBlock(8 + 4 + 8 + 8, c=64)
+        self.block4 = IFBlock(8 + 4 + 8 + 8, c=32)
+        self.encode = Head()
 
     def forward(
         self,
         img0: torch.Tensor,
         img1: torch.Tensor,
+        timestep: float = 0.5,
+        scale_list: list[float] = [8, 4, 2, 1, 1],  # noqa: B006 - matches upstream signature
     ) -> torch.Tensor:
-        """Generate an interpolated frame between img0 and img1.
+        """Return the blended frame at `timestep` between img0 and img1 in [0, 1]."""
+        timestep_map = (img0[:, :1].clone() * 0 + 1) * timestep
+        f0 = self.encode(img0[:, :3])
+        f1 = self.encode(img1[:, :3])
 
-        Args:
-            img0: First frame (B, 3, H, W), values in [0, 1].
-            img1: Second frame (B, 3, H, W), values in [0, 1].
+        flow: torch.Tensor | None = None
+        mask: torch.Tensor | None = None
+        warped_img0, warped_img1 = img0, img1
+        blocks = [self.block0, self.block1, self.block2, self.block3, self.block4]
 
-        Returns:
-            Interpolated frame (B, 3, H, W), values in [0, 1].
-        """
-        flow01, flow10 = self.ifnet(img0, img1)
-        return self.emd(
-            self.ifnet.cnet(img0),
-            self.ifnet.cnet(img1),
-            flow01,
-            flow10,
-            img0,
-            img1,
-        )
+        for i in range(5):
+            if flow is None:
+                flow, mask, feat = blocks[i](
+                    torch.cat((img0[:, :3], img1[:, :3], f0, f1, timestep_map), 1),
+                    None,
+                    scale=scale_list[i],
+                )
+            else:
+                warped_f0 = warp(f0, flow[:, :2])
+                warped_f1 = warp(f1, flow[:, 2:4])
+                flow_delta, mask, feat = blocks[i](
+                    torch.cat(
+                        (
+                            warped_img0[:, :3],
+                            warped_img1[:, :3],
+                            warped_f0,
+                            warped_f1,
+                            timestep_map,
+                            mask,
+                            feat,
+                        ),
+                        1,
+                    ),
+                    flow,
+                    scale=scale_list[i],
+                )
+                flow = flow + flow_delta
+            warped_img0 = warp(img0, flow[:, :2])
+            warped_img1 = warp(img1, flow[:, 2:4])
+
+        assert mask is not None
+        mask = torch.sigmoid(mask)
+        return warped_img0 * mask + warped_img1 * (1 - mask)
+
+
+def _load_rife_state_dict(model: IFNet, checkpoint_path: str) -> IFNet:
+    """Load a real RIFE `flownet.pkl` checkpoint into `model`.
+
+    Mirrors the official `RIFE_HDv3.Model.load_model()` loader: strips the
+    `module.` prefix left by `DistributedDataParallel` training, and ignores
+    the checkpoint's `teacher`/`caltime` submodule weights (training-only,
+    intentionally absent from this inference-only `IFNet`).
+    """
+    raw = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
+    state_dict = {k.replace("module.", ""): v for k, v in raw.items() if "module." in k}
+    if not state_dict:
+        # Some re-exports omit the "module." prefix entirely.
+        state_dict = raw
+    missing, unexpected = model.load_state_dict(state_dict, strict=False)
+    real_missing = [k for k in missing]
+    real_unexpected = [
+        k for k in unexpected if not (k.startswith("teacher") or k.startswith("caltime"))
+    ]
+    if real_missing:
+        raise RuntimeError(f"RIFE checkpoint missing required keys: {real_missing[:5]}...")
+    if real_unexpected:
+        _get_logger().warning(f"RIFE checkpoint had unexpected keys: {real_unexpected[:5]}...")
+    return model
+
+
+def _resolve_checkpoint_path(path: str) -> str:
+    """If `path` is a downloaded RIFE release zip, extract and cache `flownet.pkl`.
+
+    Official RIFE releases ship the checkpoint bundled in a zip alongside
+    its (training-only) source. The model registry points at that zip
+    directly since no unpacked `.pkl`-only mirror is guaranteed to stay
+    available; this extracts once and reuses the extracted file afterward.
+    """
+    src = Path(path)
+    if src.suffix.lower() != ".zip":
+        return path
+
+    extracted = src.with_name(f"{src.stem}_flownet.pkl")
+    if extracted.is_file():
+        return str(extracted)
+
+    with zipfile.ZipFile(src) as zf:
+        candidates = [n for n in zf.namelist() if n.endswith("flownet.pkl")]
+        if not candidates:
+            raise RuntimeError(f"No flownet.pkl found inside RIFE archive: {path}")
+        with zf.open(candidates[0]) as member, open(extracted, "wb") as out:
+            out.write(member.read())
+
+    return str(extracted)
 
 
 class RIFEInterpolator:
     """RIFE model wrapper for video frame interpolation.
 
-    Wraps the RIFE architecture with frame-pair inference and
-    support for arbitrary interpolation factors.
-
     Usage:
         interpolator = RIFEInterpolator()
-        interpolator.load_model("/path/to/rife_v4.6.pkl")
-        result = interpolator.interpolate(frame_a, frame_b)
+        interpolator.load_model()
+        result = interpolator.interpolate(frame_a, frame_b, timestep=0.5)
     """
 
-    def __init__(
-        self,
-        model_name: str = "rife_v4.6",
-        multi_scale: bool = True,
-    ):
+    def __init__(self, model_name: str = "rife_v4.6"):
         self.model_name = model_name
-        self.multi_scale = multi_scale
-        self._model: RIFEModule | None = None
+        self._model: IFNet | None = None
         self._device: Any = None
+        self._half = False
         self._loaded = False
 
     @property
@@ -423,30 +297,47 @@ class RIFEInterpolator:
         """Load the RIFE model from disk.
 
         Args:
-            model_path: Path to .pkl model file. If None, uses cached model.
+            model_path: Path to a `.pkl` checkpoint or a release `.zip`
+                bundling one. If None, uses the cached/registry model.
 
         Returns:
-            True if model loaded successfully.
+            True if the model loaded successfully.
         """
-        from autovideofixer.ai.torch_utils import get_device, load_model_from_state_dict
+        from autovideofixer.ai.torch_utils import get_device
 
         if model_path is None:
-            model_path = get_model_path(self.model_name)
-            if model_path is None:
+            cached = get_model_path(self.model_name)
+            if cached is None:
                 _get_logger().error(
                     f"Model not found: {self.model_name}. Run ensure_model_available() first."
                 )
                 return False
-            model_path = str(model_path)
+            model_path = str(cached)
 
         if not Path(model_path).is_file():
             _get_logger().error(f"Model file not found: {model_path}")
             return False
 
-        self._device = get_device("auto")
-        self._model = RIFEModule()
+        try:
+            checkpoint_path = _resolve_checkpoint_path(model_path)
+        except Exception as e:
+            _get_logger().error(f"Failed to prepare RIFE checkpoint: {e}")
+            return False
 
-        self._model = load_model_from_state_dict(self._model, model_path, self._device)
+        self._device = get_device("auto")
+        model = IFNet()
+        try:
+            model = _load_rife_state_dict(model, checkpoint_path)
+        except Exception as e:
+            _get_logger().error(f"Failed to load RIFE weights: {e}")
+            return False
+
+        model.to(self._device)
+        model.eval()
+        self._half = self._device.type == "cuda"
+        if self._half:
+            model.half()
+        self._model = model
         self._loaded = True
 
         _get_logger().info(f"Loaded RIFE {self.model_name} on {self._device}")
@@ -456,35 +347,44 @@ class RIFEInterpolator:
         self,
         frame0: Any,
         frame1: Any,
+        timestep: float = 0.5,
     ) -> Any:
-        """Interpolate a single frame between two input frames.
+        """Interpolate a single frame between two input frames at `timestep`.
 
         Args:
             frame0: First frame as numpy array (H, W, 3) BGR uint8.
             frame1: Second frame as numpy array (H, W, 3) BGR uint8.
+            timestep: Position between frame0 (0.0) and frame1 (1.0).
 
         Returns:
-            Interpolated frame as numpy array (H, W, 3) in BGR, uint8.
+            Interpolated frame as numpy array (H, W, 3) BGR uint8.
 
         Raises:
             RuntimeError: If model is not loaded.
         """
-        if not self._loaded:
+        if not self._loaded or self._model is None:
             raise RuntimeError("Model not loaded. Call load_model() first.")
 
-        from autovideofixer.ai.torch_utils import (
-            frame_from_tensor,
-            get_dtype,
-            tensor_from_frame,
-        )
+        from autovideofixer.ai.torch_utils import frame_from_tensor, get_dtype, tensor_from_frame
 
-        dtype = get_dtype("fp16") if self._device.type == "cuda" else None
+        dtype = get_dtype("fp16") if self._half else None
 
         t0 = tensor_from_frame(frame0, device=self._device, dtype=dtype)
         t1 = tensor_from_frame(frame1, device=self._device, dtype=dtype)
 
+        # RIFE's internal downsampling (5 halvings) requires dimensions
+        # divisible by 32; pad and crop back so odd resolutions don't crash.
+        _, _, h, w = t0.shape
+        pad_h = (32 - h % 32) % 32
+        pad_w = (32 - w % 32) % 32
+        if pad_h or pad_w:
+            t0 = F.pad(t0, (0, pad_w, 0, pad_h))
+            t1 = F.pad(t1, (0, pad_w, 0, pad_h))
+
         with torch.no_grad():
-            output = self._model(t0, t1)
+            output = self._model(t0, t1, timestep=timestep)
+            if pad_h or pad_w:
+                output = output[:, :, :h, :w]
             if dtype is not None:
                 output = output.float()
 
@@ -498,35 +398,38 @@ class RIFEInterpolator:
     ) -> list[Any]:
         """Interpolate frames to increase framerate by a given factor.
 
+        For `factor > 2`, each inserted frame uses a distinct timestep
+        (`j / factor`), so they are genuinely different intermediate frames
+        rather than repeated copies of a single fixed-midpoint result.
+
         Args:
             frames: List of numpy arrays (H, W, 3) in BGR, uint8.
             factor: Interpolation factor (2 = double framerate).
             progress_callback: Optional callback(current, total, message).
 
         Returns:
-            List of interpolated frames with factorx the original count.
+            List of interpolated frames with factor-x the original count.
         """
-        if factor <= 1:
+        if factor <= 1 or len(frames) < 2:
             return frames
 
         result: list[Any] = [frames[0]]
-
         total_pairs = len(frames) - 1
+        total_out = total_pairs * factor + 1
+        done = 0
+
         for i in range(total_pairs):
-            for _j in range(1, factor):
-                # The model produces the actual interpolated frame
-                frame = self.interpolate(frames[i], frames[i + 1])
+            for j in range(1, factor):
+                timestep = j / factor
+                frame = self.interpolate(frames[i], frames[i + 1], timestep=timestep)
                 result.append(frame)
+                done += 1
+                if progress_callback:
+                    progress_callback(done, total_out, f"Interpolating frame {done}/{total_out}")
             result.append(frames[i + 1])
-
-        # Remove duplicate of last frame
-        if len(result) > len(frames) * factor:
-            result = result[:-1]
-
-        total = len(result)
-        for idx in range(total):
-            if progress_callback and total_pairs > 0:
-                progress_callback(idx + 1, total, f"Interpolating frame {idx + 1}/{total}")
+            done += 1
+            if progress_callback:
+                progress_callback(done, total_out, f"Interpolating frame {done}/{total_out}")
 
         return result
 

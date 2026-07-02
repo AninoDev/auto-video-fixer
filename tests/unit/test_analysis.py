@@ -1,6 +1,8 @@
 """Tests for video analysis utilities."""
 
 import os
+import tempfile
+from pathlib import Path
 
 import pytest
 
@@ -112,7 +114,7 @@ class TestVideoAnalyzer:
 
     def setup_method(self):
         """Setup test fixtures."""
-        self.config = Config()
+        self.config = Config(Path(tempfile.mkdtemp()) / "nonexistent.yaml")
         self.analyzer = VideoAnalyzer(self.config)
 
     def test_analyzer_creation(self):

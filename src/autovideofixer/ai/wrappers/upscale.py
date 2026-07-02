@@ -149,6 +149,7 @@ class RealESRGANUpscaler:
         self._model: Any = None
         self._device: Any = None
         self._loaded = False
+        self._use_fp16 = False
 
     @property
     def is_loaded(self) -> bool:
@@ -204,6 +205,13 @@ class RealESRGANUpscaler:
         )
 
         self._model = load_model_from_state_dict(self._model, model_path, self._device)
+
+        # Cast once, at load time - not per-frame. Casting the whole model's
+        # weights on every upscale() call multiplied overhead by frame count.
+        self._use_fp16 = self._device.type == "cuda"
+        if self._use_fp16:
+            self._model.half()
+
         self._loaded = True
 
         _get_logger().info(f"Loaded {self.model_name} ({num_block} RRDB blocks) on {self._device}")
@@ -235,30 +243,24 @@ class RealESRGANUpscaler:
         from autovideofixer.ai.torch_utils import (
             apply_tta,
             frame_from_tensor,
-            get_dtype,
             tensor_from_frame,
         )
 
         if tta_mode is None:
             tta_mode = self.tta_mode
 
-        # Use fp16 for CUDA if available, otherwise fp32
-        use_fp16 = self._device.type == "cuda"
-        if use_fp16:
-            self._model.half()
-
         tensor = tensor_from_frame(frame, device=self._device)
-        if use_fp16:
+        if self._use_fp16:
             tensor = tensor.half()
 
         with torch.no_grad():
-            output = self._model(tensor)
             if tta_mode and tta_mode >= 1:
                 output = apply_tta(self._model, tensor, mode=tta_mode)
+            else:
+                output = self._model(tensor)
 
-        if use_fp16:
+        if self._use_fp16:
             output = output.float()
-            self._model.float()
 
         # Model already handles upscaling, so don't pass scale to frame_from_tensor
         result = frame_from_tensor(output, scale=1.0)
@@ -296,6 +298,7 @@ class RealESRGANUpscaler:
             del self._model
             self._model = None
             self._loaded = False
+            self._use_fp16 = False
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
 

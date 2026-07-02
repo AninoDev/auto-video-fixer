@@ -179,13 +179,13 @@ Dependencies:
 **Duration**: 1.5 weeks
 
 Tasks:
-- [ ] Design VLM interface
-- [ ] Implement Ollama integration
-- [ ] Implement OpenAI Vision integration
-- [ ] Add custom API support
-- [ ] Create frame extraction utility
-- [ ] Implement analysis pipeline
-- [ ] Write VLM tests
+- [x] Design VLM interface (provider-based with Ollama, OpenAI, custom API, local)
+- [x] Implement Ollama integration (`_run_ollama_vlm`, `_call_ollama`)
+- [x] Implement OpenAI Vision integration (`_run_openai_vlm`, `_call_openai`)
+- [x] Add custom API support (`_run_api_vlm`, `_call_custom_api`)
+- [x] Create frame extraction utility (`_extract_sample_frames`, `_frames_to_base64`)
+- [x] Implement analysis pipeline (`run_vlm_analysis`, `_parse_vlm_response`)
+- [x] Write VLM tests (test_vlm.py - 22 tests)
 
 Dependencies:
 - Ollama installation (local testing)
@@ -195,11 +195,11 @@ Dependencies:
 **Duration**: 1 week
 
 Tasks:
-- [ ] Implement frame differencing
-- [ ] Add scene change detection
-- [ ] Create event highlighting
-- [ ] Implement clip extraction
-- [ ] Write scene detection tests
+- [x] Implement frame differencing (`_detect_scene_changes`)
+- [x] Add scene change detection
+- [x] Create event highlighting (`_classify_events` with heuristic classification)
+- [x] Implement clip extraction (`extract_clip`, `extract_scenes_as_clips`, `VideoClip` dataclass)
+- [x] Write scene detection tests (test_scene_detection.py - 22 tests)
 
 Dependencies:
 - OpenCV installed
@@ -208,12 +208,13 @@ Dependencies:
 **Duration**: 0.5 weeks
 
 Tasks:
-- [ ] Improve perceptual hashing
-- [ ] Add similarity scoring
-- [ ] Implement batch deduplication
-- [ ] Write duplicate detection tests
+- [x] Improve perceptual hashing (ahash + dhash)
+- [x] Add similarity scoring (`hash_similarity` with Hamming distance)
+- [x] Implement batch deduplication (`find_duplicates`)
+- [x] Write duplicate detection tests
 
 **Phase 3 Total**: 3 weeks
+**Status**: Completed
 
 ---
 

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import copy
-import logging
 import os
 import sys
 
@@ -24,22 +23,29 @@ console = Console()
 @click.group()
 @click.version_option(version=__version__, prog_name="avf")
 @click.option("--verbose", "-v", is_flag=True, help="Enable verbose logging (DEBUG level)")
-@click.option("--log-level", type=click.Choice(["DEBUG", "INFO", "WARNING", "ERROR"], case_sensitive=False), default=None, help="Set logging level")
-@click.option("--log-file", type=click.Path(), default=None, help="Log to file in addition to console")
+@click.option(
+    "--log-level",
+    type=click.Choice(["DEBUG", "INFO", "WARNING", "ERROR"], case_sensitive=False),
+    default=None,
+    help="Set logging level",
+)
+@click.option(
+    "--log-file", type=click.Path(), default=None, help="Log to file in addition to console"
+)
 @click.pass_context
 def main(ctx: click.Context, verbose: bool, log_level: str | None, log_file: str | None) -> None:
     """Auto Video Fixer - Automated video enhancement and processing.
 
     Process one or more video files with AI-powered upscaling,
     frame interpolation, denoising, and more.
-    
+
     Logging:
       --verbose, -v          Enable DEBUG level logging
       --log-level LEVEL      Set logging level (DEBUG, INFO, WARNING, ERROR)
       --log-file PATH        Log to file (in addition to console)
     """
     ctx.ensure_object(dict)
-    
+
     # Setup logging
     if verbose:
         setup_logging("DEBUG")
@@ -47,16 +53,19 @@ def main(ctx: click.Context, verbose: bool, log_level: str | None, log_file: str
         setup_logging(log_level)
     else:
         setup_logging("INFO")
-    
+
     # Add file handler if requested
     if log_file:
-        from autovideofixer.logger import get_logger
-        logger = get_logger("autovideofixer")
         import logging
+
         file_handler = logging.FileHandler(log_file)
-        file_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s"))
-        logger.addHandler(file_handler)
-    
+        file_handler.setFormatter(
+            logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+        )
+        logging.getLogger("autovideofixer").addHandler(file_handler)
+        logging.getLogger("autovideofixer.ai").addHandler(file_handler)
+        logging.getLogger("autovideofixer.stages").addHandler(file_handler)
+
     ctx.obj["config"] = Config()
 
 
@@ -70,7 +79,12 @@ def main(ctx: click.Context, verbose: bool, log_level: str | None, log_file: str
 @click.option("--stage", "stages", multiple=True, help="Specific stages to run (can repeat)")
 @click.option("--threads", type=int, default=None, help="Number of processing threads")
 @click.option("--ai", "use_ai", flag_value=True, default=None, help="Force AI-based processing")
-@click.option("--no-ai", "use_ai", flag_value=False, help="Disable AI-based processing (use traditional methods)")
+@click.option(
+    "--no-ai",
+    "use_ai",
+    flag_value=False,
+    help="Disable AI (use traditional methods)",
+)
 @click.pass_context
 def process(
     ctx: click.Context,
@@ -148,14 +162,40 @@ def process(
     results = pipeline.execute_all(callback=_on_job_complete)
 
     # Summary
+    failed = sum(1 for r in results if not r.success)
     _print_summary(results)
+    if failed > 0:
+        sys.exit(1)
 
 
 @main.command()
 @click.argument("filepath")
-@click.option("--vlm", is_flag=True, help="Run VLM analysis")
+@click.option("--vlm", "vlm_flag", is_flag=True, default=None, help="Enable VLM analysis")
+@click.option("--no-vlm", "vlm_flag", flag_value=False, help="Disable VLM analysis")
+@click.option(
+    "--events", "events_flag", is_flag=True, default=None, help="Enable event/scene detection"
+)
+@click.option("--no-events", "events_flag", flag_value=False, help="Disable event/scene detection")
+@click.option(
+    "--classify", "classify_events", is_flag=True, help="Classify detected events with VLM"
+)
+@click.option(
+    "--clip",
+    "clip_output",
+    type=click.Path(),
+    default=None,
+    help="Extract scenes as clips to directory",
+)
+@click.option("--no-clip", "clip_output", flag_value="", help="Skip clip extraction")
 @click.pass_context
-def analyze(ctx: click.Context, filepath: str, vlm: bool) -> None:
+def analyze(
+    ctx: click.Context,
+    filepath: str,
+    vlm_flag: bool | None,
+    events_flag: bool | None,
+    classify_events: bool,
+    clip_output: str | None,
+) -> None:
     """Analyze a video file for properties, events, and content."""
     config = ctx.obj["config"]
 
@@ -164,7 +204,17 @@ def analyze(ctx: click.Context, filepath: str, vlm: bool) -> None:
     analyzer = VideoAnalyzer(config)
 
     console.print(f"Analyzing: {filepath}")
-    analysis = analyzer.analyze(filepath, include_vlm=vlm)
+    analysis = analyzer.analyze(
+        filepath,
+        include_vlm=vlm_flag,
+        include_events=events_flag,
+    )
+
+    # analyze() doesn't take a classify_events param, so re-run event detection
+    # directly with classification enabled when --classify was requested.
+    if classify_events and events_flag is not False:
+        analysis.scenes = analyzer.detect_events(filepath, classify_events=True)
+        analysis.total_scenes = len(analysis.scenes)
 
     table = Table(title="Video Analysis")
     table.add_column("Property")
@@ -180,25 +230,56 @@ def analyze(ctx: click.Context, filepath: str, vlm: bool) -> None:
     table.add_row("Scenes Detected", str(analysis.total_scenes))
 
     if analysis.vlm_summary:
-        table.add_row("VLM Summary", analysis.vlm_summary[:100] + "...")
+        summary = analysis.vlm_summary
+        if len(summary) > 120:
+            summary = summary[:120] + "..."
+        table.add_row("VLM Summary", summary)
     if analysis.vlm_tags:
         table.add_row("Tags", ", ".join(analysis.vlm_tags))
+    if analysis.content_rating:
+        table.add_row("Content Rating", analysis.content_rating)
 
     console.print(table)
 
     if analysis.scenes:
-        console.print("\n[bold]Detected Scenes:[/bold]")
-        for scene in analysis.scenes[:20]:  # Show first 20
-            console.print(f"  {scene.start_time:.1f}s - {scene.end_time:.1f}s ({scene.event_type})")
+        console.print(f"\n[bold]Detected {analysis.total_scenes} Scene(s):[/bold]")
+        for scene in analysis.scenes[:30]:
+            desc = f" - {scene.description}" if scene.description else ""
+            console.print(
+                f"  [{scene.event_type}] "
+                f"{scene.start_time:.1f}s - {scene.end_time:.1f}s "
+                f"({scene.duration:.1f}s){desc}"
+            )
+
+    # Extract clips if requested
+    if clip_output is not None and analysis.scenes:
+        if clip_output == "":
+            clip_output = None
+
+        if clip_output:
+            clips = analyzer.extract_scenes_as_clips(
+                filepath, analysis.scenes, output_dir=clip_output
+            )
+            if clips:
+                console.print(f"\n[green]Extracted {len(clips)} clip(s) to: {clip_output}[/green]")
+                for clip in clips:
+                    console.print(
+                        f"  Clip {clip.scene_index}: "
+                        f"{clip.start_time:.1f}s-{clip.end_time:.1f}s -> "
+                        f"{os.path.basename(clip.output_path)}"
+                    )
+            else:
+                console.print("\n[yellow]No clips could be extracted.[/yellow]")
 
 
 @main.command()
 @click.argument("reference")
 @click.argument("directory")
 @click.option("--threshold", type=float, default=0.95, help="Similarity threshold (0-1)")
-def find_duplicates(reference: str, directory: str, threshold: float) -> None:
+@click.pass_context
+def find_duplicates(ctx: click.Context, reference: str, directory: str, threshold: float) -> None:
     """Find similar/duplicate videos in a directory."""
-    config = Config()
+    config = ctx.obj["config"]
     from autovideofixer.core.analysis import VideoAnalyzer
 
     analyzer = VideoAnalyzer(config)
@@ -255,17 +336,17 @@ def model_info(model: str | None) -> None:
     table.add_column("Cached")
     table.add_column("SHA256")
 
-    cached = set(list_cached_models())
+    cached = {m["name"] for m in list_cached_models()}
 
     for key, meta in MODEL_REGISTRY.items():
         if model and key != model:
             continue
 
         is_cached = key in cached
-        sha = meta.get("sha256", "N/A")
+        sha = meta.get("sha256")
         if isinstance(sha, bytes):
             sha = sha.hex()
-        sha_str = str(sha)[:12] + "..."
+        sha_str = str(sha)[:12] + "..." if sha else "N/A"
 
         table.add_row(
             key,
@@ -279,7 +360,7 @@ def model_info(model: str | None) -> None:
     console.print(table)
 
     if cached:
-        console.print(f"\n[Cyan]Cached models: {', '.join(cached)}[/cyan]")
+        console.print(f"\n[blue]Cached models: {', '.join(cached)}[/blue]")
     else:
         console.print(
             "[red]No models cached. Download with: avf model-download --model <name>[/red]"
@@ -294,6 +375,7 @@ def model_download(model: str, url: str | None, force: bool) -> None:
     """Download an AI model for processing."""
     from autovideofixer.ai.model_cache import (
         MODEL_REGISTRY,
+        download_model,
         ensure_model_available,
     )
     from autovideofixer.ai.torch_utils import is_torch_available
@@ -304,20 +386,28 @@ def model_download(model: str, url: str | None, force: bool) -> None:
 
     if url:
         try:
-            path = ensure_model_available(model, url=url, force=force)
-            console.print(f"[green]Model downloaded to: {path}[/green]")
+            ok, msg = download_model(model, url=url)
         except Exception as e:
             console.print(f"[red]Download failed: {e}[/red]")
             sys.exit(1)
+        if ok:
+            console.print(f"[green]{msg}[/green]")
+        else:
+            console.print(f"[red]Download failed: {msg}[/red]")
+            sys.exit(1)
     elif model in MODEL_REGISTRY:
         try:
-            path = ensure_model_available(model, force=force)
+            ok, msg = ensure_model_available(model, force_download=force)
+        except Exception as e:
+            console.print(f"[red]Download failed: {e}[/red]")
+            sys.exit(1)
+        if ok:
             meta = MODEL_REGISTRY[model]
             console.print("[green]Model downloaded:[/green]")
             console.print(f"  Name: {meta.get('description', model)}")
-            console.print(f"  Path: {path}")
-        except Exception as e:
-            console.print(f"[red]Download failed: {e}[/red]")
+            console.print(f"  {msg}")
+        else:
+            console.print(f"[red]Download failed: {msg}[/red]")
             sys.exit(1)
     else:
         console.print(f"[red]Unknown model: {model}[/red]")

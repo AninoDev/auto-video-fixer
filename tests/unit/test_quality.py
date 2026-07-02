@@ -183,5 +183,8 @@ class TestQualityEstimation:
 
         result = estimate_quality_vmaf(str(ref_file), str(dist_file))
 
-        # VMAF should return a score between 0 and 100
-        assert 0 <= result.vmaf_score <= 100
+        # Two lightly-different encodes of the same synthetic source should score
+        # high but not perfect. This also asserts VMAF actually ran (rather than
+        # silently falling through to the 0.0 failure-default).
+        assert "error" not in result.details
+        assert 70 <= result.vmaf_score <= 100

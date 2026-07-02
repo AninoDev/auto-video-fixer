@@ -72,14 +72,19 @@ class Config:
             },
         },
         "pipeline": {
+            # Informational only -- Pipeline.optimize_stage_order() is the actual
+            # source of truth for execution order and does not read this list.
             "default_order": [
                 "detect",
                 "stabilize",
-                "denoise",
                 "deblock",
+                "denoise_video",
                 "upscale",
                 "interpolate",
-                "normalize",
+                "normalize_volume",
+                "normalize_audio",
+                "speed",
+                "hdr",
                 "encode",
             ],
             "max_stages": 10,
@@ -145,16 +150,19 @@ class Config:
                 "model": "llava",
                 "api_key": "",
                 "api_url": "",
+                "max_sample_frames": 8,
+                "sample_interval_sec": 10.0,
             },
             "event_detection": {
                 "enabled": True,
                 "scene_change_threshold": 0.3,
                 "min_scene_duration_sec": 2.0,
+                "classify_events": False,
             },
             "duplicate_detection": {
                 "enabled": True,
                 "similarity_threshold": 0.95,
-                "hash_type": "perceptual",
+                "hash_type": "perceptual",  # perceptual (ahash), dhash, combined
             },
         },
     }
@@ -171,8 +179,12 @@ class Config:
                 with open(self._path) as f:
                     user = yaml.safe_load(f) or {}
                 self._deep_update(merged, user)
-            except Exception:
-                pass
+            except Exception as e:
+                from autovideofixer.logger import get_logger
+
+                get_logger("autovideofixer.config").warning(
+                    "Failed to load config from %s: %s. Using defaults.", self._path, e
+                )
         return merged
 
     @staticmethod
@@ -182,10 +194,22 @@ class Config:
         return copy.deepcopy(d)
 
     @staticmethod
-    def _deep_update(base: dict, override: dict) -> None:
+    def _deep_update(base: dict, override: dict, _path: str = "") -> None:
+        from autovideofixer.logger import get_logger
+
         for k, v in override.items():
+            key_path = f"{_path}.{k}" if _path else k
             if isinstance(v, dict) and isinstance(base.get(k), dict):
-                Config._deep_update(base[k], v)
+                Config._deep_update(base[k], v, key_path)
+            elif k in base and isinstance(base[k], dict) and not isinstance(v, dict):
+                # Refuse to clobber a default mapping (e.g. stages.upscale, quality.quality_target)
+                # with a scalar override -- consumers unconditionally call .get()/.items() on
+                # these and would crash with an unhandled AttributeError otherwise.
+                get_logger("autovideofixer.config").warning(
+                    "Ignoring invalid config override for '%s': expected a mapping, got %s",
+                    key_path,
+                    type(v).__name__,
+                )
             else:
                 base[k] = v
 
@@ -200,8 +224,14 @@ class Config:
     def set(self, value: Any, *keys: str) -> None:
         node = self._data
         for k in keys[:-1]:
-            if k not in node or not isinstance(node[k], dict):
+            if k not in node:
                 node[k] = {}
+            elif not isinstance(node[k], dict):
+                raise TypeError(
+                    f"Cannot set config key {'.'.join(keys)!r}: "
+                    f"{'.'.join(keys[: keys.index(k) + 1])!r} is a {type(node[k]).__name__}, "
+                    "not a mapping"
+                )
             node = node[k]
         node[keys[-1]] = value
         self._save_pending = True

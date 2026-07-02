@@ -6,7 +6,7 @@ import os
 import time
 from typing import Any
 
-from autovideofixer.core.ffmpeg_utils import run_ffmpeg
+from autovideofixer.core.ffmpeg_utils import probe, run_ffmpeg
 from autovideofixer.core.stages.base import BaseStage, StageResult, StageStatus
 
 
@@ -105,8 +105,14 @@ class InterpolateStage(BaseStage):
         else:
             factor = 2
 
-        # minterpolate: fps=double:mi=interp:mb=16:vsbmc=1:vsblur=1
-        vf = f"fps={target_fps or 'double'},minterpolate=mi=interp:mb=16:vsbmc=1:vsblur=1"
+        # Real minterpolate option names (mi/mb/vsblur used by the previous
+        # implementation don't exist in ffmpeg and fail with "Option not
+        # found" on every invocation). minterpolate takes its own fps=
+        # sub-option, so the target fps must not be applied via a separate
+        # leading fps= filter -- that would just duplicate/drop frames
+        # before motion-compensated interpolation ever sees original timing.
+        target = target_fps or (current_fps * factor if current_fps else 60)
+        vf = f"minterpolate=mi_mode=mci:mc_mode=aobmc:me_mode=bilat:vsbmc=1:mb_size=16:fps={target}"
 
         args = ["-i", input_path, "-vf", vf, "-c:a", "copy", "-y", output_path]
 
@@ -206,6 +212,23 @@ class InterpolateStage(BaseStage):
                 current_fps=current_fps,
             )
 
+        # Validate resolution - RIFE model expects input frames around 256x256 or larger
+        probe_info = probe(input_path)
+        input_w, input_h = probe_info.resolution
+        if input_w < 64 or input_h < 64:
+            self.logger.warning(
+                f"Input resolution {input_w}x{input_h} too small for AI interpolation "
+                "(RIFE expects >= 64px)"
+            )
+            return self._execute_traditional(
+                input_path,
+                output_path,
+                progress_callback,
+                start,
+                target_fps=target_fps,
+                current_fps=current_fps,
+            )
+
         # Load and run RIFE
         interpolator = RIFEInterpolator(model_name=self._ai_model)
 
@@ -222,22 +245,68 @@ class InterpolateStage(BaseStage):
 
         try:
             proc = FrameProcessor()
-            frames = proc.extract_frames(input_path)
+            # Stream frames in chunks to avoid loading entire video into memory.
+            use_chunked = probe_info.frame_count and probe_info.frame_count > 1000
 
-            if not frames:
-                return StageResult(
-                    status=StageStatus.FAILED,
-                    error="No frames extracted from input video",
-                    duration_sec=time.time() - start,
+            if use_chunked:
+                chunk_size = 25
+                all_interpolated: list[Any] = []
+                total_original_frames = probe_info.frame_count
+                processed = 0
+                carry_frame: Any = None
+
+                def cb(current, total, msg):
+                    self._report_progress(
+                        0.1 + (processed / total_original_frames) * 0.9,
+                        msg,
+                        progress_callback,
+                    )
+
+                for chunk in proc.stream_frames(
+                    input_path, chunk_size=chunk_size, max_frames=total_original_frames
+                ):
+                    # Carry the previous chunk's last frame into this chunk
+                    # so a real interpolated frame is generated across the
+                    # chunk boundary instead of a hard stutter every
+                    # chunk_size source frames.
+                    extended = [carry_frame, *chunk] if carry_frame is not None else chunk
+                    chunk_interp = interpolator.interpolate_video(
+                        extended, factor=factor, progress_callback=cb
+                    )
+                    if carry_frame is not None:
+                        # interpolate_video's first output element is always
+                        # the carried frame itself, already emitted as the
+                        # previous chunk's final output element -- drop the
+                        # duplicate.
+                        chunk_interp = chunk_interp[1:]
+                    all_interpolated.extend(chunk_interp)
+                    carry_frame = chunk[-1]
+                    processed += len(chunk)
+
+                    self._report_progress(
+                        0.1 + (processed / total_original_frames) * 0.9,
+                        "Interpolating chunk...",
+                        progress_callback,
+                    )
+                proc.close()
+                interpolated = all_interpolated
+            else:
+                frames = proc.extract_frames(input_path)
+                proc.close()
+
+                if not frames:
+                    return StageResult(
+                        status=StageStatus.FAILED,
+                        error="No frames extracted from input video",
+                        duration_sec=time.time() - start,
+                    )
+
+                def cb(current, total, msg):
+                    self._report_progress(0.1 + (current / total) * 0.9, msg, progress_callback)
+
+                interpolated = interpolator.interpolate_video(
+                    frames, factor=factor, progress_callback=cb
                 )
-
-            def cb(current, total, msg):
-                self._report_progress(0.1 + (current / total) * 0.9, msg, progress_callback)
-
-            interpolated = interpolator.interpolate_video(
-                frames, factor=factor, progress_callback=cb
-            )
-            proc.close()
 
             if not interpolated:
                 return StageResult(
@@ -262,34 +331,34 @@ class InterpolateStage(BaseStage):
                 )
             proc2.close()
 
-            # Copy audio from original to interpolated temp file
-            run_ffmpeg(
-                [
-                    "-i",
-                    input_path,
-                    "-i",
-                    temp_path,
-                    "-map",
-                    "0:a:0",
-                    "-map",
-                    "1:v:0",
-                    "-c:v",
-                    "libx264",
-                    "-crf",
-                    "18",
-                    "-c:a",
-                    "copy",
-                    "-y",
-                    output_path,
-                ],
-                timeout=600,
-            )
+            # Mux the interpolated video back with the original audio (if
+            # any). Hardcoding "-map 0:a:0" on an audio-less input makes
+            # ffmpeg fail with no output file written; the return code was
+            # previously never checked, so that failure was silently
+            # reported as a completed job after deleting the only rendered
+            # content. Branch on whether an audio stream actually exists.
+            has_audio = probe_info.has_audio
+            mux_args = ["-i", input_path, "-i", temp_path]
+            if has_audio:
+                mux_args += ["-map", "0:a:0", "-map", "1:v:0"]
+            else:
+                mux_args += ["-map", "1:v:0"]
+            mux_args += ["-c:v", "libx264", "-crf", "18", "-c:a", "copy", "-y", output_path]
 
-            # Clean up temp file
+            mux_result = run_ffmpeg(mux_args, timeout=600)
+
             if os.path.exists(temp_path):
                 os.unlink(temp_path)
 
+            if mux_result.returncode != 0 or not os.path.exists(output_path):
+                return StageResult(
+                    status=StageStatus.FAILED,
+                    error=f"Failed to mux interpolated output: {mux_result.stderr[:300]}",
+                    duration_sec=time.time() - start,
+                )
+
             self._report_progress(1.0, "AI frame interpolation complete", progress_callback)
+            orig_count = probe_info.frame_count or 0
             return StageResult(
                 status=StageStatus.COMPLETED,
                 output_path=output_path,
@@ -297,7 +366,7 @@ class InterpolateStage(BaseStage):
                     "method": "ai",
                     "model": self._ai_model,
                     "factor": factor,
-                    "frames_in": len(frames),
+                    "frames_in": orig_count,
                     "frames_out": len(interpolated),
                 },
                 duration_sec=time.time() - start,

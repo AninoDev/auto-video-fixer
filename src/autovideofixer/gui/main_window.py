@@ -5,7 +5,6 @@ Provides the main window, job queue, progress display, and settings.
 
 from __future__ import annotations
 
-import copy
 import os
 import sys
 
@@ -32,6 +31,29 @@ from autovideofixer.config import Config
 from autovideofixer.core.analysis import is_video_file, scan_directory
 from autovideofixer.core.pipeline import Job, JobResult, Pipeline
 from autovideofixer.core.presets import get_preset, list_presets
+
+
+def _merge_config(config: Config, data: dict) -> None:
+    """Recursively merge data into config in place (mirrors cli.py's merge)."""
+    for key, value in data.items():
+        if isinstance(value, dict):
+            current = config.get(key, default={})
+            if isinstance(current, dict):
+                _merge_config_helper(current, value)
+                config.set(current, key)
+            else:
+                config.set(value, key)
+        else:
+            config.set(value, key)
+
+
+def _merge_config_helper(target: dict, source: dict) -> None:
+    """Recursively merge source dict into target dict."""
+    for key, value in source.items():
+        if isinstance(value, dict) and key in target and isinstance(target[key], dict):
+            _merge_config_helper(target[key], value)
+        else:
+            target[key] = value
 
 
 class ProcessingThread(QThread):
@@ -161,7 +183,7 @@ class MainWindow(QMainWindow):
         file_menu.addAction(
             "Add &Files...",
             self._on_add_files,
-            QtGui.QKeyCombination(QtGui.QKeySequence.Key_CtrlModifier, QtGui.QKeySequence.Key_O),
+            QtGui.QKeySequence(QtGui.QKeySequence.StandardKey.Open),
         )
         file_menu.addAction("Add &Directory...", self._on_add_directory)
         file_menu.addSeparator()
@@ -170,7 +192,7 @@ class MainWindow(QMainWindow):
         file_menu.addAction(
             "E&xit",
             self.close,
-            QtGui.QKeyCombination(QtGui.QKeySequence.Key_CtrlModifier, QtGui.QKeySequence.Key_Q),
+            QtGui.QKeySequence(QtGui.QKeySequence.StandardKey.Quit),
         )
 
         # Help menu
@@ -208,15 +230,16 @@ class MainWindow(QMainWindow):
 
         job = self.pipeline.add_job(filepath)
 
-        self.job_table.setItem(row, 0, QTableWidgetItem(os.path.basename(filepath)))
+        name_item = QTableWidgetItem(os.path.basename(filepath))
+        # Store the Job reference on the row's first item; QTableWidget has no
+        # native per-row data slot, so UserRole on an item is the standard way.
+        name_item.setData(Qt.ItemDataRole.UserRole, job)
+        self.job_table.setItem(row, 0, name_item)
         self.job_table.setItem(row, 1, QTableWidgetItem("Queued"))
         self.job_table.setItem(row, 2, QTableWidgetItem("0%"))
         self.job_table.setItem(row, 3, QTableWidgetItem("-"))
         self.job_table.setItem(row, 4, QTableWidgetItem("-"))
         self.job_table.setItem(row, 5, QTableWidgetItem("-"))
-
-        # Store job reference
-        self.job_table.setRowData(row, job)
 
     def _on_start(self) -> None:
         """Start processing all queued jobs."""
@@ -230,6 +253,9 @@ class MainWindow(QMainWindow):
 
             self.btn_start.setEnabled(False)
             self.btn_cancel.setEnabled(True)
+            self.btn_add_files.setEnabled(False)
+            self.btn_add_dir.setEnabled(False)
+            self.btn_clear.setEnabled(False)
             self.gui_status.setText("Processing...")
 
     def _on_cancel(self) -> None:
@@ -252,8 +278,8 @@ class MainWindow(QMainWindow):
         """Handle completed job."""
         # Update table
         for row in range(self.job_table.rowCount()):
-            data = self.job_table.rowData(row)
-            if data and data.get("job") is job:
+            name_item = self.job_table.item(row, 0)
+            if name_item is not None and name_item.data(Qt.ItemDataRole.UserRole) is job:
                 status = "Done" if result.success else "Failed"
                 self.job_table.setItem(row, 1, QTableWidgetItem(status))
                 self.job_table.setItem(row, 2, QTableWidgetItem("100%"))
@@ -266,6 +292,9 @@ class MainWindow(QMainWindow):
         """Handle all processing finished."""
         self.btn_start.setEnabled(True)
         self.btn_cancel.setEnabled(False)
+        self.btn_add_files.setEnabled(True)
+        self.btn_add_dir.setEnabled(True)
+        self.btn_clear.setEnabled(True)
         self.gui_status.setText("Processing complete")
 
     def _on_error(self, error_msg: str) -> None:
@@ -273,19 +302,19 @@ class MainWindow(QMainWindow):
         QMessageBox.critical(self, "Error", f"Processing error:\n{error_msg}")
         self.btn_start.setEnabled(True)
         self.btn_cancel.setEnabled(False)
+        self.btn_add_files.setEnabled(True)
+        self.btn_add_dir.setEnabled(True)
+        self.btn_clear.setEnabled(True)
 
     def _on_preset_changed(self, preset_name: str) -> None:
         """Apply preset configuration (in memory only, not persisted)."""
         preset = get_preset(preset_name)
         if preset:
             config_data = preset.to_config()
-            # Work on a deep copy to avoid persisting preset values to disk
-            self.config = copy.deepcopy(self.config)
-            for key, value in config_data.items():
-                if isinstance(value, dict):
-                    self.config.set(value, key)
-                else:
-                    self.config.set(value, key)
+            # Mutate self.config in place (do NOT reassign it) - self.pipeline
+            # holds a reference to this same Config object, so replacing
+            # self.config here would silently desync the two.
+            _merge_config(self.config, config_data)
 
     def _on_browse_output(self) -> None:
         """Browse for output directory."""

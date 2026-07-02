@@ -143,7 +143,9 @@ def frame_from_tensor(tensor: Any, scale: float = 1.0) -> "Any":  # numpy array
     arr = tensor.squeeze(0).numpy().transpose(1, 2, 0)
     # RGB -> BGR for OpenCV
     arr = arr[:, :, ::-1]
-    arr = np.clip(arr * 255.0, 0, 255).astype("uint8")
+    # Sanitize NaN/Inf before clipping
+    arr = np.nan_to_num(arr, nan=0.0, posinf=1.0, neginf=0.0)
+    arr = np.clip(arr * 255.0, 0.0, 255.0).astype("uint8")
     return arr
 
 
@@ -187,6 +189,15 @@ def apply_tta(
 ) -> Any:
     """Apply test-time augmentation for improved quality.
 
+    Runs the model on several geometric augmentations of the input (flips,
+    rotations) and averages the results for a slight quality improvement.
+    Each augmented output MUST be transformed back to the canonical
+    (un-augmented) orientation before averaging - a flipped output pixel
+    isn't spatially aligned with an unflipped one, so averaging first and
+    inverse-transforming the average afterward (as this used to do) mixes
+    misaligned pixels and produces ghosting rather than a genuine
+    improvement.
+
     Args:
         model: Loaded PyTorch model.
         tensor: Input tensor (1, C, H, W).
@@ -197,41 +208,37 @@ def apply_tta(
     """
     import torch
 
-    outputs = []
-    # Original
-    outputs.append(model(tensor))
+    # Each entry is already transformed back to canonical orientation.
+    canonical_outputs = [model(tensor)]
 
     if mode >= 2:
         # Horizontal flip
-        outputs.append(model(torch.flip(tensor, [3])))
+        out = model(torch.flip(tensor, [3]))
+        canonical_outputs.append(torch.flip(out, [3]))
 
     if mode >= 4:
         # Vertical flip
-        outputs.append(model(torch.flip(tensor, [2])))
+        out = model(torch.flip(tensor, [2]))
+        canonical_outputs.append(torch.flip(out, [2]))
 
     if mode >= 8:
         # Both flips
-        outputs.append(model(torch.flip(tensor, [2, 3])))
+        out = model(torch.flip(tensor, [2, 3]))
+        canonical_outputs.append(torch.flip(out, [2, 3]))
 
     if mode >= 16:
-        # Rotations
-        t90 = torch.rot90(tensor, 1, [2, 3])
-        outputs.append(model(t90))
-        outputs.append(model(torch.rot90(t90, 1, [2, 3])))
-        outputs.append(model(torch.rot90(t90, 2, [2, 3])))
+        # 90/180/270 degree rotations, each inverse-rotated back individually.
+        rot90_in = torch.rot90(tensor, 1, [2, 3])
+        rot180_in = torch.rot90(tensor, 2, [2, 3])
+        rot270_in = torch.rot90(tensor, 3, [2, 3])
+        canonical_outputs.append(torch.rot90(model(rot90_in), -1, [2, 3]))
+        canonical_outputs.append(torch.rot90(model(rot180_in), -2, [2, 3]))
+        canonical_outputs.append(torch.rot90(model(rot270_in), -3, [2, 3]))
 
-    if len(outputs) == 1:
-        return outputs[0]
+    if len(canonical_outputs) == 1:
+        return canonical_outputs[0]
 
-    result = sum(o for o in outputs) / len(outputs)
-
-    # Reverse augmentations
-    if mode >= 2:
-        result = torch.flip(result, [3])
-    if mode >= 4:
-        result = torch.flip(result, [2])
-
-    return result
+    return sum(canonical_outputs) / len(canonical_outputs)
 
 
 def infer_batch(

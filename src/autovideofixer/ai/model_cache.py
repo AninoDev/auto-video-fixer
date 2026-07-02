@@ -49,17 +49,24 @@ MODEL_REGISTRY: dict[str, dict[str, Any]] = {
         "description": "Real-ESRGAN x4 anime model (lighter, 6 RRDB blocks)",
         "scale": 4,
     },
+    # Real weights from the official author's HuggingFace mirror
+    # (https://huggingface.co/hzwer/RIFE), verified: the packaged
+    # `flownet.pkl` loads into our IFNet with zero missing/unexpected keys.
+    # Registry key kept as "rife_v4.6" for config/preset compatibility, but
+    # the actual shipped checkpoint is RIFE v4.25/4.26 (internal
+    # Model.version=4.25, release archive RIFEv4.26_0921.zip) -- there is
+    # no longer a real, separately-downloadable v4.6 or v4.11 checkpoint,
+    # so a fabricated second "rife_v4.11" entry pointing at different fake
+    # bytes was removed rather than kept as a misleading duplicate.
     "rife_v4.6": {
-        "url": "https://github.com/hzwer.com/Paper-2021-RIFE/releases/download/v4.6/flownet.pkl",
-        "filename": "rife_v4.6.pkl",
-        "size_mb": 40,
-        "description": "RIFE v4.6 frame interpolation model",
-    },
-    "rife_v4.11": {
-        "url": "https://github.com/hzwer.com/Paper-2021-RIFE/releases/download/v4.11/flownet.pkl",
-        "filename": "rife_v4.11.pkl",
-        "size_mb": 40,
-        "description": "RIFE v4.11 frame interpolation model",
+        "url": "https://huggingface.co/hzwer/RIFE/resolve/main/RIFEv4.26_0921.zip",
+        "filename": "rife_v4.6.zip",
+        "sha256": "1fa9b9cda3d9b8c3e301359e2595960902f97bf926c08598b0e9957a3f3f760e",
+        "size_mb": 22,
+        "description": (
+            "RIFE v4.25/4.26 frame interpolation model (flownet.pkl, official "
+            "hzwer/RIFE HuggingFace mirror, packaged as a release zip)"
+        ),
     },
 }
 
@@ -143,11 +150,13 @@ def download_model(
     if meta is None and url is None:
         return False, f"Unknown model: {model_name}. Available: {list_available_models()}"
 
+    expected_sha256: str | None = None
     if url is not None:
         filename = custom_path or f"{model_name}.pth"
     elif meta:
         filename = meta["filename"]
         url = url or meta["url"]
+        expected_sha256 = meta.get("sha256")
     else:
         return False, "Must provide URL for custom models"
 
@@ -158,7 +167,7 @@ def download_model(
     _get_logger().info(f"Downloading {model_name} from {url}")
 
     try:
-        _download_file(url, str(dest))
+        _download_file(url, str(dest), expected_sha256=expected_sha256)
         _get_logger().info(f"Model saved to {dest}")
         return True, f"Downloaded to {dest}"
     except Exception as e:
@@ -166,8 +175,43 @@ def download_model(
         return False, f"Download failed: {e}"
 
 
-def _download_file(url: str, dest: str, chunk_size: int = 8192) -> None:
-    """Download a file from URL to dest path."""
+def _download_file(
+    url: str,
+    dest: str,
+    chunk_size: int = 8192,
+    expected_sha256: str | None = None,
+) -> None:
+    """Download a file from URL to dest path.
+
+    Downloads to a `.part` temp file first and atomically renames into
+    place only on success (and only after hash verification, if an
+    expected SHA256 was provided). This means an interrupted download or a
+    hash mismatch never leaves a corrupt/tampered file at `dest` for
+    `get_model_path()` to later treat as validly cached.
+    """
+    tmp_dest = f"{dest}.part"
+    try:
+        _fetch_to(url, tmp_dest, chunk_size)
+
+        if expected_sha256:
+            actual = get_model_hash(tmp_dest)
+            if actual is None or actual.lower() != expected_sha256.lower():
+                raise RuntimeError(
+                    f"Downloaded file hash mismatch for {url} "
+                    f"(expected {expected_sha256}, got {actual})"
+                )
+
+        os.replace(tmp_dest, dest)
+    finally:
+        if os.path.exists(tmp_dest):
+            try:
+                os.unlink(tmp_dest)
+            except OSError:
+                pass
+
+
+def _fetch_to(url: str, dest: str, chunk_size: int = 8192) -> None:
+    """Fetch `url` to `dest`, trying urllib, then requests, then curl."""
     try:
         import urllib.request
 
@@ -230,18 +274,7 @@ def list_cached_models() -> list[dict[str, Any]]:
 
     # Also check project-level models/ directory
     project_models = Path("models")
-    if project_models.exists():
-        for item in project_models.iterdir():
-            if item.is_file():
-                cached.append(
-                    {
-                        "name": item.stem,
-                        "path": str(item),
-                        "size_mb": round(item.stat().st_size / (1024 * 1024), 1),
-                        "description": "Custom model",
-                    }
-                )
-    elif project_models.is_dir():
+    if project_models.is_dir():
         for item in project_models.iterdir():
             if item.is_file():
                 cached.append(

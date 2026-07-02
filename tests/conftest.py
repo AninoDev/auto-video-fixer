@@ -58,11 +58,11 @@ def tmp_video_directory(tmp_path):
 
 
 @pytest.fixture
-def sample_config():
-    """Provide a sample configuration for testing."""
+def sample_config(tmp_path):
+    """Provide a sample configuration for testing, isolated from the user's real config file."""
     from autovideofixer.config import Config
 
-    config = Config()
+    config = Config(tmp_path / "nonexistent.yaml")
     config.set(1, "general", "max_concurrent_jobs")
     config.set(18, "encoding", "crf")
     return config

@@ -6,7 +6,7 @@ import os
 import time
 from typing import Any
 
-from autovideofixer.core.ffmpeg_utils import run_ffmpeg
+from autovideofixer.core.ffmpeg_utils import probe, run_ffmpeg
 from autovideofixer.core.stages.base import BaseStage, StageResult, StageStatus
 
 
@@ -183,9 +183,7 @@ class UpscaleStage(BaseStage):
         max_ai_scale = 4
 
         # Get input dimensions
-        input_w, input_h = (
-            self._get_input_resolution(input_path) if input_path else (0, 0)
-        )
+        input_w, input_h = self._get_input_resolution(input_path) if input_path else (0, 0)
 
         # Calculate target dimensions (preserving aspect ratio if configured)
         if target_width and target_height and input_w > 0 and input_h > 0:
@@ -204,9 +202,7 @@ class UpscaleStage(BaseStage):
 
             # Calculate number of passes needed (each pass scales by up to max_ai_scale)
             num_passes = (
-                math.ceil(math.log(total_scale) / math.log(max_ai_scale))
-                if total_scale > 1
-                else 1
+                math.ceil(math.log(total_scale) / math.log(max_ai_scale)) if total_scale > 1 else 1
             )
         else:
             num_passes = 1
@@ -242,9 +238,10 @@ class UpscaleStage(BaseStage):
                 pass_output = output_path
             else:
                 # Use a consistent temp directory for intermediate files
+                input_stem = os.path.splitext(os.path.basename(input_path))[0]
                 pass_output = os.path.join(
                     tempfile.gettempdir(),
-                    f".avf_ai_pass{pass_num + 1}_{os.path.splitext(os.path.basename(input_path))[0]}.mp4",
+                    f".avf_ai_pass{pass_num + 1}_{input_stem}.mp4",
                 )
                 intermediate_files.append(pass_output)
 
@@ -288,7 +285,7 @@ class UpscaleStage(BaseStage):
     ) -> StageResult:
         """Run a single AI upscaling pass."""
         try:
-            from autovideofixer.ai.frame_processor import FrameProcessor
+            from autovideofixer.ai.frame_processor import FrameProcessor, StreamingVideoWriter
             from autovideofixer.ai.torch_utils import is_torch_available
             from autovideofixer.ai.wrappers.upscale import RealESRGANUpscaler
         except ImportError:
@@ -330,68 +327,130 @@ class UpscaleStage(BaseStage):
                 )
 
             proc = FrameProcessor()
-            frames = proc.extract_frames(input_path)
+            # Stream frames in chunks to avoid loading the entire video into memory.
+            # For short clips (<= 1000 frames) we load all at once for simplicity.
+            fps = self._get_input_fps(input_path)
+            probe_info = probe(input_path)
+            total_est = int(probe_info.frame_count) if probe_info.frame_count else 0
+            use_chunked = total_est > 1000
 
-            if not frames:
-                proc.close()
-                upscaler.unload()
-                return StageResult(
-                    status=StageStatus.FAILED,
-                    error="No frames extracted",
-                    duration_sec=time.time() - start,
-                )
-
-            def cb(current, total, msg):
-                self._report_progress(0.1 + (current / total) * 0.9, msg, progress_callback)
-
-            upscaled = upscaler.upscale_video(frames, progress_callback=cb)
-            proc.close()
-
-            if not upscaled:
-                upscaler.unload()
-                return StageResult(
-                    status=StageStatus.FAILED,
-                    error="No frames produced",
-                    duration_sec=time.time() - start,
-                )
-
-            # Write upscaled frames to temp file first
             temp_path = os.path.join(
                 os.path.dirname(output_path) or ".",
                 f".avf_upscaled_{os.path.basename(output_path)}",
             )
-            fps = self._get_input_fps(input_path)
-            proc2 = FrameProcessor()
-            if not proc2.frames_to_video(upscaled, temp_path, fps=fps):
+
+            if use_chunked:
+                chunk_size = 25
+                writer = StreamingVideoWriter(temp_path, fps=fps)
+                total_chunks = 0
+                processed_frames = 0
+                frames_written = 0
+
+                def cb(current, total, msg):
+                    self._report_progress(
+                        0.1 + (processed_frames / (total_est * self._scale_factor)) * 0.9,
+                        msg,
+                        progress_callback,
+                    )
+
+                for chunk in proc.stream_frames(
+                    input_path, chunk_size=chunk_size, max_frames=total_est
+                ):
+                    total_chunks += 1
+                    chunk_upscaled = upscaler.upscale_video(chunk, progress_callback=cb)
+                    # Write each chunk's output straight to the ffmpeg pipe
+                    # instead of buffering the whole video's frames in memory.
+                    writer.write(chunk_upscaled)
+                    frames_written += len(chunk_upscaled)
+                    processed_frames += len(chunk)
+
+                    self._report_progress(
+                        0.1 + (processed_frames / (total_est * self._scale_factor)) * 0.9,
+                        f"Processing chunk {total_chunks}...",
+                        progress_callback,
+                    )
+                proc.close()
+                write_ok = writer.close()
+
+                if frames_written == 0:
+                    upscaler.unload()
+                    return StageResult(
+                        status=StageStatus.FAILED,
+                        error="No frames produced",
+                        duration_sec=time.time() - start,
+                    )
+                if not write_ok:
+                    upscaler.unload()
+                    if os.path.exists(temp_path):
+                        os.unlink(temp_path)
+                    return StageResult(
+                        status=StageStatus.FAILED,
+                        error="Failed to write upscaled frames",
+                        duration_sec=time.time() - start,
+                    )
+            else:
+                frames = proc.extract_frames(input_path)
+                proc.close()
+
+                if not frames:
+                    upscaler.unload()
+                    return StageResult(
+                        status=StageStatus.FAILED,
+                        error="No frames extracted",
+                        duration_sec=time.time() - start,
+                    )
+
+                def cb(current, total, msg):
+                    self._report_progress(0.1 + (current / total) * 0.9, msg, progress_callback)
+
+                all_upscaled = upscaler.upscale_video(frames, progress_callback=cb)
+
+                if not all_upscaled:
+                    upscaler.unload()
+                    return StageResult(
+                        status=StageStatus.FAILED,
+                        error="No frames produced",
+                        duration_sec=time.time() - start,
+                    )
+
+                proc2 = FrameProcessor()
+                if not proc2.frames_to_video(all_upscaled, temp_path, fps=fps):
+                    proc2.close()
+                    upscaler.unload()
+                    return StageResult(
+                        status=StageStatus.FAILED,
+                        error="Failed to write frames",
+                        duration_sec=time.time() - start,
+                    )
                 proc2.close()
-                upscaler.unload()
-                return StageResult(
-                    status=StageStatus.FAILED,
-                    error="Failed to write frames",
-                    duration_sec=time.time() - start,
-                )
-            proc2.close()
 
-            # Copy audio from input to output, using temp file as video source
-            run_ffmpeg(
-                [
-                    "-i", input_path,
-                    "-i", temp_path,
-                    "-map", "0:a:0",
-                    "-map", "1:v:0",
-                    "-c:v", "libx264",
-                    "-crf", "18",
-                    "-c:a", "copy",
-                    "-y", output_path,
-                ],
-                timeout=600,
-            )
+            # Mux processed video back with the original audio (if any). The
+            # input may have no audio stream at all - mapping "0:a:0"
+            # unconditionally would make ffmpeg fail, and NOT checking the
+            # return code here used to mean that failure (e.g. on any
+            # silent/muted input) was reported as a successful COMPLETED
+            # stage with the only rendered output already deleted.
+            try:
+                has_audio = probe(input_path).has_audio
+            except Exception:
+                has_audio = False
 
-            # Clean up temp file
+            mux_args = ["-i", input_path, "-i", temp_path]
+            mux_args += ["-map", "0:a:0", "-map", "1:v:0"] if has_audio else ["-map", "1:v:0"]
+            mux_args += ["-c:v", "libx264", "-crf", "18", "-c:a", "copy", "-y", output_path]
+            mux_result = run_ffmpeg(mux_args, timeout=600)
+
             if os.path.exists(temp_path):
                 os.unlink(temp_path)
 
             upscaler.unload()
+
+            if mux_result.returncode != 0:
+                return StageResult(
+                    status=StageStatus.FAILED,
+                    error=f"Failed to finalize upscaled output: {mux_result.stderr[:2000]}",
+                    duration_sec=time.time() - start,
+                )
 
             return StageResult(
                 status=StageStatus.COMPLETED,
@@ -405,165 +464,6 @@ class UpscaleStage(BaseStage):
                 status=StageStatus.FAILED,
                 error=f"AI upscaling failed: {e}",
                 duration_sec=time.time() - start,
-            )
-
-        try:
-            from autovideofixer.ai.frame_processor import FrameProcessor
-            from autovideofixer.ai.torch_utils import is_torch_available
-            from autovideofixer.ai.wrappers.upscale import RealESRGANUpscaler
-        except ImportError:
-            self.logger.warning("PyTorch not available, falling back to traditional upscaling")
-            return self._execute_traditional(
-                input_path,
-                output_path,
-                progress_callback,
-                start,
-                target_width=int(
-                    (input_path and self._get_input_resolution(input_path)[0] * sf)
-                    if input_path
-                    else None
-                ),
-                target_height=int(
-                    (self._get_input_resolution(input_path)[1] * sf) if input_path else None
-                ),
-            )
-
-        if not is_torch_available():
-            self.logger.warning("PyTorch not installed, falling back to traditional upscaling")
-            return self._execute_traditional(
-                input_path,
-                output_path,
-                progress_callback,
-                start,
-                target_width=int(self._get_input_resolution(input_path)[0] * sf)
-                if input_path
-                else None,
-                target_height=int(self._get_input_resolution(input_path)[1] * sf)
-                if input_path
-                else None,
-            )
-
-        try:
-            from autovideofixer.ai.model_cache import ensure_model_available
-
-            success, msg = ensure_model_available(self._ai_model)
-            if not success:
-                self.logger.warning(f"Model not available ({msg}), falling back")
-                return self._execute_traditional(
-                    input_path,
-                    output_path,
-                    progress_callback,
-                    start,
-                    target_width=int(self._get_input_resolution(input_path)[0] * sf)
-                    if input_path
-                    else None,
-                    target_height=int(self._get_input_resolution(input_path)[1] * sf)
-                    if input_path
-                    else None,
-                )
-
-        except Exception as e:
-            self.logger.warning(f"Model check failed ({e}), falling back to traditional")
-            return self._execute_traditional(
-                input_path,
-                output_path,
-                progress_callback,
-                start,
-                target_width=int(self._get_input_resolution(input_path)[0] * sf)
-                if input_path
-                else None,
-                target_height=int(self._get_input_resolution(input_path)[1] * sf)
-                if input_path
-                else None,
-            )
-
-        try:
-            # Load and run Real-ESRGAN
-            upscaler = RealESRGANUpscaler(
-                scale=int(sf),
-                model_name=self._ai_model,
-                tta_mode=self._tt_mode,
-            )
-
-            if not upscaler.load_model():
-                raise RuntimeError("Failed to load Real-ESRGAN model")
-
-            proc = FrameProcessor()
-            frames = proc.extract_frames(input_path)
-
-            if not frames:
-                proc.close()
-                upscaler.unload()
-                raise RuntimeError("No frames extracted from input video")
-
-            def cb(current, total, msg):
-                self._report_progress(0.1 + (current / total) * 0.9, msg, progress_callback)
-
-            upscaled = upscaler.upscale_video(frames, progress_callback=cb)
-            proc.close()
-
-            if not upscaled:
-                upscaler.unload()
-                raise RuntimeError("No frames produced by upscaler")
-
-            # Write upscaled frames to temp file, then use FFmpeg to finalize
-            temp_path = os.path.join(
-                os.path.dirname(input_path) or ".",
-                f".avf_upscaled_{os.path.basename(input_path)}",
-            )
-            fps = self._get_input_fps(input_path)
-            proc2 = FrameProcessor()
-            if not proc2.frames_to_video(upscaled, temp_path, fps=fps):
-                proc2.close()
-                upscaler.unload()
-                raise RuntimeError("Failed to write upscaled frames to temp file")
-            proc2.close()
-
-            # Copy audio from original to upscaled temp file
-            # Note: We keep the AI upscaled resolution (may exceed target)
-            # The encode stage will handle final resolution adjustment
-            run_ffmpeg(
-                [
-                    "-i", input_path,
-                    "-i", temp_path,
-                    "-map", "0:a:0",
-                    "-map", "1:v:0",
-                    "-c:v", "libx264",
-                    "-crf", "18",
-                    "-c:a", "copy",
-                    "-y", output_path,
-                ],
-                timeout=600,
-            )
-
-            # Clean up temp file
-            if os.path.exists(temp_path):
-                os.unlink(temp_path)
-
-            upscaler.unload()
-
-            self._report_progress(1.0, "AI upscaling complete", progress_callback)
-            return StageResult(
-                status=StageStatus.COMPLETED,
-                output_path=output_path,
-                metadata={
-                    "method": "ai",
-                    "model": self._ai_model,
-                    "scale_factor": sf,
-                    "frames_processed": len(upscaled),
-                },
-                duration_sec=time.time() - start,
-            )
-
-        except Exception as e:
-            self.logger.warning(f"AI upscaling failed ({e}), falling back to traditional")
-            return self._execute_traditional(
-                input_path,
-                output_path,
-                progress_callback,
-                start,
-                target_width=target_width,
-                target_height=target_height,
             )
 
     def _get_input_resolution(self, path: str) -> tuple[int, int]:
@@ -620,8 +520,7 @@ class UpscaleStage(BaseStage):
     @staticmethod
     def _round_to_even(width: int, height: int) -> tuple[int, int]:
         """Round dimensions to even values (required by H.264/YUV420p)."""
-        return (width if width % 2 == 0 else width + 1,
-                height if height % 2 == 0 else height + 1)
+        return (width if width % 2 == 0 else width + 1, height if height % 2 == 0 else height + 1)
 
     def _get_input_fps(self, path: str) -> float:
         """Get input video framerate."""

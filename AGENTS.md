@@ -22,7 +22,7 @@ src/autovideofixer/
 ├── config.py               # Config + DEFAULTS
 ├── core/
 │   ├── pipeline.py         # Pipeline orchestrator
-│   ├── analysis.py         # VideoAnalyzer, duplicate detection
+│   ├── analysis.py         # VideoAnalyzer, VLM, scene detection, clip extraction, dedup
 │   ├── ffmpeg_utils.py     # FFmpeg wrappers, probe, run
 │   ├── presets.py          # Preset definitions (1080p60, 4k60, etc.)
 │   └── stages/             # Processing stages
@@ -107,6 +107,18 @@ Example: 1080p60 preset (1920×1080) + 9:16 portrait input → scales to ~1080×
 - **`NormalizeVolumeStage`** (name `"normalize_volume"`) and **`NormalizeAudioStage`** (name `"normalize_audio"`) are two separate classes in `normalize_audio.py`.
 - **Preset stage enable**: Presets define `enable_stages` which controls which stages run. A stage not listed in a preset's `enable_stages` will not execute, even if it's in the default order.
 
+## Known bugs / pitfalls to avoid
+
+- **`cb` scoping in chunked AI paths**: In `deblock.py`, `upscale.py`, `denoise_video.py`, and `interpolate.py`, the `cb` variable is defined inside the `else` branch (non-chunked) but referenced in the `if use_chunked` branch. When a video has ≥1001 frames the chunked branch executes, and `cb` is `UnboundLocalError`. Fix: define `cb` (accepts `(current, total, msg)` signature) before the chunked loop.
+- **`upscaled` vs `all_upscaled` typo** in `upscale.py:407` (was pre-existing). The variable that collects the frames is `all_upscaled`, but the `frames_to_video` call used `upscaled`.
+- **missing imports**: `deblock.py` uses `os.path.join`/`os.path.basename`/`os.unlink` without `import os` at top. `denoise_video.py` calls `probe(input_path)` without importing `probe` at top (only imported locally inside `_execute_traditional`).
+- **unused local import** in `denoise_video.py:80`: `from ... import run_ffmpeg` shadows the module-level `run_ffmpeg` import.
+- **`f"..."` without placeholders** triggers `F541`; the progress message strings like `f"Deblocking chunk..."` need no f-prefix.
+- **unused `fps_val`** in `upscale.py:331` (assigned but never read after that line).
+- **ruff I001** on `deblock.py` imports: blank line between `from __future__` and the stdlib imports is expected by the sort rule.
+- **ruff E501** line length is 100. Several stage files (stabilize, interpolate, upscale, cli) exceed it with long f-strings; plan around this.
+- **mypy `--ignore-missing-imports`** is required; `torch`/`cv2`/`rife` are optional and mypy will flag them without that flag.
+
 ## CLI Flags
 
 - `--verbose, -v`: Enable DEBUG level logging
@@ -118,3 +130,6 @@ Example: 1080p60 preset (1920×1080) + 9:16 portrait input → scales to ~1080×
 - `--dry-run`: Show what would be done without processing
 - `--list-presets`: List available presets
 - `--ai` / `--no-ai`: Force AI or traditional methods
+- `--events` / `--no-events`: Enable/disable event/scene detection in `analyze`
+- `--classify`: Classify detected events with VLM
+- `--clip DIR`: Extract detected scenes as clips to a directory

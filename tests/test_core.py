@@ -9,8 +9,8 @@ from autovideofixer.core.presets import get_preset, list_presets
 class TestConfig:
     """Test configuration system."""
 
-    def test_default_config(self):
-        config = Config()
+    def test_default_config(self, tmp_path):
+        config = Config(tmp_path / "nonexistent.yaml")
         assert config.get("general", "max_concurrent_jobs") == 1
         assert config.get("quality", "vmaf_model") == "vmaf_v0.6.1"
 
@@ -72,13 +72,13 @@ class TestAnalysis:
 class TestPipeline:
     """Test pipeline engine."""
 
-    def test_create_pipeline(self):
-        config = Config()
+    def test_create_pipeline(self, tmp_path):
+        config = Config(tmp_path / "nonexistent.yaml")
         pipeline = Pipeline(config)
         assert len(pipeline.jobs) == 0
 
     def test_add_job(self, tmp_path):
-        config = Config()
+        config = Config(tmp_path / "nonexistent.yaml")
         pipeline = Pipeline(config)
 
         # Create a dummy file
@@ -89,8 +89,8 @@ class TestPipeline:
         assert len(pipeline.jobs) == 1
         assert job.input_path == str(test_file)
 
-    def test_auto_determine_stages(self, tmp_video_file):
-        config = Config()
+    def test_auto_determine_stages(self, tmp_video_file, tmp_path):
+        config = Config(tmp_path / "nonexistent.yaml")
         # Set quality target
         config.set([3840, 2160], "quality", "quality_target", "target_resolution")
         config.set(60.0, "quality", "quality_target", "target_framerate")
@@ -105,8 +105,8 @@ class TestPipeline:
         assert "interpolate" in stages
         assert "encode" in stages
 
-    def test_optimize_stage_order(self):
-        config = Config()
+    def test_optimize_stage_order(self, tmp_path):
+        config = Config(tmp_path / "nonexistent.yaml")
         pipeline = Pipeline(config)
 
         stages = ["encode", "upscale", "stabilize", "denoise_video"]

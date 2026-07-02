@@ -1,10 +1,12 @@
 """Auto Video Fixer - Video/Audio detection stage.
 
-Analyzes input files to determine what processing is needed.
+Analyzes input files to determine what processing is needed via FFmpeg
+probing for metadata.
 """
 
 from __future__ import annotations
 
+import time
 from typing import Any
 
 from autovideofixer.core.ffmpeg_utils import ProbeResult, probe
@@ -15,7 +17,8 @@ class DetectStage(BaseStage):
     """Detect and analyze video properties to determine needed processing.
 
     This stage runs first to gather detailed information about the input
-    that subsequent stages can use for decision-making.
+    that subsequent stages can use for decision-making, via FFmpeg metadata
+    probing.
     """
 
     name = "detect"
@@ -31,7 +34,6 @@ class DetectStage(BaseStage):
         super().__init__(config)
 
     def should_run(self, input_info: dict[str, Any]) -> tuple[bool, str | None]:
-        # Always run detection first
         return True, None
 
     def execute(
@@ -41,8 +43,6 @@ class DetectStage(BaseStage):
         progress_callback=None,
         **kwargs,
     ) -> StageResult:
-        import time
-
         start = time.time()
         self._report_progress(0.0, "Analyzing video properties...", progress_callback)
 
@@ -64,7 +64,17 @@ class DetectStage(BaseStage):
             )
 
     def _build_detection_metadata(self, info: ProbeResult) -> dict[str, Any]:
-        """Build comprehensive detection metadata from probe results."""
+        """Build detection metadata from probe results.
+
+        Scene-change/shake detection is intentionally not done here: this
+        stage's metadata has no consumer in Pipeline.auto_determine_stages()
+        (which does its own independent, cheaper probing), and core/analysis.py
+        already provides the real scene-detection implementation used by
+        `avf analyze`/`--events`. A full per-job video decode here would be
+        pure wasted CPU/IO. If stage-selection ever needs this stage's output,
+        wire specific fields into Pipeline.auto_determine_stages() explicitly
+        rather than reintroducing a third, disconnected implementation.
+        """
         vs = info.video_stream
         metadata = {
             "has_video": info.has_video,
@@ -86,19 +96,12 @@ class DetectStage(BaseStage):
             "needs_processing": [],
         }
 
-        # Auto-detect processing needs
         needs = metadata["needs_processing"]
 
         if info.is_hdr:
             needs.append("hdr")
 
-        if info.framerate < 30 and info.framerate > 0:
-            needs.append("interpolate")
-
         if info.format_name in ("matroska", "mkv"):
             needs.append("remux")
-
-        # Check for potential shake (requires analysis)
-        metadata["shake_detected"] = False  # Will be set by shake analysis
 
         return metadata

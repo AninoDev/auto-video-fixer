@@ -1,19 +1,27 @@
 """Auto Video Fixer - Video analysis utilities.
 
-Provides video file detection, content analysis via VLM,
-event detection, and duplicate/similar video detection.
+Provides video file detection, content analysis via VLM (Ollama, OpenAI,
+custom API), scene/event detection with highlighting, clip extraction,
+and duplicate/similar video detection via perceptual hashing.
 """
 
 from __future__ import annotations
 
+import base64
+import logging
 import os
+import re
+import shutil
+import tempfile
 from dataclasses import dataclass, field
 from typing import Any
 
 from autovideofixer.config import Config
 
+logger = logging.getLogger(__name__)
+
 # Supported video extensions
-VIDEO_EXTENSIONS = {
+VIDEO_EXTENSIONS: set[str] = {
     ".mp4",
     ".mkv",
     ".avi",
@@ -36,7 +44,21 @@ VIDEO_EXTENSIONS = {
 }
 
 # Supported image frame extensions (for still image analysis)
-IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".webp"}
+IMAGE_EXTENSIONS: set[str] = {".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".webp"}
+
+# VLM prompt for video analysis
+_VLM_SYSTEM_PROMPT = (
+    "You are a video analysis assistant. Analyze the provided frames from a video "
+    "and provide: a brief summary of the content (1-2 sentences), relevant tags "
+    "(comma-separated keywords), objects detected (comma-separated), and an "
+    "appropriate content rating (G, PG, PG-13, R). Respond in valid JSON format "
+    'with keys: "summary", "tags", "objects", "rating".'
+)
+
+_VLM_USER_PROMPT = (
+    "Analyze these video frames and describe the content. "
+    "Provide a summary, tags, detected objects, and content rating."
+)
 
 
 def is_video_file(path: str) -> bool:
@@ -44,10 +66,7 @@ def is_video_file(path: str) -> bool:
     if not os.path.isfile(path):
         return False
     ext = os.path.splitext(path)[1].lower()
-    if ext in VIDEO_EXTENSIONS:
-        return True
-    # Could also check magic bytes for more reliable detection
-    return False
+    return ext in VIDEO_EXTENSIONS
 
 
 def is_image_file(path: str) -> bool:
@@ -63,7 +82,7 @@ def scan_directory(
     recursive: bool = True,
 ) -> list[str]:
     """Scan a directory for video files."""
-    videos = []
+    videos: list[str] = []
     if not os.path.isdir(directory):
         return videos
 
@@ -92,6 +111,23 @@ class SceneEvent:
     confidence: float = 0.0
     description: str | None = None
     frame_numbers: list[int] = field(default_factory=list)
+
+    @property
+    def duration(self) -> float:
+        """Duration of this scene in seconds."""
+        return self.end_time - self.start_time
+
+
+@dataclass
+class VideoClip:
+    """A clip extracted from a video based on scene boundaries."""
+
+    source_path: str
+    start_time: float
+    end_time: float
+    output_path: str
+    scene_index: int = 0
+    event_type: str = "scene_change"
 
 
 @dataclass
@@ -142,7 +178,6 @@ class VideoAnalyzer:
         if filepath in self._analysis_cache:
             return self._analysis_cache[filepath]
 
-        # Basic probe
         from autovideofixer.core.ffmpeg_utils import probe
 
         info = probe(filepath)
@@ -157,7 +192,6 @@ class VideoAnalyzer:
             is_hdr=info.is_hdr,
         )
 
-        # Scene/event detection
         if (
             include_events
             if include_events is not None
@@ -166,7 +200,6 @@ class VideoAnalyzer:
             analysis.scenes = self.detect_events(filepath)
             analysis.total_scenes = len(analysis.scenes)
 
-        # VLM analysis
         if (
             include_vlm
             if include_vlm is not None
@@ -185,10 +218,22 @@ class VideoAnalyzer:
         self,
         filepath: str,
         min_duration: float | None = None,
+        classify_events: bool = False,
     ) -> list[SceneEvent]:
         """Detect scene changes and events in a video.
 
-        Uses frame differencing to find scene boundaries.
+        Uses frame differencing to find scene boundaries, with optional
+        event-type classification via frame-property heuristics (edge
+        density/brightness) — not a VLM call. See run_vlm_analysis() for
+        actual VLM-based content understanding.
+
+        Args:
+            filepath: Path to the video file
+            min_duration: Minimum scene duration in seconds
+            classify_events: Whether to heuristically classify event types
+
+        Returns:
+            List of SceneEvent objects
         """
         if min_duration is None:
             min_duration = self.config.get(
@@ -199,9 +244,98 @@ class VideoAnalyzer:
             "analysis", "event_detection", "scene_change_threshold", default=0.3
         )
 
-        # Extract frames and compare
         scenes = _detect_scene_changes(filepath, threshold, min_duration)
+
+        if classify_events and scenes:
+            scenes = _classify_events(scenes, filepath, self.config)
+
         return scenes
+
+    def extract_clip(
+        self,
+        filepath: str,
+        start_time: float,
+        end_time: float,
+        output_dir: str | None = None,
+    ) -> VideoClip | None:
+        """Extract a clip from a video file.
+
+        Args:
+            filepath: Source video path
+            start_time: Start time in seconds
+            end_time: End time in seconds
+            output_dir: Output directory (default: temp dir)
+
+        Returns:
+            VideoClip on success, None on failure
+        """
+        from autovideofixer.core.ffmpeg_utils import run_ffmpeg
+
+        if not os.path.isfile(filepath):
+            return None
+
+        if output_dir is None:
+            output_dir = tempfile.mkdtemp(prefix="avf_clip_")
+
+        stem = os.path.splitext(os.path.basename(filepath))[0]
+        output_path = os.path.join(output_dir, f"{stem}_clip_{start_time:.1f}_{end_time:.1f}.mp4")
+
+        try:
+            run_ffmpeg(
+                [
+                    "-ss",
+                    str(start_time),
+                    "-i",
+                    filepath,
+                    "-to",
+                    str(end_time - start_time),
+                    "-c",
+                    "copy",
+                    "-avoid_negative_ts",
+                    "make_zero",
+                    "-y",
+                    output_path,
+                ],
+                timeout=300,
+            )
+            return VideoClip(
+                source_path=filepath,
+                start_time=start_time,
+                end_time=end_time,
+                output_path=output_path,
+            )
+        except Exception:
+            return None
+
+    def extract_scenes_as_clips(
+        self,
+        filepath: str,
+        scenes: list[SceneEvent],
+        output_dir: str | None = None,
+    ) -> list[VideoClip]:
+        """Extract all detected scenes as separate clip files.
+
+        Args:
+            filepath: Source video path
+            scenes: List of SceneEvent objects
+            output_dir: Output directory
+
+        Returns:
+            List of VideoClip objects
+        """
+        clips: list[VideoClip] = []
+        for idx, scene in enumerate(scenes):
+            clip = self.extract_clip(
+                filepath,
+                scene.start_time,
+                scene.end_time,
+                output_dir=output_dir,
+            )
+            if clip is not None:
+                clip.scene_index = idx
+                clip.event_type = scene.event_type
+                clips.append(clip)
+        return clips
 
     def run_vlm_analysis(
         self,
@@ -210,29 +344,48 @@ class VideoAnalyzer:
     ) -> dict[str, Any]:
         """Run VLM (Vision Language Model) analysis on video content.
 
-        Samples frames at intervals and sends them to a VLM for analysis.
+        Samples frames at intervals and sends them to a configured VLM
+        provider for content analysis.
+
+        Args:
+            filepath: Path to the video file
+            sample_interval_sec: Seconds between frame samples
+
+        Returns:
+            Dict with keys: summary, tags, objects, rating
         """
         vlm_config = self.config.get("analysis", "vlm", default={})
         provider = vlm_config.get("provider", "local")
         model = vlm_config.get("model", "llava")
         api_url = vlm_config.get("api_url", "")
         api_key = vlm_config.get("api_key", "")
+        max_frames = vlm_config.get("max_sample_frames", 8)
 
-        # Extract sample frames
-        frames = _extract_sample_frames(filepath, sample_interval_sec)
+        frames = _extract_sample_frames(filepath, sample_interval_sec, max_frames=max_frames)
         if not frames:
             return {"summary": "", "tags": [], "objects": []}
 
-        if provider == "local":
-            return _run_local_vlm(frames, model, api_url)
-        elif provider == "api":
-            return _run_api_vlm(frames, api_key, api_url, model)
-        elif provider == "ollama":
-            return _run_ollama_vlm(frames, model, api_url)
-        elif provider == "openai":
-            return _run_openai_vlm(frames, api_key, model)
-        else:
+        # All sample frames live in one temp dir created by _extract_sample_frames;
+        # it must be cleaned up here, after the provider has read the frames into
+        # base64, not inside _extract_sample_frames itself (which would delete the
+        # files before they're ever read).
+        tmp_dir = os.path.dirname(frames[0])
+        try:
+            if provider in ("local", "ollama"):
+                return _run_ollama_vlm(frames, model, api_url)
+            elif provider == "openai":
+                return _run_openai_vlm(frames, api_key, model)
+            elif provider == "api":
+                return _run_api_vlm(frames, api_key, api_url, model)
+            else:
+                return {"summary": "", "tags": [], "objects": []}
+        except Exception:
+            logger.warning(
+                "VLM analysis failed for %r (provider=%s)", filepath, provider, exc_info=True
+            )
             return {"summary": "", "tags": [], "objects": []}
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
 
     def find_similar(
         self,
@@ -257,25 +410,362 @@ class VideoAnalyzer:
                 "analysis", "duplicate_detection", "similarity_threshold", default=0.95
             )
 
-        ref_hash = _compute_video_hash(filepath)
-        results = []
+        ref_hash = compute_video_hash(filepath)
+        results: list[tuple[str, float]] = []
 
         for candidate in candidates:
             if candidate == filepath:
                 continue
-            cand_hash = _compute_video_hash(candidate)
-            similarity = _hash_similarity(ref_hash, cand_hash)
+            cand_hash = compute_video_hash(candidate)
+            similarity = hash_similarity(ref_hash, cand_hash)
             if similarity >= threshold:
                 results.append((candidate, similarity))
 
         return sorted(results, key=lambda x: -x[1])
+
+    def find_duplicates(
+        self,
+        files: list[str],
+        threshold: float | None = None,
+    ) -> list[list[str]]:
+        """Find all duplicate videos in a batch.
+
+        Computes perceptual hashes for all files, then groups files
+        that are above the similarity threshold of each other.
+
+        Args:
+            files: List of video file paths
+            threshold: Similarity threshold (0-1, higher = more similar)
+
+        Returns:
+            List of groups, where each group contains paths of duplicate files.
+            Only groups with 2+ members are returned.
+        """
+        if threshold is None:
+            threshold = self.config.get(
+                "analysis", "duplicate_detection", "similarity_threshold", default=0.95
+            )
+
+        # Compute hashes for all files
+        hashes: dict[str, str] = {}
+        for f in files:
+            h = compute_video_hash(f)
+            if h:
+                hashes[f] = h
+
+        # Union-find over the similarity graph so each file lands in exactly
+        # one cluster, instead of a per-pair min()-keyed dict that can emit
+        # overlapping groups (e.g. both [A,B,C] and [B,C]) for 3+ mutually
+        # similar files.
+        parent: dict[str, str] = {f: f for f in hashes}
+
+        def find(x: str) -> str:
+            while parent[x] != x:
+                parent[x] = parent[parent[x]]
+                x = parent[x]
+            return x
+
+        def union(a: str, b: str) -> None:
+            ra, rb = find(a), find(b)
+            if ra != rb:
+                parent[rb] = ra
+
+        paths = list(hashes.keys())
+        for i, path_a in enumerate(paths):
+            for path_b in paths[i + 1 :]:
+                if hash_similarity(hashes[path_a], hashes[path_b]) >= threshold:
+                    union(path_a, path_b)
+
+        clusters: dict[str, list[str]] = {}
+        for f in paths:
+            clusters.setdefault(find(f), []).append(f)
+
+        result = [sorted(members) for members in clusters.values() if len(members) >= 2]
+        return sorted(result, key=lambda g: -len(g))
 
     def clear_cache(self) -> None:
         """Clear the analysis cache."""
         self._analysis_cache.clear()
 
 
-# ─── Internal helpers ──────────────────────────────────────────────
+# ─── VLM Providers ─────────────────────────────────────────────────
+
+
+def _frames_to_base64(frame_paths: list[str]) -> list[str]:
+    """Convert frame image paths to base64-encoded strings."""
+    encoded: list[str] = []
+    for path in frame_paths:
+        try:
+            with open(path, "rb") as f:
+                encoded.append(base64.b64encode(f.read()).decode("utf-8"))
+        except OSError:
+            continue
+    return encoded
+
+
+def _parse_vlm_response(response_text: str) -> dict[str, Any]:
+    """Parse a VLM JSON response into analysis results."""
+    import json
+
+    original = response_text.strip()
+    # Strip markdown code fences if present. Anchored regex (not positional
+    # line-slicing) so a response truncated before the closing fence doesn't
+    # get reduced to an empty string.
+    text = re.sub(r"^```(?:json)?\s*\n?", "", original)
+    text = re.sub(r"\n?```\s*$", "", text).strip()
+
+    try:
+        data = json.loads(text)
+        return {
+            "summary": data.get("summary", ""),
+            "tags": [t.strip() for t in data.get("tags", "").split(",") if t.strip()]
+            if isinstance(data.get("tags"), str)
+            else data.get("tags", []),
+            "objects": [o.strip() for o in data.get("objects", "").split(",") if o.strip()]
+            if isinstance(data.get("objects"), str)
+            else data.get("objects", []),
+            "rating": data.get("rating"),
+        }
+    except json.JSONDecodeError, AttributeError:
+        # Fallback: treat the original (pre-fence-stripping) response as the
+        # summary, so a truncated/malformed fenced response still degrades to
+        # real content instead of the empty string left by failed stripping.
+        return {"summary": original, "tags": [], "objects": [], "rating": None}
+
+
+def _call_ollama(
+    api_url: str,
+    model: str,
+    system_prompt: str,
+    user_prompt: str,
+    image_b64_list: list[str],
+) -> str:
+    """Send a request to an Ollama API endpoint.
+
+    Args:
+        api_url: Ollama API base URL (e.g., http://localhost:11434)
+        model: Model name
+        system_prompt: System message
+        user_prompt: User message text
+        image_b64_list: Base64-encoded image strings
+
+    Returns:
+        Response text from the model
+    """
+    import json
+
+    # Ollama's /api/chat expects images as a plain base64 list on the message
+    # object itself (message["images"]), not as OpenAI-style content blocks.
+    payload = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt, "images": image_b64_list},
+        ],
+        "stream": False,
+        "format": "json",
+    }
+
+    try:
+        import urllib.request
+
+        req = urllib.request.Request(
+            f"{api_url.rstrip('/')}/api/chat",
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            result = json.loads(resp.read().decode("utf-8"))
+            return result.get("message", {}).get("content", "")
+    except Exception:
+        logger.warning("Ollama VLM request to %s failed", api_url, exc_info=True)
+        return ""
+
+
+def _call_openai(
+    api_key: str,
+    model: str,
+    system_prompt: str,
+    user_prompt: str,
+    image_b64_list: list[str],
+) -> str:
+    """Send a request to the OpenAI Vision API.
+
+    Args:
+        api_key: OpenAI API key
+        model: Model name (e.g., gpt-4o)
+        system_prompt: System message
+        user_prompt: User message text
+        image_b64_list: Base64-encoded image strings
+
+    Returns:
+        Response text from the model
+    """
+    import json
+
+    content: list[dict[str, Any]] = [{"type": "text", "text": user_prompt}]
+    for b64 in image_b64_list:
+        content.append(
+            {
+                "type": "image_url",
+                "image_url": {"url": f"data:image/jpeg;base64,{b64}"},
+            }
+        )
+
+    payload = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": content},
+        ],
+        "max_tokens": 1000,
+        "response_format": {"type": "json_object"},
+    }
+
+    try:
+        import urllib.request
+
+        req = urllib.request.Request(
+            "https://api.openai.com/v1/chat/completions",
+            data=json.dumps(payload).encode("utf-8"),
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {api_key}",
+            },
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            result = json.loads(resp.read().decode("utf-8"))
+            return result.get("choices", [{}])[0].get("message", {}).get("content", "")
+    except Exception:
+        logger.warning("OpenAI VLM request failed (model=%s)", model, exc_info=True)
+        return ""
+
+
+def _call_custom_api(
+    api_key: str,
+    api_url: str,
+    model: str,
+    system_prompt: str,
+    user_prompt: str,
+    image_b64_list: list[str],
+) -> str:
+    """Send a request to a custom API endpoint.
+
+    Uses the OpenAI-compatible chat completions format.
+
+    Args:
+        api_key: API key for authentication
+        api_url: Custom API base URL
+        model: Model name
+        system_prompt: System message
+        user_prompt: User message text
+        image_b64_list: Base64-encoded image strings
+
+    Returns:
+        Response text from the API
+    """
+    import json
+
+    content: list[dict[str, Any]] = [{"type": "text", "text": user_prompt}]
+    for b64 in image_b64_list:
+        content.append(
+            {
+                "type": "image_url",
+                "image_url": {"url": f"data:image/jpeg;base64,{b64}"},
+            }
+        )
+
+    payload = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": content},
+        ],
+        "max_tokens": 1000,
+        "response_format": {"type": "json_object"},
+    }
+
+    try:
+        import urllib.request
+
+        headers = {"Content-Type": "application/json"}
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
+
+        req = urllib.request.Request(
+            api_url.rstrip("/"),
+            data=json.dumps(payload).encode("utf-8"),
+            headers=headers,
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            result = json.loads(resp.read().decode("utf-8"))
+            return result.get("choices", [{}])[0].get("message", {}).get("content", "")
+    except Exception:
+        logger.warning("Custom API VLM request to %s failed", api_url, exc_info=True)
+        return ""
+
+
+def _run_ollama_vlm(
+    frames: list[str],
+    model: str,
+    api_url: str,
+) -> dict[str, Any]:
+    """Run analysis using Ollama."""
+    image_b64 = _frames_to_base64(frames)
+    if not image_b64:
+        return {"summary": "", "tags": [], "objects": []}
+
+    base_url = api_url or "http://localhost:11434"
+    response = _call_ollama(
+        base_url,
+        model,
+        _VLM_SYSTEM_PROMPT,
+        _VLM_USER_PROMPT,
+        image_b64,
+    )
+    return _parse_vlm_response(response)
+
+
+def _run_openai_vlm(
+    frames: list[str],
+    api_key: str,
+    model: str,
+) -> dict[str, Any]:
+    """Run analysis using OpenAI Vision API."""
+    image_b64 = _frames_to_base64(frames)
+    if not image_b64:
+        return {"summary": "", "tags": [], "objects": []}
+
+    response = _call_openai(api_key, model, _VLM_SYSTEM_PROMPT, _VLM_USER_PROMPT, image_b64)
+    return _parse_vlm_response(response)
+
+
+def _run_api_vlm(
+    frames: list[str],
+    api_key: str,
+    api_url: str,
+    model: str,
+) -> dict[str, Any]:
+    """Run analysis using a custom API endpoint (OpenAI-compatible)."""
+    image_b64 = _frames_to_base64(frames)
+    if not image_b64:
+        return {"summary": "", "tags": [], "objects": []}
+
+    response = _call_custom_api(
+        api_key,
+        api_url,
+        model,
+        _VLM_SYSTEM_PROMPT,
+        _VLM_USER_PROMPT,
+        image_b64,
+    )
+    return _parse_vlm_response(response)
+
+
+# ─── Scene Detection ───────────────────────────────────────────────
 
 
 def _detect_scene_changes(
@@ -283,7 +773,11 @@ def _detect_scene_changes(
     threshold: float,
     min_duration_sec: float,
 ) -> list[SceneEvent]:
-    """Detect scene changes using frame differencing."""
+    """Detect scene changes using frame differencing.
+
+    Compares consecutive frames at reduced resolution and identifies
+    boundaries where pixel difference exceeds the threshold.
+    """
     import cv2
 
     cap = cv2.VideoCapture(filepath)
@@ -291,17 +785,22 @@ def _detect_scene_changes(
         return []
 
     scenes: list[SceneEvent] = []
-    prev_frame = None
+    prev_frame: Any = None
     scene_start = 0.0
     fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
     frame_idx = 0
+    current_time = 0.0
 
     while True:
         ret, frame = cap.read()
         if not ret:
             break
 
-        current_time = frame_idx / fps if fps > 0 else 0.0
+        # Prefer the container's actual presentation timestamp so scene
+        # boundaries stay accurate on variable-frame-rate sources; fall back
+        # to a constant-fps estimate for backends that don't report POS_MSEC.
+        msec = cap.get(cv2.CAP_PROP_POS_MSEC)
+        current_time = msec / 1000.0 if msec > 0 else (frame_idx / fps if fps > 0 else 0.0)
 
         # Convert to grayscale and resize for faster comparison
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
@@ -312,33 +811,102 @@ def _detect_scene_changes(
             diff_score = float(diff.mean()) / 255.0
 
             if diff_score > threshold:
-                # Scene change detected
+                # Scene change detected. Only close out and start a new scene
+                # when the current one is long enough; otherwise keep
+                # accumulating so a too-short cut is absorbed into the next
+                # scene instead of leaving an unaccounted time gap.
                 if current_time - scene_start >= min_duration_sec:
                     scenes.append(
                         SceneEvent(
                             start_time=scene_start,
                             end_time=current_time,
-                            confidence=diff_score,
+                            confidence=min(diff_score, 1.0),
                         )
                     )
-                scene_start = current_time
+                    scene_start = current_time
 
         prev_frame = gray
         frame_idx += 1
 
     cap.release()
 
-    # Final scene
+    # Final scene: subject to the same min-duration filter as every other
+    # scene, except when it's the only scene detected (i.e. no cuts were
+    # found at all) — a short whole video should still yield one scene.
     if scene_start < current_time:
-        scenes.append(
-            SceneEvent(
-                start_time=scene_start,
-                end_time=current_time,
-                confidence=0.5,
+        final_duration = current_time - scene_start
+        if final_duration >= min_duration_sec or not scenes:
+            scenes.append(
+                SceneEvent(
+                    start_time=scene_start,
+                    end_time=current_time,
+                    confidence=0.5,
+                )
             )
-        )
 
     return scenes
+
+
+def _classify_events(
+    scenes: list[SceneEvent],
+    filepath: str,
+    config: Config,
+) -> list[SceneEvent]:
+    """Classify scene events using frame-property heuristics.
+
+    Samples a frame from the middle of each scene and classifies it via
+    simple image heuristics (edge density, brightness) — NOT a VLM call.
+    This is a fast, offline pre-classification; real content-understanding
+    classification is provided separately by VideoAnalyzer.run_vlm_analysis.
+    """
+    import cv2
+
+    for scene in scenes:
+        if scene.confidence < 0.2:
+            scene.event_type = "talking_head"
+            scene.description = "Low-motion scene"
+            continue
+
+        # Sample a frame from the middle of the scene
+        cap = cv2.VideoCapture(filepath)
+        if not cap.isOpened():
+            continue
+        native_fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+        midpoint_sec = (scene.start_time + scene.end_time) / 2
+        target_frame = int(midpoint_sec * native_fps)
+        cap.set(cv2.CAP_PROP_POS_FRAMES, target_frame)
+        ret, frame = cap.read()
+        cap.release()
+
+        if not ret:
+            scene.event_type = "scene_change"
+            continue
+
+        # Simple heuristic classification based on frame properties
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        edges = cv2.Canny(gray, 100, 200)
+        edge_ratio = float(edges.sum()) / (gray.shape[0] * gray.shape[1] * 255)
+        brightness = float(gray.mean())
+
+        if edge_ratio > 0.15 and brightness < 100:
+            scene.event_type = "action"
+            scene.description = "High-motion dark scene"
+        elif edge_ratio < 0.05:
+            scene.event_type = "landscape"
+            scene.description = "Low-detail scenic shot"
+        elif brightness > 200:
+            scene.event_type = "transition"
+            scene.description = "Bright scene (possible fade)"
+        else:
+            scene.event_type = "scene_change"
+            scene.description = "Standard scene"
+
+        scene.confidence = min(scene.confidence, 1.0)
+
+    return scenes
+
+
+# ─── Frame Extraction ──────────────────────────────────────────────
 
 
 def _extract_sample_frames(
@@ -346,9 +914,19 @@ def _extract_sample_frames(
     interval_sec: float,
     max_frames: int = 20,
 ) -> list[str]:
-    """Extract evenly-spaced sample frames from a video."""
-    import tempfile
+    """Extract evenly-spaced sample frames from a video.
 
+    Samples frames at regular intervals to provide representative
+    visual content for VLM analysis.
+
+    Args:
+        filepath: Path to the video file
+        interval_sec: Seconds between samples
+        max_frames: Maximum number of frames to extract
+
+    Returns:
+        List of paths to extracted frame images
+    """
     import cv2
 
     cap = cv2.VideoCapture(filepath)
@@ -363,14 +941,14 @@ def _extract_sample_frames(
     tmp_dir = tempfile.mkdtemp(prefix="avf_samples_")
 
     try:
-        while frame_idx < max_frames * frame_interval:
+        while len(frames) < max_frames:
             cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
             ret, frame = cap.read()
             if not ret:
                 break
 
             frame_path = os.path.join(tmp_dir, f"frame_{frame_idx:06d}.jpg")
-            cv2.imwrite(frame_path, frame)
+            cv2.imwrite(frame_path, frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
             frames.append(frame_path)
 
             frame_idx += frame_interval
@@ -380,52 +958,22 @@ def _extract_sample_frames(
     return frames
 
 
-def _run_local_vlm(
-    frames: list[str],
-    model_name: str,
-    api_url: str,
-) -> dict[str, Any]:
-    """Run analysis using a local VLM (e.g., Ollama, local server)."""
-    # Placeholder for local VLM integration
-    # In practice, this would use a local inference server
-    return {"summary": "", "tags": [], "objects": []}
+# ─── Perceptual Hashing & Duplicate Detection ──────────────────────
 
 
-def _run_api_vlm(
-    frames: list[str],
-    api_key: str,
-    api_url: str,
-    model: str,
-) -> dict[str, Any]:
-    """Run analysis using an API-based VLM."""
-    # Placeholder for API-based VLM (e.g., custom API endpoint)
-    return {"summary": "", "tags": [], "objects": []}
-
-
-def _run_ollama_vlm(
-    frames: list[str],
-    model: str,
-    api_url: str,
-) -> dict[str, Any]:
-    """Run analysis using Ollama."""
-    # Placeholder for Ollama integration
-    return {"summary": "", "tags": [], "objects": []}
-
-
-def _run_openai_vlm(
-    frames: list[str],
-    api_key: str,
-    model: str,
-) -> dict[str, Any]:
-    """Run analysis using OpenAI Vision API."""
-    # Placeholder for OpenAI integration
-    return {"summary": "", "tags": [], "objects": []}
-
-
-def _compute_video_hash(filepath: str, num_frames: int = 30) -> str:
+def compute_video_hash(filepath: str, num_frames: int = 30) -> str:
     """Compute a perceptual hash of a video for similarity comparison.
 
-    Extracts evenly-spaced frames, computes per-frame hashes, and combines.
+    Uses average hash (ahash) on evenly-spaced frames. Each frame is
+    resized to 16x16 grayscale, hashed via the ahash algorithm, and
+    all frame hashes are combined via majority voting per bit position.
+
+    Args:
+        filepath: Path to the video file
+        num_frames: Number of frames to sample
+
+    Returns:
+        Binary hash string (e.g., '10110010...')
     """
     import cv2
 
@@ -439,37 +987,107 @@ def _compute_video_hash(filepath: str, num_frames: int = 30) -> str:
         return ""
 
     step = max(1, total_frames // num_frames)
-    hashes = []
+    hashes: list[str] = []
 
     for i in range(0, total_frames, step):
         cap.set(cv2.CAP_PROP_POS_FRAMES, i)
         ret, frame = cap.read()
         if not ret:
-            break
+            # A single transient decode glitch shouldn't truncate all
+            # subsequent sampling — skip this frame and keep going.
+            continue
 
-        # Convert to grayscale, resize, and hash
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        gray = cv2.resize(gray, (64, 36))
+        gray = cv2.resize(gray, (16, 16))
         mean = gray.mean()
         h = "".join("1" if p > mean else "0" for p in gray.flatten())
         hashes.append(h)
 
     cap.release()
 
-    # Combine all frame hashes (majority vote for each bit position)
     if not hashes:
         return ""
 
+    # Combine all frame hashes via majority vote per bit position
+    hash_len = len(hashes[0])
     combined = []
-    for i in range(len(hashes[0])):
+    for i in range(hash_len):
         bits = [h[i] for h in hashes if i < len(h)]
         combined.append("1" if bits.count("1") > len(bits) / 2 else "0")
 
     return "".join(combined)
 
 
-def _hash_similarity(hash1: str, hash2: str) -> float:
-    """Compute similarity between two perceptual hashes (0-1)."""
+def compute_video_dhash(filepath: str, width: int = 16) -> str:
+    """Compute a difference hash (dhash) of a video.
+
+    Dhash compares adjacent pixels to detect structural patterns,
+    which is more robust than ahash for videos with similar
+    content but different lighting/contrast.
+
+    Args:
+        filepath: Path to the video file
+        width: Hash width in pixels (default 16)
+
+    Returns:
+        Binary hash string
+    """
+    import cv2
+
+    cap = cv2.VideoCapture(filepath)
+    if not cap.isOpened():
+        return ""
+
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    if total_frames == 0:
+        cap.release()
+        return ""
+
+    step = max(1, total_frames // 10)  # Sample fewer frames for dhash
+    hashes: list[str] = []
+
+    for i in range(0, total_frames, step):
+        cap.set(cv2.CAP_PROP_POS_FRAMES, i)
+        ret, frame = cap.read()
+        if not ret:
+            continue
+
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        gray = cv2.resize(gray, (width, width + 1))
+
+        # Dhash: compare each pixel to its right neighbor
+        bits = []
+        for row in range(gray.shape[0]):
+            for col in range(gray.shape[1] - 1):
+                bits.append("1" if gray[row, col] > gray[row, col + 1] else "0")
+        hashes.append("".join(bits))
+
+    cap.release()
+
+    if not hashes:
+        return ""
+
+    hash_len = len(hashes[0])
+    combined = []
+    for i in range(hash_len):
+        bits = [h[i] for h in hashes if i < len(h)]
+        combined.append("1" if bits.count("1") > len(bits) / 2 else "0")
+
+    return "".join(combined)
+
+
+def hash_similarity(hash1: str, hash2: str) -> float:
+    """Compute similarity between two perceptual hashes (0-1).
+
+    Uses Hamming distance: percentage of matching bits.
+
+    Args:
+        hash1: First hash string
+        hash2: Second hash string
+
+    Returns:
+        Similarity score between 0.0 and 1.0
+    """
     if not hash1 or not hash2 or len(hash1) != len(hash2):
         return 0.0
 

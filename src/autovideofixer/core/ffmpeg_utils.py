@@ -47,6 +47,7 @@ class StreamInfo:
     color_transfer: str = ""
     is_default: bool = False
     language: str = ""
+    nb_frames: int = 0
 
     @property
     def is_video(self) -> bool:
@@ -105,6 +106,15 @@ class ProbeResult:
             return False
         ct = vs.color_transfer or ""
         return ct.lower() in ("smpte2084", "arib-std-b67")
+
+    @property
+    def frame_count(self) -> int:
+        vs = self.video_stream
+        if vs and vs.nb_frames > 0:
+            return vs.nb_frames
+        if vs and vs.fps > 0:
+            return int(self.duration * vs.fps)
+        return 0
 
     def to_info_dict(self) -> dict[str, Any]:
         """Convert to dictionary for pipeline use."""
@@ -172,6 +182,7 @@ def probe(filepath: str, config: Config | None = None) -> ProbeResult:
         "json",
         "-show_format",
         "-show_streams",
+        "--",
         filepath,
     ]
     result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
@@ -205,6 +216,7 @@ def _parse_probe_result(data: dict, filepath: str) -> ProbeResult:
             color_transfer=s.get("color_transfer", ""),
             is_default=s.get("disposition", {}).get("default", 0) != 0,
             language=s.get("tags", {}).get("language", ""),
+            nb_frames=_safe_int(s.get("nb_frames", 0)),
         )
         streams.append(stream)
 
@@ -229,15 +241,22 @@ def _parse_fps(s: dict) -> float:
             num, den = float(num), float(den)
             return num / den if den else 0.0
         return float(fps_str)
-    except (ValueError, ZeroDivisionError):
+    except ValueError, ZeroDivisionError:
         return 0.0
 
 
 def _safe_float(val: Any) -> float:
     try:
         return float(val)
-    except (ValueError, TypeError):
+    except ValueError, TypeError:
         return 0.0
+
+
+def _safe_int(val: Any) -> int:
+    try:
+        return int(val)
+    except ValueError, TypeError:
+        return 0
 
 
 def detect_hardware_acceleration() -> list[str]:
@@ -252,7 +271,7 @@ def detect_hardware_acceleration() -> list[str]:
             if line:
                 hwaccels.append(line.lower())
         return hwaccels
-    except (FileNotFoundError, subprocess.TimeoutExpired):
+    except FileNotFoundError, subprocess.TimeoutExpired:
         return []
 
 
@@ -370,11 +389,17 @@ def generate_temp_path(
     base_dir: str,
     original_path: str,
     suffix: str = "_proc",
+    temp_dir: str | None = None,
 ) -> str:
-    """Generate a safe temporary file path for intermediate processing."""
+    """Generate a safe temporary file path for intermediate processing.
+
+    Uses ``temp_dir`` (typically sourced from config's ``general.temp_dir``) when
+    provided; otherwise falls back to the input file's own directory, or ``base_dir``.
+    """
     import uuid
 
-    base = os.path.dirname(original_path) or base_dir
+    base = temp_dir or os.path.dirname(original_path) or base_dir
+    os.makedirs(base, exist_ok=True)
     ext = os.path.splitext(original_path)[1]
     return os.path.join(base, f".avf_{uuid.uuid4().hex[:8]}{suffix}{ext}")
 

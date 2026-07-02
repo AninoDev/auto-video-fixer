@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import json
 import os
+import re
 import tempfile
 from dataclasses import dataclass
 from enum import Enum
 
-from autovideofixer.core.ffmpeg_utils import get_ffmpeg_path, run_ffmpeg
+from autovideofixer.core.ffmpeg_utils import run_ffmpeg
 
 
 class QualityMode(Enum):
@@ -57,6 +59,14 @@ class QualityResult:
         return self.score >= self.target
 
 
+# Maps our short feature names to libvmaf's real `feature=name=...` values.
+_VMAF_FEATURE_NAMES = {
+    "psnr": "psnr",
+    "ssim": "float_ssim",
+    "ms_ssim": "float_ms_ssim",
+}
+
+
 def estimate_quality_vmaf(
     reference: str,
     distorted: str,
@@ -67,32 +77,45 @@ def estimate_quality_vmaf(
 
     VMAF (Video Multi-Method Assessment Fusion) is a perceptual video quality
     metric developed by Netflix. It combines multiple metrics into a single
-    score from 0-100 (higher is better).
+    score from 0-100 (higher is better). Requires an FFmpeg build with
+    --enable-libvmaf.
 
     Args:
         reference: Path to original/high-quality reference video
         distorted: Path to processed/encoded video
         model: VMAF model version
-        features: Additional metrics to compute
+        features: Additional metrics to compute (psnr, ssim, ms_ssim; "fast"
+            is accepted for backwards compatibility but is not a real libvmaf
+            feature and is ignored)
 
     Returns:
         QualityResult with scores
     """
-    ffmpeg = get_ffmpeg_path()
-
     fd, json_path = tempfile.mkstemp(suffix=".json", prefix="avf_vmaf_")
     os.close(fd)
 
+    feature_names = [
+        _VMAF_FEATURE_NAMES[name]
+        for f in features.split(",")
+        if (name := f.strip()) in _VMAF_FEATURE_NAMES
+    ]
+    feature_opt = (
+        ":feature=" + "|".join(f"name={name}" for name in feature_names) if feature_names else ""
+    )
+
     try:
-        feature_flags = ":".join(f"{f.strip()}=1" for f in features.split(","))
-        filter_complex = f"[0:v][1:v]vmaf=model={model}:{feature_flags}:result={json_path}"
+        # libvmaf's inputs are #0 "main" (the distorted stream) and #1 "reference" -
+        # distorted must come first.
+        filter_complex = (
+            f"[0:v][1:v]libvmaf=log_path={json_path}:log_fmt=json:"
+            f"model=version={model}{feature_opt}"
+        )
 
         cmd = [
-            ffmpeg,
-            "-i",
-            reference,
             "-i",
             distorted,
+            "-i",
+            reference,
             "-filter_complex",
             filter_complex,
             "-f",
@@ -100,16 +123,19 @@ def estimate_quality_vmaf(
             "-",
         ]
 
-        run_ffmpeg(cmd, timeout=600)
-        scores = _parse_vmaf_json(json_path)
+        result = run_ffmpeg(cmd, timeout=600, capture_stderr=True)
 
+        if result.returncode != 0:
+            return QualityResult(
+                vmaf_score=0.0,
+                details={"error": "VMAF computation failed", "stderr": result.stderr[-2000:]},
+            )
+
+        scores = _parse_vmaf_json(json_path)
         if scores is None:
             return QualityResult(
                 vmaf_score=0.0,
-                psnr=0.0,
-                ssim=0.0,
-                ms_ssim=0.0,
-                details={"error": "VMAF computation failed"},
+                details={"error": "Could not parse VMAF output", "stderr": result.stderr[-2000:]},
             )
 
         return QualityResult(
@@ -134,35 +160,29 @@ def estimate_quality_vmaf(
 
 
 def _parse_vmaf_json(path: str) -> dict[str, float] | None:
-    """Parse VMAF JSON output file."""
-    import json
-
+    """Parse libvmaf's JSON log output (log_fmt=json)."""
     try:
         with open(path) as f:
             data = json.load(f)
+    except FileNotFoundError, json.JSONDecodeError:
+        return None
 
-        # VMAF can output either a single score or a list of frame scores
-        if isinstance(data, dict):
-            return {
-                "vmaf": data.get("mean", data.get("vmaf", 0.0)),
-                "vmaf_min": data.get("min", data.get("vmaf", 0.0)),
-                "vmaf_max": data.get("max", data.get("vmaf", 0.0)),
-                "psnr_average": data.get("psnr_average", 0.0),
-                "ssim_mean": data.get("ssim_mean", 0.0),
-                "ms_ssim_mean": data.get("ms_ssim_mean", 0.0),
-            }
-        elif isinstance(data, list):
-            scores = [d.get("vmaf", 0.0) for d in data if isinstance(d, dict)]
-            if not scores:
-                return None
-            return {
-                "vmaf": sum(scores) / len(scores),
-                "vmaf_min": min(scores),
-                "vmaf_max": max(scores),
-            }
+    pooled = data.get("pooled_metrics") if isinstance(data, dict) else None
+    if not isinstance(pooled, dict) or "vmaf" not in pooled:
         return None
-    except (FileNotFoundError, json.JSONDecodeError):
-        return None
+
+    def _mean(key: str) -> float:
+        metric = pooled.get(key)
+        return float(metric["mean"]) if isinstance(metric, dict) and "mean" in metric else 0.0
+
+    return {
+        "vmaf": _mean("vmaf"),
+        "vmaf_min": float(pooled["vmaf"].get("min", 0.0)),
+        "vmaf_max": float(pooled["vmaf"].get("max", 0.0)),
+        "psnr_average": _mean("psnr_y"),
+        "ssim_mean": _mean("float_ssim"),
+        "ms_ssim_mean": _mean("float_ms_ssim"),
+    }
 
 
 def estimate_quality_fast(
@@ -173,15 +193,13 @@ def estimate_quality_fast(
 
     Much faster than full VMAF but less accurate perceptually.
     """
-    ffmpeg = get_ffmpeg_path()
     cmd = [
-        ffmpeg,
         "-i",
         reference,
         "-i",
         distorted,
         "-filter_complex",
-        "psnr,ssim",
+        "[0:v]split[a][b];[1:v]split[c][d];[a][c]psnr;[b][d]ssim",
         "-f",
         "null",
         "-",
@@ -189,27 +207,11 @@ def estimate_quality_fast(
 
     try:
         result = run_ffmpeg(cmd, capture_stderr=True)
-        scores = _parse_fast_metrics(result.stderr)
-        return scores
+        if result.returncode != 0:
+            return {}
+        return _parse_ssim_psnr_stderr(result.stderr)
     except Exception:
         return {}
-
-
-def _parse_fast_metrics(stderr: str) -> dict[str, float]:
-    """Parse PSNR/SSIM from FFmpeg stderr."""
-    import re
-
-    scores: dict[str, float] = {}
-
-    psnr_match = re.search(r"PSNR.*?=\s*([\d.]+)", stderr)
-    if psnr_match:
-        scores["psnr"] = float(psnr_match.group(1))
-
-    ssim_match = re.search(r"SSIM.*?=\s*([\d.]+)", stderr)
-    if ssim_match:
-        scores["ssim"] = float(ssim_match.group(1))
-
-    return scores
 
 
 def estimate_ssim_psnr(
@@ -220,26 +222,26 @@ def estimate_ssim_psnr(
     """Estimate quality using SSIM and PSNR (no VMAF required).
 
     Much faster than full VMAF while still providing reliable metrics
-    for encoding quality assessment.
+    for encoding quality assessment. Does not compute a VMAF score -
+    `vmaf_score` is left at its default (0.0); use `psnr`/`ssim` instead.
 
     Args:
         reference: Path to reference/original video.
         distorted: Path to processed/encoded video.
-        max_frames: Maximum number of frames to compare (None = all).
+        max_frames: Maximum number of frames to compare (currently unused;
+            reserved for future frame-limited comparison).
 
     Returns:
-        QualityResult with SSIM, PSNR, and MS-SSIM scores.
+        QualityResult with SSIM and PSNR scores populated (ms_ssim mirrors ssim,
+        since this path does not compute a true multi-scale SSIM).
     """
-    ffmpeg = get_ffmpeg_path()
-
     cmd = [
-        ffmpeg,
         "-i",
         reference,
         "-i",
         distorted,
         "-filter_complex",
-        "psnr,ssim",
+        "[0:v]split[a][b];[1:v]split[c][d];[a][c]psnr;[b][d]ssim",
         "-f",
         "null",
         "-",
@@ -247,10 +249,16 @@ def estimate_ssim_psnr(
 
     try:
         result = run_ffmpeg(cmd, capture_stderr=True)
+        if result.returncode != 0:
+            return QualityResult(
+                details={"error": "PSNR/SSIM computation failed", "stderr": result.stderr[-2000:]}
+            )
+
         scores = _parse_ssim_psnr_stderr(result.stderr)
+        if not scores:
+            return QualityResult(details={"error": "Could not parse PSNR/SSIM output"})
 
         return QualityResult(
-            vmaf_score=scores.get("psnr", 0.0),
             psnr=scores.get("psnr", 0.0),
             ssim=scores.get("ssim", 0.0),
             ms_ssim=scores.get("ssim", 0.0),
@@ -263,39 +271,38 @@ def estimate_ssim_psnr(
         )
 
 
-def _parse_ssim_psnr_stderr(stderr: str) -> dict[str, float]:
-    """Parse PSNR and SSIM values from FFmpeg stderr output."""
-    import re
+def _to_float(value: str) -> float:
+    """Convert an ffmpeg metric value to float, handling 'inf'/'-inf'."""
+    return float(value)
 
+
+def _parse_ssim_psnr_stderr(stderr: str) -> dict[str, float]:
+    """Parse PSNR and SSIM summary lines from FFmpeg stderr output.
+
+    Real ffmpeg output (verified against ffmpeg n8.1.2):
+        PSNR y:18.29 u:42.98 v:43.59 average:20.05 min:19.07 max:21.35
+        SSIM Y:0.74 (5.85) U:0.98 (19.88) V:0.99 (20.50) All:0.82 (7.53)
+    """
+    num = r"(-?[\d.]+|inf|-inf)"
     scores: dict[str, float] = {}
 
-    # FFmpeg outputs per-frame: "PSNR_y: X.X  PSNR_u: X.X  PSNR_v: X.X"
-    # and at the end: "PSNR average: X.X  PSNR minimum: X.X"
-    # Also: "SSIM average: X.X  SSIM maximum: X.X  SSIM minimum: X.X"
+    psnr_match = re.search(
+        rf"PSNR\s+y:{num}\s+u:{num}\s+v:{num}\s+average:{num}\s+min:{num}\s+max:{num}",
+        stderr,
+    )
+    if psnr_match:
+        scores["psnr_y"] = _to_float(psnr_match.group(1))
+        scores["psnr"] = _to_float(psnr_match.group(4))
+        scores["psnr_min"] = _to_float(psnr_match.group(5))
+        scores["psnr_max"] = _to_float(psnr_match.group(6))
 
-    psnr_matches = re.findall(r"PSNR_y:\s*([\d.]+)", stderr)
-    ssim_matches = re.findall(r"SSIM_y:\s*([\d.]+)", stderr)
-
-    if psnr_matches:
-        values = [float(v) for v in psnr_matches]
-        scores["psnr"] = sum(values) / len(values)
-        scores["psnr_min"] = min(values)
-        scores["psnr_max"] = max(values)
-
-    if ssim_matches:
-        values = [float(v) for v in ssim_matches]
-        scores["ssim"] = sum(values) / len(values)
-        scores["ssim_min"] = min(values)
-        scores["ssim_max"] = max(values)
-
-    # Try to get average values from summary lines
-    avg_psnr = re.search(r"PSNR\s+average:\s*([\d.]+)", stderr)
-    if avg_psnr:
-        scores["psnr"] = float(avg_psnr.group(1))
-
-    avg_ssim = re.search(r"SSIM\s+average:\s*([\d.]+)", stderr)
-    if avg_ssim:
-        scores["ssim"] = float(avg_ssim.group(1))
+    ssim_match = re.search(
+        rf"SSIM\s+Y:{num}\s*\([^)]*\)\s+U:{num}\s*\([^)]*\)\s+V:{num}\s*\([^)]*\)\s+All:{num}",
+        stderr,
+    )
+    if ssim_match:
+        scores["ssim_y"] = _to_float(ssim_match.group(1))
+        scores["ssim"] = _to_float(ssim_match.group(4))
 
     return scores
 

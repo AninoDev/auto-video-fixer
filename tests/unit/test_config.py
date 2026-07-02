@@ -10,9 +10,9 @@ from autovideofixer.config import Config
 class TestConfig:
     """Test configuration management."""
 
-    def test_default_config_creation(self):
+    def test_default_config_creation(self, tmp_path):
         """Test creating config with defaults."""
-        config = Config()
+        config = Config(tmp_path / "nonexistent.yaml")
         assert config is not None
         assert config.get("general", "max_concurrent_jobs") == 1
         assert config.get("quality", "vmaf_model") == "vmaf_v0.6.1"
@@ -24,15 +24,15 @@ class TestConfig:
         assert config is not None
         assert config._path == config_path
 
-    def test_get_nested_value(self):
+    def test_get_nested_value(self, tmp_path):
         """Test getting nested configuration values."""
-        config = Config()
+        config = Config(tmp_path / "config.yaml")
         assert config.get("stages", "upscale", "enabled") is True
         assert config.get("stages", "interpolate", "ai_model") == "rife_v4.6"
 
-    def test_get_with_default(self):
+    def test_get_with_default(self, tmp_path):
         """Test getting values with defaults."""
-        config = Config()
+        config = Config(tmp_path / "nonexistent.yaml")
         assert config.get("nonexistent", "key", default="fallback") == "fallback"
         assert config.get("general", "nonexistent_key", default="/tmp") == "/tmp"
 
@@ -94,9 +94,9 @@ class TestConfig:
         assert config2.get("general", "max_concurrent_jobs") == 10
         assert config2.get("general", "new_key") == "new_value"
 
-    def test_config_data_property(self):
+    def test_config_data_property(self, tmp_path):
         """Test accessing raw config data."""
-        config = Config()
+        config = Config(tmp_path / "nonexistent.yaml")
         data = config.data
         assert isinstance(data, dict)
         assert "general" in data

@@ -35,6 +35,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Stage registration
 - **Stabilization B-frame artifacting** - Fixed vid.stab buffer corruption bug (github.com/georgmartius/vid.stab#144) by piping raw video between decode and transform processes instead of feeding decoder reference frames directly to vidstabtransform
 - **Preset merge overwriting config** - Fixed `_merge_config()` to recursively merge nested dicts instead of replacing entire stage configs. Previously, applying a preset like `-p 1080p60` would overwrite `stages.stabilize` with just `{"enabled": true}`, losing all custom settings (smoothness, maxshift, zoom_enabled, etc.)
+- **CLI model-info crash** - Fixed `set(list_cached_models())` error where cached models are dicts, not strings. Now extracts model names with set comprehension
+- **CLI styling** - Fixed Rich markup error (`[Cyan]` not recognized, changed to `[blue]`)
+- **Test isolation** - Fixed `test_get_nested_value` to use `tmp_path` config instead of reading from system config directory
+- **Dead code in upscale stage** - Removed unreachable code in `_execute_ai()` that referenced undefined `sf` and `target_width`/`target_height` variables from a previous refactoring
+- **Unused imports/variables** - Removed unused `logging` import, `max_mag` and `prev_time` unused variables in stabilize stage
 
 ---
 
@@ -73,6 +78,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 - No security advisories
+
+---
+
+## [0.3.0] - 2026-06-30
+
+### Added
+- **VLM (Vision Language Model) integration** - Analyze video content using AI language models
+  - Ollama support (local models, default at localhost:11434)
+  - OpenAI Vision API support (GPT-4o, etc.)
+  - Custom API endpoint support (OpenAI-compatible format)
+  - Local VLM server support
+  - JSON response parsing with fallback for non-JSON responses
+  - Configurable model, API URL, API key, and sample frame count
+- **Event classification** - Automatic classification of detected scenes (talking_head, action, landscape, text_overlay, transition) using frame analysis heuristics
+- **Clip extraction** - Extract detected scenes as separate video clips via FFmpeg
+  - `VideoClip` dataclass with source path, timing, and output path
+  - `extract_scenes_as_clips()` for batch extraction
+- **Improved perceptual hashing** - Added difference hash (dhash) in addition to average hash (ahash)
+  - dhash compares adjacent pixels for structural pattern detection
+  - More robust for videos with similar content but different lighting
+- **Batch deduplication** - `find_duplicates()` method to find all duplicate groups in a file batch
+  - Groups files by perceptual hash similarity
+  - Returns deduplicated groups of 2+ duplicate files
+- **New CLI flags for `analyze` command**:
+  - `--events` / `--no-events` to enable/disable event detection
+  - `--classify` to enable VLM-based event classification
+  - `--clip DIR` to extract scenes as clips to a directory
+- **Analysis config options**: `max_sample_frames`, `sample_interval_sec`, `classify_events`, `hash_type`
+
+### Changed
+- Version bumped to 0.3.0
+- `SceneEvent` dataclass: added `duration` property
+- `analyze` CLI command: enhanced output with scene duration, event type descriptions, content rating
+- VLM frame extraction: now uses `max_frames` parameter instead of fixed limit
+
+### Fixed
+- Video analysis `analyze()` now properly respects `include_vlm` and `include_events` boolean flags with None-sentinel pattern
 
 ---
 

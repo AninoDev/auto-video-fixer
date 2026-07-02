@@ -2,6 +2,7 @@
 
 import os
 import tempfile
+from pathlib import Path
 
 import pytest
 
@@ -15,7 +16,7 @@ class TestPipeline:
 
     def setup_method(self):
         """Setup test fixtures."""
-        self.config = Config()
+        self.config = Config(Path(tempfile.mkdtemp()) / "nonexistent.yaml")
         self.pipeline = Pipeline(self.config)
 
     def test_pipeline_creation(self):
@@ -185,7 +186,7 @@ class TestPipelineExecution:
 
     def setup_method(self):
         """Setup test fixtures."""
-        self.config = Config()
+        self.config = Config(Path(tempfile.mkdtemp()) / "nonexistent.yaml")
         self.pipeline = Pipeline(self.config)
 
     @pytest.mark.integration

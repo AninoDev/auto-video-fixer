@@ -32,6 +32,31 @@ class SpeedStage(BaseStage):
             return False, "No speed change requested"
         return True, None
 
+    @staticmethod
+    def _build_atempo_chain(speed: float) -> str:
+        """Build an atempo filter chain for an arbitrary positive speed factor.
+
+        A single atempo filter only accepts tempo scale factors in [0.5, 100].
+        Factors outside that range (e.g. slow-motion below 0.5x) are reached
+        by chaining multiple atempo stages whose product equals `speed`.
+        """
+        if speed <= 0:
+            raise ValueError(f"speed factor must be positive, got {speed}")
+
+        stages: list[float] = []
+        remaining = speed
+        if remaining < 0.5:
+            while remaining < 0.5:
+                stages.append(0.5)
+                remaining /= 0.5
+        elif remaining > 100:
+            while remaining > 100:
+                stages.append(100.0)
+                remaining /= 100.0
+        stages.append(remaining)
+
+        return ",".join(f"atempo={s}" for s in stages)
+
     def execute(
         self,
         input_path: str,
@@ -42,6 +67,13 @@ class SpeedStage(BaseStage):
     ) -> StageResult:
         start = time.time()
         self._report_progress(0.0, "Adjusting speed...", progress_callback)
+
+        if not output_path:
+            return StageResult(
+                status=StageStatus.FAILED,
+                error="no output_path provided to speed stage",
+                duration_sec=time.time() - start,
+            )
 
         try:
             from autovideofixer.core.ffmpeg_utils import run_ffmpeg
@@ -56,9 +88,11 @@ class SpeedStage(BaseStage):
                 )
 
             # Video speed: setpts filter
-            # Audio speed: atempo filter (with pitch preservation via aresample)
+            # Audio speed: atempo filter chain (a single atempo only accepts
+            # tempo scale factors in [0.5, 100]; chain multiple stages for
+            # factors outside that range, e.g. slow-motion below 0.5x)
             video_filter = f"setpts={1.0 / speed}*PTS"
-            audio_filter = f"atempo={speed}"
+            audio_filter = self._build_atempo_chain(speed)
 
             args = [
                 "-i",
@@ -76,7 +110,7 @@ class SpeedStage(BaseStage):
                 "-c:a",
                 "aac",
                 "-y",
-                output_path or input_path,
+                output_path,
             ]
 
             def cb(p, m):
@@ -94,7 +128,7 @@ class SpeedStage(BaseStage):
             self._report_progress(1.0, "Speed adjustment complete", progress_callback)
             return StageResult(
                 status=StageStatus.COMPLETED,
-                output_path=output_path or input_path,
+                output_path=output_path,
                 metadata={"speed_factor": speed},
                 duration_sec=time.time() - start,
             )

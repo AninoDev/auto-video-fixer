@@ -32,17 +32,24 @@ class Preset:
 
     def to_config(self) -> dict[str, Any]:
         """Convert preset to configuration dict."""
-        config = {}
+        config: dict[str, Any] = {}
 
+        quality_target: dict[str, Any] = {}
         if self.target_resolution:
-            config["quality"] = {
-                "quality_target": {
+            quality_target.update(
+                {
                     "mode": "target",
                     "target": self.crf,
                     "target_resolution": list(self.target_resolution),
                     "target_framerate": self.target_framerate,
                 }
-            }
+            )
+        # Explicit quality_target (e.g. size_reduction's max_loss_pct bound) always
+        # merges in, and can override the target-resolution-derived defaults above.
+        if self.quality_target:
+            quality_target.update(self.quality_target)
+        if quality_target:
+            config["quality"] = {"quality_target": quality_target}
 
         stages = {}
         for name, enabled in self.enable_stages.items():
@@ -255,5 +262,5 @@ def load_preset(path: str) -> Preset | None:
             tuple(data["target_resolution"]) if data.get("target_resolution") else None
         )
         return Preset(**data)
-    except (FileNotFoundError, json.JSONDecodeError, TypeError):
+    except FileNotFoundError, json.JSONDecodeError, TypeError:
         return None

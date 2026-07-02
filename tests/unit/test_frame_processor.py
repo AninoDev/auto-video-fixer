@@ -76,3 +76,50 @@ class TestFrameProcessor:
         proc = FrameProcessor()
         proc.close()  # Should not raise
         assert proc._cap is None
+
+
+class TestFrameProcessorRealVideo:
+    """Regression tests against a real decoded video.
+
+    _stream_frames() contains `yield` statements, which makes the whole
+    method a generator function regardless of which branch executes - a
+    `return frames` on some other branch does NOT hand `frames` back to a
+    `for` loop over the call, it just ends iteration early with nothing
+    yielded. Extracting via mocks alone doesn't catch this: it only shows
+    up against a real cv2.VideoCapture.
+    """
+
+    def test_extract_frames_returns_flat_ndarray_list(self, tmp_video_file):
+        import numpy as np
+
+        proc = FrameProcessor()
+        frames = proc.extract_frames(tmp_video_file, max_frames=5)
+
+        assert len(frames) == 5
+        for frame in frames:
+            assert isinstance(frame, np.ndarray)
+            assert frame.ndim == 3
+
+    def test_stream_frames_chunk_sizes(self, tmp_video_file):
+        proc = FrameProcessor()
+        chunks = list(proc.stream_frames(tmp_video_file, max_frames=7, chunk_size=3))
+
+        assert [len(c) for c in chunks] == [3, 3, 1]
+        for chunk in chunks:
+            for frame in chunk:
+                assert frame.ndim == 3
+
+    def test_extract_frames_small_video_default_batch_size(self, tmp_video_file):
+        """A video shorter than any chunk size must still extract as a flat list.
+
+        This is the exact scenario that used to silently return frames
+        wrapped in singleton lists (`[[frame], [frame], ...]`) because the
+        internal chunking granularity was tied to `self.batch_size`, which
+        defaults to 1.
+        """
+        proc = FrameProcessor()  # default batch_size=1
+        frames = proc.extract_frames(tmp_video_file)
+
+        assert len(frames) > 0
+        assert not isinstance(frames[0], list)
+        assert frames[0].ndim == 3

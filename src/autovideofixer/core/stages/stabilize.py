@@ -38,8 +38,13 @@ class StabilizeStage(BaseStage):
         self._sharpen_enabled = self._stage_config.get("sharpen_enabled", True)
         self._optalgo = self._stage_config.get("optalgo", "gauss")
         self._shakiness = self._stage_config.get("shakiness", 10)
-        
-        self.logger.debug(f"StabilizeStage initialized: smoothness={self._smoothness}, maxshift={self._maxshift}, shakiness={self._shakiness}, threshold={self._threshold}")
+        self._pipe_timeout = self._stage_config.get("pipe_timeout", 1800)
+
+        self.logger.debug(
+            f"StabilizeStage initialized: smoothness={self._smoothness}, "
+            f"maxshift={self._maxshift}, shakiness={self._shakiness}, "
+            f"threshold={self._threshold}"
+        )
 
     def should_run(self, input_info: dict[str, Any]) -> tuple[bool, str | None]:
         if not self.is_enabled():
@@ -74,8 +79,7 @@ class StabilizeStage(BaseStage):
                 magnitudes.append(magnitude)
 
             avg_mag = sum(magnitudes) / len(magnitudes)
-            max_mag = max(magnitudes)
-            
+
             # Count significant movements (> 2 pixels)
             significant = [m for m in magnitudes if m > 2.0]
             significant_pct = len(significant) / len(magnitudes) if magnitudes else 0.0
@@ -83,7 +87,7 @@ class StabilizeStage(BaseStage):
             # Needs stabilization if average magnitude exceeds threshold
             # or if significant percentage is high
             needs_stab = (avg_mag > threshold) or (significant_pct > 0.5)
-            
+
             return needs_stab, avg_mag
 
         except Exception:
@@ -93,13 +97,24 @@ class StabilizeStage(BaseStage):
         """Get video width and height from ffprobe."""
         try:
             import subprocess
-            result = subprocess.run([
-                "ffprobe", "-v", "error",
-                "-select_streams", "v:0",
-                "-show_entries", "stream=width,height",
-                "-of", "csv=p=0",
-                input_path
-            ], stderr=subprocess.DEVNULL, stdout=subprocess.PIPE, text=True)
+
+            result = subprocess.run(
+                [
+                    "ffprobe",
+                    "-v",
+                    "error",
+                    "-select_streams",
+                    "v:0",
+                    "-show_entries",
+                    "stream=width,height",
+                    "-of",
+                    "csv=p=0",
+                    input_path,
+                ],
+                stderr=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                text=True,
+            )
 
             if result.stdout and "," in result.stdout:
                 parts = result.stdout.strip().split(",")
@@ -112,13 +127,24 @@ class StabilizeStage(BaseStage):
         """Get video framerate from ffprobe."""
         try:
             import subprocess
-            result = subprocess.run([
-                "ffprobe", "-v", "error",
-                "-select_streams", "v:0",
-                "-show_entries", "stream=r_frame_rate",
-                "-of", "csv=p=0",
-                input_path
-            ], stderr=subprocess.DEVNULL, stdout=subprocess.PIPE, text=True)
+
+            result = subprocess.run(
+                [
+                    "ffprobe",
+                    "-v",
+                    "error",
+                    "-select_streams",
+                    "v:0",
+                    "-show_entries",
+                    "stream=r_frame_rate",
+                    "-of",
+                    "csv=p=0",
+                    input_path,
+                ],
+                stderr=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                text=True,
+            )
 
             if result.stdout and "/" in result.stdout:
                 num, den = result.stdout.strip().split("/")
@@ -130,92 +156,89 @@ class StabilizeStage(BaseStage):
 
     def _clean_trf_outliers(self, trf_path: str) -> str:
         """Remove outlier frames from TRF file to prevent artifact bursts.
-        
+
         Returns path to cleaned TRF file.
         """
         import tempfile
-        
+
         try:
-            with open(trf_path, 'r') as f:
+            with open(trf_path, "r") as f:
                 content = f.read()
-            
+
             # Parse TRF file into structured data
             # Format: Frame N (List M [(LM dx dy x y w h contrast magnitude),...])
             frames_data = {}
             current_frame = None
-            
-            for line in content.split('\n'):
-                if line.startswith('Frame '):
+
+            for line in content.split("\n"):
+                if line.startswith("Frame "):
                     match = re.match(r"Frame (\d+)", line)
                     if match:
                         current_frame = int(match.group(1))
                         frames_data[current_frame] = []
-                elif line.startswith('(') and current_frame is not None:
+                elif line.startswith("(") and current_frame is not None:
                     # Parse LM entries
-                    lm_matches = re.findall(r'\(LM\s+(-?\d+)\s+(-?\d+)\s+', line)
+                    lm_matches = re.findall(r"\(LM\s+(-?\d+)\s+(-?\d+)\s+", line)
                     for dx, dy in lm_matches:
                         frames_data[current_frame].append((int(dx), int(dy)))
-            
+
             if not frames_data:
                 return trf_path
-            
+
             # Calculate average movement magnitude for each frame
             frame_magnitudes = {}
             for frame, lms in frames_data.items():
                 if lms:
-                    total_mag = sum((dx**2 + dy**2)**0.5 for dx, dy in lms)
+                    total_mag = sum((dx**2 + dy**2) ** 0.5 for dx, dy in lms)
                     frame_magnitudes[frame] = total_mag / len(lms)
-            
+
             # Calculate median magnitude
             magnitudes = list(frame_magnitudes.values())
             if not magnitudes:
                 return trf_path
-            
+
             from statistics import median
+
             median_mag = median(magnitudes)
-            
+
             # Threshold: frames with magnitude > 3x median are outliers
             threshold = median_mag * 3
-            
+
             # Identify outlier frames
             outlier_frames = {frame for frame, mag in frame_magnitudes.items() if mag > threshold}
-            
+
             if not outlier_frames:
                 return trf_path
-            
+
             self.logger.info(f"Cleaned {len(outlier_frames)} outlier frames from TRF")
-            
+
             # Rebuild TRF file with cleaned data
-            lines = content.split('\n')
+            lines = content.split("\n")
             cleaned_lines = []
-            
+
             for line in lines:
-                if line.startswith('Frame '):
+                if line.startswith("Frame "):
                     match = re.match(r"Frame (\d+)", line)
                     if match:
                         frame_num = int(match.group(1))
                         if frame_num in outlier_frames:
                             # Replace this frame's LM values with zeros
-                            new_line = re.sub(
-                                r'\(LM\s+-?\d+\s+-?\d+\s+',
-                                '(LM 0 0 ',
-                                line
-                            )
+                            new_line = re.sub(r"\(LM\s+-?\d+\s+-?\d+\s+", "(LM 0 0 ", line)
                             cleaned_lines.append(new_line)
                         else:
                             cleaned_lines.append(line)
                 else:
                     cleaned_lines.append(line)
-            
+
             # Write cleaned TRF to temp file
             cleaned_fd, cleaned_path = tempfile.mkstemp(suffix=".trf", prefix="avf_clean_")
             os.close(cleaned_fd)
-            
-            with open(cleaned_path, 'w') as f:
-                f.write('\n'.join(cleaned_lines))
-            
+
+            with open(cleaned_path, "w") as f:
+                f.write("\n".join(cleaned_lines))
+
             return cleaned_path
-            
+
         except Exception as e:
             self.logger.warning(f"TRF cleaning failed: {e}")
             return trf_path
@@ -253,7 +276,7 @@ class StabilizeStage(BaseStage):
             # Calculate zoom percentage based on movement relative to frame size
             # Aim to keep at least 80% of frame visible
             zoom_percent = -((max_movement / min(video_width, video_height)) * 100 * 0.75)
-            
+
             # Clamp zoom to reasonable range (-20% to 0%)
             zoom_percent = max(-20.0, min(0.0, zoom_percent))
 
@@ -270,62 +293,46 @@ class StabilizeStage(BaseStage):
             List of timestamps (in seconds) where scene changes occur.
         """
         import tempfile
-        from PIL import Image
+
         import numpy as np
+        from PIL import Image
 
         scene_changes = []
         temp_dir = tempfile.mkdtemp(prefix="avf_scene_")
 
         try:
-            # Extract frames at 1 fps to reduce processing
+            # Extract frames at 1 fps to reduce processing. Frame i of this
+            # sampled sequence corresponds to timestamp ~i seconds -- do NOT
+            # index into ffprobe's full per-decoded-frame pts_time array with
+            # this same counter, its length/stride has nothing to do with the
+            # 1fps-sampled sequence and produces timestamps compressed into
+            # the first few seconds of the video regardless of actual length.
             frame_pattern = os.path.join(temp_dir, "frame_%06d.png")
-            
-            extract_args = [
-                "-i", input_path,
-                "-vf", "fps=1",
-                "-q:v", "2",
-                frame_pattern
-            ]
-            
+
+            extract_args = ["-i", input_path, "-vf", "fps=1", "-q:v", "2", frame_pattern]
+
             run_ffmpeg(extract_args, timeout=120)
 
             # Load and compare consecutive frames
             import glob
+
             frame_files = sorted(glob.glob(os.path.join(temp_dir, "frame_*.png")))
 
             if len(frame_files) < 2:
                 return []
 
             prev_frame = None
-            prev_time = 0.0
-
-            # Get frame timestamps from ffprobe
-            import subprocess
-            result = subprocess.run([
-                "ffprobe", "-v", "quiet",
-                "-select_streams", "v:0",
-                "-show_entries", "frame=pts_time",
-                "-of", "csv=p=0",
-                input_path
-            ], stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL, text=True)
-
-            if result.stdout:
-                times = [float(t) for t in result.stdout.strip().split('\n')]
-            else:
-                times = list(range(len(frame_files)))
 
             for i, frame_file in enumerate(frame_files):
                 if i == 0:
-                    prev_frame = np.array(Image.open(frame_file).convert('L'))
-                    prev_time = times[i] if i < len(times) else 0.0
+                    prev_frame = np.array(Image.open(frame_file).convert("L"))
                     continue
 
-                curr_frame = np.array(Image.open(frame_file).convert('L'))
+                curr_frame = np.array(Image.open(frame_file).convert("L"))
 
                 # Calculate structural similarity or correlation
                 if prev_frame.shape != curr_frame.shape:
                     prev_frame = curr_frame
-                    prev_time = times[i] if i < len(times) else 0.0
                     continue
 
                 # Normalize frames
@@ -337,16 +344,16 @@ class StabilizeStage(BaseStage):
 
                 # If correlation is low, it's a scene change
                 if correlation < scene_threshold and i > 0:
-                    scene_changes.append(times[i])
+                    scene_changes.append(float(i))
 
                 prev_frame = curr_frame
-                prev_time = times[i] if i < len(times) else 0.0
 
         except Exception as e:
             self.logger.warning(f"Scene detection failed: {e}")
         finally:
             # Cleanup
             import shutil
+
             if os.path.exists(temp_dir):
                 shutil.rmtree(temp_dir, ignore_errors=True)
 
@@ -394,7 +401,10 @@ class StabilizeStage(BaseStage):
 
             # Step 2: Analyze shake intensity
             needs_stab, avg_value = self._analyze_trf_file(trf_path, thresh)
-            self.logger.debug(f"Shake analysis: needs_stab={needs_stab}, avg_value={avg_value:.3f}, threshold={thresh}")
+            self.logger.debug(
+                f"Shake analysis: needs_stab={needs_stab}, "
+                f"avg_value={avg_value:.3f}, threshold={thresh}"
+            )
 
             # Step 2.5: Detect scene changes
             self._report_progress(0.2, "Detecting scenes...", progress_callback)
@@ -408,18 +418,27 @@ class StabilizeStage(BaseStage):
                 zoom_value = self._calculate_zoom(trf_path, video_width, video_height)
                 self.logger.debug(f"Zoom calculated: {zoom_value:.2f}%")
             else:
-                self.logger.debug(f"Zoom skipped: enabled={self._zoom_enabled}, needs_stab={needs_stab}")
+                self.logger.debug(
+                    f"Zoom skipped: enabled={self._zoom_enabled}, needs_stab={needs_stab}"
+                )
 
             if not needs_stab:
-                self.logger.info(f"Skipping stabilization (avg shake: {avg_value:.3f} < threshold: {thresh})")
-                self._report_progress(1.0, f"No stabilization needed (avg: {avg_value:.3f})", progress_callback)
+                self.logger.info(
+                    f"Skipping stabilization (avg shake: {avg_value:.3f} < threshold: {thresh})"
+                )
+                self._report_progress(
+                    1.0, f"No stabilization needed (avg: {avg_value:.3f})", progress_callback
+                )
                 # Skip stabilization, just copy the input
                 run_ffmpeg(
                     [
                         "-hide_banner",
-                        "-i", input_path,
-                        "-c", "copy",
-                        "-y", output_path,
+                        "-i",
+                        input_path,
+                        "-c",
+                        "copy",
+                        "-y",
+                        output_path,
                     ],
                     timeout=120,
                 )
@@ -453,7 +472,11 @@ class StabilizeStage(BaseStage):
             zoom_param = f":zoom={zoom_value}:optzoom=2" if zoom_value != 0.0 else ""
 
             # Build filter chain with optional sharpening
-            stab_filter = f"vidstabtransform=smoothing={smooth}:input={clean_trf_path}:crop={crop_mode}:interpol=bilinear:maxshift={self._maxshift}:optalgo={self._optalgo}{zoom_param}"
+            stab_filter = (
+                f"vidstabtransform=smoothing={smooth}:input={clean_trf_path}:"
+                f"crop={crop_mode}:interpol=bilinear:maxshift={self._maxshift}:"
+                f"optalgo={self._optalgo}{zoom_param}"
+            )
 
             # Add sharpening if stabilization was auto-triggered (not user-disabled)
             auto_triggered = needs_stab and self._sharpen_enabled
@@ -461,67 +484,214 @@ class StabilizeStage(BaseStage):
                 stab_filter = f"{stab_filter},unsharp=3:3:0.5:3:3:0.0"
 
             self._report_progress(0.6, "Stabilizing (pipe decode→transform)...", progress_callback)
-            self.logger.info(f"Piping raw video: {video_width}x{video_height} @ {framerate}fps, format={pixel_format}")
+            self.logger.info(
+                f"Piping raw video: {video_width}x{video_height} @ {framerate}fps, "
+                f"format={pixel_format}"
+            )
             self.logger.debug(f"vidstabtransform filter: {stab_filter}")
-            self.logger.debug(f"Config: smoothness={self._smoothness}, maxshift={self._maxshift}, zoom_enabled={self._zoom_enabled}, zoom_mode={self._zoom_mode}, zoom_value={zoom_value}")
+            self.logger.debug(
+                f"Config: smoothness={self._smoothness}, maxshift={self._maxshift}, "
+                f"zoom_enabled={self._zoom_enabled}, zoom_mode={self._zoom_mode}, "
+                f"zoom_value={zoom_value}"
+            )
 
             # Use subprocess to pipe decode stdout → transform stdin
             import subprocess as sp
+
             from autovideofixer.core.ffmpeg_utils import get_ffmpeg_path
 
             ffmpeg_bin = get_ffmpeg_path()
-            
+
             # Decode process: outputs raw video (no audio) to stdout
             # NOTE: -s explicitly sets output size to match transform's -s input
             # This prevents corruption when ffprobe returns incorrect dimensions
             decode_proc = sp.Popen(
-                [ffmpeg_bin, "-hide_banner", "-i", input_path,
-                 "-vf", f"format={pixel_format}", "-c:v", "rawvideo",
-                 "-f", "rawvideo", "-s", f"{video_width}x{video_height}",
-                 "-bufsize", "10M", "-"],
+                [
+                    ffmpeg_bin,
+                    "-hide_banner",
+                    "-i",
+                    input_path,
+                    "-vf",
+                    f"format={pixel_format}",
+                    "-c:v",
+                    "rawvideo",
+                    "-f",
+                    "rawvideo",
+                    "-s",
+                    f"{video_width}x{video_height}",
+                    "-bufsize",
+                    "10M",
+                    "-",
+                ],
                 stdout=sp.PIPE,
                 stderr=sp.PIPE,
             )
 
+            # Check if audio exists in input
+            has_audio = input_info and input_info.get("has_audio", False) if input_info else False
+
             # Transform process: reads raw video from stdin, audio from original file
-            transform_proc = sp.Popen(
-                [ffmpeg_bin, "-hide_banner",
-                 "-f", "rawvideo",
-                 "-pix_fmt", pixel_format, "-s", f"{video_width}x{video_height}",
-                 "-r", str(framerate), "-i", "-",
-                 "-i", input_path,
-                 "-map", "0:v", "-map", "1:a:0",
-                 "-vf", stab_filter,
-                 "-c:v", "libx264", "-preset", "medium", "-crf", "18",
-                 "-c:a", "copy",
-                 "-y", output_path],
-                stdin=decode_proc.stdout,
-                stderr=sp.PIPE,
-            )
+            if has_audio:
+                transform_proc = sp.Popen(
+                    [
+                        ffmpeg_bin,
+                        "-hide_banner",
+                        "-f",
+                        "rawvideo",
+                        "-pix_fmt",
+                        pixel_format,
+                        "-s",
+                        f"{video_width}x{video_height}",
+                        "-r",
+                        str(framerate),
+                        "-i",
+                        "-",
+                        "-i",
+                        input_path,
+                        "-map",
+                        "0:v",
+                        "-map",
+                        "1:a:0",
+                        "-vf",
+                        stab_filter,
+                        "-c:v",
+                        "libx264",
+                        "-preset",
+                        "medium",
+                        "-crf",
+                        "18",
+                        "-c:a",
+                        "copy",
+                        "-y",
+                        output_path,
+                    ],
+                    stdin=decode_proc.stdout,
+                    stderr=sp.PIPE,
+                )
+            else:
+                transform_proc = sp.Popen(
+                    [
+                        ffmpeg_bin,
+                        "-hide_banner",
+                        "-f",
+                        "rawvideo",
+                        "-pix_fmt",
+                        pixel_format,
+                        "-s",
+                        f"{video_width}x{video_height}",
+                        "-r",
+                        str(framerate),
+                        "-i",
+                        "-",
+                        "-i",
+                        input_path,
+                        "-map",
+                        "0:v",
+                        "-vf",
+                        stab_filter,
+                        "-c:v",
+                        "libx264",
+                        "-preset",
+                        "medium",
+                        "-crf",
+                        "18",
+                        "-an",
+                        "-y",
+                        output_path,
+                    ],
+                    stdin=decode_proc.stdout,
+                    stderr=sp.PIPE,
+                )
 
             # Close decode's stdout in parent - only transform reads it
             decode_proc.stdout.close()
 
-            # Wait for both to complete
-            _, decode_stderr = decode_proc.communicate()
-            transform_stderr = transform_proc.communicate()[1]
+            # Drain both processes' stderr concurrently via background threads
+            # instead of sequential communicate(). Draining decode then
+            # transform in sequence deadlocks: if transform writes enough to
+            # stderr (e.g. elevated logging on a long/slow transcode) to fill
+            # the OS pipe buffer before decode exits, transform blocks on its
+            # own stderr write, stops reading stdin, decode blocks on its
+            # stdout write, and neither process ever exits.
+            import threading
 
-            if decode_proc.returncode != 0:
-                self.logger.error(f"Decode failed: {decode_stderr[:500].decode() if isinstance(decode_stderr, bytes) else decode_stderr}")
+            decode_stderr_chunks: list[bytes] = []
+            transform_stderr_chunks: list[bytes] = []
+
+            def _drain(pipe, sink: list[bytes]) -> None:
+                try:
+                    for chunk in iter(lambda: pipe.read(65536), b""):
+                        sink.append(chunk)
+                except OSError, ValueError:
+                    pass
+                finally:
+                    try:
+                        pipe.close()
+                    except OSError:
+                        pass
+
+            decode_stderr_thread = threading.Thread(
+                target=_drain, args=(decode_proc.stderr, decode_stderr_chunks), daemon=True
+            )
+            transform_stderr_thread = threading.Thread(
+                target=_drain, args=(transform_proc.stderr, transform_stderr_chunks), daemon=True
+            )
+            decode_stderr_thread.start()
+            transform_stderr_thread.start()
+
+            def _kill_both() -> None:
+                for proc in (decode_proc, transform_proc):
+                    try:
+                        proc.kill()
+                    except OSError:
+                        pass
+                decode_stderr_thread.join(timeout=5)
+                transform_stderr_thread.join(timeout=5)
+
+            try:
+                decode_proc.wait(timeout=self._pipe_timeout)
+            except sp.TimeoutExpired:
+                _kill_both()
                 return StageResult(
                     status=StageStatus.FAILED,
-                    error=f"Raw decode failed: {decode_stderr[:500]}",
+                    error=f"Stabilization decode process timed out after {self._pipe_timeout}s",
+                    duration_sec=time.time() - start,
+                )
+
+            try:
+                transform_proc.wait(timeout=self._pipe_timeout)
+            except sp.TimeoutExpired:
+                _kill_both()
+                return StageResult(
+                    status=StageStatus.FAILED,
+                    error=f"Stabilization transform process timed out after {self._pipe_timeout}s",
+                    duration_sec=time.time() - start,
+                )
+
+            decode_stderr_thread.join(timeout=5)
+            transform_stderr_thread.join(timeout=5)
+            decode_stderr = b"".join(decode_stderr_chunks)
+            transform_stderr = b"".join(transform_stderr_chunks)
+
+            decode_stderr_text = decode_stderr[:500].decode(errors="replace")
+            transform_stderr_text = transform_stderr[:500].decode(errors="replace")
+
+            if decode_proc.returncode != 0:
+                self.logger.error(f"Decode failed: {decode_stderr_text}")
+                return StageResult(
+                    status=StageStatus.FAILED,
+                    error=f"Raw decode failed: {decode_stderr_text}",
                     duration_sec=time.time() - start,
                 )
 
             if transform_proc.returncode != 0:
-                self.logger.error(f"Transform failed: {transform_stderr[:500].decode() if isinstance(transform_stderr, bytes) else transform_stderr}")
+                self.logger.error(f"Transform failed: {transform_stderr_text}")
                 # Remove empty/failed output file
                 if os.path.exists(output_path):
                     os.remove(output_path)
                 return StageResult(
                     status=StageStatus.FAILED,
-                    error=f"Stabilization failed: {transform_stderr[:500]}",
+                    error=f"Stabilization failed: {transform_stderr_text}",
                     duration_sec=time.time() - start,
                 )
 

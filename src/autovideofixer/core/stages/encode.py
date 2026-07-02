@@ -45,6 +45,13 @@ class EncodeStage(BaseStage):
         start = time.time()
         self._report_progress(0.0, f"Encoding with {codec}...", progress_callback)
 
+        if not output_path:
+            return StageResult(
+                status=StageStatus.FAILED,
+                error="no output_path provided to encode stage",
+                duration_sec=time.time() - start,
+            )
+
         try:
             from autovideofixer.core.ffmpeg_utils import (
                 build_hwaccel_args,
@@ -104,7 +111,7 @@ class EncodeStage(BaseStage):
             if vf:
                 args.extend(["-vf", vf])
 
-            args.extend(["-y", output_path or input_path])
+            args.extend(["-y", output_path])
 
             def cb(p, m):
                 self._report_progress(0.2 + p * 0.8, m, progress_callback)
@@ -121,7 +128,7 @@ class EncodeStage(BaseStage):
             self._report_progress(1.0, "Encoding complete", progress_callback)
             return StageResult(
                 status=StageStatus.COMPLETED,
-                output_path=output_path or input_path,
+                output_path=output_path,
                 metadata={
                     "codec": codec,
                     "preset": preset,

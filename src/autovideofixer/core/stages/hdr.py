@@ -42,14 +42,28 @@ class HDRStage(BaseStage):
         start = time.time()
         self._report_progress(0.0, "Converting HDR to SDR...", progress_callback)
 
+        if not output_path:
+            return StageResult(
+                status=StageStatus.FAILED,
+                error="no output_path provided to hdr stage",
+                duration_sec=time.time() - start,
+            )
+
         try:
             from autovideofixer.core.ffmpeg_utils import run_ffmpeg
 
-            # Build HDR to SDR conversion filter chain
-            # Uses PQ transfer function -> linear -> SDR transfer function
+            # HDR (PQ/HLG, bt2020) -> SDR (bt709) requires converting to linear
+            # light before tonemapping, then converting back to the target
+            # transfer/matrix/primaries. tonemap's own options are only
+            # `tonemap`, `param`, `desat`, `peak` -- color-space tags must be
+            # applied via zscale before/after, not passed to tonemap itself.
             filter_chain = (
-                "tonemap=tonemap=hable:desat=0.1:"
-                "format=yuv420p:matrix=bt2020:primaries=bt2020:transfer=bt709"
+                "zscale=t=linear:npl=100,"
+                "format=gbrpf32le,"
+                "zscale=p=bt709,"
+                "tonemap=tonemap=hable:desat=0,"
+                "zscale=t=bt709:m=bt709:r=tv,"
+                "format=yuv420p"
             )
 
             args = [
@@ -66,7 +80,7 @@ class HDRStage(BaseStage):
                 "-c:a",
                 "copy",
                 "-y",
-                output_path or input_path,
+                output_path,
             ]
 
             def cb(p, m):
@@ -84,7 +98,7 @@ class HDRStage(BaseStage):
             self._report_progress(1.0, "HDR conversion complete", progress_callback)
             return StageResult(
                 status=StageStatus.COMPLETED,
-                output_path=output_path or input_path,
+                output_path=output_path,
                 metadata={"method": method},
                 duration_sec=time.time() - start,
             )
