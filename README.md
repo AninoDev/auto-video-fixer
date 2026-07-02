@@ -33,7 +33,7 @@ pip install -e ".[all]"
 ### Prerequisites
 
 - **FFmpeg**: Must be installed and in PATH (https://ffmpeg.org/)
-- **Python**: 3.10 or higher
+- **Python**: 3.14 or higher
 - **GPU** (optional): NVIDIA CUDA, Apple Metal, or Intel QuickSync for hardware acceleration
 
 ## Usage

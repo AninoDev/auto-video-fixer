@@ -12,7 +12,7 @@ uv run mypy src/ --ignore-missing-imports
 uv run avf process video.mp4 -p 1080p60   # CLI entry
 ```
 
-CI runs: `ruff check` -> `ruff format --check` -> `mypy` -> `pytest tests/unit/` -> `pytest -m integration` (3.12 only).
+CI runs: `ruff check` -> `ruff format --check` -> `mypy` -> `pytest tests/unit/` -> `pytest -m integration` (3.14 only).
 
 ## Architecture
 
