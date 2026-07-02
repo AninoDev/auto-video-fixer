@@ -26,7 +26,7 @@ This project follows the [Contributor Covenant](https://www.contributor-covenant
 
 ### Prerequisites
 
-- Python 3.10 or higher
+- Python 3.14 or higher
 - FFmpeg (installed and in PATH)
 - Git
 - uv (package manager)
@@ -519,7 +519,7 @@ What actually happened.
 
 **Environment**
 - OS: [e.g., Ubuntu 22.04]
-- Python: [e.g., 3.11]
+- Python: [e.g., 3.14]
 - FFmpeg: [e.g., 5.1]
 - Auto Video Fixer: [e.g., 0.1.0]
 

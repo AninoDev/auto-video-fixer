@@ -20,7 +20,7 @@
 
 Before installing Auto Video Fixer, ensure you have:
 
-- **Python 3.10 or higher**
+- **Python 3.14 or higher**
 - **FFmpeg** (must be installed and in your PATH)
 - **Git** (for cloning the repository)
 - **PyTorch** (optional, for AI upscaling/interpolation) - install with `uv pip install "auto-video-fixer[ai]"`

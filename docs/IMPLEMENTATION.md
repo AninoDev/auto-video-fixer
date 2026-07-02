@@ -7,7 +7,7 @@ This document outlines the detailed implementation plan for Auto Video Fixer, br
 ## Architecture Decisions
 
 ### Technology Stack
-- **Language**: Python 3.10+
+- **Language**: Python 3.14+
 - **GUI**: PySide6 (Qt for Python)
 - **CLI**: Click + Rich
 - **Video Processing**: FFmpeg (subprocess)

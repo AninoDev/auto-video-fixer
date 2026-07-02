@@ -11,7 +11,7 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        python-version: ["3.10", "3.11", "3.12"]
+        python-version: ["3.14"]
 
     steps:
     - uses: actions/checkout@v4
@@ -50,13 +50,13 @@ jobs:
         uv run pytest tests/unit/ -v -m "not integration"
 
     - name: Run integration tests
-      if: matrix.python-version == '3.12'
+      if: matrix.python-version == '3.14'
       run: |
         uv run pytest tests/ -v -m "integration"
 
     - name: Upload coverage
       uses: codecov/codecov-action@v4
-      if: matrix.python-version == '3.12'
+      if: matrix.python-version == '3.14'
       with:
         file: ./coverage.xml
         flags: unittests
@@ -72,7 +72,7 @@ jobs:
     - name: Set up Python
       uses: actions/setup-python@v5
       with:
-        python-version: "3.12"
+        python-version: "3.14"
 
     - name: Install uv
       uses: astral-sh/setup-uv@v3

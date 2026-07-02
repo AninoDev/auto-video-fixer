@@ -27,6 +27,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 - Initial release
+- Raised minimum supported Python version to 3.14
 
 ### Fixed
 - Debounce filter compatibility across FFmpeg versions
