@@ -450,6 +450,7 @@ class Pipeline:
                         current_path,
                         stage_output,
                         progress_callback=progress_cb,
+                        input_info=input_info,
                         **overrides,
                     )
                 except Exception as e:

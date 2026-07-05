@@ -91,6 +91,7 @@ class BaseStage(ABC):
         input_path: str,
         output_path: str | None = None,
         progress_callback: Callable[[float, str], None] | None = None,
+        input_info: dict | None = None,
         **kwargs: Any,
     ) -> StageResult:
         """Execute the processing stage on the input file.
