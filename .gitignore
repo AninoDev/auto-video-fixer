@@ -79,3 +79,6 @@ logs/
 # Test frames
 frame_*.png
 frame_*.jpg
+
+# Agent Session Exports
+/????-??-??-*.txt
