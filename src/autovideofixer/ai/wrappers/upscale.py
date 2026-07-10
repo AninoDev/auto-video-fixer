@@ -291,8 +291,20 @@ class RealESRGANUpscaler:
         if self._use_fp16:
             output = output.float()
 
-        # Model already handles upscaling, so don't pass scale to frame_from_tensor
-        result = frame_from_tensor(output, scale=1.0)
+        # RRDBNet.forward() always performs a fixed native 4x spatial
+        # upsample (two hardcoded nn.functional.interpolate(scale_factor=2)
+        # stages) regardless of self.scale -- unlike the official BasicSR
+        # RRDBNet, this implementation has no pixel-unshuffle preprocessing
+        # to make forward() natively honor arbitrary scale values. That
+        # meant callers requesting scale=1 (deblock/denoise_video: expect
+        # same-resolution output) or scale=2 (multi-pass upscale chaining)
+        # silently got genuine 4x output instead -- e.g. denoising a
+        # 640x360 clip produced a 2560x1440 result. Correct for it by
+        # resizing the model's native 4x output down/up to the actually
+        # requested scale before returning.
+        native_forward_scale = 4
+        correction = self.scale / native_forward_scale
+        result = frame_from_tensor(output, scale=correction)
         return result
 
     def upscale_video(

@@ -36,6 +36,12 @@ class QualityResult:
     # has something meaningful to compare against `target` in TARGET mode --
     # without this, `.score` would fall back to vmaf_score=0.0 for that path.
     score_override: float | None = None
+    # True when the underlying ffmpeg comparison itself failed (nonzero exit,
+    # unparseable output, exception) rather than genuinely measuring a low-quality
+    # score. Distinguishes "we don't know" from "we measured 0.0" -- callers
+    # should surface this as a measurement failure, not a failed quality gate
+    # (see `details["error"]` for the reason).
+    measurement_failed: bool = False
 
     def __post_init__(self):
         if self.details is None:
@@ -135,6 +141,7 @@ def estimate_quality_vmaf(
             return QualityResult(
                 vmaf_score=0.0,
                 details={"error": "VMAF computation failed", "stderr": result.stderr[-2000:]},
+                measurement_failed=True,
             )
 
         scores = _parse_vmaf_json(json_path)
@@ -142,6 +149,7 @@ def estimate_quality_vmaf(
             return QualityResult(
                 vmaf_score=0.0,
                 details={"error": "Could not parse VMAF output", "stderr": result.stderr[-2000:]},
+                measurement_failed=True,
             )
 
         return QualityResult(
@@ -156,6 +164,7 @@ def estimate_quality_vmaf(
         return QualityResult(
             vmaf_score=0.0,
             details={"error": str(e)},
+            measurement_failed=True,
         )
     finally:
         if json_path and os.path.exists(json_path):
@@ -259,8 +268,14 @@ def estimate_ssim_psnr(
 
     try:
         dist_info = probe(distorted)
-        dist_w = dist_info.streams[0].width if dist_info.streams else 0
-        dist_h = dist_info.streams[0].height if dist_info.streams else 0
+        # Use the video stream specifically, not streams[0] -- for containers
+        # where an audio stream is muxed first, streams[0] would be audio (width/
+        # height 0), silently producing the same "no scale" fallback below and
+        # re-triggering the exact dimension-mismatch failure this scaling exists
+        # to avoid.
+        dist_video = dist_info.video_stream
+        dist_w = dist_video.width if dist_video else 0
+        dist_h = dist_video.height if dist_video else 0
     except Exception:
         dist_w = dist_h = 0
 
@@ -291,6 +306,7 @@ def estimate_ssim_psnr(
                 mode=mode,
                 target=target or 0.0,
                 details={"error": "PSNR/SSIM computation failed", "stderr": result.stderr[-2000:]},
+                measurement_failed=True,
             )
 
         scores = _parse_ssim_psnr_stderr(result.stderr)
@@ -299,6 +315,7 @@ def estimate_ssim_psnr(
                 mode=mode,
                 target=target or 0.0,
                 details={"error": "Could not parse PSNR/SSIM output"},
+                measurement_failed=True,
             )
 
         ssim = scores.get("ssim", 0.0)
@@ -317,6 +334,7 @@ def estimate_ssim_psnr(
             mode=mode,
             target=target or 0.0,
             details={"error": str(e)},
+            measurement_failed=True,
         )
 
 

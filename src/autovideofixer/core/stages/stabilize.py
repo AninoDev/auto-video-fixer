@@ -673,8 +673,8 @@ class StabilizeStage(BaseStage):
             decode_stderr = b"".join(decode_stderr_chunks)
             transform_stderr = b"".join(transform_stderr_chunks)
 
-            decode_stderr_text = decode_stderr[:500].decode(errors="replace")
-            transform_stderr_text = transform_stderr[:500].decode(errors="replace")
+            decode_stderr_text = decode_stderr[:5000].decode(errors="replace")
+            transform_stderr_text = transform_stderr[:5000].decode(errors="replace")
 
             if decode_proc.returncode != 0:
                 self.logger.error(f"Decode failed: {decode_stderr_text}")

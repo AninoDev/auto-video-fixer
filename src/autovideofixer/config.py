@@ -43,6 +43,8 @@ class Config:
     DEFAULTS: dict[str, Any] = {
         "general": {
             "output_dir": None,  # None means same as input
+            "output_container": "mp4",  # extension for auto-generated output filenames
+            # ("mp4" or ".mp4"); None/empty keeps the input's own extension.
             "temp_dir": None,
             "max_concurrent_jobs": 1,
             "log_level": "INFO",

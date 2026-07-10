@@ -435,17 +435,23 @@ def generate_temp_path(
     original_path: str,
     suffix: str = "_proc",
     temp_dir: str | None = None,
+    ext: str = ".mkv",
 ) -> str:
     """Generate a safe temporary file path for intermediate processing.
 
     Uses ``temp_dir`` (typically sourced from config's ``general.temp_dir``) when
     provided; otherwise falls back to the input file's own directory, or ``base_dir``.
+
+    Always defaults to a ``.mkv`` extension regardless of the input container:
+    intermediate stages hardcode codecs (e.g. libx264) that aren't valid in every
+    container (e.g. WebM only permits VP8/VP9+Opus/Vorbis), so re-using the input's
+    extension for intermediates can make ffmpeg reject the output outright. MKV can
+    hold essentially any codec, so it's a safe universal intermediate container.
     """
     import uuid
 
     base = temp_dir or os.path.dirname(original_path) or base_dir
     os.makedirs(base, exist_ok=True)
-    ext = os.path.splitext(original_path)[1]
     return os.path.join(base, f".avf_{uuid.uuid4().hex[:8]}{suffix}{ext}")
 
 

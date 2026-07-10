@@ -89,11 +89,17 @@ def scan_directory(
     if recursive:
         for root, _dirs, files in os.walk(directory):
             for f in sorted(files):
+                if f.startswith("."):
+                    # Skip hidden files, including orphaned ".avf_*" intermediate
+                    # temp files that pipeline.py writes next to the input.
+                    continue
                 full = os.path.join(root, f)
                 if is_video_file(full):
                     videos.append(full)
     else:
         for f in sorted(os.listdir(directory)):
+            if f.startswith("."):
+                continue
             full = os.path.join(directory, f)
             if is_video_file(full):
                 videos.append(full)

@@ -9,11 +9,24 @@ summary-line format, captured live against `local_test_videos/` fixtures:
 
 from unittest.mock import MagicMock, patch
 
+from autovideofixer.core.ffmpeg_utils import ProbeResult, StreamInfo
 from autovideofixer.core.quality import (
     QualityResult,
     _parse_ssim_psnr_stderr,
     estimate_ssim_psnr,
 )
+
+
+def _fake_probe_result(width: int, height: int, video_stream_index: int = 0) -> ProbeResult:
+    """Build a ProbeResult whose video stream isn't necessarily streams[0], to
+    mirror containers that mux an audio stream before the video stream."""
+    streams = []
+    for i in range(video_stream_index):
+        streams.append(StreamInfo(index=i, codec_type="audio"))
+    streams.append(
+        StreamInfo(index=video_stream_index, codec_type="video", width=width, height=height)
+    )
+    return ProbeResult(filepath="dist.mp4", filename="dist.mp4", streams=streams)
 
 
 class TestParseSsimPsnr:
@@ -118,6 +131,89 @@ class TestEstimateSsimPsnr:
 
         result = estimate_ssim_psnr("ref.mp4", "dist.mp4")
         assert "error" in result.details
+
+    @patch("autovideofixer.core.ffmpeg_utils.probe")
+    @patch("autovideofixer.core.quality.run_ffmpeg")
+    def test_mismatched_resolution_scales_reference_to_output(self, mock_run, mock_probe):
+        """Regression test: comparing an upscaled output against its original
+        reference must scale the reference to the output's resolution in the
+        filter graph, or ffmpeg rejects the comparison with a dimension mismatch
+        (surfacing as a fake 0.0 score via the pre-fix code path)."""
+        mock_probe.return_value = _fake_probe_result(3840, 2160)
+        mock_result = MagicMock()
+        mock_result.returncode = 0
+        mock_result.stderr = (
+            "[Parsed_psnr_2 @ 0x1] PSNR y:44.0 u:45.0 v:45.0 average:45.0 min:44.0 max:46.0\n"
+            "[Parsed_ssim_3 @ 0x1] SSIM Y:0.975 (16.0) U:0.98 (17.0) V:0.98 (17.0) "
+            "All:0.980 (17.0)\n"
+        )
+        mock_run.return_value = mock_result
+
+        result = estimate_ssim_psnr("ref_1080p.mp4", "dist_4k.mp4")
+
+        assert result.measurement_failed is False
+        assert result.psnr == 45.0
+        cmd = mock_run.call_args[0][0]
+        filter_complex = cmd[cmd.index("-filter_complex") + 1]
+        assert "scale=3840:2160" in filter_complex
+        # Reference (input 0) is what gets scaled, not the distorted output.
+        assert filter_complex.startswith("[0:v]scale=3840:2160")
+
+    @patch("autovideofixer.core.ffmpeg_utils.probe")
+    def test_uses_video_stream_not_streams_index_zero(self, mock_probe):
+        """A container where an audio stream is muxed before the video stream
+        must still pick up the video stream's dimensions, not silently fall back
+        to the no-scale filter (streams[0] would be audio: width/height 0)."""
+        mock_probe.return_value = _fake_probe_result(1280, 720, video_stream_index=1)
+
+        with patch("autovideofixer.core.quality.run_ffmpeg") as mock_run:
+            mock_result = MagicMock()
+            mock_result.returncode = 0
+            mock_result.stderr = (
+                "[Parsed_psnr_2 @ 0x1] PSNR y:40.0 u:41.0 v:41.0 "
+                "average:41.0 min:40.0 max:42.0\n"
+                "[Parsed_ssim_3 @ 0x1] SSIM Y:0.9 (10.0) U:0.9 (10.0) V:0.9 (10.0) "
+                "All:0.900 (10.0)\n"
+            )
+            mock_run.return_value = mock_result
+
+            estimate_ssim_psnr("ref.mp4", "dist.mkv")
+
+            cmd = mock_run.call_args[0][0]
+            filter_complex = cmd[cmd.index("-filter_complex") + 1]
+            assert "scale=1280:720" in filter_complex
+
+    @patch("autovideofixer.core.quality.run_ffmpeg")
+    def test_measurement_failed_flag_set_on_nonzero_exit(self, mock_run):
+        mock_result = MagicMock()
+        mock_result.returncode = 1
+        mock_result.stderr = "Width and height of input videos must be same\n"
+        mock_run.return_value = mock_result
+
+        result = estimate_ssim_psnr("ref.mp4", "dist.mp4", target=95.0)
+
+        assert result.measurement_failed is True
+        # A failed measurement must not read as a genuine 0.0 quality score.
+        assert result.score == 0.0
+        assert result.meets_target() is False
+
+    @patch("autovideofixer.core.quality.run_ffmpeg", side_effect=RuntimeError("boom"))
+    def test_measurement_failed_flag_set_on_exception(self, mock_run):
+        result = estimate_ssim_psnr("ref.mp4", "dist.mp4")
+        assert result.measurement_failed is True
+
+    @patch("autovideofixer.core.quality.run_ffmpeg")
+    def test_measurement_failed_flag_set_on_unparseable_output(self, mock_run):
+        mock_result = MagicMock()
+        mock_result.returncode = 0
+        mock_result.stderr = "no metrics here\n"
+        mock_run.return_value = mock_result
+
+        result = estimate_ssim_psnr("ref.mp4", "dist.mp4")
+        assert result.measurement_failed is True
+
+    def test_measurement_succeeded_flag_false_by_default(self):
+        assert QualityResult().measurement_failed is False
 
 
 class TestQualityResult:

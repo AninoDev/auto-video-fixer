@@ -181,9 +181,20 @@ class TestPathGeneration:
 
         temp_path = generate_temp_path(str(tmp_path), input_path, suffix="_test")
 
-        assert temp_path.endswith("_test.mp4")
+        # Intermediate temp files always use .mkv regardless of the input's
+        # container, since stages hardcode codecs that aren't valid in every
+        # container (e.g. libx264 in a .webm/VP9 container).
+        assert temp_path.endswith("_test.mkv")
         assert str(tmp_path) in temp_path
         assert ".avf_" in temp_path
+
+    def test_generate_temp_path_webm_input_still_mkv(self, tmp_path):
+        """A .webm input's intermediate temp path must not inherit .webm."""
+        input_path = str(tmp_path / "input.webm")
+
+        temp_path = generate_temp_path(str(tmp_path), input_path)
+
+        assert temp_path.endswith(".mkv")
 
     def test_generate_temp_path_uniqueness(self, tmp_path):
         """Test that generated paths are unique."""

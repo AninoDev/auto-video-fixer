@@ -62,6 +62,16 @@ class BaseStage(ABC):
         self.config = config
         self._stage_config = config.get("stages", self.name, default={})
         self._logger = None
+        # Set by Pipeline.execute_job() on stage instances belonging to a job whose
+        # stage list was explicitly requested (e.g. CLI --stage), as opposed to
+        # auto-determined/preset-derived. --stage's help text says it "replaces the
+        # preset/auto-determined list", so a stage the user explicitly named must
+        # run even if stages.<name>.enabled is False in config -- otherwise
+        # should_run() silently skips it as "Stage disabled in configuration",
+        # contradicting the CLI's documented behavior. Auto-determined/preset stage
+        # lists are unaffected: they never set this, so is_enabled() keeps honoring
+        # the config flag exactly as before.
+        self._force_enabled = False
 
     @property
     def logger(self):
@@ -72,7 +82,13 @@ class BaseStage(ABC):
         return self._logger
 
     def is_enabled(self) -> bool:
-        """Check if this stage is enabled in config."""
+        """Check if this stage is enabled in config.
+
+        Always True when the stage was explicitly requested by name (see
+        ``_force_enabled``), regardless of the ``enabled`` config flag.
+        """
+        if self._force_enabled:
+            return True
         return self._stage_config.get("enabled", True)
 
     def should_run(self, input_info: dict[str, Any]) -> tuple[bool, str | None]:

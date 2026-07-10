@@ -188,126 +188,136 @@ class DenoiseVideoStage(BaseStage):
             except Exception:
                 fps = 30.0
 
+            # The temp file's extension must NOT be derived from the input's
+            # extension: frames_to_video()/StreamingVideoWriter always mux
+            # with codec="libx264" (H.264), which webm/mkv/etc. containers
+            # can't hold -- so e.g. a .webm input produced a
+            # ".avf_denoise_test.webm" temp target that ffmpeg then failed
+            # to write into. ".mp4" always matches the actual codec being
+            # written, regardless of input container.
             temp_path = _os.path.join(
                 _os.path.dirname(input_path) or ".",
-                f".avf_denoise_{_os.path.basename(input_path)}",
+                f".avf_denoise_{_os.path.splitext(_os.path.basename(input_path))[0]}.mp4",
             )
 
-            if use_chunked:
-                chunk_size = 25
-                writer = StreamingVideoWriter(temp_path, fps=fps)
-                processed = 0
-                frames_written = 0
-
-                def cb(current, total, msg):
-                    self._report_progress(
-                        0.1 + (processed / total_est) * 0.9, msg, progress_callback
-                    )
-
-                for chunk in proc.stream_frames(
-                    input_path, chunk_size=chunk_size, max_frames=total_est
-                ):
-                    chunk_denoised = upscaler.upscale_video(chunk, progress_callback=cb)
-                    # Write each chunk's output straight to the ffmpeg pipe
-                    # instead of buffering the whole video's frames in memory.
-                    writer.write(chunk_denoised)
-                    frames_written += len(chunk_denoised)
-                    processed += len(chunk)
-
-                    self._report_progress(
-                        0.1 + (processed / total_est) * 0.9,
-                        "Denoising chunk...",
-                        progress_callback,
-                    )
-                proc.close()
-                write_ok = writer.close()
-
-                if frames_written == 0:
-                    return StageResult(
-                        status=StageStatus.FAILED,
-                        error="No frames produced by denoiser",
-                        duration_sec=time.time() - start,
-                    )
-                if not write_ok:
-                    if _os.path.exists(temp_path):
-                        _os.unlink(temp_path)
-                    return StageResult(
-                        status=StageStatus.FAILED,
-                        error="Failed to write denoised frames to temp file",
-                        duration_sec=time.time() - start,
-                    )
-            else:
-                frames = proc.extract_frames(input_path)
-                proc.close()
-
-                if not frames:
-                    return StageResult(
-                        status=StageStatus.FAILED,
-                        error="No frames extracted from input video",
-                        duration_sec=time.time() - start,
-                    )
-
-                def cb(current, total, msg):
-                    self._report_progress(0.1 + (current / total) * 0.9, msg, progress_callback)
-
-                denoised = upscaler.upscale_video(frames, progress_callback=cb)
-
-                if not denoised:
-                    return StageResult(
-                        status=StageStatus.FAILED,
-                        error="No frames produced by denoiser",
-                        duration_sec=time.time() - start,
-                    )
-
-                proc2 = FrameProcessor()
-                if not proc2.frames_to_video(denoised, temp_path, fps=fps):
-                    proc2.close()
-                    return StageResult(
-                        status=StageStatus.FAILED,
-                        error="Failed to write denoised frames to temp file",
-                        duration_sec=time.time() - start,
-                    )
-                proc2.close()
-                frames_written = len(denoised)
-
-            # Mux processed video back with the original audio (if any). The
-            # input may have no audio stream at all - mapping "0:a:0"
-            # unconditionally would make ffmpeg fail, and NOT checking the
-            # return code here used to mean that failure (e.g. on any
-            # silent/muted input) was reported as a successful COMPLETED
-            # stage with the only rendered output already deleted.
             try:
-                has_audio = probe(input_path).has_audio
-            except Exception:
-                has_audio = False
+                if use_chunked:
+                    chunk_size = 25
+                    writer = StreamingVideoWriter(temp_path, fps=fps)
+                    processed = 0
+                    frames_written = 0
 
-            mux_args = ["-i", input_path, "-i", temp_path]
-            mux_args += ["-map", "0:a:0", "-map", "1:v:0"] if has_audio else ["-map", "1:v:0"]
-            mux_args += ["-c:v", "libx264", "-crf", "18", "-c:a", "copy", "-y", output_path]
-            mux_result = run_ffmpeg(mux_args, timeout=600)
+                    def cb(current, total, msg):
+                        self._report_progress(
+                            0.1 + (processed / total_est) * 0.9, msg, progress_callback
+                        )
 
-            # Clean up temp file
-            if _os.path.exists(temp_path):
-                _os.unlink(temp_path)
+                    for chunk in proc.stream_frames(
+                        input_path, chunk_size=chunk_size, max_frames=total_est
+                    ):
+                        chunk_denoised = upscaler.upscale_video(chunk, progress_callback=cb)
+                        # Write each chunk's output straight to the ffmpeg pipe
+                        # instead of buffering the whole video's frames in memory.
+                        writer.write(chunk_denoised)
+                        frames_written += len(chunk_denoised)
+                        processed += len(chunk)
 
-            if mux_result.returncode != 0:
+                        self._report_progress(
+                            0.1 + (processed / total_est) * 0.9,
+                            "Denoising chunk...",
+                            progress_callback,
+                        )
+                    proc.close()
+                    write_ok = writer.close()
+
+                    if frames_written == 0:
+                        return StageResult(
+                            status=StageStatus.FAILED,
+                            error="No frames produced by denoiser",
+                            duration_sec=time.time() - start,
+                        )
+                    if not write_ok:
+                        return StageResult(
+                            status=StageStatus.FAILED,
+                            error="Failed to write denoised frames to temp file",
+                            duration_sec=time.time() - start,
+                        )
+                else:
+                    frames = proc.extract_frames(input_path)
+                    proc.close()
+
+                    if not frames:
+                        return StageResult(
+                            status=StageStatus.FAILED,
+                            error="No frames extracted from input video",
+                            duration_sec=time.time() - start,
+                        )
+
+                    def cb(current, total, msg):
+                        self._report_progress(0.1 + (current / total) * 0.9, msg, progress_callback)
+
+                    denoised = upscaler.upscale_video(frames, progress_callback=cb)
+
+                    if not denoised:
+                        return StageResult(
+                            status=StageStatus.FAILED,
+                            error="No frames produced by denoiser",
+                            duration_sec=time.time() - start,
+                        )
+
+                    proc2 = FrameProcessor()
+                    if not proc2.frames_to_video(denoised, temp_path, fps=fps):
+                        proc2.close()
+                        return StageResult(
+                            status=StageStatus.FAILED,
+                            error="Failed to write denoised frames to temp file",
+                            duration_sec=time.time() - start,
+                        )
+                    proc2.close()
+                    frames_written = len(denoised)
+
+                # Mux processed video back with the original audio (if any).
+                # The input may have no audio stream at all - mapping
+                # "0:a:0" unconditionally would make ffmpeg fail, and NOT
+                # checking the return code here used to mean that failure
+                # (e.g. on any silent/muted input) was reported as a
+                # successful COMPLETED stage with the only rendered output
+                # already deleted.
+                try:
+                    has_audio = probe(input_path).has_audio
+                except Exception:
+                    has_audio = False
+
+                mux_args = ["-i", input_path, "-i", temp_path]
+                mux_args += ["-map", "0:a:0", "-map", "1:v:0"] if has_audio else ["-map", "1:v:0"]
+                mux_args += ["-c:v", "libx264", "-crf", "18", "-c:a", "copy", "-y", output_path]
+                mux_result = run_ffmpeg(mux_args, timeout=600)
+
+                if mux_result.returncode != 0:
+                    return StageResult(
+                        status=StageStatus.FAILED,
+                        error=f"Failed to finalize denoised output: {mux_result.stderr[:2000]}",
+                        duration_sec=time.time() - start,
+                    )
+
+                self._report_progress(1.0, "AI denoising complete", progress_callback)
                 return StageResult(
-                    status=StageStatus.FAILED,
-                    error=f"Failed to finalize denoised output: {mux_result.stderr[:2000]}",
+                    status=StageStatus.COMPLETED,
+                    output_path=output_path,
+                    metadata={
+                        "method": "ai",
+                        "model": self._stage_config.get("ai_model", "RealESRGAN_x4plus"),
+                        "frames_processed": frames_written,
+                    },
                     duration_sec=time.time() - start,
                 )
-
-            self._report_progress(1.0, "AI denoising complete", progress_callback)
-            return StageResult(
-                status=StageStatus.COMPLETED,
-                output_path=output_path,
-                metadata={
-                    "method": "ai",
-                    "model": self._stage_config.get("ai_model", "RealESRGAN_x4plus"),
-                    "frames_processed": frames_written,
-                },
-                duration_sec=time.time() - start,
-            )
+            finally:
+                # Always remove the internal temp file, on both the success
+                # and failure paths -- previously several early-return
+                # failure paths skipped cleanup entirely, orphaning a
+                # partial temp file next to the input video.
+                if _os.path.exists(temp_path):
+                    _os.unlink(temp_path)
 
         except Exception as e:
             self.logger.error(f"AI denoising failed: {e}")

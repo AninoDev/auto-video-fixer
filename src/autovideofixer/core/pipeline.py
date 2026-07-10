@@ -8,6 +8,7 @@ intelligent stage selection based on input/output requirements.
 from __future__ import annotations
 
 import os
+import shutil
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Callable
@@ -146,6 +147,11 @@ class Pipeline:
             output_dir = self.config.get("general", "output_dir", default=None)
             base_name = os.path.basename(input_path)
             stem, ext = os.path.splitext(base_name)
+            output_container = self.config.get("general", "output_container", default=None)
+            if output_container:
+                ext = (
+                    output_container if output_container.startswith(".") else f".{output_container}"
+                )
             output_filename = f"{stem}_enhanced{ext}"
             if output_dir:
                 output_path = os.path.join(output_dir, output_filename)
@@ -313,6 +319,14 @@ class Pipeline:
         """
         self._cancel_requested = False
 
+        # A caller-provided (e.g. CLI --stage) job.stages means the user is
+        # explicitly naming which stages to run, replacing the preset/auto-determined
+        # list -- captured before auto-determination fills job.stages in, so this
+        # stays False for the preset/default path. Threaded onto each stage instance
+        # below so should_run() bypasses that stage's `enabled: false` config instead
+        # of silently skipping a stage the user explicitly asked for.
+        explicit_stage_request = bool(job.stages)
+
         # Determine stages if not specified
         if not job.stages:
             job.stages = self.auto_determine_stages(job)
@@ -398,111 +412,159 @@ class Pipeline:
 
         temp_dir = self.config.get("general", "temp_dir", default=None)
 
+        # Every path generate_temp_path() hands out during this job, tracked
+        # independently of StageResult so a FAILED stage (which typically returns
+        # no output_path) doesn't leave its partial temp file orphaned next to the
+        # user's source video, and so cleanup still runs on cancel.
+        generated_temp_paths: list[str] = []
+
+        # Whether the surviving-intermediate fallback below (final_output_path =
+        # current_path) got moved onto job.output_path. Guards the outer finally's
+        # cleanup-safety-net from deleting a temp file that was already promoted
+        # (moved, not copied) to the user-visible output path.
+        promoted_output = False
+
         try:
-            for i, stage_name in enumerate(stage_names):
-                if self._cancel_requested:
-                    job.status = PipelineStatus.CANCELLED
-                    break
-
-                stage = create_stage(stage_name, self.config)
-                if stage is None:
-                    # Already filtered above; defensive only.
-                    skipped.append(stage_name)
-                    continue
-
-                # Check if stage should run
-                should_run, reason = stage.should_run(input_info)
-                if not should_run:
-                    self.logger.info(f"Skipping {stage_name}: {reason}")
-                    skipped.append(stage_name)
-                    stage_results[stage_name] = StageResult(
-                        status=StageStatus.SKIPPED,
-                        skipped_reason=reason,
-                    )
-                    continue
-
-                # Apply per-stage overrides
-                overrides = job.stage_overrides.get(stage_name, {})
-
-                # Determine output path for this stage
-                is_last = i == len(stage_names) - 1
-                if is_last:
-                    stage_output = job.output_path
-                else:
-                    stage_output = generate_temp_path(
-                        os.path.dirname(job.input_path),
-                        job.input_path,
-                        suffix=f"_{stage_name}",
-                        temp_dir=temp_dir,
-                    )
-
-                job.current_stage = stage_name
-                self.logger.info(f"Running stage: {stage_name}")
-
-                # Execute stage with progress
-                def progress_cb(prog, msg, _i=i, _n=len(stage_names)):
-                    job.progress = (_i + prog) / _n
-                    if progress_callback:
-                        progress_callback(job, job.progress, msg)
-
-                try:
-                    result = stage.execute(
-                        current_path,
-                        stage_output,
-                        progress_callback=progress_cb,
-                        input_info=input_info,
-                        **overrides,
-                    )
-                except Exception as e:
-                    self.logger.exception(f"Stage {stage_name} raised an unexpected exception")
-                    result = StageResult(status=StageStatus.FAILED, error=str(e))
-
-                stage_results[stage_name] = result
-
-                if result.status == StageStatus.FAILED:
-                    errors.append(f"{stage_name}: {result.error}")
-                    self.logger.error(f"Stage {stage_name} failed: {result.error}")
-                    if self.config.get("pipeline", "skip_stage_on_error", default=True):
-                        # Continue with next stage using original input
-                        self.logger.info(f"Continuing pipeline after {stage_name} failure")
-                    else:
-                        self.logger.error(f"Stopping pipeline: {stage_name} failed")
+            try:
+                for i, stage_name in enumerate(stage_names):
+                    if self._cancel_requested:
+                        job.status = PipelineStatus.CANCELLED
                         break
-                else:
-                    if result.output_path:
-                        current_path = result.output_path
-                    elif result.status == StageStatus.COMPLETED and stage.produces_output:
-                        self.logger.warning(
-                            f"Stage {stage_name} reported COMPLETED with no output_path; "
-                            "treating as failed"
-                        )
-                        result.status = StageStatus.FAILED
-                        result.error = result.error or "Stage completed without an output_path"
-                        errors.append(f"{stage_name}: {result.error}")
-        finally:
-            total_time = __import__("time").time() - start_time
-            # Clean up temp files regardless of how the loop above exited.
-            if not self._cancel_requested:
-                self._cleanup_temp_files(stage_names, stage_results, job)
 
-        # Resolve the job's output path: the terminal stage's output, or if that stage
-        # was skipped/failed, fall back to the last successfully-produced path so a
-        # "success" JobResult never carries a None output_path.
-        final_output_path: str | None = None
-        if stage_names:
-            final_result = stage_results.get(stage_names[-1])
-            final_stage = create_stage(stage_names[-1], self.config)
-            if final_result is not None and final_result.output_path:
-                final_output_path = final_result.output_path
-            elif final_result is not None and (
-                final_result.status == StageStatus.SKIPPED
-                or (
-                    final_result.status == StageStatus.COMPLETED
-                    and final_stage is not None
-                    and not final_stage.produces_output
-                )
+                    stage = create_stage(stage_name, self.config)
+                    if stage is None:
+                        # Already filtered above; defensive only.
+                        skipped.append(stage_name)
+                        continue
+                    if explicit_stage_request:
+                        stage._force_enabled = True
+
+                    # Check if stage should run
+                    should_run, reason = stage.should_run(input_info)
+                    if not should_run:
+                        self.logger.info(f"Skipping {stage_name}: {reason}")
+                        skipped.append(stage_name)
+                        stage_results[stage_name] = StageResult(
+                            status=StageStatus.SKIPPED,
+                            skipped_reason=reason,
+                        )
+                        continue
+
+                    # Apply per-stage overrides
+                    overrides = job.stage_overrides.get(stage_name, {})
+
+                    # Determine output path for this stage
+                    is_last = i == len(stage_names) - 1
+                    if is_last:
+                        stage_output = job.output_path
+                    else:
+                        stage_output = generate_temp_path(
+                            os.path.dirname(job.input_path),
+                            job.input_path,
+                            suffix=f"_{stage_name}",
+                            temp_dir=temp_dir,
+                        )
+                        generated_temp_paths.append(stage_output)
+
+                    job.current_stage = stage_name
+                    self.logger.info(f"Running stage: {stage_name}")
+
+                    # Execute stage with progress
+                    def progress_cb(prog, msg, _i=i, _n=len(stage_names)):
+                        job.progress = (_i + prog) / _n
+                        if progress_callback:
+                            progress_callback(job, job.progress, msg)
+
+                    try:
+                        result = stage.execute(
+                            current_path,
+                            stage_output,
+                            progress_callback=progress_cb,
+                            input_info=input_info,
+                            **overrides,
+                        )
+                    except Exception as e:
+                        self.logger.exception(f"Stage {stage_name} raised an unexpected exception")
+                        result = StageResult(status=StageStatus.FAILED, error=str(e))
+
+                    stage_results[stage_name] = result
+
+                    if result.status == StageStatus.FAILED:
+                        errors.append(f"{stage_name}: {result.error}")
+                        self.logger.error(f"Stage {stage_name} failed: {result.error}")
+                        if self.config.get("pipeline", "skip_stage_on_error", default=True):
+                            # Continue with next stage using original input
+                            self.logger.info(f"Continuing pipeline after {stage_name} failure")
+                        else:
+                            self.logger.error(f"Stopping pipeline: {stage_name} failed")
+                            break
+                    else:
+                        if result.output_path:
+                            current_path = result.output_path
+                        elif result.status == StageStatus.COMPLETED and stage.produces_output:
+                            self.logger.warning(
+                                f"Stage {stage_name} reported COMPLETED with no output_path; "
+                                "treating as failed"
+                            )
+                            result.status = StageStatus.FAILED
+                            result.error = result.error or "Stage completed without an output_path"
+                            errors.append(f"{stage_name}: {result.error}")
+            finally:
+                total_time = __import__("time").time() - start_time
+                # Clean up temp files regardless of how the loop above exited, including
+                # on cancel/exception -- a FAILED stage typically returns no output_path,
+                # so relying solely on StageResult.output_path (as the StageResult-based
+                # cleanup below does) leaves its partial temp file orphaned.
+                #
+                # current_path is deliberately kept alive here (not passed for removal):
+                # if the terminal stage was skipped or produced no output, final-output
+                # resolution below falls back to current_path as the job's result, and
+                # it needs to survive long enough to be promoted to job.output_path.
+                self._cleanup_temp_files(stage_names, stage_results, job, keep={current_path})
+                self._cleanup_generated_temp_paths(generated_temp_paths, job, keep={current_path})
+
+            # Resolve the job's output path: the terminal stage's output, or if that stage
+            # was skipped/failed, fall back to the last successfully-produced path so a
+            # "success" JobResult never carries a None output_path.
+            final_output_path: str | None = None
+            if stage_names:
+                final_result = stage_results.get(stage_names[-1])
+                final_stage = create_stage(stage_names[-1], self.config)
+                if final_result is not None and final_result.output_path:
+                    final_output_path = final_result.output_path
+                elif final_result is not None and (
+                    final_result.status == StageStatus.SKIPPED
+                    or (
+                        final_result.status == StageStatus.COMPLETED
+                        and final_stage is not None
+                        and not final_stage.produces_output
+                    )
+                ):
+                    final_output_path = current_path
+
+            # The fallback above can resolve to a surviving intermediate temp file
+            # (e.g. terminal stage skipped after an earlier stage completed). That
+            # temp file was kept alive through cleanup above specifically so it can
+            # be promoted here to the user-visible job.output_path -- otherwise the
+            # JobResult would report a path that either doesn't exist (it would have
+            # been deleted as a temp file) or never reaches the location the caller
+            # asked for.
+            if (
+                final_output_path is not None
+                and final_output_path in generated_temp_paths
+                and final_output_path != job.output_path
             ):
-                final_output_path = current_path
+                self._promote_temp_to_output(final_output_path, job.output_path)
+                final_output_path = job.output_path
+                promoted_output = True
+        finally:
+            # Safety net: if we exited the block above (return or exception) without
+            # promoting current_path, and it's a temp file we deliberately kept alive
+            # through the cleanup above, it's now a genuine orphan -- remove it. Runs
+            # even if an exception propagated out of the stage loop or the promotion
+            # step itself.
+            if not promoted_output and current_path in generated_temp_paths:
+                self._cleanup_generated_temp_paths([current_path], job)
 
         # Build result
         job_result = JobResult(
@@ -532,13 +594,24 @@ class Pipeline:
                 quality_result = estimate_ssim_psnr(
                     job.input_path, final_output_path, target=target
                 )
-                job_result.quality_score = quality_result.score
-                job_result.quality_meets_target = quality_result.meets_target()
-                if not job_result.quality_meets_target:
+                if quality_result.measurement_failed:
+                    # The ffmpeg comparison itself failed (e.g. couldn't determine
+                    # dimensions, nonzero exit, unparseable output) -- leave
+                    # quality_score/quality_meets_target as "not checked" (None)
+                    # rather than reporting a fake 0.0 score that reads as a
+                    # genuine failing measurement.
+                    reason = quality_result.details.get("error", "unknown error")
                     self.logger.warning(
-                        f"Output quality {quality_result.score:.1f} below target "
-                        f"{target} for {job.input_path}"
+                        f"Quality check could not be measured for {job.input_path}: {reason}"
                     )
+                else:
+                    job_result.quality_score = quality_result.score
+                    job_result.quality_meets_target = quality_result.meets_target()
+                    if not job_result.quality_meets_target:
+                        self.logger.warning(
+                            f"Output quality {quality_result.score:.1f} below target "
+                            f"{target} for {job.input_path}"
+                        )
             except Exception as e:
                 self.logger.warning(f"Quality check failed for {job.input_path}: {e}")
 
@@ -627,6 +700,7 @@ class Pipeline:
         stage_names: list[str],
         stage_results: dict[str, StageResult],
         job: Job,
+        keep: set[str] | None = None,
     ) -> None:
         """Remove intermediate temp files, keep only final output.
 
@@ -634,15 +708,57 @@ class Pipeline:
         written a partial/temp output file before erroring, and with the default
         skip_stage_on_error=True those would otherwise be orphaned permanently next
         to the user's source video.
+
+        ``keep`` paths (e.g. a surviving intermediate that final-output resolution
+        may still promote to job.output_path) are left alone.
         """
+        keep = keep or set()
         for name, result in stage_results.items():
             if result.status in (StageStatus.COMPLETED, StageStatus.FAILED) and result.output_path:
-                if result.output_path != job.output_path:
+                if result.output_path != job.output_path and result.output_path not in keep:
                     if os.path.exists(result.output_path):
                         try:
                             os.remove(result.output_path)
                         except OSError:
                             pass
+
+    def _cleanup_generated_temp_paths(
+        self, paths: list[str], job: Job, keep: set[str] | None = None
+    ) -> None:
+        """Remove every path generate_temp_path() handed out this job.
+
+        Complements ``_cleanup_temp_files`` (which only knows about paths recorded
+        in a COMPLETED/FAILED StageResult): a stage that fails before returning a
+        result, or a job cancelled mid-stage, can still have written a partial temp
+        file to a path we generated. Never removes the job's final output_path.
+
+        ``keep`` paths (e.g. current_path, which final-output resolution may still
+        promote to job.output_path) are left alone.
+        """
+        keep = keep or set()
+        for path in paths:
+            if path == job.output_path or path in keep:
+                continue
+            if os.path.exists(path):
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
+
+    def _promote_temp_to_output(self, temp_path: str, output_path: str) -> None:
+        """Move a surviving intermediate temp file onto the job's final output path.
+
+        Used when the terminal stage was skipped or produced no output but an
+        earlier stage's temp file is the best available result: without this, the
+        unconditional temp cleanup elsewhere would delete the only copy of that
+        output before it ever reached the user-visible output path.
+        """
+        try:
+            os.replace(temp_path, output_path)
+        except OSError:
+            # os.replace can fail across filesystems (EXDEV); shutil.move falls
+            # back to copy+delete in that case.
+            shutil.move(temp_path, output_path)
 
     def generate_report(self, job_result: JobResult) -> str:
         """Generate a human-readable processing report."""

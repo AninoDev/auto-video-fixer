@@ -389,130 +389,142 @@ class UpscaleStage(BaseStage):
             total_est = int(probe_info.frame_count) if probe_info.frame_count else 0
             use_chunked = total_est > 1000
 
+            # The temp file's extension must NOT be derived from output_path's
+            # extension: frames_to_video()/StreamingVideoWriter always mux
+            # with codec="libx264" (H.264), which webm/mkv/etc. containers
+            # can't hold -- so e.g. a .webm output target produced a
+            # ".avf_upscaled_test_enhanced.webm" temp file that ffmpeg then
+            # failed to write into. ".mp4" always matches the actual codec
+            # being written, regardless of the final output's container.
             temp_path = os.path.join(
                 os.path.dirname(output_path) or ".",
-                f".avf_upscaled_{os.path.basename(output_path)}",
+                f".avf_upscaled_{os.path.splitext(os.path.basename(output_path))[0]}.mp4",
             )
 
-            if use_chunked:
-                chunk_size = 25
-                writer = StreamingVideoWriter(temp_path, fps=fps)
-                total_chunks = 0
-                processed_frames = 0
-                frames_written = 0
-
-                def cb(current, total, msg):
-                    self._report_progress(
-                        0.1 + (processed_frames / (total_est * self._scale_factor)) * 0.9,
-                        msg,
-                        progress_callback,
-                    )
-
-                for chunk in proc.stream_frames(
-                    input_path, chunk_size=chunk_size, max_frames=total_est
-                ):
-                    total_chunks += 1
-                    chunk_upscaled = upscaler.upscale_video(chunk, progress_callback=cb)
-                    # Write each chunk's output straight to the ffmpeg pipe
-                    # instead of buffering the whole video's frames in memory.
-                    writer.write(chunk_upscaled)
-                    frames_written += len(chunk_upscaled)
-                    processed_frames += len(chunk)
-
-                    self._report_progress(
-                        0.1 + (processed_frames / (total_est * self._scale_factor)) * 0.9,
-                        f"Processing chunk {total_chunks}...",
-                        progress_callback,
-                    )
-                proc.close()
-                write_ok = writer.close()
-
-                if frames_written == 0:
-                    upscaler.unload()
-                    return StageResult(
-                        status=StageStatus.FAILED,
-                        error="No frames produced",
-                        duration_sec=time.time() - start,
-                    )
-                if not write_ok:
-                    upscaler.unload()
-                    if os.path.exists(temp_path):
-                        os.unlink(temp_path)
-                    return StageResult(
-                        status=StageStatus.FAILED,
-                        error="Failed to write upscaled frames",
-                        duration_sec=time.time() - start,
-                    )
-            else:
-                frames = proc.extract_frames(input_path)
-                proc.close()
-
-                if not frames:
-                    upscaler.unload()
-                    return StageResult(
-                        status=StageStatus.FAILED,
-                        error="No frames extracted",
-                        duration_sec=time.time() - start,
-                    )
-
-                def cb(current, total, msg):
-                    self._report_progress(0.1 + (current / total) * 0.9, msg, progress_callback)
-
-                all_upscaled = upscaler.upscale_video(frames, progress_callback=cb)
-
-                if not all_upscaled:
-                    upscaler.unload()
-                    return StageResult(
-                        status=StageStatus.FAILED,
-                        error="No frames produced",
-                        duration_sec=time.time() - start,
-                    )
-
-                proc2 = FrameProcessor()
-                if not proc2.frames_to_video(all_upscaled, temp_path, fps=fps):
-                    proc2.close()
-                    upscaler.unload()
-                    return StageResult(
-                        status=StageStatus.FAILED,
-                        error="Failed to write frames",
-                        duration_sec=time.time() - start,
-                    )
-                proc2.close()
-
-            # Mux processed video back with the original audio (if any). The
-            # input may have no audio stream at all - mapping "0:a:0"
-            # unconditionally would make ffmpeg fail, and NOT checking the
-            # return code here used to mean that failure (e.g. on any
-            # silent/muted input) was reported as a successful COMPLETED
-            # stage with the only rendered output already deleted.
             try:
-                has_audio = probe(input_path).has_audio
-            except Exception:
-                has_audio = False
+                if use_chunked:
+                    chunk_size = 25
+                    writer = StreamingVideoWriter(temp_path, fps=fps)
+                    total_chunks = 0
+                    processed_frames = 0
+                    frames_written = 0
 
-            mux_args = ["-i", input_path, "-i", temp_path]
-            mux_args += ["-map", "0:a:0", "-map", "1:v:0"] if has_audio else ["-map", "1:v:0"]
-            mux_args += ["-c:v", "libx264", "-crf", "18", "-c:a", "copy", "-y", output_path]
-            mux_result = run_ffmpeg(mux_args, timeout=600)
+                    def cb(current, total, msg):
+                        self._report_progress(
+                            0.1 + (processed_frames / (total_est * self._scale_factor)) * 0.9,
+                            msg,
+                            progress_callback,
+                        )
 
-            if os.path.exists(temp_path):
-                os.unlink(temp_path)
+                    for chunk in proc.stream_frames(
+                        input_path, chunk_size=chunk_size, max_frames=total_est
+                    ):
+                        total_chunks += 1
+                        chunk_upscaled = upscaler.upscale_video(chunk, progress_callback=cb)
+                        # Write each chunk's output straight to the ffmpeg pipe
+                        # instead of buffering the whole video's frames in memory.
+                        writer.write(chunk_upscaled)
+                        frames_written += len(chunk_upscaled)
+                        processed_frames += len(chunk)
 
-            upscaler.unload()
+                        self._report_progress(
+                            0.1 + (processed_frames / (total_est * self._scale_factor)) * 0.9,
+                            f"Processing chunk {total_chunks}...",
+                            progress_callback,
+                        )
+                    proc.close()
+                    write_ok = writer.close()
 
-            if mux_result.returncode != 0:
+                    if frames_written == 0:
+                        upscaler.unload()
+                        return StageResult(
+                            status=StageStatus.FAILED,
+                            error="No frames produced",
+                            duration_sec=time.time() - start,
+                        )
+                    if not write_ok:
+                        upscaler.unload()
+                        return StageResult(
+                            status=StageStatus.FAILED,
+                            error="Failed to write upscaled frames",
+                            duration_sec=time.time() - start,
+                        )
+                else:
+                    frames = proc.extract_frames(input_path)
+                    proc.close()
+
+                    if not frames:
+                        upscaler.unload()
+                        return StageResult(
+                            status=StageStatus.FAILED,
+                            error="No frames extracted",
+                            duration_sec=time.time() - start,
+                        )
+
+                    def cb(current, total, msg):
+                        self._report_progress(0.1 + (current / total) * 0.9, msg, progress_callback)
+
+                    all_upscaled = upscaler.upscale_video(frames, progress_callback=cb)
+
+                    if not all_upscaled:
+                        upscaler.unload()
+                        return StageResult(
+                            status=StageStatus.FAILED,
+                            error="No frames produced",
+                            duration_sec=time.time() - start,
+                        )
+
+                    proc2 = FrameProcessor()
+                    if not proc2.frames_to_video(all_upscaled, temp_path, fps=fps):
+                        proc2.close()
+                        upscaler.unload()
+                        return StageResult(
+                            status=StageStatus.FAILED,
+                            error="Failed to write frames",
+                            duration_sec=time.time() - start,
+                        )
+                    proc2.close()
+
+                # Mux processed video back with the original audio (if any).
+                # The input may have no audio stream at all - mapping
+                # "0:a:0" unconditionally would make ffmpeg fail, and NOT
+                # checking the return code here used to mean that failure
+                # (e.g. on any silent/muted input) was reported as a
+                # successful COMPLETED stage with the only rendered output
+                # already deleted.
+                try:
+                    has_audio = probe(input_path).has_audio
+                except Exception:
+                    has_audio = False
+
+                mux_args = ["-i", input_path, "-i", temp_path]
+                mux_args += ["-map", "0:a:0", "-map", "1:v:0"] if has_audio else ["-map", "1:v:0"]
+                mux_args += ["-c:v", "libx264", "-crf", "18", "-c:a", "copy", "-y", output_path]
+                mux_result = run_ffmpeg(mux_args, timeout=600)
+
+                upscaler.unload()
+
+                if mux_result.returncode != 0:
+                    return StageResult(
+                        status=StageStatus.FAILED,
+                        error=f"Failed to finalize upscaled output: {mux_result.stderr[:2000]}",
+                        duration_sec=time.time() - start,
+                    )
+
                 return StageResult(
-                    status=StageStatus.FAILED,
-                    error=f"Failed to finalize upscaled output: {mux_result.stderr[:2000]}",
+                    status=StageStatus.COMPLETED,
+                    output_path=output_path,
+                    metadata={"method": "ai", "scale": scale_factor},
                     duration_sec=time.time() - start,
                 )
-
-            return StageResult(
-                status=StageStatus.COMPLETED,
-                output_path=output_path,
-                metadata={"method": "ai", "scale": scale_factor},
-                duration_sec=time.time() - start,
-            )
+            finally:
+                # Always remove the internal temp file, on both the success
+                # and failure paths -- previously several early-return
+                # failure paths (e.g. frames_to_video() failing) skipped
+                # cleanup entirely, orphaning a partial temp file next to the
+                # job's output directory.
+                if os.path.exists(temp_path):
+                    os.unlink(temp_path)
 
         except Exception as e:
             return StageResult(

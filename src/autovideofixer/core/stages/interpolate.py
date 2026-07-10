@@ -333,62 +333,83 @@ class InterpolateStage(BaseStage):
                     duration_sec=time.time() - start,
                 )
 
-            # Write interpolated frames to temp file, then use FFmpeg to finalize
+            # Write interpolated frames to temp file, then use FFmpeg to finalize.
+            # Interpolation adds `factor`x more frames covering the SAME time
+            # span as the original clip, so the output must be written at
+            # `factor`x the original fps (i.e. the actual achieved framerate)
+            # to preserve duration. Using the original input's fps here (a
+            # pre-existing bug) kept the frame rate unchanged and instead
+            # stretched the clip's duration by `factor`x.
+            #
+            # The temp file's extension must NOT be derived from the input's
+            # extension: frames_to_video() always muxes with codec="libx264"
+            # (H.264), which webm/mkv/etc. containers can't hold -- so e.g. a
+            # .webm input produced a ".avf_interp_test.webm" temp target that
+            # ffmpeg then failed to write into. ".mp4" always matches the
+            # actual codec being written, regardless of input container.
             temp_path = os.path.join(
                 os.path.dirname(input_path) or ".",
-                f".avf_interp_{os.path.basename(input_path)}",
+                f".avf_interp_{os.path.splitext(os.path.basename(input_path))[0]}.mp4",
             )
-            fps = self._get_input_fps(input_path)
-            proc2 = FrameProcessor()
-            if not proc2.frames_to_video(interpolated, temp_path, fps=fps):
+            try:
+                source_fps = current_fps if current_fps else self._get_input_fps(input_path)
+                fps = source_fps * factor
+                proc2 = FrameProcessor()
+                if not proc2.frames_to_video(interpolated, temp_path, fps=fps):
+                    proc2.close()
+                    return StageResult(
+                        status=StageStatus.FAILED,
+                        error="Failed to write interpolated frames to temp file",
+                        duration_sec=time.time() - start,
+                    )
                 proc2.close()
+
+                # Mux the interpolated video back with the original audio (if
+                # any). Hardcoding "-map 0:a:0" on an audio-less input makes
+                # ffmpeg fail with no output file written; the return code was
+                # previously never checked, so that failure was silently
+                # reported as a completed job after deleting the only rendered
+                # content. Branch on whether an audio stream actually exists.
+                has_audio = probe_info.has_audio
+                mux_args = ["-i", input_path, "-i", temp_path]
+                if has_audio:
+                    mux_args += ["-map", "0:a:0", "-map", "1:v:0"]
+                else:
+                    mux_args += ["-map", "1:v:0"]
+                mux_args += ["-c:v", "libx264", "-crf", "18", "-c:a", "copy", "-y", output_path]
+
+                mux_result = run_ffmpeg(mux_args, timeout=600)
+
+                if mux_result.returncode != 0 or not os.path.exists(output_path):
+                    return StageResult(
+                        status=StageStatus.FAILED,
+                        error=f"Failed to mux interpolated output: {mux_result.stderr[:300]}",
+                        duration_sec=time.time() - start,
+                    )
+
+                self._report_progress(1.0, "AI frame interpolation complete", progress_callback)
+                orig_count = probe_info.frame_count or 0
                 return StageResult(
-                    status=StageStatus.FAILED,
-                    error="Failed to write interpolated frames to temp file",
+                    status=StageStatus.COMPLETED,
+                    output_path=output_path,
+                    metadata={
+                        "method": "ai",
+                        "model": self._ai_model,
+                        "factor": factor,
+                        "frames_in": orig_count,
+                        "frames_out": len(interpolated),
+                    },
                     duration_sec=time.time() - start,
                 )
-            proc2.close()
-
-            # Mux the interpolated video back with the original audio (if
-            # any). Hardcoding "-map 0:a:0" on an audio-less input makes
-            # ffmpeg fail with no output file written; the return code was
-            # previously never checked, so that failure was silently
-            # reported as a completed job after deleting the only rendered
-            # content. Branch on whether an audio stream actually exists.
-            has_audio = probe_info.has_audio
-            mux_args = ["-i", input_path, "-i", temp_path]
-            if has_audio:
-                mux_args += ["-map", "0:a:0", "-map", "1:v:0"]
-            else:
-                mux_args += ["-map", "1:v:0"]
-            mux_args += ["-c:v", "libx264", "-crf", "18", "-c:a", "copy", "-y", output_path]
-
-            mux_result = run_ffmpeg(mux_args, timeout=600)
-
-            if os.path.exists(temp_path):
-                os.unlink(temp_path)
-
-            if mux_result.returncode != 0 or not os.path.exists(output_path):
-                return StageResult(
-                    status=StageStatus.FAILED,
-                    error=f"Failed to mux interpolated output: {mux_result.stderr[:300]}",
-                    duration_sec=time.time() - start,
-                )
-
-            self._report_progress(1.0, "AI frame interpolation complete", progress_callback)
-            orig_count = probe_info.frame_count or 0
-            return StageResult(
-                status=StageStatus.COMPLETED,
-                output_path=output_path,
-                metadata={
-                    "method": "ai",
-                    "model": self._ai_model,
-                    "factor": factor,
-                    "frames_in": orig_count,
-                    "frames_out": len(interpolated),
-                },
-                duration_sec=time.time() - start,
-            )
+            finally:
+                # Always remove the internal temp file, on both the success
+                # and failure paths -- previously this only ran after a
+                # successful frames_to_video() + before the mux-result check,
+                # so any failure before that point (e.g. a codec/container
+                # mismatch) orphaned a partial temp file next to the user's
+                # source video.
+                if os.path.exists(temp_path):
+                    os.unlink(temp_path)
 
         except Exception as e:
             self.logger.error(f"RIFE processing failed: {e}")
