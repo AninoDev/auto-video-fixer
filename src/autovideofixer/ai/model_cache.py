@@ -72,8 +72,17 @@ MODEL_REGISTRY: dict[str, dict[str, Any]] = {
     "RealESRGAN_x2plus": {
         "url": "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.1/RealESRGAN_x2plus.pth",
         "filename": "RealESRGAN_x2plus.pth",
-        "size_mb": 65,
-        "description": "Real-ESRGAN x2 upscaling model",
+        # Verified: sha256sum of the officially-hosted asset downloaded
+        # directly from the URL above.
+        "sha256": "49fafd45f8fd7aa8d31ab2a22d14d91b536c34494a5cfe31eb5d89c2fa266abb",
+        "size_mb": 64,
+        "description": (
+            "Real-ESRGAN x2 upscaling model -- used automatically instead of "
+            "x4plus whenever an upscale pass needs <=2x, so the RRDB body "
+            "(the dominant cost of a forward pass) runs on a proportionally "
+            "smaller feature map instead of computing a native 4x result "
+            "and discarding half the work."
+        ),
         "scale": 2,
     },
     "RealESRGAN_x4plus_anime_6B": {
