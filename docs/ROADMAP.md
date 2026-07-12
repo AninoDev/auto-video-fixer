@@ -50,6 +50,12 @@ draws an explicit VERIFIED / UNVERIFIED line instead of a flat done/not-done che
 - **VFR/YouTube-origin input handling**: `_parse_fps`/stabilize's framerate probing now prefer
   `avg_frame_rate` over `r_frame_rate` ("tbr"), fixing a 2x-speed-then-freeze artifact on VFR
   sources where the two rates diverge; hardened against ffprobe's `"0/0"` undefined-rate value.
+- **VLM (Vision Language Model) classification** — the generic OpenAI-compatible `api` provider
+  (`analysis.vlm.provider: api`) has been run end-to-end against a live llama.cpp server on the
+  LAN (via `analysis.vlm.allow_http`), producing real summary/tags/objects/rating output. Ollama
+  and OpenAI Vision providers share the same request/response code path
+  (`_call_ollama`/`_call_openai` vs. `_call_custom_api`) and are unit-tested
+  (`tests/unit/test_vlm.py`) but have not themselves been run against a live instance/key.
 
 ### Implemented but not independently verified
 
@@ -57,10 +63,6 @@ These have working code paths and existing unit tests, but have not been checked
 against real-world inputs the way the traditional pipeline and the AI upscale/interpolate paths
 above have been. Treat their behavior as "probably correct, unconfirmed" rather than "done":
 
-- **VLM (Vision Language Model) classification** — Ollama, OpenAI Vision, and generic
-  OpenAI-compatible custom-API providers (`analysis.vlm.provider`) are implemented in
-  `core/analysis.py` with unit test coverage (`tests/unit/test_vlm.py`), but have not been run
-  against a live Ollama instance or OpenAI API key as part of this verification pass.
 - **Scene detection quality** — frame-differencing scene-change detection
   (`_detect_scene_changes`) and heuristic event classification exist and are unit-tested
   (`tests/unit/test_scene_detection.py`); detection accuracy/threshold tuning on real footage is

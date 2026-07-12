@@ -231,11 +231,39 @@ Global (before the subcommand):
   separate from `--hwaccel`
 - `--threads N`: sets `general.max_concurrent_jobs`
 
-`avf analyze`:
+`avf analyze PATHS...`: like `process`, accepts multiple files and/or directories (directories
+scanned via `scan_directory`, hidden files skipped) and analyzes each in sequence; a per-file
+failure is logged and skipped, remaining files still run, and the command exits non-zero if any
+failed.
 - `--vlm` / `--no-vlm`: Enable/disable VLM analysis
 - `--events` / `--no-events`: Enable/disable event/scene detection
 - `--classify`: Classify detected events with VLM
 - `--clip DIR` / `--no-clip`: Extract detected scenes as clips to a directory
+- `--recursive, -r`: Scan directories recursively (same as `process`)
+- `--scene-threshold FLOAT`: Override `analysis.event_detection.scene_change_threshold` (default
+  0.15) for this run -- mean fractional per-pixel luma change between consecutive downscaled
+  frames, 0-1; lower is more sensitive (risks false positives from motion/noise), higher only
+  catches hard cuts. See `_detect_scene_changes()` in `core/analysis.py` for the full metric
+  writeup and calibration data (0.3, the previous default, under-detected real footage).
+- `--min-scene-duration FLOAT`: Override `analysis.event_detection.min_scene_duration_sec`
+  (default 2.0) for this run -- doesn't affect cut *detection*, only whether a cut close to the
+  previous one gets its own scene vs. being merged into the next.
+- `--full`: Print the complete, untruncated VLM summary per file in a Rich panel below the table
+  (the table's own "VLM Summary" row is always a truncated preview with a "(use --full for full
+  text)" hint). The full summary is also always written at INFO to the log (auto per-run DEBUG
+  log file always has it; console has it at INFO too unless `--log-level` raises the threshold).
+- `--csv PATH`: Write one row per analyzed video (filepath, filename, duration, resolution,
+  framerate, codec, has_video/has_audio/hdr, scenes_detected, and — when VLM ran — the FULL
+  untruncated summary, `;`-joined tags/objects, and content_rating) to a UTF-8 CSV. Overwrites
+  `PATH` if it exists; does not append across runs.
+- `--prompt-append TEXT`: Extra text appended to the VLM user prompt for this run (overrides
+  `analysis.vlm.prompt_append`) -- e.g. job-specific context like "these are trail-camera clips".
+- `--prompt-override TEXT`: Replace the VLM user prompt entirely for this run (overrides
+  `analysis.vlm.prompt_override`; `--prompt-append`/`prompt_append` still appends after an
+  override). Changing the requested output format away from JSON degrades gracefully --
+  `_parse_vlm_response()`'s fallback treats non-JSON text as the summary (empty tags/objects/
+  rating) instead of erroring. There's no CLI flag for the system prompt -- use
+  `analysis.vlm.system_prompt_override` in config.
 
 Other subcommands: `avf find-duplicates REFERENCE DIRECTORY [--threshold FLOAT]`,
 `avf presets-cmd` (lists presets), `avf gpu-info`, `avf model-info [--model NAME]`,

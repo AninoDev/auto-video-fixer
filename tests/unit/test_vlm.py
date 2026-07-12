@@ -2,11 +2,17 @@
 
 import json
 import os
+import tempfile
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
 
+from autovideofixer.config import Config
 from autovideofixer.core.analysis import (
+    _VLM_SYSTEM_PROMPT,
+    _VLM_USER_PROMPT,
+    VideoAnalyzer,
     _call_custom_api,
     _call_ollama,
     _call_openai,
@@ -273,3 +279,152 @@ class TestCustomAPI:
             "key", "https://10.0.1.4:8080/v1/chat", "model", "sys", "usr", ["data"]
         )
         assert "sec" in result
+
+
+class TestPromptCustomization:
+    """Tests for analysis.vlm.prompt_append/prompt_override/system_prompt_override
+    and explicit-arg-beats-config precedence in VideoAnalyzer.run_vlm_analysis()."""
+
+    @staticmethod
+    def _analyzer(vlm_overrides: dict) -> VideoAnalyzer:
+        config = Config(Path(tempfile.mkdtemp()) / "nonexistent.yaml")
+        merged = dict(config.get("analysis", "vlm", default={}))
+        merged.update(vlm_overrides)
+        config.set(merged, "analysis", "vlm")
+        return VideoAnalyzer(config)
+
+    @staticmethod
+    def _mock_ollama_response(mock_urlopen, content: str) -> None:
+        mock_response = json.dumps({"message": {"content": content}})
+        mock_resp = MagicMock()
+        mock_resp.read.return_value = mock_response.encode()
+        mock_resp.__enter__ = MagicMock(return_value=mock_resp)
+        mock_resp.__exit__ = MagicMock(return_value=False)
+        mock_urlopen.return_value = mock_resp
+
+    @staticmethod
+    def _sent_user_prompt(mock_urlopen) -> str:
+        req = mock_urlopen.call_args[0][0]
+        payload = json.loads(req.data.decode("utf-8"))
+        return payload["messages"][1]["content"]
+
+    @staticmethod
+    def _sent_system_prompt(mock_urlopen) -> str:
+        req = mock_urlopen.call_args[0][0]
+        payload = json.loads(req.data.decode("utf-8"))
+        return payload["messages"][0]["content"]
+
+    @patch("urllib.request.urlopen")
+    @patch("autovideofixer.core.analysis._extract_sample_frames")
+    def test_prompt_append_from_config_extends_default(self, mock_frames, mock_urlopen, tmp_path):
+        frame = tmp_path / "frame.jpg"
+        frame.write_bytes(b"fake")
+        mock_frames.return_value = [str(frame)]
+        self._mock_ollama_response(mock_urlopen, '{"summary": "ok"}')
+
+        analyzer = self._analyzer(
+            {"provider": "ollama", "prompt_append": "these are trail camera clips"}
+        )
+        analyzer.run_vlm_analysis("fake.mp4")
+
+        sent = self._sent_user_prompt(mock_urlopen)
+        assert _VLM_USER_PROMPT in sent
+        assert "these are trail camera clips" in sent
+        # The appended text comes after the default prompt.
+        assert sent.index(_VLM_USER_PROMPT) < sent.index("these are trail camera clips")
+
+    @patch("urllib.request.urlopen")
+    @patch("autovideofixer.core.analysis._extract_sample_frames")
+    def test_prompt_override_from_config_replaces_default(
+        self, mock_frames, mock_urlopen, tmp_path
+    ):
+        frame = tmp_path / "frame.jpg"
+        frame.write_bytes(b"fake")
+        mock_frames.return_value = [str(frame)]
+        self._mock_ollama_response(mock_urlopen, '{"summary": "ok"}')
+
+        analyzer = self._analyzer({"provider": "ollama", "prompt_override": "custom prompt only"})
+        analyzer.run_vlm_analysis("fake.mp4")
+
+        sent = self._sent_user_prompt(mock_urlopen)
+        assert sent == "custom prompt only"
+        assert _VLM_USER_PROMPT not in sent
+
+    @patch("urllib.request.urlopen")
+    @patch("autovideofixer.core.analysis._extract_sample_frames")
+    def test_prompt_append_still_applies_after_override(self, mock_frames, mock_urlopen, tmp_path):
+        frame = tmp_path / "frame.jpg"
+        frame.write_bytes(b"fake")
+        mock_frames.return_value = [str(frame)]
+        self._mock_ollama_response(mock_urlopen, '{"summary": "ok"}')
+
+        analyzer = self._analyzer(
+            {
+                "provider": "ollama",
+                "prompt_override": "custom prompt only",
+                "prompt_append": "plus this context",
+            }
+        )
+        analyzer.run_vlm_analysis("fake.mp4")
+
+        sent = self._sent_user_prompt(mock_urlopen)
+        assert sent == "custom prompt only\n\nplus this context"
+
+    @patch("urllib.request.urlopen")
+    @patch("autovideofixer.core.analysis._extract_sample_frames")
+    def test_system_prompt_override_from_config(self, mock_frames, mock_urlopen, tmp_path):
+        frame = tmp_path / "frame.jpg"
+        frame.write_bytes(b"fake")
+        mock_frames.return_value = [str(frame)]
+        self._mock_ollama_response(mock_urlopen, '{"summary": "ok"}')
+
+        analyzer = self._analyzer(
+            {"provider": "ollama", "system_prompt_override": "you are a wildlife expert"}
+        )
+        analyzer.run_vlm_analysis("fake.mp4")
+
+        assert self._sent_system_prompt(mock_urlopen) == "you are a wildlife expert"
+
+    @patch("urllib.request.urlopen")
+    @patch("autovideofixer.core.analysis._extract_sample_frames")
+    def test_explicit_arg_beats_config_value(self, mock_frames, mock_urlopen, tmp_path):
+        """The equivalent of a CLI flag (an explicit run_vlm_analysis() kwarg) wins
+        over the config value -- this is what --prompt-override/--prompt-append map
+        to at the CLI layer (see TestAnalyzeCommand.test_prompt_flags_forwarded_to_analyzer
+        in tests/unit/test_cli.py for the CLI-level wiring)."""
+        frame = tmp_path / "frame.jpg"
+        frame.write_bytes(b"fake")
+        mock_frames.return_value = [str(frame)]
+        self._mock_ollama_response(mock_urlopen, '{"summary": "ok"}')
+
+        analyzer = self._analyzer({"provider": "ollama", "prompt_override": "from config"})
+        analyzer.run_vlm_analysis("fake.mp4", prompt_override="from explicit arg")
+
+        assert self._sent_user_prompt(mock_urlopen) == "from explicit arg"
+
+    @patch("urllib.request.urlopen")
+    @patch("autovideofixer.core.analysis._extract_sample_frames")
+    def test_no_customization_uses_defaults(self, mock_frames, mock_urlopen, tmp_path):
+        frame = tmp_path / "frame.jpg"
+        frame.write_bytes(b"fake")
+        mock_frames.return_value = [str(frame)]
+        self._mock_ollama_response(mock_urlopen, '{"summary": "ok"}')
+
+        analyzer = self._analyzer({"provider": "ollama"})
+        analyzer.run_vlm_analysis("fake.mp4")
+
+        assert self._sent_user_prompt(mock_urlopen) == _VLM_USER_PROMPT
+        assert self._sent_system_prompt(mock_urlopen) == _VLM_SYSTEM_PROMPT
+
+    def test_non_json_override_response_degrades_to_plain_summary(self):
+        """An override that changes the requested output format away from JSON still
+        produces a usable result: _parse_vlm_response's fallback treats non-JSON text
+        as the summary (empty tags/objects/rating) instead of erroring."""
+        plain_text_response = (
+            "This clip shows a red fox crossing a clearing at dusk, no other animals visible."
+        )
+        result = _parse_vlm_response(plain_text_response)
+        assert result["summary"] == plain_text_response
+        assert result["tags"] == []
+        assert result["objects"] == []
+        assert result["rating"] is None

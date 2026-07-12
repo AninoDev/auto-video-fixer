@@ -279,8 +279,9 @@ stages:
 analysis:
   vlm:
     # Master switch for VLM (Vision Language Model) content analysis. Off by default -- costs
-    # API calls / requires a local Ollama instance. See docs/REQUIREMENTS.md's "Foundation"
-    # section: this is implemented but not independently verified end-to-end.
+    # API calls / requires a local Ollama instance. The "api" provider has been run end-to-end
+    # against a live server; "ollama"/"openai" share the same code path but haven't themselves
+    # been independently verified -- see docs/ROADMAP.md's verified/unverified breakdown.
     enabled: false
 
     # Which backend to call: local, ollama, openai, or api.
@@ -339,12 +340,61 @@ analysis:
     # Seconds between sampled frames (see _extract_sample_frames() in core/analysis.py).
     sample_interval_sec: 10.0
 
+    # --- Prompt customization ---
+    # The default prompts ask the model to return JSON with keys "summary", "tags",
+    # "objects", "rating" (see _VLM_SYSTEM_PROMPT/_VLM_USER_PROMPT in core/analysis.py).
+    # _parse_vlm_response() falls back to treating a non-JSON response as the summary
+    # (tags/objects empty, rating null), so an override that changes the requested
+    # output format degrades gracefully -- you'll still get a summary, just no
+    # structured tags/objects/rating.
+
+    # Extra text appended to the user prompt (default or overridden) when non-empty.
+    # Use this to give the VLM job-specific context without losing the JSON-output
+    # instructions in the default prompt. Also settable per-run with
+    # `avf analyze --prompt-append TEXT` (the CLI flag wins over this config value).
+    #
+    # Example:
+    # prompt_append: >
+    #   These clips are from a trail camera monitoring a backyard. Focus on identifying
+    #   any wildlife species present and note the approximate time of day.
+    prompt_append: ""
+
+    # Replaces the default user prompt entirely when non-empty. prompt_append (if set)
+    # is still appended after this. Also settable per-run with
+    # `avf analyze --prompt-override TEXT` (the CLI flag wins over this config value).
+    prompt_override: ""
+
+    # Replaces the default system prompt entirely when non-empty. Config-only, no CLI
+    # flag.
+    system_prompt_override: ""
+
   event_detection:
     enabled: true
-    # Frame-differencing correlation threshold below which a scene change is flagged
-    # (lower = more sensitive to detecting cuts).
-    scene_change_threshold: 0.3
-    # Minimum scene duration in seconds; shorter detected segments are merged with neighbors.
+    # Scene-change sensitivity: consecutive frames are grayscaled, downscaled to
+    # 320x180, and compared with mean absolute per-pixel luma difference (normalized
+    # to 0-1) -- i.e. "what fraction of the frame's brightness changed, on average,
+    # between this frame and the last one". A frame pair scoring ABOVE this value is
+    # called a cut. See _detect_scene_changes() in core/analysis.py for the full
+    # writeup, including calibration data from a synthetic ground-truth clip (12
+    # visually distinct 5s segments: max within-segment score 0.040, min actual-cut
+    # score 0.184).
+    #   0.05-0.10 -- more sensitive: catches soft/gradual cuts and similar-toned shot
+    #                changes, but risks false positives from camera motion, flicker,
+    #                or compression noise in busy real footage.
+    #   0.15      -- the default; calibrated to catch every cut in the synthetic
+    #                ground-truth test with zero false positives, and to catch cuts
+    #                that a too-high threshold misses on real footage.
+    #   0.3-0.5   -- only hard, high-contrast cuts register; this used to be the
+    #                default and under-detected real-world footage (a 3-minute clip
+    #                with a cut every 5-7s found only ~5 of ~30 real cuts at 0.3).
+    # Also settable per-run with `avf analyze --scene-threshold FLOAT`.
+    scene_change_threshold: 0.15
+    # Minimum scene duration in seconds. This does NOT affect whether a cut is
+    # detected -- only whether a cut that would produce a scene shorter than this
+    # gets to start its own scene, versus being absorbed into the following one. For
+    # content with legitimately short scenes (fast cuts under ~2s apart), lower this
+    # too, or correctly-detected adjacent cuts will still get merged away. Also
+    # settable per-run with `avf analyze --min-scene-duration FLOAT`.
     min_scene_duration_sec: 2.0
     # Whether `avf analyze` runs VLM-based classification on each detected scene by default
     # (also toggleable per-invocation with `avf analyze --classify`).

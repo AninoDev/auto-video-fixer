@@ -8,6 +8,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **`avf analyze` multi-file support**: now accepts multiple files and/or directories
+  (`avf analyze PATHS...`), with `--recursive`/`-r` mirroring `process`'s directory scanning. A
+  failure analyzing one file is logged and skipped; the remaining files still run, and the
+  command exits non-zero if any file failed.
+- **`avf analyze --full`**: prints the complete, untruncated VLM summary per file in a Rich
+  panel below the results table (the table's own "VLM Summary" row stays a truncated preview,
+  now with an explicit "(use --full for full text)" hint instead of a bare `...`). The full
+  summary (plus tags/objects/rating) is now also always logged at INFO — previously it was
+  truncated in the table and never appeared anywhere in full, including the always-on per-run
+  DEBUG log file.
+- **`avf analyze --csv PATH`**: writes one row per analyzed video (filepath, filename, duration,
+  resolution, framerate, codec, has_video/has_audio/hdr, scenes_detected, and — when VLM ran —
+  the FULL summary, `;`-joined tags/objects, and content_rating) to a UTF-8 CSV via Python's
+  `csv` module (proper quoting for summaries containing commas/newlines). Overwrites `PATH` if
+  it already exists rather than appending across runs.
+- **`analysis.vlm.prompt_append` / `prompt_override` / `system_prompt_override`** config keys,
+  plus `avf analyze --prompt-append TEXT` / `--prompt-override TEXT` CLI flags (CLI overrides
+  config for that run): lets a user add job-specific context to the VLM prompt (e.g. "these are
+  trail-camera clips, focus on wildlife species") or replace it/the system prompt entirely.
+  `_parse_vlm_response()`'s existing non-JSON fallback (treats the raw response as the summary)
+  means an override that changes the requested JSON output format degrades gracefully instead
+  of erroring.
+- **`avf analyze` progress reporting**: `VideoAnalyzer.analyze()`/`detect_events()`/
+  `run_vlm_analysis()` now accept an optional `progress_callback(phase, detail)` invoked at
+  phase transitions (probing, scene-detection start/periodic-progress/done, VLM frame
+  sampling/request, done) — scene detection's frame-differencing loop reports roughly every 5%.
+  The CLI wires this to a live Rich status line on a TTY (plain scrolling INFO log lines
+  otherwise), and every phase transition is logged at INFO regardless, so slow videos/VLM
+  endpoints no longer look hung with no feedback.
+- **`avf analyze --scene-threshold FLOAT` / `--min-scene-duration FLOAT`**: per-run overrides
+  for `analysis.event_detection.scene_change_threshold`/`min_scene_duration_sec` (which now
+  actually flow into `_detect_scene_changes()` as a `threshold` param on
+  `VideoAnalyzer.detect_events()` — previously the threshold was config-only with no override
+  path). See "Changed" below for the recalibrated default.
 - **`analysis.vlm.allow_http`** (default `false`): the OpenAI-compatible `api` VLM provider
   refuses plain-HTTP endpoints on non-loopback hosts by default (frames and the API key would
   travel unencrypted); setting this to `true` permits plain HTTP for e.g. a LAN inference box
@@ -37,6 +71,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   native 4x result and discarding most of it.
 
 ### Changed
+- **`analysis.event_detection.scene_change_threshold` default lowered from `0.3` to `0.15`** —
+  calibrated against a synthetic ground-truth clip (12 visually distinct 5s segments, 11 known
+  hard cuts): the old default found only 9/12 segments (missed 3 real cuts scoring 0.18-0.27 on
+  the frame-differencing metric), while 0.15 finds all 12 with zero false positives (measured
+  max within-segment score 0.040, min actual-cut score 0.184). Matches a user report of a real
+  3-minute clip (~30 real cuts) where the old default found only ~5. See
+  `_detect_scene_changes()`'s docstring in `core/analysis.py` for the full metric writeup, and
+  `avf analyze --scene-threshold`/`--min-scene-duration` above for per-run overrides.
 - **Intermediate pipeline temp files always use `.mkv`**, regardless of input/output container
   (MKV can hold any codec the pipeline's hardcoded intermediate encodes use; some source
   containers, e.g. WebM, cannot). Final output extension is now driven by

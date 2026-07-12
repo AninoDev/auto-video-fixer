@@ -93,6 +93,31 @@ class TestDetectSceneChanges:
         scenes = _detect_scene_changes("/nonexistent/video.mp4", 0.3, 1.0)
         assert scenes == []
 
+    @pytest.mark.integration
+    def test_detect_scenes_reports_progress(self, tmp_video_file):
+        """The frame-differencing loop periodically calls progress_callback."""
+        from autovideofixer.core.analysis import _detect_scene_changes
+
+        calls: list[tuple[str, str]] = []
+        _detect_scene_changes(
+            tmp_video_file,
+            threshold=0.3,
+            min_duration_sec=0.5,
+            progress_callback=lambda phase, detail: calls.append((phase, detail)),
+        )
+
+        assert calls, "expected at least one progress_callback invocation"
+        assert all(phase == "scene_detection" for phase, _ in calls)
+        # Detail should reference frame progress (percentage and/or frame count).
+        assert all("frame" in detail for _, detail in calls)
+
+    def test_detect_scenes_no_progress_callback_is_a_noop(self):
+        """Omitting progress_callback (the default) doesn't error on a missing file."""
+        from autovideofixer.core.analysis import _detect_scene_changes
+
+        scenes = _detect_scene_changes("/nonexistent/video.mp4", 0.3, 1.0)
+        assert scenes == []
+
 
 class TestVideoAnalyzerEvents:
     """Test VideoAnalyzer event detection."""
@@ -142,6 +167,105 @@ class TestVideoAnalyzerEvents:
         assert len(self.analyzer._analysis_cache) == 1
         self.analyzer.clear_cache()
         assert len(self.analyzer._analysis_cache) == 0
+
+
+class TestSceneDetectionCalibration:
+    """Calibration test for the scene_change_threshold default (0.15).
+
+    Builds a small synthetic ground-truth video by concatenating 4 visually
+    distinct 1s segments (testsrc2, solid red, solid blue, smptebars) -- 3
+    known hard cuts, no motion/noise within a segment. This is a smaller,
+    faster version of the 12-segment/11-cut clip used to derive the default:
+    on that larger clip the previous default (0.3) found only 9/12 segments
+    (missed 3 real cuts scoring 0.18-0.27), while 0.15 found all 12 with zero
+    false positives (max within-segment score measured: 0.040; min actual-cut
+    score measured: 0.184). This test asserts the same "no missed cuts, no
+    false positives within a segment" property holds at the shipped default.
+    """
+
+    @staticmethod
+    def _build_ground_truth(tmp_path) -> str:
+        import subprocess
+
+        sources = [
+            "testsrc2=size=64x36:rate=10:duration=1",
+            "color=red:size=64x36:rate=10:duration=1",
+            "color=blue:size=64x36:rate=10:duration=1",
+            "smptebars=size=64x36:rate=10:duration=1",
+        ]
+        segments = []
+        for i, src in enumerate(sources):
+            seg = tmp_path / f"seg{i}.mp4"
+            subprocess.run(
+                [
+                    "ffmpeg",
+                    "-y",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    src,
+                    "-c:v",
+                    "libx264",
+                    "-pix_fmt",
+                    "yuv420p",
+                    "-r",
+                    "10",
+                    str(seg),
+                ],
+                capture_output=True,
+                check=True,
+            )
+            segments.append(seg)
+
+        concat_file = tmp_path / "concat.txt"
+        concat_file.write_text("".join(f"file '{seg}'\n" for seg in segments))
+
+        ground_truth = tmp_path / "ground_truth.mp4"
+        subprocess.run(
+            [
+                "ffmpeg",
+                "-y",
+                "-f",
+                "concat",
+                "-safe",
+                "0",
+                "-i",
+                str(concat_file),
+                "-c",
+                "copy",
+                str(ground_truth),
+            ],
+            capture_output=True,
+            check=True,
+        )
+        return str(ground_truth)
+
+    @pytest.mark.integration
+    def test_default_threshold_finds_all_known_cuts_no_false_positives(self, tmp_path):
+        from autovideofixer.config import Config
+        from autovideofixer.core.analysis import _detect_scene_changes
+
+        default_threshold = Config.DEFAULTS["analysis"]["event_detection"]["scene_change_threshold"]
+        assert default_threshold == pytest.approx(0.15)
+
+        ground_truth = self._build_ground_truth(tmp_path)
+        # min_duration_sec well under the 1s segment length so it can't mask
+        # a missed/extra cut by merging segments together.
+        scenes = _detect_scene_changes(ground_truth, default_threshold, 0.2)
+
+        # 4 segments -> 4 scenes (3 detected cuts), each ~1s.
+        assert len(scenes) == 4, f"expected 4 scenes (3 cuts), got {len(scenes)}: {scenes}"
+        for scene in scenes:
+            assert scene.duration == pytest.approx(1.0, abs=0.3)
+
+    @pytest.mark.integration
+    def test_old_default_threshold_under_detects(self, tmp_path):
+        """Regression guard: 0.3 (the previous default) missed real cuts on this clip."""
+        from autovideofixer.core.analysis import _detect_scene_changes
+
+        ground_truth = self._build_ground_truth(tmp_path)
+        scenes = _detect_scene_changes(ground_truth, 0.3, 0.2)
+        assert len(scenes) < 4, "expected the old 0.3 threshold to under-detect on this clip"
 
 
 class TestPerceptualHashing:

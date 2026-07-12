@@ -2,14 +2,18 @@
 
 from __future__ import annotations
 
+import contextlib
 import copy
+import csv
 import logging
 import os
 import sys
 from datetime import datetime
+from typing import TYPE_CHECKING, Any
 
 import click
 from rich.console import Console
+from rich.panel import Panel
 from rich.table import Table
 
 from autovideofixer import __version__
@@ -24,6 +28,9 @@ from autovideofixer.core.analysis import is_video_file, scan_directory
 from autovideofixer.core.pipeline import Pipeline
 from autovideofixer.core.presets import get_preset, list_presets
 from autovideofixer.logger import get_logger, setup_logging
+
+if TYPE_CHECKING:
+    from autovideofixer.core.analysis import VideoAnalysis
 
 console = Console()
 
@@ -419,8 +426,143 @@ def process(
         sys.exit(1)
 
 
+# Preview length for the VLM summary in the default (non---full) table row.
+# Kept generous (well beyond the old 120-char cutoff) since the table can wrap;
+# --full prints the complete, untruncated text in a separate Rich Panel.
+_VLM_SUMMARY_PREVIEW_LEN = 300
+
+_ANALYZE_CSV_FIELDS = [
+    "filepath",
+    "filename",
+    "duration_sec",
+    "resolution",
+    "framerate_fps",
+    "video_codec",
+    "has_video",
+    "has_audio",
+    "hdr",
+    "scenes_detected",
+    "vlm_summary",
+    "vlm_tags",
+    "vlm_objects",
+    "content_rating",
+]
+
+
+def _print_analysis_result(analysis: "VideoAnalysis", *, full_output: bool) -> None:
+    """Print the Rich table (and, with --full, a full-text panel) for one analysis."""
+    table = Table(title="Video Analysis")
+    table.add_column("Property")
+    table.add_column("Value")
+
+    table.add_row("Filename", analysis.filename)
+    table.add_row("Duration", f"{analysis.duration:.1f}s")
+    table.add_row("Resolution", f"{analysis.resolution[0]}x{analysis.resolution[1]}")
+    table.add_row("Framerate", f"{analysis.framerate:.1f} fps")
+    if analysis.video_codec:
+        table.add_row("Video Codec", analysis.video_codec)
+    table.add_row("Has Video", str(analysis.has_video))
+    table.add_row("Has Audio", str(analysis.has_audio))
+    table.add_row("HDR", str(analysis.is_hdr))
+    table.add_row("Scenes Detected", str(analysis.total_scenes))
+
+    if analysis.vlm_summary:
+        summary = analysis.vlm_summary
+        if len(summary) > _VLM_SUMMARY_PREVIEW_LEN:
+            summary = (
+                summary[:_VLM_SUMMARY_PREVIEW_LEN].rstrip() + " [...] (use --full for full text)"
+            )
+        table.add_row("VLM Summary", summary)
+    if analysis.vlm_tags:
+        table.add_row("Tags", ", ".join(analysis.vlm_tags))
+    if analysis.vlm_objects:
+        table.add_row("Objects", ", ".join(analysis.vlm_objects))
+    if analysis.content_rating:
+        table.add_row("Content Rating", analysis.content_rating)
+
+    console.print(table)
+
+    if full_output and analysis.vlm_summary:
+        console.print(
+            Panel(
+                analysis.vlm_summary,
+                title=f"Full VLM Summary: {analysis.filename}",
+                expand=True,
+            )
+        )
+
+    if analysis.scenes:
+        console.print(f"\n[bold]Detected {analysis.total_scenes} Scene(s):[/bold]")
+        for scene in analysis.scenes[:30]:
+            desc = f" - {scene.description}" if scene.description else ""
+            console.print(
+                f"  [{scene.event_type}] "
+                f"{scene.start_time:.1f}s - {scene.end_time:.1f}s "
+                f"({scene.duration:.1f}s){desc}"
+            )
+
+
+def _analysis_to_csv_row(analysis: "VideoAnalysis") -> dict[str, Any]:
+    """Build one CSV row dict from a VideoAnalysis, matching the printed table's fields."""
+    return {
+        "filepath": analysis.filepath,
+        "filename": analysis.filename,
+        "duration_sec": f"{analysis.duration:.3f}",
+        "resolution": f"{analysis.resolution[0]}x{analysis.resolution[1]}",
+        "framerate_fps": f"{analysis.framerate:.3f}",
+        "video_codec": analysis.video_codec,
+        "has_video": analysis.has_video,
+        "has_audio": analysis.has_audio,
+        "hdr": analysis.is_hdr,
+        "scenes_detected": analysis.total_scenes,
+        "vlm_summary": analysis.vlm_summary or "",
+        "vlm_tags": ";".join(analysis.vlm_tags),
+        "vlm_objects": ";".join(analysis.vlm_objects),
+        "content_rating": analysis.content_rating or "",
+    }
+
+
+def _write_analysis_csv(csv_path: str, rows: list[dict[str, Any]]) -> None:
+    """Write analyze results to CSV. Overwrites csv_path if it already exists."""
+    with open(csv_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=_ANALYZE_CSV_FIELDS, quoting=csv.QUOTE_MINIMAL)
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def _make_progress_reporter(
+    logger: logging.Logger,
+    filepath: str,
+    file_index: int,
+    file_count: int,
+    status: Any,
+) -> Any:
+    """Build a VideoAnalyzer progress_callback(phase, detail) for one file.
+
+    Every phase transition is logged at INFO (so it always lands in the
+    always-on per-run log file, and on the console unless --log-level raises
+    the threshold), and additionally pushed to `status` (a Rich Status object)
+    when the console is a TTY, so a long-running phase (scene detection, a
+    slow VLM request) doesn't look hung. `status` may be None (non-TTY /
+    plain fallback) -- the log lines alone then serve as the progress trail.
+    """
+
+    def _callback(phase: str, detail: str) -> None:
+        message = f"{phase}: {detail}" if detail else phase
+        # Rich's console handler renders log messages as markup, so avoid "[...]"
+        # around an interpolated filepath -- an unrelated "[" in the path (or,
+        # elsewhere, in the message) would otherwise be parsed as a markup tag
+        # and raise MarkupError instead of just logging.
+        logger.info("analyze progress (%s): %s", filepath, message)
+        if status is not None:
+            prefix = f"[{file_index}/{file_count}] " if file_count > 1 else ""
+            status.update(f"{prefix}{os.path.basename(filepath)} -- {message}")
+
+    return _callback
+
+
 @main.command()
-@click.argument("filepath")
+@click.argument("paths", nargs=-1, required=True)
 @click.option("--vlm", "vlm_flag", is_flag=True, default=None, help="Enable VLM analysis")
 @click.option("--no-vlm", "vlm_flag", flag_value=False, help="Disable VLM analysis")
 @click.option(
@@ -438,89 +580,211 @@ def process(
     help="Extract scenes as clips to directory",
 )
 @click.option("--no-clip", "clip_output", flag_value="", help="Skip clip extraction")
+@click.option("--recursive", "-r", is_flag=True, help="Scan directories recursively")
+@click.option(
+    "--scene-threshold",
+    "scene_threshold",
+    type=float,
+    default=None,
+    help="Scene-change sensitivity override for this run (overrides "
+    "analysis.event_detection.scene_change_threshold in config; default 0.15). This is "
+    "the mean fractional per-pixel luma change between consecutive downscaled frames, "
+    "0-1: lower (e.g. 0.05-0.10) is more sensitive but risks false positives from "
+    "camera motion/noise; higher (e.g. 0.3-0.5) only catches hard, high-contrast cuts "
+    "and will under-detect soft/similar-toned shot changes. See _detect_scene_changes() "
+    "in core/analysis.py for the full metric writeup and calibration data.",
+)
+@click.option(
+    "--min-scene-duration",
+    "min_scene_duration",
+    type=float,
+    default=None,
+    help="Minimum scene duration override for this run, in seconds (overrides "
+    "analysis.event_detection.min_scene_duration_sec in config; default 2.0). Does not "
+    "affect whether a cut is detected -- only whether a cut that would produce a "
+    "shorter scene gets to start its own scene vs. being merged into the next one. "
+    "Lower this for fast-cut content (scenes under ~2s) or legitimate adjacent cuts "
+    "will be silently merged away.",
+)
+@click.option(
+    "--full",
+    "full_output",
+    is_flag=True,
+    help="Print the complete, untruncated VLM summary for each file in a panel below "
+    "the table (the table always shows a truncated preview)",
+)
+@click.option(
+    "--csv",
+    "csv_path",
+    type=click.Path(),
+    default=None,
+    help="Write one row per analyzed video to this CSV file (UTF-8, full untruncated "
+    "VLM summary included). Overwrites the file if it already exists -- results are "
+    "not appended across runs, since the header would drift as fields change.",
+)
+@click.option(
+    "--prompt-append",
+    "prompt_append",
+    default=None,
+    help="Extra text appended to the VLM user prompt for this run, e.g. job-specific "
+    "context (overrides analysis.vlm.prompt_append in config)",
+)
+@click.option(
+    "--prompt-override",
+    "prompt_override",
+    default=None,
+    help="Replace the VLM user prompt entirely for this run (overrides "
+    "analysis.vlm.prompt_override in config). Changing the requested output format "
+    "away from JSON degrades gracefully into a plain-text summary -- see AGENTS.md.",
+)
 @click.pass_context
 def analyze(
     ctx: click.Context,
-    filepath: str,
+    paths: tuple[str, ...],
     vlm_flag: bool | None,
     events_flag: bool | None,
     classify_events: bool,
     clip_output: str | None,
+    recursive: bool,
+    scene_threshold: float | None,
+    min_scene_duration: float | None,
+    full_output: bool,
+    csv_path: str | None,
+    prompt_append: str | None,
+    prompt_override: str | None,
 ) -> None:
-    """Analyze a video file for properties, events, and content."""
+    """Analyze video file(s) for properties, events, and content.
+
+    Accepts one or more files and/or directories (directories are scanned for video
+    files; pass --recursive to scan subdirectories). Each file is analyzed in
+    sequence; a failure on one file is logged and skipped, and the remaining files
+    are still processed -- the command exits non-zero if any file failed.
+    """
     config = ctx.obj["config"]
+    logger = get_logger("autovideofixer.cli")
 
     from autovideofixer.core.analysis import VideoAnalyzer
 
     analyzer = VideoAnalyzer(config)
 
-    console.print(f"Analyzing: {filepath}")
-    analysis = analyzer.analyze(
-        filepath,
-        include_vlm=vlm_flag,
-        include_events=events_flag,
-    )
+    input_files: list[str] = []
+    for path in paths:
+        if os.path.isdir(path):
+            input_files.extend(scan_directory(path, recursive=recursive))
+        elif is_video_file(path):
+            input_files.append(path)
+        else:
+            console.print(f"[yellow]Skipping non-video file: {path}[/yellow]")
 
-    # analyze() doesn't take a classify_events param, so re-run event detection
-    # directly with classification enabled when --classify was requested.
-    if classify_events and events_flag is not False:
-        analysis.scenes = analyzer.detect_events(filepath, classify_events=True)
-        analysis.total_scenes = len(analysis.scenes)
+    if not input_files:
+        console.print("[red]No video files found.[/red]")
+        sys.exit(1)
 
-    table = Table(title="Video Analysis")
-    table.add_column("Property")
-    table.add_column("Value")
+    console.print(f"Found {len(input_files)} video file(s)")
 
-    table.add_row("Filename", analysis.filename)
-    table.add_row("Duration", f"{analysis.duration:.1f}s")
-    table.add_row("Resolution", f"{analysis.resolution[0]}x{analysis.resolution[1]}")
-    table.add_row("Framerate", f"{analysis.framerate:.1f} fps")
-    table.add_row("Has Video", str(analysis.has_video))
-    table.add_row("Has Audio", str(analysis.has_audio))
-    table.add_row("HDR", str(analysis.is_hdr))
-    table.add_row("Scenes Detected", str(analysis.total_scenes))
+    csv_rows: list[dict[str, Any]] = []
+    failed_files: list[str] = []
 
-    if analysis.vlm_summary:
-        summary = analysis.vlm_summary
-        if len(summary) > 120:
-            summary = summary[:120] + "..."
-        table.add_row("VLM Summary", summary)
-    if analysis.vlm_tags:
-        table.add_row("Tags", ", ".join(analysis.vlm_tags))
-    if analysis.content_rating:
-        table.add_row("Content Rating", analysis.content_rating)
+    for idx, filepath in enumerate(input_files, start=1):
+        if len(input_files) > 1:
+            console.print(f"\n[bold]== [{idx}/{len(input_files)}] Analyzing: {filepath} ==[/bold]")
+        else:
+            console.print(f"Analyzing: {filepath}")
 
-    console.print(table)
+        # A live-updating status line on a real terminal; on a non-TTY (e.g.
+        # captured output, CI, a pipe) Rich prints status updates as plain
+        # scrolling lines instead, which combined with the INFO log lines
+        # below is the "plain log lines" fallback.
+        status_ctx = (
+            console.status("Starting analysis...", spinner="dots")
+            if console.is_terminal
+            else contextlib.nullcontext()
+        )
 
-    if analysis.scenes:
-        console.print(f"\n[bold]Detected {analysis.total_scenes} Scene(s):[/bold]")
-        for scene in analysis.scenes[:30]:
-            desc = f" - {scene.description}" if scene.description else ""
-            console.print(
-                f"  [{scene.event_type}] "
-                f"{scene.start_time:.1f}s - {scene.end_time:.1f}s "
-                f"({scene.duration:.1f}s){desc}"
-            )
+        try:
+            with status_ctx as status:
+                progress_cb = _make_progress_reporter(
+                    logger, filepath, idx, len(input_files), status
+                )
+                analysis = analyzer.analyze(
+                    filepath,
+                    include_vlm=vlm_flag,
+                    include_events=events_flag,
+                    prompt_append=prompt_append,
+                    prompt_override=prompt_override,
+                    progress_callback=progress_cb,
+                    scene_threshold=scene_threshold,
+                    min_scene_duration=min_scene_duration,
+                )
 
-    # Extract clips if requested
-    if clip_output is not None and analysis.scenes:
-        if clip_output == "":
-            clip_output = None
-
-        if clip_output:
-            clips = analyzer.extract_scenes_as_clips(
-                filepath, analysis.scenes, output_dir=clip_output
-            )
-            if clips:
-                console.print(f"\n[green]Extracted {len(clips)} clip(s) to: {clip_output}[/green]")
-                for clip in clips:
-                    console.print(
-                        f"  Clip {clip.scene_index}: "
-                        f"{clip.start_time:.1f}s-{clip.end_time:.1f}s -> "
-                        f"{os.path.basename(clip.output_path)}"
+                # analyze() doesn't take a classify_events param, so re-run event
+                # detection directly with classification enabled when --classify
+                # was requested.
+                if classify_events and events_flag is not False:
+                    analysis.scenes = analyzer.detect_events(
+                        filepath,
+                        classify_events=True,
+                        progress_callback=progress_cb,
+                        threshold=scene_threshold,
+                        min_duration=min_scene_duration,
                     )
-            else:
-                console.print("\n[yellow]No clips could be extracted.[/yellow]")
+                    analysis.total_scenes = len(analysis.scenes)
+        except Exception:
+            logger.error("Analysis failed for %r", filepath, exc_info=True)
+            console.print(f"[red]Analysis failed for {filepath} -- see log for details.[/red]")
+            failed_files.append(filepath)
+            continue
+
+        # Full VLM result always lands in the log file (DEBUG-level auto log
+        # captures everything regardless of console verbosity); INFO so it also
+        # shows up in a --verbose/--log-level INFO console without needing --full.
+        if analysis.vlm_summary or analysis.vlm_tags or analysis.vlm_objects:
+            logger.info(
+                "VLM analysis for %s -- summary: %s | tags: %s | objects: %s | rating: %s",
+                filepath,
+                analysis.vlm_summary or "",
+                ", ".join(analysis.vlm_tags),
+                ", ".join(analysis.vlm_objects),
+                analysis.content_rating or "",
+            )
+
+        _print_analysis_result(analysis, full_output=full_output)
+
+        if csv_path:
+            csv_rows.append(_analysis_to_csv_row(analysis))
+
+        # Extract clips if requested
+        file_clip_output = clip_output
+        if file_clip_output is not None and analysis.scenes:
+            if file_clip_output == "":
+                file_clip_output = None
+
+            if file_clip_output:
+                clips = analyzer.extract_scenes_as_clips(
+                    filepath, analysis.scenes, output_dir=file_clip_output
+                )
+                if clips:
+                    console.print(
+                        f"\n[green]Extracted {len(clips)} clip(s) to: {file_clip_output}[/green]"
+                    )
+                    for clip in clips:
+                        console.print(
+                            f"  Clip {clip.scene_index}: "
+                            f"{clip.start_time:.1f}s-{clip.end_time:.1f}s -> "
+                            f"{os.path.basename(clip.output_path)}"
+                        )
+                else:
+                    console.print("\n[yellow]No clips could be extracted.[/yellow]")
+
+    if csv_path:
+        _write_analysis_csv(csv_path, csv_rows)
+        console.print(f"\n[green]Wrote {len(csv_rows)} row(s) to {csv_path}[/green]")
+
+    if failed_files:
+        console.print(
+            f"\n[red]{len(failed_files)} of {len(input_files)} file(s) failed analysis.[/red]"
+        )
+        sys.exit(1)
 
 
 @main.command()

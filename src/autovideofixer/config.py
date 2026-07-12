@@ -288,10 +288,36 @@ class Config:
                 "allow_http": False,
                 "max_sample_frames": 8,
                 "sample_interval_sec": 10.0,
+                # Extra text appended to the default (or overridden) user prompt when
+                # non-empty, e.g. job-specific context like "these are wildlife clips
+                # from a trail camera". Also settable per-run via `avf analyze
+                # --prompt-append`.
+                "prompt_append": "",
+                # Replaces the default user prompt entirely when non-empty.
+                # `prompt_append` (if set) is still appended after this. Also settable
+                # per-run via `avf analyze --prompt-override`. WARNING: the default
+                # prompt instructs the model to return JSON with summary/tags/objects/
+                # rating -- an override that changes the requested output format will
+                # break that JSON parsing (see _parse_vlm_response's fallback below).
+                "prompt_override": "",
+                # Replaces the default system prompt entirely when non-empty. No CLI
+                # flag; config-only.
+                "system_prompt_override": "",
             },
             "event_detection": {
                 "enabled": True,
-                "scene_change_threshold": 0.3,
+                # Frame-differencing sensitivity (mean fractional luma change between
+                # consecutive downscaled frames, 0-1; see _detect_scene_changes()'s
+                # docstring in core/analysis.py for the full metric writeup and
+                # calibration data). 0.3 (the old default) under-detected real cuts;
+                # 0.15 was calibrated against a synthetic ground-truth clip to catch
+                # every hard cut with zero false positives. Also settable per-run via
+                # `avf analyze --scene-threshold`.
+                "scene_change_threshold": 0.15,
+                # Cuts closer together than this are merged into the following scene
+                # rather than starting a new one -- doesn't affect cut *detection*,
+                # only whether a short segment gets its own SceneEvent. Also settable
+                # per-run via `avf analyze --min-scene-duration`.
                 "min_scene_duration_sec": 2.0,
                 "classify_events": False,
             },

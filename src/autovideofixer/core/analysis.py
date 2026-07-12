@@ -14,11 +14,17 @@ import re
 import shutil
 import tempfile
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Callable
 
 from autovideofixer.config import Config
 
 logger = logging.getLogger(__name__)
+
+# Signature for progress callbacks threaded through VideoAnalyzer.analyze():
+# progress_callback(phase, detail) -- phase is a short stable machine-readable
+# tag (e.g. "probe", "scenes_start", "scene_detection", "vlm_request", "done"),
+# detail is a human-readable string for that phase (may be empty).
+ProgressCallback = Callable[[str, str], None]
 
 # Supported video extensions
 VIDEO_EXTENSIONS: set[str] = {
@@ -148,6 +154,7 @@ class VideoAnalysis:
     has_video: bool = False
     has_audio: bool = False
     is_hdr: bool = False
+    video_codec: str = ""
     total_scenes: int = 0
     scenes: list[SceneEvent] = field(default_factory=list)
     vlm_summary: str | None = None
@@ -170,6 +177,12 @@ class VideoAnalyzer:
         filepath: str,
         include_vlm: bool | None = None,
         include_events: bool | None = None,
+        prompt_append: str | None = None,
+        prompt_override: str | None = None,
+        system_prompt_override: str | None = None,
+        progress_callback: ProgressCallback | None = None,
+        scene_threshold: float | None = None,
+        min_scene_duration: float | None = None,
     ) -> VideoAnalysis:
         """Perform full analysis on a video file.
 
@@ -177,16 +190,43 @@ class VideoAnalyzer:
             filepath: Path to the video file
             include_vlm: Whether to run VLM analysis (None = use config)
             include_events: Whether to detect events (None = use config)
+            scene_threshold: Scene-change sensitivity override for this call
+                (None = use ``analysis.event_detection.scene_change_threshold``
+                from config). See ``_detect_scene_changes`` for the metric.
+            min_scene_duration: Minimum scene duration override for this call
+                (None = use ``analysis.event_detection.min_scene_duration_sec``).
+            prompt_append: Extra text appended to the VLM user prompt (None =
+                use ``analysis.vlm.prompt_append`` from config). See
+                ``run_vlm_analysis`` for full semantics.
+            prompt_override: Replaces the default VLM user prompt entirely
+                (None = use ``analysis.vlm.prompt_override`` from config).
+            system_prompt_override: Replaces the default VLM system prompt
+                entirely (None = use ``analysis.vlm.system_prompt_override``).
+            progress_callback: Optional ``callback(phase, detail)`` invoked at
+                phase transitions (probing, scene detection start/progress/done,
+                VLM sampling/request, done) so callers (e.g. the CLI) can show
+                a live status line on slow videos. See ``ProgressCallback``.
 
         Returns:
             VideoAnalysis with all detected information
         """
+
+        def _report(phase: str, detail: str = "") -> None:
+            if progress_callback is not None:
+                progress_callback(phase, detail)
+
         if filepath in self._analysis_cache:
             return self._analysis_cache[filepath]
 
         from autovideofixer.core.ffmpeg_utils import probe
 
+        _report("probe", f"Probing {os.path.basename(filepath)}")
         info = probe(filepath)
+        _report(
+            "probe_done",
+            f"{info.resolution[0]}x{info.resolution[1]} @ {info.framerate:.1f}fps, "
+            f"{info.duration:.1f}s",
+        )
         analysis = VideoAnalysis(
             filepath=filepath,
             filename=info.filename,
@@ -196,6 +236,7 @@ class VideoAnalyzer:
             has_video=info.has_video,
             has_audio=info.has_audio,
             is_hdr=info.is_hdr,
+            video_codec=info.video_stream.codec_name if info.video_stream else "",
         )
 
         if (
@@ -203,20 +244,35 @@ class VideoAnalyzer:
             if include_events is not None
             else self.config.get("analysis", "event_detection", "enabled", default=True)
         ):
-            analysis.scenes = self.detect_events(filepath)
+            _report("scenes_start", "Detecting scenes/events")
+            analysis.scenes = self.detect_events(
+                filepath,
+                min_duration=min_scene_duration,
+                threshold=scene_threshold,
+                progress_callback=progress_callback,
+            )
             analysis.total_scenes = len(analysis.scenes)
+            _report("scenes_done", f"{analysis.total_scenes} scene(s) detected")
 
         if (
             include_vlm
             if include_vlm is not None
             else self.config.get("analysis", "vlm", "enabled", default=False)
         ):
-            vlm_result = self.run_vlm_analysis(filepath)
+            vlm_result = self.run_vlm_analysis(
+                filepath,
+                prompt_append=prompt_append,
+                prompt_override=prompt_override,
+                system_prompt_override=system_prompt_override,
+                progress_callback=progress_callback,
+            )
             analysis.vlm_summary = vlm_result.get("summary")
             analysis.vlm_tags = vlm_result.get("tags", [])
             analysis.vlm_objects = vlm_result.get("objects", [])
             analysis.content_rating = vlm_result.get("rating")
+            _report("vlm_done", "VLM analysis complete")
 
+        _report("done", "Analysis complete")
         self._analysis_cache[filepath] = analysis
         return analysis
 
@@ -225,6 +281,8 @@ class VideoAnalyzer:
         filepath: str,
         min_duration: float | None = None,
         classify_events: bool = False,
+        progress_callback: ProgressCallback | None = None,
+        threshold: float | None = None,
     ) -> list[SceneEvent]:
         """Detect scene changes and events in a video.
 
@@ -235,8 +293,20 @@ class VideoAnalyzer:
 
         Args:
             filepath: Path to the video file
-            min_duration: Minimum scene duration in seconds
+            min_duration: Minimum scene duration in seconds (None = use
+                ``analysis.event_detection.min_scene_duration_sec`` from config).
+                Cuts closer together than this are absorbed into the following
+                scene rather than emitted as their own (short) scene -- lower
+                this for fast-cut content if legitimate short scenes are being
+                merged away.
             classify_events: Whether to heuristically classify event types
+            progress_callback: Optional ``callback(phase, detail)`` invoked
+                periodically during the frame-differencing pass (phase
+                "scene_detection") so a caller can show progress on long videos.
+            threshold: Scene-change sensitivity (None = use
+                ``analysis.event_detection.scene_change_threshold`` from
+                config). See ``_detect_scene_changes`` for what the metric
+                measures and what value range is useful.
 
         Returns:
             List of SceneEvent objects
@@ -246,11 +316,14 @@ class VideoAnalyzer:
                 "analysis", "event_detection", "min_scene_duration_sec", default=2.0
             )
 
-        threshold = self.config.get(
-            "analysis", "event_detection", "scene_change_threshold", default=0.3
-        )
+        if threshold is None:
+            threshold = self.config.get(
+                "analysis", "event_detection", "scene_change_threshold", default=0.15
+            )
 
-        scenes = _detect_scene_changes(filepath, threshold, min_duration)
+        scenes = _detect_scene_changes(
+            filepath, threshold, min_duration, progress_callback=progress_callback
+        )
 
         if classify_events and scenes:
             scenes = _classify_events(scenes, filepath, self.config)
@@ -347,6 +420,10 @@ class VideoAnalyzer:
         self,
         filepath: str,
         sample_interval_sec: float = 10.0,
+        prompt_append: str | None = None,
+        prompt_override: str | None = None,
+        system_prompt_override: str | None = None,
+        progress_callback: ProgressCallback | None = None,
     ) -> dict[str, Any]:
         """Run VLM (Vision Language Model) analysis on video content.
 
@@ -356,10 +433,28 @@ class VideoAnalyzer:
         Args:
             filepath: Path to the video file
             sample_interval_sec: Seconds between frame samples
+            prompt_append: Extra text appended to the (possibly overridden) user
+                prompt, e.g. job-specific context. None falls back to
+                ``analysis.vlm.prompt_append`` in config; empty string suppresses it.
+            prompt_override: Replaces the default user prompt entirely when
+                non-empty. None falls back to ``analysis.vlm.prompt_override``.
+                ``prompt_append`` (if any) is still appended after an override.
+            system_prompt_override: Replaces the default system prompt entirely
+                when non-empty. None falls back to
+                ``analysis.vlm.system_prompt_override``.
+            progress_callback: Optional ``callback(phase, detail)`` invoked
+                before frame sampling ("vlm_sampling") and before the request
+                to the provider ("vlm_request") -- useful since the request
+                itself can take several seconds with no other feedback.
 
         Returns:
             Dict with keys: summary, tags, objects, rating
         """
+
+        def _report(phase: str, detail: str = "") -> None:
+            if progress_callback is not None:
+                progress_callback(phase, detail)
+
         vlm_config = self.config.get("analysis", "vlm", default={})
         provider = vlm_config.get("provider", "local")
         model = vlm_config.get("model", "llava")
@@ -367,6 +462,26 @@ class VideoAnalyzer:
         api_key = vlm_config.get("api_key", "")
         max_frames = vlm_config.get("max_sample_frames", 8)
 
+        resolved_append = (
+            prompt_append if prompt_append is not None else vlm_config.get("prompt_append", "")
+        ) or ""
+        resolved_override = (
+            prompt_override
+            if prompt_override is not None
+            else vlm_config.get("prompt_override", "")
+        ) or ""
+        resolved_system_override = (
+            system_prompt_override
+            if system_prompt_override is not None
+            else vlm_config.get("system_prompt_override", "")
+        ) or ""
+
+        system_prompt = resolved_system_override or _VLM_SYSTEM_PROMPT
+        user_prompt = resolved_override or _VLM_USER_PROMPT
+        if resolved_append:
+            user_prompt = f"{user_prompt}\n\n{resolved_append}"
+
+        _report("vlm_sampling", f"Extracting up to {max_frames} sample frame(s)")
         frames = _extract_sample_frames(filepath, sample_interval_sec, max_frames=max_frames)
         if not frames:
             return {"summary": "", "tags": [], "objects": []}
@@ -377,16 +492,22 @@ class VideoAnalyzer:
         # files before they're ever read).
         tmp_dir = os.path.dirname(frames[0])
         try:
+            _report(
+                "vlm_request",
+                f"Sending {len(frames)} frame(s) to {provider} VLM provider (model={model})",
+            )
             if provider in ("local", "ollama"):
-                return _run_ollama_vlm(frames, model, api_url)
+                return _run_ollama_vlm(frames, model, api_url, system_prompt, user_prompt)
             elif provider == "openai":
-                return _run_openai_vlm(frames, api_key, model)
+                return _run_openai_vlm(frames, api_key, model, system_prompt, user_prompt)
             elif provider == "api":
                 return _run_api_vlm(
                     frames,
                     api_key,
                     api_url,
                     model,
+                    system_prompt,
+                    user_prompt,
                     allow_http=bool(vlm_config.get("allow_http", False)),
                 )
             else:
@@ -748,6 +869,8 @@ def _run_ollama_vlm(
     frames: list[str],
     model: str,
     api_url: str,
+    system_prompt: str = _VLM_SYSTEM_PROMPT,
+    user_prompt: str = _VLM_USER_PROMPT,
 ) -> dict[str, Any]:
     """Run analysis using Ollama."""
     image_b64 = _frames_to_base64(frames)
@@ -758,8 +881,8 @@ def _run_ollama_vlm(
     response = _call_ollama(
         base_url,
         model,
-        _VLM_SYSTEM_PROMPT,
-        _VLM_USER_PROMPT,
+        system_prompt,
+        user_prompt,
         image_b64,
     )
     return _parse_vlm_response(response)
@@ -769,13 +892,15 @@ def _run_openai_vlm(
     frames: list[str],
     api_key: str,
     model: str,
+    system_prompt: str = _VLM_SYSTEM_PROMPT,
+    user_prompt: str = _VLM_USER_PROMPT,
 ) -> dict[str, Any]:
     """Run analysis using OpenAI Vision API."""
     image_b64 = _frames_to_base64(frames)
     if not image_b64:
         return {"summary": "", "tags": [], "objects": []}
 
-    response = _call_openai(api_key, model, _VLM_SYSTEM_PROMPT, _VLM_USER_PROMPT, image_b64)
+    response = _call_openai(api_key, model, system_prompt, user_prompt, image_b64)
     return _parse_vlm_response(response)
 
 
@@ -784,6 +909,8 @@ def _run_api_vlm(
     api_key: str,
     api_url: str,
     model: str,
+    system_prompt: str = _VLM_SYSTEM_PROMPT,
+    user_prompt: str = _VLM_USER_PROMPT,
     allow_http: bool = False,
 ) -> dict[str, Any]:
     """Run analysis using a custom API endpoint (OpenAI-compatible)."""
@@ -795,8 +922,8 @@ def _run_api_vlm(
         api_key,
         api_url,
         model,
-        _VLM_SYSTEM_PROMPT,
-        _VLM_USER_PROMPT,
+        system_prompt,
+        user_prompt,
         image_b64,
         allow_http=allow_http,
     )
@@ -810,11 +937,38 @@ def _detect_scene_changes(
     filepath: str,
     threshold: float,
     min_duration_sec: float,
+    progress_callback: ProgressCallback | None = None,
 ) -> list[SceneEvent]:
     """Detect scene changes using frame differencing.
 
-    Compares consecutive frames at reduced resolution and identifies
-    boundaries where pixel difference exceeds the threshold.
+    The metric: each consecutive pair of frames is converted to grayscale,
+    downscaled to 320x180, and compared with ``cv2.absdiff`` (per-pixel
+    absolute luma difference). ``diff_score`` is the mean of that difference
+    image divided by 255, i.e. the *average fractional luma change per pixel*
+    between the two frames, in [0, 1]. A hard cut between visually distinct
+    shots typically scores ~0.15-1.0; static or slowly-panning content within
+    a single shot typically scores well under 0.05 (measured on a synthetic
+    ground-truth clip of 12 visually distinct 5s segments -- see
+    tests/unit/test_scene_detection.py's TestSceneDetectionCalibration -- max
+    within-segment score 0.040, min cut score 0.184). ``threshold`` (default
+    0.15, ``analysis.event_detection.scene_change_threshold``) is the cutoff
+    above which a frame pair is called a cut:
+      - Lower (e.g. 0.05-0.10): more sensitive -- catches subtler cuts (soft
+        transitions, similar-toned shots) but risks false positives from
+        camera motion, flicker, or compression noise in busy real-world
+        footage.
+      - Higher (e.g. 0.3-0.5): only very hard, high-contrast cuts register;
+        gradual/soft cuts and same-toned shot changes are missed (this was
+        the previous default of 0.3, which under-detected on real footage --
+        see CHANGELOG).
+    ``min_duration_sec`` (default 2.0,
+    ``analysis.event_detection.min_scene_duration_sec``) then absorbs any cut
+    that would produce a scene shorter than this into the following scene --
+    it doesn't affect whether a cut is *detected*, only whether it's allowed
+    to start a new scene on its own. For content with legitimately short
+    scenes (fast cuts under ~2s apart), lower this too or short scenes will
+    be silently merged into their neighbor even though the underlying cuts
+    were both correctly detected.
     """
     import cv2
 
@@ -828,6 +982,12 @@ def _detect_scene_changes(
     fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
     frame_idx = 0
     current_time = 0.0
+
+    # Report progress roughly every 5% of the video (or every 200 frames if
+    # the container doesn't report a usable frame count) so a caller watching
+    # a long scan doesn't see a silent hang.
+    total_frames = cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0
+    report_interval = max(int(total_frames / 20), 1) if total_frames > 0 else 200
 
     while True:
         ret, frame = cap.read()
@@ -865,6 +1025,15 @@ def _detect_scene_changes(
 
         prev_frame = gray
         frame_idx += 1
+
+        if progress_callback is not None and frame_idx % report_interval == 0:
+            if total_frames > 0:
+                pct = min(100, int(frame_idx / total_frames * 100))
+                progress_callback(
+                    "scene_detection", f"{pct}% (frame {frame_idx}/{int(total_frames)})"
+                )
+            else:
+                progress_callback("scene_detection", f"frame {frame_idx}")
 
     cap.release()
 

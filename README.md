@@ -61,8 +61,9 @@ avf process ./videos/ -r -p max_quality -o ./output/
 # Dry run to see what would be processed
 avf process video.mp4 --dry-run
 
-# Analyze a video
+# Analyze a video (or multiple files/directories, like `process`)
 avf analyze video.mp4
+avf analyze ./videos/ -r --csv report.csv --full
 
 # Find similar/duplicate videos
 avf find-duplicates reference.mp4 ./library/
