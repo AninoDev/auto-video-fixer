@@ -382,7 +382,13 @@ class VideoAnalyzer:
             elif provider == "openai":
                 return _run_openai_vlm(frames, api_key, model)
             elif provider == "api":
-                return _run_api_vlm(frames, api_key, api_url, model)
+                return _run_api_vlm(
+                    frames,
+                    api_key,
+                    api_url,
+                    model,
+                    allow_http=bool(vlm_config.get("allow_http", False)),
+                )
             else:
                 return {"summary": "", "tags": [], "objects": []}
         except Exception:
@@ -656,6 +662,7 @@ def _call_custom_api(
     system_prompt: str,
     user_prompt: str,
     image_b64_list: list[str],
+    allow_http: bool = False,
 ) -> str:
     """Send a request to a custom API endpoint.
 
@@ -680,9 +687,21 @@ def _call_custom_api(
     # input). Still, require https except for loopback so a shared/untrusted
     # config/preset can't silently point frame uploads + credentials at an
     # arbitrary internal address over plaintext.
+    # analysis.vlm.allow_http opts out for e.g. a LAN inference box that only
+    # speaks plain HTTP; frames and the API key then travel unencrypted, which
+    # is the user's call to make for their own network.
     parsed = urlparse(api_url)
-    if parsed.scheme != "https" and parsed.hostname not in ("localhost", "127.0.0.1", "::1"):
-        logger.warning("Refusing non-https custom VLM API URL for non-loopback host: %s", api_url)
+    if (
+        parsed.scheme != "https"
+        and parsed.hostname not in ("localhost", "127.0.0.1", "::1")
+        and not allow_http
+    ):
+        logger.warning(
+            "Refusing non-https custom VLM API URL for non-loopback host: %s "
+            "(set analysis.vlm.allow_http: true in config.yaml to permit plain "
+            "HTTP, e.g. for a server on your own LAN)",
+            api_url,
+        )
         return ""
 
     content: list[dict[str, Any]] = [{"type": "text", "text": user_prompt}]
@@ -765,6 +784,7 @@ def _run_api_vlm(
     api_key: str,
     api_url: str,
     model: str,
+    allow_http: bool = False,
 ) -> dict[str, Any]:
     """Run analysis using a custom API endpoint (OpenAI-compatible)."""
     image_b64 = _frames_to_base64(frames)
@@ -778,6 +798,7 @@ def _run_api_vlm(
         _VLM_SYSTEM_PROMPT,
         _VLM_USER_PROMPT,
         image_b64,
+        allow_http=allow_http,
     )
     return _parse_vlm_response(response)
 

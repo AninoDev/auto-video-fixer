@@ -281,6 +281,11 @@ class Config:
                 "model": "llava",
                 "api_key": "",
                 "api_url": "",
+                # Plain-HTTP api_url endpoints are refused for non-loopback
+                # hosts unless this is true (frames + api_key travel
+                # unencrypted; only enable for a server on a network you
+                # control, e.g. a LAN inference box).
+                "allow_http": False,
                 "max_sample_frames": 8,
                 "sample_interval_sec": 10.0,
             },

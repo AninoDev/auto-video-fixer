@@ -226,3 +226,50 @@ class TestCustomAPI:
         call_args = mock_urlopen.call_args
         req = call_args[0][0]
         assert "Authorization" not in req.headers
+
+    @patch("urllib.request.urlopen")
+    def test_plain_http_non_loopback_refused_by_default(self, mock_urlopen):
+        """Plain HTTP to a non-loopback host is refused unless allow_http is set."""
+        result = _call_custom_api(
+            "key", "http://10.0.1.4:8080/v1/chat", "model", "sys", "usr", ["data"]
+        )
+        assert result == ""
+        mock_urlopen.assert_not_called()
+
+    @patch("urllib.request.urlopen")
+    def test_plain_http_non_loopback_allowed_with_override(self, mock_urlopen):
+        """allow_http=True permits plain HTTP to a LAN host."""
+        content = '{"summary": "lan", "tags": "x", "objects": "y"}'
+        mock_response = json.dumps({"choices": [{"message": {"content": content}}]})
+        mock_resp = MagicMock()
+        mock_resp.read.return_value = mock_response.encode()
+        mock_resp.__enter__ = MagicMock(return_value=mock_resp)
+        mock_resp.__exit__ = MagicMock(return_value=False)
+        mock_urlopen.return_value = mock_resp
+
+        result = _call_custom_api(
+            "key",
+            "http://10.0.1.4:8080/v1/chat",
+            "model",
+            "sys",
+            "usr",
+            ["data"],
+            allow_http=True,
+        )
+        assert "lan" in result
+
+    @patch("urllib.request.urlopen")
+    def test_https_never_needs_override(self, mock_urlopen):
+        """HTTPS to any host works without allow_http."""
+        content = '{"summary": "sec", "tags": "x", "objects": "y"}'
+        mock_response = json.dumps({"choices": [{"message": {"content": content}}]})
+        mock_resp = MagicMock()
+        mock_resp.read.return_value = mock_response.encode()
+        mock_resp.__enter__ = MagicMock(return_value=mock_resp)
+        mock_resp.__exit__ = MagicMock(return_value=False)
+        mock_urlopen.return_value = mock_resp
+
+        result = _call_custom_api(
+            "key", "https://10.0.1.4:8080/v1/chat", "model", "sys", "usr", ["data"]
+        )
+        assert "sec" in result

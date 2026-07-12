@@ -316,10 +316,22 @@ analysis:
     # model: your-vision-model
     # api_url: "https://your-api.example.com/v1/chat/completions"
     # api_key: "..."                       # sent as a Bearer token if non-empty
+    #
+    # --- Example: llama.cpp / LM Studio / vLLM on a LAN machine (plain HTTP) ---
+    # provider: api
+    # model: your-vision-model
+    # api_url: "http://10.0.1.4:8080/v1/chat/completions"
+    # allow_http: true                     # required for non-loopback plain HTTP (see below)
 
     # Base URL override for ollama/api providers. Empty string = provider-specific default
     # (http://localhost:11434 for ollama).
     api_url: ""
+
+    # The "api" provider refuses plain-HTTP api_url endpoints on non-loopback hosts by
+    # default: sampled video frames and the api_key would travel unencrypted. Set true to
+    # permit plain HTTP anyway -- only do this for a server on a network you control
+    # (e.g. a LAN inference box on a private subnet). HTTPS never needs this.
+    allow_http: false
 
     # Max number of frames sampled from the video and sent to the VLM per analysis call.
     max_sample_frames: 8

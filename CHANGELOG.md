@@ -8,6 +8,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **`analysis.vlm.allow_http`** (default `false`): the OpenAI-compatible `api` VLM provider
+  refuses plain-HTTP endpoints on non-loopback hosts by default (frames and the API key would
+  travel unencrypted); setting this to `true` permits plain HTTP for e.g. a LAN inference box
+  (llama.cpp, LM Studio, vLLM) on a private subnet. HTTPS and loopback never need it. The
+  refusal log message now names the override.
 - **AI-fallback policy** for AI-capable stages (upscale, interpolate, denoise_video, deblock):
   `general.ai_fallback` (default `true`) plus per-stage `stages.<name>.ai_fallback` (default
   `null` = inherit) control whether a stage silently falls back to its traditional FFmpeg
