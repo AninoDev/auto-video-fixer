@@ -442,11 +442,23 @@ _ANALYZE_CSV_FIELDS = [
     "has_audio",
     "hdr",
     "scenes_detected",
+    "scene_boundaries",
     "vlm_summary",
     "vlm_tags",
     "vlm_objects",
     "content_rating",
 ]
+
+
+def _scene_boundaries_str(analysis: "VideoAnalysis") -> str:
+    """Semicolon-joined "t=<seconds>s@<confidence>" per detected scene, for the
+    CSV/--full output's "would a lower --scene-threshold find more cuts?"
+    diagnostics. confidence is SceneEvent.confidence -- the frame-differencing
+    diff_score of the cut that ended this scene (see _detect_scene_changes()'s
+    docstring in core/analysis.py); the final scene's confidence is a fixed
+    0.5 placeholder rather than a real cut score, since nothing ends it.
+    """
+    return ";".join(f"t={s.end_time:.1f}s@{s.confidence:.3f}" for s in analysis.scenes)
 
 
 def _print_analysis_result(analysis: "VideoAnalysis", *, full_output: bool) -> None:
@@ -495,10 +507,22 @@ def _print_analysis_result(analysis: "VideoAnalysis", *, full_output: bool) -> N
         console.print(f"\n[bold]Detected {analysis.total_scenes} Scene(s):[/bold]")
         for scene in analysis.scenes[:30]:
             desc = f" - {scene.description}" if scene.description else ""
+            # Boundary confidence (the frame-differencing diff_score that ended
+            # this scene) only in --full -- keeps the default view uncluttered;
+            # see _scene_boundaries_str()'s docstring for what it means and the
+            # last-scene caveat.
+            score = f" [score={scene.confidence:.3f}]" if full_output else ""
+            # markup=False: this line's own "[...]" segments (event_type, and
+            # now score) are plain text, not Rich style tags -- with markup
+            # parsing on (the console default), Rich silently swallows any
+            # "[...]" that isn't a recognized style name instead of erroring,
+            # which was quietly eating the "[scene_change]"/"[talking_head]"
+            # prefix on every line here.
             console.print(
                 f"  [{scene.event_type}] "
                 f"{scene.start_time:.1f}s - {scene.end_time:.1f}s "
-                f"({scene.duration:.1f}s){desc}"
+                f"({scene.duration:.1f}s){desc}{score}",
+                markup=False,
             )
 
 
@@ -515,6 +539,7 @@ def _analysis_to_csv_row(analysis: "VideoAnalysis") -> dict[str, Any]:
         "has_audio": analysis.has_audio,
         "hdr": analysis.is_hdr,
         "scenes_detected": analysis.total_scenes,
+        "scene_boundaries": _scene_boundaries_str(analysis),
         "vlm_summary": analysis.vlm_summary or "",
         "vlm_tags": ";".join(analysis.vlm_tags),
         "vlm_objects": ";".join(analysis.vlm_objects),
@@ -619,8 +644,10 @@ def _make_progress_reporter(
     type=click.Path(),
     default=None,
     help="Write one row per analyzed video to this CSV file (UTF-8, full untruncated "
-    "VLM summary included). Overwrites the file if it already exists -- results are "
-    "not appended across runs, since the header would drift as fields change.",
+    "VLM summary included, plus a scene_boundaries column with ';'-joined "
+    "t=<seconds>s@<confidence> entries per detected cut -- see --full). Overwrites "
+    "the file if it already exists -- results are not appended across runs, since "
+    "the header would drift as fields change.",
 )
 @click.option(
     "--prompt-append",
@@ -637,6 +664,38 @@ def _make_progress_reporter(
     "analysis.vlm.prompt_override in config). Changing the requested output format "
     "away from JSON degrades gracefully into a plain-text summary -- see AGENTS.md.",
 )
+@click.option(
+    "--max-sample-frames",
+    "max_sample_frames",
+    type=int,
+    default=None,
+    help="Max frames sampled from the video and sent to the VLM provider for this run "
+    "(overrides analysis.vlm.max_sample_frames in config; default 8).",
+)
+@click.option(
+    "--sample-interval",
+    "sample_interval",
+    type=float,
+    default=None,
+    help="Seconds between VLM sample frames for this run (overrides "
+    "analysis.vlm.sample_interval_sec in config; default 10.0).",
+)
+@click.option(
+    "--vlm-model",
+    "vlm_model",
+    default=None,
+    help="VLM model name override for this run (overrides analysis.vlm.model in "
+    "config; e.g. 'llava', 'gpt-4o').",
+)
+@click.option(
+    "--vlm-url",
+    "vlm_url",
+    default=None,
+    help="VLM provider URL override for this run (overrides analysis.vlm.api_url in "
+    "config). Still subject to the same HTTPS-required-for-non-loopback gate as the "
+    "config value (analysis.vlm.allow_http permits plain HTTP for e.g. a LAN box) -- "
+    "there is no flag for allow_http or api_key; set those in config.yaml only.",
+)
 @click.pass_context
 def analyze(
     ctx: click.Context,
@@ -652,6 +711,10 @@ def analyze(
     csv_path: str | None,
     prompt_append: str | None,
     prompt_override: str | None,
+    max_sample_frames: int | None,
+    sample_interval: float | None,
+    vlm_model: str | None,
+    vlm_url: str | None,
 ) -> None:
     """Analyze video file(s) for properties, events, and content.
 
@@ -715,6 +778,10 @@ def analyze(
                     progress_callback=progress_cb,
                     scene_threshold=scene_threshold,
                     min_scene_duration=min_scene_duration,
+                    max_sample_frames=max_sample_frames,
+                    sample_interval_sec=sample_interval,
+                    vlm_model=vlm_model,
+                    vlm_api_url=vlm_url,
                 )
 
                 # analyze() doesn't take a classify_events param, so re-run event

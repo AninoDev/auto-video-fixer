@@ -42,6 +42,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   actually flow into `_detect_scene_changes()` as a `threshold` param on
   `VideoAnalyzer.detect_events()` — previously the threshold was config-only with no override
   path). See "Changed" below for the recalibrated default.
+- **Scene-detection score visibility**: `detect_events()` now logs, per file, the effective
+  `threshold`/`min_duration` actually used (config or CLI override — makes it obvious an
+  override took effect) and a one-line cut-score summary (count, min/median/max `diff_score`).
+  `_detect_scene_changes()` additionally tracks and logs up to the 10 highest "near-miss"
+  `diff_score`s that fell *below* threshold but *above* threshold/4, with timestamps — i.e.
+  plausible cuts a lower `--scene-threshold` would catch, without having to rerun detection to
+  find out. `avf analyze --full` now prints each scene's boundary `diff_score` in the console
+  scene listing, and `--csv` gained a `scene_boundaries` column (`;`-joined
+  `t=<seconds>s@<confidence>` per scene). Prompted by a real-world report of a flat scene count
+  across `--scene-threshold` 0.01-0.30 on a real clip — this makes that kind of bimodal-vs-buggy
+  question answerable from the log/CSV instead of guesswork.
+- **`avf analyze --max-sample-frames INT` / `--sample-interval FLOAT` / `--vlm-model TEXT` /
+  `--vlm-url TEXT`**: per-run overrides for `analysis.vlm.max_sample_frames`/
+  `sample_interval_sec`/`model`/`api_url`. `--vlm-url` goes through the same
+  HTTPS-required-for-non-loopback gate as the config value; there is deliberately no CLI flag for
+  `analysis.vlm.allow_http` or `api_key` — those stay config-file-only. (Fixes a latent bug along
+  the way: `analysis.vlm.sample_interval_sec` in config was never actually read —
+  `run_vlm_analysis()` hardcoded a 10.0 default regardless — so this also makes that config key
+  do something.)
 - **`analysis.vlm.allow_http`** (default `false`): the OpenAI-compatible `api` VLM provider
   refuses plain-HTTP endpoints on non-loopback hosts by default (frames and the API key would
   travel unencrypted); setting this to `true` permits plain HTTP for e.g. a LAN inference box
@@ -100,6 +119,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   async writer thread instead of serializing read → infer → write per chunk.
 
 ### Fixed
+- **`avf analyze`'s per-scene console listing was silently dropping its `[event_type]` prefix**
+  (e.g. `[scene_change]`, `[talking_head]`) — Rich's console markup parser (on by default)
+  swallows any `[...]` segment that isn't a recognized style tag instead of erroring, so the tag
+  just vanished. Found while adding the `--full` boundary-confidence display (which used the
+  same bracket pattern and would have had the identical problem). Fixed by printing that line
+  with `markup=False`.
 - **AI upscaling produced solid-black output on GPU** — the Real-ESRGAN RRDB residual-dense
   block was missing its `0.2` residual-scaling factor, causing activations to compound/explode
   into NaNs on real (non-toy) inputs. Verified fixed: AI upscale now produces real, non-black

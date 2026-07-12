@@ -12,6 +12,7 @@ import logging
 import os
 import re
 import shutil
+import statistics
 import tempfile
 from dataclasses import dataclass, field
 from typing import Any, Callable
@@ -183,6 +184,10 @@ class VideoAnalyzer:
         progress_callback: ProgressCallback | None = None,
         scene_threshold: float | None = None,
         min_scene_duration: float | None = None,
+        max_sample_frames: int | None = None,
+        sample_interval_sec: float | None = None,
+        vlm_model: str | None = None,
+        vlm_api_url: str | None = None,
     ) -> VideoAnalysis:
         """Perform full analysis on a video file.
 
@@ -206,6 +211,15 @@ class VideoAnalyzer:
                 phase transitions (probing, scene detection start/progress/done,
                 VLM sampling/request, done) so callers (e.g. the CLI) can show
                 a live status line on slow videos. See ``ProgressCallback``.
+            max_sample_frames: VLM sample-frame count override (None = use
+                ``analysis.vlm.max_sample_frames``). See ``run_vlm_analysis``.
+            sample_interval_sec: VLM frame-sampling interval override in
+                seconds (None = use ``analysis.vlm.sample_interval_sec``).
+            vlm_model: VLM model name override (None = use
+                ``analysis.vlm.model``).
+            vlm_api_url: VLM provider URL override (None = use
+                ``analysis.vlm.api_url``). See ``run_vlm_analysis`` for the
+                ``allow_http`` gate this still goes through.
 
         Returns:
             VideoAnalysis with all detected information
@@ -265,6 +279,10 @@ class VideoAnalyzer:
                 prompt_override=prompt_override,
                 system_prompt_override=system_prompt_override,
                 progress_callback=progress_callback,
+                max_sample_frames=max_sample_frames,
+                sample_interval_sec=sample_interval_sec,
+                model=vlm_model,
+                api_url=vlm_api_url,
             )
             analysis.vlm_summary = vlm_result.get("summary")
             analysis.vlm_tags = vlm_result.get("tags", [])
@@ -320,6 +338,16 @@ class VideoAnalyzer:
             threshold = self.config.get(
                 "analysis", "event_detection", "scene_change_threshold", default=0.15
             )
+
+        # Logged unconditionally (not just under --verbose) since "did my
+        # --scene-threshold/--min-scene-duration override actually take
+        # effect" is exactly the kind of thing that's otherwise invisible.
+        logger.info(
+            "scene detection for %s: using threshold=%.3f min_duration=%.2fs",
+            filepath,
+            threshold,
+            min_duration,
+        )
 
         scenes = _detect_scene_changes(
             filepath, threshold, min_duration, progress_callback=progress_callback
@@ -419,11 +447,14 @@ class VideoAnalyzer:
     def run_vlm_analysis(
         self,
         filepath: str,
-        sample_interval_sec: float = 10.0,
+        sample_interval_sec: float | None = None,
         prompt_append: str | None = None,
         prompt_override: str | None = None,
         system_prompt_override: str | None = None,
         progress_callback: ProgressCallback | None = None,
+        max_sample_frames: int | None = None,
+        model: str | None = None,
+        api_url: str | None = None,
     ) -> dict[str, Any]:
         """Run VLM (Vision Language Model) analysis on video content.
 
@@ -432,7 +463,9 @@ class VideoAnalyzer:
 
         Args:
             filepath: Path to the video file
-            sample_interval_sec: Seconds between frame samples
+            sample_interval_sec: Seconds between frame samples (None = use
+                ``analysis.vlm.sample_interval_sec`` from config, default 10.0).
+                Also settable per-run via ``avf analyze --sample-interval``.
             prompt_append: Extra text appended to the (possibly overridden) user
                 prompt, e.g. job-specific context. None falls back to
                 ``analysis.vlm.prompt_append`` in config; empty string suppresses it.
@@ -446,6 +479,18 @@ class VideoAnalyzer:
                 before frame sampling ("vlm_sampling") and before the request
                 to the provider ("vlm_request") -- useful since the request
                 itself can take several seconds with no other feedback.
+            max_sample_frames: Max frames sampled and sent to the provider
+                (None = use ``analysis.vlm.max_sample_frames``, default 8).
+                Also settable per-run via ``avf analyze --max-sample-frames``.
+            model: Model name override (None = use ``analysis.vlm.model``,
+                default "llava"). Also settable per-run via
+                ``avf analyze --vlm-model``.
+            api_url: Provider base/endpoint URL override (None = use
+                ``analysis.vlm.api_url``). Also settable per-run via
+                ``avf analyze --vlm-url``. Flows through to the same
+                ``allow_http``/HTTPS-required gate as the config value (see
+                ``_call_custom_api``) -- there is deliberately no CLI override
+                for ``allow_http`` or ``api_key``; those stay config-file-only.
 
         Returns:
             Dict with keys: summary, tags, objects, rating
@@ -457,10 +502,19 @@ class VideoAnalyzer:
 
         vlm_config = self.config.get("analysis", "vlm", default={})
         provider = vlm_config.get("provider", "local")
-        model = vlm_config.get("model", "llava")
-        api_url = vlm_config.get("api_url", "")
+        model = model if model is not None else vlm_config.get("model", "llava")
+        api_url = api_url if api_url is not None else vlm_config.get("api_url", "")
         api_key = vlm_config.get("api_key", "")
-        max_frames = vlm_config.get("max_sample_frames", 8)
+        max_frames = (
+            max_sample_frames
+            if max_sample_frames is not None
+            else vlm_config.get("max_sample_frames", 8)
+        )
+        sample_interval_sec = (
+            sample_interval_sec
+            if sample_interval_sec is not None
+            else vlm_config.get("sample_interval_sec", 10.0)
+        )
 
         resolved_append = (
             prompt_append if prompt_append is not None else vlm_config.get("prompt_append", "")
@@ -933,6 +987,20 @@ def _run_api_vlm(
 # ─── Scene Detection ───────────────────────────────────────────────
 
 
+def _select_near_misses(
+    near_misses: list[tuple[float, float]], limit: int = 10
+) -> list[tuple[float, float]]:
+    """Return the `limit` highest-scoring entries from a list of (time, diff_score)
+    near-miss candidates, highest score first.
+
+    Pulled out of `_detect_scene_changes` as a small pure function so the
+    "which near-misses get reported" selection logic is unit-testable without
+    decoding real video frames -- see TestNearMissTracking in
+    tests/unit/test_scene_detection.py.
+    """
+    return sorted(near_misses, key=lambda item: -item[1])[:limit]
+
+
 def _detect_scene_changes(
     filepath: str,
     threshold: float,
@@ -983,6 +1051,20 @@ def _detect_scene_changes(
     frame_idx = 0
     current_time = 0.0
 
+    # "Near-miss" tracking: frame pairs that scored close to (but under) the
+    # threshold, i.e. plausible cuts that a slightly lower threshold would
+    # catch. Floor of threshold/4 keeps ordinary within-shot noise/motion out
+    # of the list -- see the "near-miss scores" log line below, which exists
+    # specifically to answer "would lowering the threshold find more cuts,
+    # and where?" without having to rerun detection at several thresholds.
+    near_miss_floor = threshold / 4.0
+    near_misses: list[tuple[float, float]] = []  # (time, diff_score), diff_score < threshold
+    # Raw diff_score of each actually-detected cut (NOT SceneEvent.confidence --
+    # the final trailing SceneEvent after the loop gets a hardcoded confidence
+    # of 0.5 that isn't a real score, so this list is tracked separately to
+    # keep the score summary below accurate).
+    cut_scores: list[float] = []
+
     # Report progress roughly every 5% of the video (or every 200 frames if
     # the container doesn't report a usable frame count) so a caller watching
     # a long scan doesn't see a silent hang.
@@ -1021,7 +1103,10 @@ def _detect_scene_changes(
                             confidence=min(diff_score, 1.0),
                         )
                     )
+                    cut_scores.append(diff_score)
                     scene_start = current_time
+            elif diff_score > near_miss_floor:
+                near_misses.append((current_time, diff_score))
 
         prev_frame = gray
         frame_idx += 1
@@ -1050,6 +1135,33 @@ def _detect_scene_changes(
                     confidence=0.5,
                 )
             )
+
+    if cut_scores:
+        logger.info(
+            "scene detection for %s: %d cut(s) found (threshold=%.3f), "
+            "cut score min=%.3f median=%.3f max=%.3f",
+            filepath,
+            len(cut_scores),
+            threshold,
+            min(cut_scores),
+            statistics.median(cut_scores),
+            max(cut_scores),
+        )
+    else:
+        logger.info(
+            "scene detection for %s: no cuts found above threshold %.3f", filepath, threshold
+        )
+
+    if near_misses:
+        top_near_misses = _select_near_misses(near_misses)
+        near_miss_str = ", ".join(f"{score:.3f} @ {t:.1f}s" for t, score in top_near_misses)
+        logger.info(
+            "near-miss scores for %s below threshold %.3f (above %.3f): %s",
+            filepath,
+            threshold,
+            near_miss_floor,
+            near_miss_str,
+        )
 
     return scenes
 

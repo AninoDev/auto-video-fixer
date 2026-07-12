@@ -291,13 +291,16 @@ analysis:
     #                      if the endpoint needs auth, refuses non-HTTPS for non-loopback hosts.
     provider: local
 
-    # Model name passed to the provider, e.g. "llava" (Ollama), "gpt-4o" (OpenAI).
+    # Model name passed to the provider, e.g. "llava" (Ollama), "gpt-4o" (OpenAI). Also settable
+    # per-run with `avf analyze --vlm-model TEXT`.
     model: llava
 
     # API key for openai/api providers. Leave empty for a local Ollama instance that doesn't
     # require auth. NEVER commit a real key here -- this value is redacted ("***") in the
     # startup settings banner and DEBUG config dumps because the key "api_key" matches
     # config.py's secret-key heuristic, but the config.yaml file on disk is still plaintext.
+    # Deliberately config-file-only: there is no `avf analyze` CLI flag for this (or for
+    # allow_http below) -- keeping secrets/security posture out of shell history/process args.
     api_key: ""
 
     # --- Example: local Ollama (default provider) ---
@@ -325,19 +328,24 @@ analysis:
     # allow_http: true                     # required for non-loopback plain HTTP (see below)
 
     # Base URL override for ollama/api providers. Empty string = provider-specific default
-    # (http://localhost:11434 for ollama).
+    # (http://localhost:11434 for ollama). Also settable per-run with
+    # `avf analyze --vlm-url TEXT` -- the override still goes through the same allow_http/HTTPS
+    # gate below, unchanged.
     api_url: ""
 
     # The "api" provider refuses plain-HTTP api_url endpoints on non-loopback hosts by
     # default: sampled video frames and the api_key would travel unencrypted. Set true to
     # permit plain HTTP anyway -- only do this for a server on a network you control
-    # (e.g. a LAN inference box on a private subnet). HTTPS never needs this.
+    # (e.g. a LAN inference box on a private subnet). HTTPS never needs this. Deliberately
+    # config-file-only -- see the api_key note above.
     allow_http: false
 
-    # Max number of frames sampled from the video and sent to the VLM per analysis call.
+    # Max number of frames sampled from the video and sent to the VLM per analysis call. Also
+    # settable per-run with `avf analyze --max-sample-frames INT`.
     max_sample_frames: 8
 
-    # Seconds between sampled frames (see _extract_sample_frames() in core/analysis.py).
+    # Seconds between sampled frames (see _extract_sample_frames() in core/analysis.py). Also
+    # settable per-run with `avf analyze --sample-interval FLOAT`.
     sample_interval_sec: 10.0
 
     # --- Prompt customization ---

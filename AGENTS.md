@@ -253,9 +253,9 @@ failed.
   text)" hint). The full summary is also always written at INFO to the log (auto per-run DEBUG
   log file always has it; console has it at INFO too unless `--log-level` raises the threshold).
 - `--csv PATH`: Write one row per analyzed video (filepath, filename, duration, resolution,
-  framerate, codec, has_video/has_audio/hdr, scenes_detected, and — when VLM ran — the FULL
-  untruncated summary, `;`-joined tags/objects, and content_rating) to a UTF-8 CSV. Overwrites
-  `PATH` if it exists; does not append across runs.
+  framerate, codec, has_video/has_audio/hdr, scenes_detected, `scene_boundaries` (see below), and
+  — when VLM ran — the FULL untruncated summary, `;`-joined tags/objects, and content_rating) to
+  a UTF-8 CSV. Overwrites `PATH` if it exists; does not append across runs.
 - `--prompt-append TEXT`: Extra text appended to the VLM user prompt for this run (overrides
   `analysis.vlm.prompt_append`) -- e.g. job-specific context like "these are trail-camera clips".
 - `--prompt-override TEXT`: Replace the VLM user prompt entirely for this run (overrides
@@ -264,6 +264,32 @@ failed.
   `_parse_vlm_response()`'s fallback treats non-JSON text as the summary (empty tags/objects/
   rating) instead of erroring. There's no CLI flag for the system prompt -- use
   `analysis.vlm.system_prompt_override` in config.
+- `--max-sample-frames INT`: Override `analysis.vlm.max_sample_frames` (default 8) for this run.
+- `--sample-interval FLOAT`: Override `analysis.vlm.sample_interval_sec` (default 10.0) for this
+  run. (Prior to this flag being added, `sample_interval_sec` in config was never actually read
+  -- `run_vlm_analysis()` hardcoded 10.0 -- so this also fixes a dead config key.)
+- `--vlm-model TEXT`: Override `analysis.vlm.model` (e.g. `llava`, `gpt-4o`) for this run.
+- `--vlm-url TEXT`: Override `analysis.vlm.api_url` for this run. Still goes through the same
+  HTTPS-required-for-non-loopback-hosts gate as the config value (`_call_custom_api`'s `urlparse`
+  check) -- `analysis.vlm.allow_http` is what permits plain HTTP, and deliberately has no CLI
+  flag, same as `analysis.vlm.api_key`; both stay config-file-only (secrets/security posture
+  shouldn't be one flag away from a shell history entry).
+
+**Scene-score visibility** (added after a real-world report of a flat scene count across
+`--scene-threshold` 0.01-0.30 that turned out to need the raw scores to diagnose): every
+`detect_events()`/`_detect_scene_changes()` call now logs at INFO, per file:
+  - The effective `threshold`/`min_duration` actually used (config value or CLI override,
+    whichever applied) -- confirms an override took effect.
+  - A one-line cut-score summary: number of cuts found, min/median/max `diff_score` among them.
+  - A "near-miss" line (only if any exist): up to the 10 highest diff_scores that fell *below*
+    threshold but *above* threshold/4 -- i.e. plausible cuts a lower threshold would catch, with
+    their timestamps, so "would lowering the threshold help, and where?" doesn't require a rerun.
+`avf analyze --full` also prints each scene's boundary `diff_score` in the console scene listing
+(`(score=0.XXX)`; the default view omits it to stay uncluttered), and `--csv`'s
+`scene_boundaries` column has one `t=<seconds>s@<confidence>` entry per scene, `;`-joined.
+`SceneEvent.confidence` is the `diff_score` of the cut that *ended* that scene (not started it);
+the final scene per video has a fixed placeholder confidence of 0.5 (nothing ends it) -- see
+`_scene_boundaries_str()`'s docstring in `cli/cli.py`.
 
 Other subcommands: `avf find-duplicates REFERENCE DIRECTORY [--threshold FLOAT]`,
 `avf presets-cmd` (lists presets), `avf gpu-info`, `avf model-info [--model NAME]`,

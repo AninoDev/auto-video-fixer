@@ -10,6 +10,7 @@ from autovideofixer.config import Config
 from autovideofixer.core.analysis import (
     SceneEvent,
     VideoAnalyzer,
+    _select_near_misses,
     compute_video_dhash,
     compute_video_hash,
     hash_similarity,
@@ -167,6 +168,80 @@ class TestVideoAnalyzerEvents:
         assert len(self.analyzer._analysis_cache) == 1
         self.analyzer.clear_cache()
         assert len(self.analyzer._analysis_cache) == 0
+
+
+class TestNearMissTracking:
+    """Tests for near-miss score tracking/reporting -- added to answer "would
+    lowering --scene-threshold find more cuts, and where?" without a rerun.
+
+    `_select_near_misses` is the pure "which candidates get reported" selection
+    logic pulled out of `_detect_scene_changes` (see its docstring); tested
+    here directly with synthetic (time, score) pairs so it doesn't need real
+    video decoding. The full logging behavior (near_miss_floor filtering
+    during the actual frame-differencing loop) is covered by
+    test_near_miss_logging_on_real_clip below (integration, real ffmpeg clip).
+    """
+
+    def test_select_near_misses_returns_highest_scores_first(self):
+        near_misses = [(1.0, 0.05), (2.0, 0.12), (3.0, 0.09), (4.0, 0.14), (5.0, 0.02)]
+        top = _select_near_misses(near_misses, limit=3)
+        assert top == [(4.0, 0.14), (2.0, 0.12), (3.0, 0.09)]
+
+    def test_select_near_misses_respects_default_limit_of_ten(self):
+        # 20 synthetic candidates with scores straddling an implied threshold
+        # (e.g. threshold=0.20, floor=0.05): scores 0.00-0.19 in 0.01 steps.
+        near_misses = [(float(i), i / 100.0) for i in range(20)]
+        top = _select_near_misses(near_misses)
+        assert len(top) == 10
+        # Highest-scoring synthetic candidates (0.19 down to 0.10) reported first.
+        assert [score for _, score in top] == [round(x / 100, 2) for x in range(19, 9, -1)]
+
+    def test_select_near_misses_empty_input(self):
+        assert _select_near_misses([]) == []
+
+    def test_select_near_misses_fewer_than_limit(self):
+        near_misses = [(1.0, 0.08), (2.0, 0.11)]
+        top = _select_near_misses(near_misses, limit=10)
+        assert top == [(2.0, 0.11), (1.0, 0.08)]
+
+    @pytest.mark.integration
+    def test_near_miss_logging_on_real_clip(self, tmp_path, caplog):
+        """With threshold set above this clip's real cut scores, the near-miss
+        log line fires and lists candidates in the (threshold/4, threshold) band."""
+        import logging
+
+        ground_truth = TestSceneDetectionCalibration._build_ground_truth(tmp_path)
+
+        from autovideofixer.core.analysis import _detect_scene_changes
+
+        with caplog.at_level(logging.INFO, logger="autovideofixer.core.analysis"):
+            # 0.3 is above every real cut score on this small clip (see
+            # TestSceneDetectionCalibration.test_old_default_threshold_under_detects
+            # -- 0.3 under-detects it), so real cuts should surface as near-misses.
+            _detect_scene_changes(ground_truth, threshold=0.3, min_duration_sec=0.2)
+
+        near_miss_records = [r for r in caplog.records if "near-miss scores" in r.message]
+        assert near_miss_records, "expected a near-miss log line"
+        message = near_miss_records[0].message
+        assert "threshold 0.300" in message
+        assert "@" in message  # "<score> @ <time>s" entries present
+
+    @pytest.mark.integration
+    def test_no_near_miss_log_when_scores_cleanly_separated(self, tmp_path, caplog):
+        """At the shipped default threshold (0.15), this clip's real cuts (~0.17-0.30)
+        all clear the threshold outright and its noise floor (~0.001) sits well below
+        threshold/4 -- nothing lands in the near-miss band, so no log line fires."""
+        import logging
+
+        ground_truth = TestSceneDetectionCalibration._build_ground_truth(tmp_path)
+
+        from autovideofixer.core.analysis import _detect_scene_changes
+
+        with caplog.at_level(logging.INFO, logger="autovideofixer.core.analysis"):
+            _detect_scene_changes(ground_truth, threshold=0.15, min_duration_sec=0.2)
+
+        near_miss_records = [r for r in caplog.records if "near-miss scores" in r.message]
+        assert not near_miss_records
 
 
 class TestSceneDetectionCalibration:

@@ -365,6 +365,110 @@ class TestAnalyzeCommand:
         assert captured.get("scene_threshold") == pytest.approx(0.08)
         assert captured.get("min_scene_duration") == pytest.approx(0.5)
 
+    def test_vlm_sampling_flags_forwarded_to_analyzer(self, tmp_path):
+        """--max-sample-frames/--sample-interval/--vlm-model/--vlm-url are threaded
+        through to VideoAnalyzer.analyze() (analysis.vlm.* CLI overrides)."""
+        video = self._touch_video(tmp_path / "clip.mp4")
+        captured = {}
+
+        def side_effect(fp, **kw):
+            captured.update(kw)
+            return self._fake_analysis(fp)
+
+        with patch("autovideofixer.core.analysis.VideoAnalyzer.analyze", side_effect=side_effect):
+            result = self.runner.invoke(
+                main,
+                [
+                    "analyze",
+                    video,
+                    "--vlm",
+                    "--max-sample-frames",
+                    "3",
+                    "--sample-interval",
+                    "2.5",
+                    "--vlm-model",
+                    "custom-model",
+                    "--vlm-url",
+                    "https://vlm.example.com/v1/chat/completions",
+                ],
+            )
+
+        assert result.exit_code == 0, result.output
+        assert captured.get("max_sample_frames") == 3
+        assert captured.get("sample_interval_sec") == pytest.approx(2.5)
+        assert captured.get("vlm_model") == "custom-model"
+        assert captured.get("vlm_api_url") == "https://vlm.example.com/v1/chat/completions"
+
+    def test_vlm_sampling_flags_absent_when_not_given(self, tmp_path):
+        """Omitted flags forward as None, so config values are used (not silently
+        overridden with e.g. 0/empty-string)."""
+        video = self._touch_video(tmp_path / "clip.mp4")
+        captured = {}
+
+        def side_effect(fp, **kw):
+            captured.update(kw)
+            return self._fake_analysis(fp)
+
+        with patch("autovideofixer.core.analysis.VideoAnalyzer.analyze", side_effect=side_effect):
+            result = self.runner.invoke(main, ["analyze", video, "--no-vlm"])
+
+        assert result.exit_code == 0, result.output
+        assert captured.get("max_sample_frames") is None
+        assert captured.get("sample_interval_sec") is None
+        assert captured.get("vlm_model") is None
+        assert captured.get("vlm_api_url") is None
+
+    def test_csv_includes_scene_boundaries(self, tmp_path):
+        """--csv's scene_boundaries column has one t=<seconds>s@<confidence> entry
+        per detected scene, semicolon-joined."""
+        from autovideofixer.core.analysis import SceneEvent
+
+        video = self._touch_video(tmp_path / "clip.mp4")
+        csv_path = tmp_path / "boundaries.csv"
+        scenes = [
+            SceneEvent(start_time=0.0, end_time=12.3, confidence=0.42),
+            SceneEvent(start_time=12.3, end_time=30.0, confidence=0.87),
+        ]
+        fake = self._fake_analysis(video, scenes=scenes, total_scenes=len(scenes))
+
+        with patch("autovideofixer.core.analysis.VideoAnalyzer.analyze", return_value=fake):
+            result = self.runner.invoke(
+                main, ["analyze", video, "--no-vlm", "--csv", str(csv_path)]
+            )
+
+        assert result.exit_code == 0, result.output
+
+        import csv
+
+        with open(csv_path, newline="", encoding="utf-8") as f:
+            rows = list(csv.DictReader(f))
+
+        assert len(rows) == 1
+        assert rows[0]["scene_boundaries"] == "t=12.3s@0.420;t=30.0s@0.870"
+
+    def test_full_flag_shows_scene_confidence_default_view_does_not(self, tmp_path):
+        """Per-scene boundary confidence is shown only with --full."""
+        from autovideofixer.core.analysis import SceneEvent
+
+        video = self._touch_video(tmp_path / "clip.mp4")
+        scenes = [SceneEvent(start_time=0.0, end_time=12.3, confidence=0.42)]
+        fake = self._fake_analysis(video, scenes=scenes, total_scenes=len(scenes))
+
+        with patch("autovideofixer.core.analysis.VideoAnalyzer.analyze", return_value=fake):
+            full_result = self.runner.invoke(main, ["analyze", video, "--no-vlm", "--full"])
+            default_result = self.runner.invoke(main, ["analyze", video, "--no-vlm"])
+
+        assert full_result.exit_code == 0, full_result.output
+        assert default_result.exit_code == 0, default_result.output
+        full_plain = _plain(full_result.output)
+        default_plain = _plain(default_result.output)
+        assert _plain("score=0.420") in full_plain
+        assert _plain("score=0.420") not in default_plain
+        # Regression check for the Rich-markup-swallows-"[...]" bug: the
+        # event_type tag itself must also survive (both views).
+        assert _plain("[scene_change]") in full_plain
+        assert _plain("[scene_change]") in default_plain
+
     def test_no_video_files_found(self, tmp_path):
         """analyze on a path with no video files exits non-zero with a clear message."""
         empty_dir = tmp_path / "empty"
