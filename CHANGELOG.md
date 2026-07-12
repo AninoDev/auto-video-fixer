@@ -8,6 +8,121 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **`gpu.vulkan_device` (default `0`)**: selects which Vulkan physical device index the ncnn
+  backend (`stages.upscale.backend: ncnn`, `stages.interpolate.backend: ncnn`) runs on. Both
+  `RealESRGANUpscaler`/`RIFEInterpolator` and the stages constructing them now thread this
+  through; previously it was hardcoded to device 0, which on a multi-GPU machine may not be the
+  fastest one visible (e.g. an integrated GPU can enumerate before a passed-through discrete
+  GPU) -- see `avf gpu-info`/`ncnn.get_gpu_count()` to find the right index.
+- **RIFE's ncnn/Vulkan interpolation backend is now real and fast**: replaces the previous
+  generic-`ncnn`-bindings implementation (which could never load the official RIFE graph -- it
+  needs a custom `rife.Warp` ncnn layer the generic bindings don't register) with the
+  `rife-ncnn-vulkan-python` package, a SWIG wrapper around the actual upstream C++ tool. No
+  prebuilt wheel exists for Python 3.14 yet; building from source needs the `swig` system package
+  and `CMAKE_POLICY_VERSION_MINIMUM=3.5` set for the install (works around a stale vendored
+  `cmake_minimum_required()` in the package's bundled ncnn snapshot that modern CMake rejects --
+  see the `ncnn` extra's comment in `pyproject.toml`). Verified: 81.8 fps interpolating a real
+  1280x720 frame pair on an RTX 5060 Ti (raw backend), ~18 fps through the full `interpolate`
+  stage end-to-end, correct non-black output.
+- **Planned: three Rust rewrite targets** (not yet implemented, scoped for a near-term push) --
+  scene-detection frame differencing, perceptual-hash duplicate detection, and the chunked AI
+  frame prefetch/writer threading. See `docs/REQUIREMENTS.md`'s "5. Rust rewrite candidates" for
+  full scope and `AGENTS.md` for a pointer.
+- **`analysis.vlm.max_tokens` (default 1024) and `analysis.llm.max_tokens` (default 4096)**:
+  the VLM/LLM response token budget was previously hardcoded to 1000 in the request payload
+  (client-side -- not a server setting), which truncated reasoning models mid-thought (their
+  thinking tokens count against the same budget) and made the scene coordinator fail open.
+  Now configurable; Ollama requests map it to `options.num_predict`.
+- **Auto-crop stage (opt-in, off by default)**: new `crop` stage (`core/stages/crop.py`) detects
+  a video's true content bounds -- the union over the whole video (the furthest real content
+  ever reaches toward each edge), not a per-frame crop -- via FFmpeg
+  `cropdetect=limit=<L>:round=<R>:reset=0` and crops to that single window
+  (`crop=w:h:x:y`, `libx264 -crf 18`, `-c:a copy`). Strips letterboxing/pillarboxing from source
+  video and any residual black border stabilization can itself introduce. Enable with
+  `--enable-stage crop` or `stages.crop.enabled: true`; runs right after `stabilize` and before
+  every other enhancement/AI stage in `Pipeline.optimize_stage_order()` so deblock/denoise/
+  upscale/interpolate never spend compute on pixels about to be cropped away. New config:
+  `stages.crop.limit` (default 24), `.round` (default 2), `.min_crop_px` (default 8 -- skip if
+  the crop would save fewer pixels than this in both dimensions), `.analyze_duration_sec` (0 =
+  full-video scan, default; >0 = sample only the first N seconds), `.vlm_check` (default false),
+  `.vlm_policy` (`"warn"` default | `"skip"`). New CLI flag `--crop-limit INT`.
+  - **VLM-assisted watermark/content disambiguation (opt-in, `stages.crop.vlm_check`)**: a
+    watermark/logo sitting in the border area can fool naive cropdetect either way -- bright
+    enough to widen the kept region, or dim enough to get cropped away with no way for cropdetect
+    alone to flag it as meaningful. When enabled (requires `analysis.vlm.enabled: true`), one
+    frame is rendered twice (plain, and with the proposed crop box drawn via `drawbox`) and sent
+    to the VLM with a fixed internal prompt (`core.analysis.run_crop_vlm_check`, parsed via a
+    tolerant JSON-then-text fallback, `_parse_crop_vlm_response`). `vlm_policy: "warn"` logs a
+    WARNING and crops anyway (default); `"skip"` skips cropping the video entirely. Fails open on
+    any VLM error (unreachable endpoint, exception, unparseable response) -- logs a WARNING and
+    proceeds with the plain cropdetect result. An `"expand"` policy (grow the crop box to include
+    just the flagged region) was considered and rejected: VLMs don't reliably return pixel
+    coordinates, so there's nothing to expand to.
+  - Verified against real FFmpeg-generated fixtures: a 640x360-in-640x480 letterboxed video crops
+    back to ~640x360 with no border left on re-scan; a border-free video is left uncropped
+    (via `should_run()`'s quick pre-filter or `execute()`'s `min_crop_px` skip); a letterboxed
+    video with a dim in-border overlay is cropped away in plain mode (documented limitation --
+    plain cropdetect has no notion of "meaningful overlay" vs. background), while
+    `vlm_check` + a mocked VLM response + `vlm_policy: "skip"` leaves that video uncropped. See
+    `tests/integration/test_integration.py::TestCropIntegration`.
+- **Optional ncnn/Vulkan inference backend** for the upscale and interpolate stages
+  (`stages.upscale.backend: ncnn`, `stages.interpolate.backend: ncnn`) — an alternative to
+  PyTorch/CUDA that works on AMD/Intel/integrated GPUs with no CUDA-matched torch build. Upscale
+  runs in-process via the generic `ncnn` Python package. RIFE interpolation runs via a separate
+  package, `rife-ncnn-vulkan-python` (also part of the new `ncnn` extra) — RIFE's official ncnn
+  graph needs a custom `rife.Warp` ncnn layer that only this package's wrapped upstream C++ build
+  registers; the generic `ncnn` package doesn't. `rife-ncnn-vulkan-python` has no prebuilt wheel
+  for Python 3.14 yet: building it from source needs the `swig` system package and, against
+  modern CMake, `CMAKE_POLICY_VERSION_MINIMUM=3.5` set for the install command (see the `ncnn`
+  extra's comment in `pyproject.toml`). Both backends are verified working (correct, non-black
+  output); RIFE/ncnn is also fast — ~82 fps interpolating a real 1280x720 frame pair via the raw
+  backend, ~18 fps end-to-end through the full `interpolate` stage, both on an RTX 5060 Ti over
+  Vulkan. ncnn models (.param/.bin) get their own SHA256-verified registry and download path.
+  Unavailability (missing package, no Vulkan device, no models) flows through the existing
+  `ai_fallback` policy.
+- **Scene-based processing (opt-in, off by default)**: new `core/scenes.py` splits a video at
+  existing scene-detection boundaries (`VideoAnalyzer.detect_events`), re-encodes each scene as
+  its own clip, runs `stabilize`/`interpolate` per-scene, and concatenates the result (video and
+  audio cut at the same boundaries, remuxed together) before the remaining whole-video stages
+  (upscale/denoise/deblock/normalize/encode) run. Enable with config `scenes.enabled: true` or
+  CLI `--scene-mode`; the whole-video path is completely unaffected when disabled (zero behavior
+  change). See AGENTS.md's "Scene mode" section for the full design.
+  - **Never interpolate across a cut**: frame interpolation now always runs per-scene when scene
+    mode is on, so RIFE/minterpolate never synthesizes a blend frame between two unrelated shots.
+    Verified on a synthetic multi-scene clip: zero ghosting/blend frames at any sampled boundary
+    frame; output duration/fps stay within the documented tolerance of the original.
+  - **Per-scene stabilization strength tiering**: each scene gets its own `vidstabdetect` pass;
+    scenes below `stages.stabilize.threshold` skip stabilization entirely, scenes above
+    `scenes.stabilize.aggressive_shake_threshold` get a second pass with smoothness multiplied by
+    `scenes.stabilize.aggressive_smoothness_multiplier` (default tiers: skip / normal /
+    aggressive). New config: `scenes.stabilize.enabled`, `.aggressive_shake_threshold`,
+    `.aggressive_smoothness_multiplier`.
+  - **Drop non-content scenes (opt-in, requires scene mode)**: `scenes.drop_non_content: true` (+
+    CLI `--drop-non-content`) runs per-scene VLM sampling (`VideoAnalyzer.
+    run_vlm_analysis_for_scene`, frame count scaled down for short scenes) followed by a
+    coordinating text-LLM pass (`run_scene_coordinator`, new `analysis.llm` config section --
+    provider/model/api_url/api_key/allow_http, same HTTPS/allow_http gate as `analysis.vlm`) that
+    reviews all per-scene summaries together and flags scenes that aren't part of the main
+    content (e.g. a "like and subscribe" interstitial). **Fails open on any failure** -- unparseable
+    response, out-of-range/non-integer drop index, unreachable endpoint, or an exception --
+    logging a WARNING and keeping every scene; verified live against a real (LAN) VLM endpoint,
+    including a real failure case (the coordinator model's reasoning tokens exhausted its
+    response budget before emitting JSON) that correctly triggered fail-open.
+  - `avf process --scene-mode/--no-scene-mode` and `--drop-non-content/--no-drop-non-content` CLI
+    flags (override `scenes.enabled`/`scenes.drop_non_content` for the run).
+- **Parallel-chunked traditional frame interpolation**: `minterpolate` is single-threaded per
+  ffmpeg process and slow on long clips. `InterpolateStage`'s traditional path now splits a long
+  enough input into N frame-index-aligned chunks (1-frame overlap, trimmed on concat) and runs
+  them as parallel ffmpeg processes, bounded by `stages.interpolate.parallel_chunks` (0 = auto,
+  `min(cpu_count, 8)`; 1 = previous serial behavior) and `stages.interpolate.
+  min_chunk_duration_sec`. Applies to whole-video interpolation AND to each scene's interpolation
+  pass under scene mode (worker budget shared between scenes-in-parallel and chunks-per-scene so
+  the two pools don't oversubscribe each other -- see `core/scenes.py::_scene_worker_budget`).
+  The AI/RIFE path is unaffected and stays serial (GPU-bound). Benchmarked on a 60s 720p30 clip
+  interpolated to 60fps on an 8-core machine: ~270s serial vs. ~58-64s with `parallel_chunks=8`
+  (~4.2-4.7x). Frame counts between serial and chunked runs are close but not bit-exact (within
+  ~1-2%, from `minterpolate`'s own per-chunk duration-based frame-count rounding, not from
+  dropped/duplicated content) -- see `_execute_traditional_parallel`'s docstring.
 - **`avf analyze` multi-file support**: now accepts multiple files and/or directories
   (`avf analyze PATHS...`), with `--recursive`/`-r` mirroring `process`'s directory scanning. A
   failure analyzing one file is logged and skipped; the remaining files still run, and the

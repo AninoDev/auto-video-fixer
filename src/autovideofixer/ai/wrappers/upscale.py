@@ -351,7 +351,20 @@ class RealESRGANUpscaler:
         device_preference: str = "auto",
         tile_size: int = 0,
         tile_overlap: int = DEFAULT_TILE_OVERLAP,
+        backend: str = "torch",
+        vulkan_device: int = 0,
     ):
+        """
+        Args:
+            backend: "torch" (default -- unchanged existing behavior) or
+                "ncnn". "ncnn" delegates every method below to
+                `ai.backends.ncnn_upscale.NcnnUpscaleBackend` instead of
+                running the torch/RRDBNet code in this class -- the torch
+                path is untouched either way, this only decides which
+                implementation `load_model()`/`upscale()`/`unload()` run.
+                See ai/WIRING.md for how a stage would plumb a config
+                value through to this parameter.
+        """
         self.scale = scale
         self.model_name = model_name
         self.tta_mode = tta_mode
@@ -365,6 +378,9 @@ class RealESRGANUpscaler:
         #   > 0: always tile at this size (skips the auto-threshold check).
         self.tile_size = tile_size
         self.tile_overlap = max(0, tile_overlap)
+        self.backend = backend
+        self.vulkan_device = vulkan_device
+        self._ncnn_backend: Any = None
         self._model: Any = None
         self._device: Any = None
         self._loaded = False
@@ -379,11 +395,31 @@ class RealESRGANUpscaler:
         """Load the Real-ESRGAN model from disk.
 
         Args:
-            model_path: Path to .pth file. If None, uses cached model.
+            model_path: Path to .pth file (torch backend) or ignored
+                (ncnn backend resolves its own .param/.bin via the ncnn
+                model registry -- see ai/backends/ncnn_upscale.py).
 
         Returns:
-            True if model loaded successfully.
+            True if model loaded successfully. Never raises: an
+            ncnn-specific failure (bindings missing, no such model, a
+            graph load error) is logged and returns False here, exactly
+            like every existing torch failure path below, so a calling
+            stage's `_ai_fallback_or_fail()` handling needs no changes to
+            cover this backend too.
         """
+        if self.backend == "ncnn":
+            from autovideofixer.ai.backends.ncnn_upscale import NcnnUpscaleBackend
+
+            self._ncnn_backend = NcnnUpscaleBackend(
+                model_name=self.model_name,
+                scale=self.scale,
+                tile_size=self.tile_size,
+                tile_overlap=self.tile_overlap,
+                vulkan_device=self.vulkan_device,
+            )
+            self._loaded = self._ncnn_backend.load_model()
+            return self._loaded
+
         try:
             import importlib.util
 
@@ -496,6 +532,10 @@ class RealESRGANUpscaler:
         """
         if not self._loaded:
             raise RuntimeError("Model not loaded. Call load_model() first.")
+
+        if self.backend == "ncnn":
+            assert self._ncnn_backend is not None
+            return self._ncnn_backend.upscale(frame)
 
         import torch
 
@@ -629,6 +669,12 @@ class RealESRGANUpscaler:
 
     def unload(self) -> None:
         """Release model from memory."""
+        if self.backend == "ncnn":
+            if self._ncnn_backend is not None:
+                self._ncnn_backend.unload()
+                self._ncnn_backend = None
+            self._loaded = False
+            return
         if self._model is not None:
             del self._model
             self._model = None

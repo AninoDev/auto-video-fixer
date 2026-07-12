@@ -428,7 +428,15 @@ class UpscaleStage(BaseStage):
             if pass_model == "RealESRGAN_x4plus" and scale_factor <= 2:
                 pass_model = "RealESRGAN_x2plus"
 
-            success, msg = ensure_model_available(pass_model)
+            backend = self._stage_config.get("backend", "torch")
+
+            # The pre-flight availability check below queries the torch
+            # MODEL_REGISTRY (.pth files); for the ncnn backend the wrapper's
+            # own load_model() resolves/downloads the .param/.bin pair via
+            # ensure_ncnn_model_available(), and a load failure already routes
+            # through _ai_fallback_or_fail() -- so skip the wrong-registry
+            # check entirely rather than gating ncnn on cached torch weights.
+            success, msg = (True, "") if backend == "ncnn" else ensure_model_available(pass_model)
             if not success:
                 # Fall back to the originally configured model if the
                 # auto-selected lighter one isn't available (e.g. offline
@@ -454,6 +462,8 @@ class UpscaleStage(BaseStage):
                 tta_mode=self._tt_mode,
                 device_preference=self.config.get("gpu", "preferred_device", default="auto"),
                 tile_size=self._stage_config.get("tile_size", 0),
+                backend=backend,
+                vulkan_device=self.config.get("gpu", "vulkan_device", default=0),
             )
 
             if not upscaler.load_model():

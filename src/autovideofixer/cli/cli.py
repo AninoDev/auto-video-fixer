@@ -260,6 +260,35 @@ def _log_effective_settings(
     "--hwaccel (overrides gpu.preferred_device). Run `avf gpu-info` to check what "
     "PyTorch actually sees.",
 )
+@click.option(
+    "--scene-mode/--no-scene-mode",
+    "scene_mode",
+    default=None,
+    help="Process stabilize/interpolate per-scene instead of whole-video (overrides "
+    "scenes.enabled): shaky scenes get stabilized more aggressively than calm ones, and "
+    "frame interpolation never runs across a scene cut. Reuses existing scene detection "
+    "(analysis.event_detection.*); off by default. Whole-video stages (upscale/denoise/"
+    "deblock/normalize/encode) are unaffected and still run once on the reassembled video.",
+)
+@click.option(
+    "--drop-non-content/--no-drop-non-content",
+    "drop_non_content",
+    default=None,
+    help="With --scene-mode: run per-scene VLM analysis + a coordinating LLM pass "
+    "(analysis.vlm / analysis.llm) that flags and removes scenes that aren't part of the "
+    "video's main content (e.g. a 'like and subscribe' interstitial). Fails open (keeps "
+    "every scene, logs a WARNING) if the VLM/coordinator is unavailable or its response "
+    "can't be parsed -- never drops content on an LLM failure (overrides "
+    "scenes.drop_non_content).",
+)
+@click.option(
+    "--crop-limit",
+    type=int,
+    default=None,
+    help="cropdetect luma threshold for the auto-crop stage (overrides stages.crop.limit); "
+    "the crop stage itself still needs --enable-stage crop or stages.crop.enabled: true "
+    "in config, since auto-crop is opt-in.",
+)
 @click.pass_context
 def process(
     ctx: click.Context,
@@ -285,6 +314,9 @@ def process(
     encoder_preset: str | None,
     hwaccel: str | None,
     gpu_device: str | None,
+    scene_mode: bool | None,
+    drop_non_content: bool | None,
+    crop_limit: int | None,
 ) -> None:
     """Process video files with the specified settings."""
     if list_presets_flag:
@@ -361,6 +393,15 @@ def process(
 
     if gpu_device is not None:
         config.set(gpu_device, "gpu", "preferred_device")
+
+    if scene_mode is not None:
+        config.set(scene_mode, "scenes", "enabled")
+
+    if drop_non_content is not None:
+        config.set(drop_non_content, "scenes", "drop_non_content")
+
+    if crop_limit is not None:
+        config.set(crop_limit, "stages", "crop", "limit")
 
     for stage_name in enable_stages:
         config.set(True, "stages", stage_name, "enabled")

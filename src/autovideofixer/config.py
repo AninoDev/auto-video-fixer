@@ -169,6 +169,13 @@ class Config:
             "auto_detect": True,
             "preferred_device": "auto",  # auto, cpu, cuda, metal
             "memory_limit_gb": None,
+            # Which Vulkan physical device index the ncnn backend uses (stages.<name>.backend:
+            # ncnn only -- irrelevant to the torch backend, which uses gpu.preferred_device
+            # instead). 0 = ncnn's own default device. On a multi-GPU machine this is NOT
+            # necessarily your fastest/discrete GPU -- e.g. an iGPU can enumerate before a
+            # passed-through dGPU. Check `avf gpu-info` (or `ncnn.get_gpu_count()`/
+            # `ncnn.get_gpu_info(i).device_name()`) to find the right index.
+            "vulkan_device": 0,
         },
         "ffmpeg": {
             "binary": None,  # None = auto-detect in PATH
@@ -223,12 +230,33 @@ class Config:
                 # None = inherit general.ai_fallback; True/False overrides it
                 # for this stage only.
                 "ai_fallback": None,
+                # Inference backend: "torch" (PyTorch/CUDA) or "ncnn" (Vulkan via
+                # the ncnn Python package -- portable to AMD/Intel/iGPUs). Falls
+                # through the ai_fallback policy if the backend is unavailable.
+                "backend": "torch",
             },
             "interpolate": {
                 "enabled": True,
                 "ai_model": "rife_v4.6",
                 "traditional_method": "minterpolate",
                 "ai_fallback": None,  # see "upscale".ai_fallback above
+                # "torch" | "ncnn" -- see "upscale".backend. RIFE's ncnn backend
+                # uses the separate "rife-ncnn-vulkan-python" package (the
+                # generic ncnn Python bindings lack RIFE's custom rife.Warp
+                # layer); requires the "ncnn" extra installed, otherwise falls
+                # back per ai_fallback policy.
+                "backend": "torch",
+                # Traditional (minterpolate) path only -- the AI/RIFE path stays serial
+                # (GPU-bound; concurrent GPU jobs contend rather than speed things up).
+                # minterpolate is single-threaded per ffmpeg process, so a long clip is
+                # split into N time-chunks (1-frame overlap trimmed on concat) and run as
+                # N parallel ffmpeg processes, then concatenated back together.
+                # 0 = auto (min(os.cpu_count(), 8)); 1 = disable chunking (previous serial
+                # behavior, one ffmpeg process for the whole input).
+                "parallel_chunks": 0,
+                # Minimum chunk length in seconds -- below this, chunking isn't worth the
+                # per-chunk ffmpeg startup/concat overhead and the input runs as one chunk.
+                "min_chunk_duration_sec": 5.0,
             },
             "denoise_video": {
                 "enabled": True,
@@ -273,8 +301,96 @@ class Config:
                 "enabled": False,
                 "factor": 1.0,
             },
+            "crop": {
+                # Auto-crop: detect and remove black borders (letterbox/pillarbox),
+                # including residual borders stabilize can introduce. Strictly
+                # opt-in -- see docs/REQUIREMENTS.md feature 3, AGENTS.md stage list.
+                "enabled": False,
+                # cropdetect luma threshold (0-255, ffmpeg default is 24) -- pixels
+                # darker than this are treated as "black" border.
+                "limit": 24,
+                # cropdetect round=2 keeps cropped width/height even (H.264
+                # requirement), matching UpscaleStage._round_to_even's convention.
+                "round": 2,
+                # Skip cropping entirely if the detected crop would save fewer than
+                # this many pixels in BOTH width and height -- avoids a pointless
+                # 2px crop from encoder rounding noise.
+                "min_crop_px": 8,
+                # 0 = scan the whole video (reset=0 accumulates the tightest safe
+                # crop across every frame scanned, i.e. the furthest real content
+                # ever reaches toward each edge -- a per-frame crop would flicker).
+                # >0 = seconds to sample from the start of the video instead, for
+                # very long inputs where a full scan is too slow.
+                "analyze_duration_sec": 0,
+                # Optional VLM-assisted disambiguation: a watermark/logo sitting
+                # outside the true content area (e.g. positioned relative to a
+                # letterboxed frame) can fool naive cropdetect into "protecting" it
+                # as non-black content. When enabled AND analysis.vlm.enabled is
+                # true, one frame is rendered twice (plain + the proposed crop box
+                # drawn via drawbox) and sent to the VLM with a narrow fixed
+                # question. Off by default; fails open (WARNING + proceed with the
+                # plain cropdetect result) on any VLM error.
+                "vlm_check": False,
+                # "warn" (default): log the VLM's objection but still crop.
+                # "skip": don't crop this video at all if the VLM flags content
+                # outside the box. "expand" (growing the crop box to include the
+                # flagged region) was considered and rejected -- VLMs don't return
+                # reliable pixel coordinates, so there's nothing to expand *to*.
+                "vlm_policy": "warn",
+            },
+        },
+        "scenes": {
+            # Master switch for scene-based processing (see docs/REQUIREMENTS.md features
+            # 1-2, AGENTS.md "Scene mode"). Off by default -- zero behavior change to the
+            # existing whole-video pipeline when disabled. When enabled, stabilize and
+            # interpolate (if requested for the job) run per-scene instead of on the whole
+            # file, then scenes are concatenated back together before the remaining
+            # whole-video stages (upscale/denoise/deblock/normalize/encode) run.
+            "enabled": False,
+            # Reuses analysis.event_detection.scene_change_threshold/min_scene_duration_sec
+            # for boundary detection -- no separate scene-mode threshold.
+            "drop_non_content": False,  # see analysis.llm below; requires VLM + coordinator
+            # Re-encode codec/crf used for the per-scene split/concat intermediate passes
+            # (segments get re-encoded again by the final whole-video "encode" stage, so
+            # this only needs to be visually lossless-ish, not archival quality).
+            "intermediate_crf": 14,
+            "intermediate_preset": "veryfast",
+            "stabilize": {
+                # Whether per-scene stabilize-strength tiering runs at all when scene mode
+                # is active and the "stabilize" stage was requested for the job. If false,
+                # stabilize still runs per-scene (never across a cut) but with the stage's
+                # normal (non-tiered) config for every scene.
+                "enabled": True,
+                # avg_shake (px, from StabilizeStage's own TRF analysis) above which a
+                # scene is escalated from "normal" to "aggressive" tier (re-run with
+                # smoothness multiplied by aggressive_smoothness_multiplier). Below the
+                # stage's own stabilize.threshold, a scene is already skipped entirely
+                # ("skip" tier) by StabilizeStage's existing needs_stab logic.
+                "aggressive_shake_threshold": 8.0,
+                "aggressive_smoothness_multiplier": 2.0,
+            },
         },
         "analysis": {
+            "llm": {
+                # Coordinating text-LLM used only when scenes.drop_non_content is true.
+                # Reviews ALL per-scene VLM summaries together and returns which scene
+                # indices (if any) are not part of the video's main content and should be
+                # dropped (e.g. a "like and subscribe" interstitial, a channel bumper, an
+                # unrelated promotional insert). Can be a cheaper/faster text-only model
+                # than analysis.vlm's vision model -- separate provider/model/url/key.
+                # Same provider set and the same allow_http/HTTPS gate as analysis.vlm.
+                "provider": "ollama",  # ollama, openai, api
+                "model": "llama3",
+                "api_key": "",
+                "api_url": "",
+                "allow_http": False,
+                # Response token budget (max_tokens / Ollama num_predict) for the
+                # coordinator call. Reasoning models spend "thinking" tokens from
+                # this same budget before emitting their JSON -- keep this
+                # generous or the response gets truncated mid-thought (which
+                # fails open: no scenes dropped).
+                "max_tokens": 4096,
+            },
             "vlm": {
                 "enabled": False,
                 "provider": "local",  # local, api, ollama, openai
@@ -286,6 +402,10 @@ class Config:
                 # unencrypted; only enable for a server on a network you
                 # control, e.g. a LAN inference box).
                 "allow_http": False,
+                # Response token budget (max_tokens / Ollama num_predict) per VLM
+                # call. Raise if using a reasoning VLM whose thinking tokens
+                # count against the response budget.
+                "max_tokens": 1024,
                 "max_sample_frames": 8,
                 "sample_interval_sec": 10.0,
                 # Extra text appended to the default (or overridden) user prompt when

@@ -114,6 +114,256 @@ MODEL_REGISTRY: dict[str, dict[str, Any]] = {
 }
 
 
+# ncnn/Vulkan model registry.
+#
+# ncnn Real-ESRGAN/RIFE models ship as .param (network graph, text) + .bin
+# (weights, binary) pairs -- a different format from the PyTorch .pth
+# checkpoints in MODEL_REGISTRY above, and not downloadable as standalone
+# files: the upstream projects only publish them bundled inside a release
+# archive alongside a prebuilt CLI executable. Each entry here therefore
+# describes an archive (with its own pinned sha256) plus the specific
+# member paths to extract from it, rather than a single direct-download
+# URL+filename like MODEL_REGISTRY. The archive is downloaded/verified once
+# and cached; individual .param/.bin members are extracted from it once and
+# cached separately (re-extracting a 400MB archive on every run would be
+# wasteful) -- see ensure_ncnn_model_available()/get_ncnn_model_paths().
+#
+# Logical names intentionally match the corresponding torch MODEL_REGISTRY
+# key where one exists (e.g. "RealESRGAN_x4plus"), so the same config value
+# (e.g. `stages.upscale.ai_model`) can resolve to either a .pth or a
+# .param/.bin pair depending on `stages.<name>.backend`.
+NCNN_MODEL_REGISTRY: dict[str, dict[str, Any]] = {
+    "RealESRGAN_x4plus": {
+        # Official xinntao/Real-ESRGAN release asset (the ncnn-only
+        # xinntao/Real-ESRGAN-ncnn-vulkan repo's own release zips do NOT
+        # bundle model files, only the CLI binary -- this one does).
+        "archive_url": (
+            "https://github.com/xinntao/Real-ESRGAN/releases/download/"
+            "v0.2.5.0/realesrgan-ncnn-vulkan-20220424-ubuntu.zip"
+        ),
+        "archive_filename": "realesrgan-ncnn-vulkan-20220424-ubuntu.zip",
+        # Verified: sha256sum of the archive downloaded directly from the
+        # URL above.
+        "archive_sha256": "e5aa6eb131234b87c0c51f82b89390f5e3e642b7b70f2b9bbe95b6a285a40c96",
+        "param_member": "models/realesrgan-x4plus.param",
+        "param_sha256": "35330ececcea33b6c397a72548e788d5d53becee4734c50b7fada36e89f10a86",
+        "bin_member": "models/realesrgan-x4plus.bin",
+        "bin_sha256": "713ee713b0353afaa27976f0563a64a5043bd70b9bd8936c2e26e25ebcdbcddf",
+        "scale": 4,
+        "description": "Real-ESRGAN x4 ncnn/Vulkan model (official xinntao release asset).",
+    },
+    "RealESRGAN_x4plus_anime_6B": {
+        "archive_url": (
+            "https://github.com/xinntao/Real-ESRGAN/releases/download/"
+            "v0.2.5.0/realesrgan-ncnn-vulkan-20220424-ubuntu.zip"
+        ),
+        "archive_filename": "realesrgan-ncnn-vulkan-20220424-ubuntu.zip",
+        "archive_sha256": "e5aa6eb131234b87c0c51f82b89390f5e3e642b7b70f2b9bbe95b6a285a40c96",
+        "param_member": "models/realesrgan-x4plus-anime.param",
+        "param_sha256": "2b8fb6e0ae4d2d85704ca08c119a2f5ea40add4f2ecd512eb7f4cd44b6127ed4",
+        "bin_member": "models/realesrgan-x4plus-anime.bin",
+        "bin_sha256": "fe01c269cfd10cdef8e018ab66ebe750cf79c7af4d1f9c16c737e1295229bacc",
+        "scale": 4,
+        "description": "Real-ESRGAN x4 anime ncnn/Vulkan model (official xinntao release asset).",
+    },
+    "rife_v4.6": {
+        # Official nihui/rife-ncnn-vulkan release asset. "rife-v4" is the
+        # single-flownet architecture matching this project's torch IFNet
+        # (older rife-v2.x/v3.x/HD/anime variants use a separate
+        # contextnet+fusionnet architecture and are not wired up here).
+        "archive_url": (
+            "https://github.com/nihui/rife-ncnn-vulkan/releases/download/"
+            "20221029/rife-ncnn-vulkan-20221029-ubuntu.zip"
+        ),
+        "archive_filename": "rife-ncnn-vulkan-20221029-ubuntu.zip",
+        "archive_sha256": "1e2c7ee7fa7daa326542d50622f0afedc80cf6f1858bda411d16385ffa5cdf68",
+        "param_member": "rife-ncnn-vulkan-20221029-ubuntu/rife-v4/flownet.param",
+        "param_sha256": "1fec6c821c62f9d9d81f529b6a44d678b2e3d354131251e7ca4dbd36fc2f0577",
+        "bin_member": "rife-ncnn-vulkan-20221029-ubuntu/rife-v4/flownet.bin",
+        "bin_sha256": "f307230e32bffeaef5d27a1ea48ec4a67371f99e363ffde1f0f62016a1f725b4",
+        "description": (
+            "RIFE v4 ncnn/Vulkan flownet (official nihui release asset). This network graph "
+            "references a custom 'rife.Warp' ncnn layer implemented in the rife-ncnn-vulkan "
+            "C++ project's own source -- the generic 'ncnn' PyPI Python bindings used by "
+            "NcnnUpscaleBackend do not register that layer, so this graph is NOT loaded via "
+            "plain ncnn.Net().load_param(). Instead, NcnnInterpolateBackend loads it through "
+            "the 'rife-ncnn-vulkan-python' package, which wraps the same upstream C++ tool "
+            "(including the custom layer) directly, and works correctly -- see "
+            "ai/backends/ncnn_interpolate.py."
+        ),
+    },
+}
+
+
+def get_ncnn_model_dir() -> Path:
+    """Return the directory where extracted ncnn .param/.bin model files are stored.
+
+    Same root as get_model_dir() (a subdirectory), kept distinct so ncnn's
+    extracted-member cache files don't visually collide with the flat
+    per-model .pth files download_model() writes.
+    """
+    ncnn_dir = get_model_dir() / "ncnn"
+    ncnn_dir.mkdir(parents=True, exist_ok=True)
+    return ncnn_dir
+
+
+def _extract_member(
+    archive_path: Path,
+    member_name: str,
+    dest: Path,
+    expected_sha256: str,
+    max_bytes: int = 512 * 1024 * 1024,
+) -> None:
+    """Extract one member from a zip archive to `dest`, verifying its sha256.
+
+    Mirrors the size-cap/streaming-extraction approach used for the RIFE
+    .pkl-in-zip torch checkpoint (see wrappers/interpolate.py's
+    `_resolve_checkpoint_path`) -- a malicious/corrupted archive can't
+    exhaust memory via an oversized claimed member size, and extraction
+    only completes (via atomic rename) once the extracted bytes actually
+    match the pinned hash.
+    """
+    import zipfile
+
+    tmp_dest = dest.with_suffix(dest.suffix + ".part")
+    try:
+        with zipfile.ZipFile(archive_path) as zf:
+            info = zf.getinfo(member_name)
+            if info.file_size > max_bytes:
+                raise RuntimeError(
+                    f"Archive member {member_name!r} in {archive_path} is "
+                    f"{info.file_size} bytes, exceeds the {max_bytes} byte safety limit"
+                )
+            with zf.open(member_name) as src, open(tmp_dest, "wb") as out:
+                while chunk := src.read(1024 * 1024):
+                    out.write(chunk)
+
+        actual = get_model_hash(str(tmp_dest))
+        if actual is None or actual.lower() != expected_sha256.lower():
+            raise RuntimeError(
+                f"Extracted member {member_name!r} from {archive_path} failed hash "
+                f"verification (expected {expected_sha256}, got {actual})"
+            )
+        os.replace(tmp_dest, dest)
+    finally:
+        if tmp_dest.exists():
+            try:
+                tmp_dest.unlink()
+            except OSError:
+                pass
+
+
+def ensure_ncnn_model_available(
+    logical_name: str,
+    force_download: bool = False,
+) -> tuple[bool, str]:
+    """Ensure an ncnn .param/.bin model pair is downloaded, extracted, and verified.
+
+    Downloads (and hash-verifies) the upstream release archive if not
+    already cached, then extracts the specific .param/.bin members (also
+    hash-verified) if not already extracted. Safe to call repeatedly --
+    each step is skipped once its target already exists and re-verifies.
+
+    Args:
+        logical_name: Key into NCNN_MODEL_REGISTRY (e.g. "RealESRGAN_x4plus").
+        force_download: If True, redownload the archive even if cached.
+
+    Returns:
+        (success, message) tuple. On success, use get_ncnn_model_paths()
+        to retrieve the resulting (param_path, bin_path).
+    """
+    meta = NCNN_MODEL_REGISTRY.get(logical_name)
+    if meta is None:
+        return False, f"Unknown ncnn model: {logical_name}. Available: {list(NCNN_MODEL_REGISTRY)}"
+
+    try:
+        _validate_safe_name(logical_name, "model name")
+        _validate_https_url(meta["archive_url"])
+
+        model_dir = get_model_dir()
+        model_dir.mkdir(parents=True, exist_ok=True)
+        archive_dest = model_dir / meta["archive_filename"]
+        _validate_dest_containment(archive_dest, model_dir)
+    except ModelPathError as e:
+        _get_logger().error(f"Rejected ncnn model request: {e}")
+        return False, str(e)
+
+    need_download = force_download or not archive_dest.is_file()
+    if not need_download:
+        actual = get_model_hash(str(archive_dest))
+        if actual is None or actual.lower() != meta["archive_sha256"].lower():
+            _get_logger().warning(
+                f"Cached ncnn archive {archive_dest} failed hash re-verification; will re-download"
+            )
+            need_download = True
+
+    if need_download:
+        _get_logger().info(
+            f"Downloading ncnn archive for {logical_name} from {meta['archive_url']}"
+        )
+        try:
+            _download_file(
+                meta["archive_url"], str(archive_dest), expected_sha256=meta["archive_sha256"]
+            )
+        except Exception as e:
+            _get_logger().error(f"Failed to download ncnn archive for {logical_name}: {e}")
+            return False, f"Archive download failed: {e}"
+
+    ncnn_dir = get_ncnn_model_dir()
+    param_dest = ncnn_dir / f"{logical_name}.param"
+    bin_dest = ncnn_dir / f"{logical_name}.bin"
+
+    for dest, member_key, hash_key in (
+        (param_dest, "param_member", "param_sha256"),
+        (bin_dest, "bin_member", "bin_sha256"),
+    ):
+        expected = meta[hash_key]
+        if dest.is_file():
+            actual = get_model_hash(str(dest))
+            if actual and actual.lower() == expected.lower():
+                continue
+        try:
+            _validate_dest_containment(dest, ncnn_dir)
+            _extract_member(archive_dest, meta[member_key], dest, expected)
+        except Exception as e:
+            _get_logger().error(f"Failed to extract {member_key} for {logical_name}: {e}")
+            return False, f"Extraction failed for {member_key}: {e}"
+
+    return True, f"ncnn model {logical_name} available at {param_dest}, {bin_dest}"
+
+
+def get_ncnn_model_paths(logical_name: str) -> tuple[Path, Path] | None:
+    """Return (param_path, bin_path) for a cached, hash-verified ncnn model pair.
+
+    Does not download or extract -- call ensure_ncnn_model_available() first.
+    Returns None if either file is missing or fails hash re-verification.
+    """
+    meta = NCNN_MODEL_REGISTRY.get(logical_name)
+    if meta is None:
+        return None
+
+    ncnn_dir = get_ncnn_model_dir()
+    param_path = ncnn_dir / f"{logical_name}.param"
+    bin_path = ncnn_dir / f"{logical_name}.bin"
+
+    for path, hash_key in ((param_path, "param_sha256"), (bin_path, "bin_sha256")):
+        if not path.is_file():
+            return None
+        actual = get_model_hash(str(path))
+        if actual is None or actual.lower() != meta[hash_key].lower():
+            _get_logger().warning(
+                f"Cached ncnn file {path} failed hash re-verification; treating as not cached"
+            )
+            return None
+
+    return param_path, bin_path
+
+
+def list_available_ncnn_models() -> list[str]:
+    """List all known ncnn model logical names in the registry."""
+    return list(NCNN_MODEL_REGISTRY.keys())
+
+
 def get_model_dir() -> Path:
     """Return the directory where AI models are stored."""
     model_dir = get_data_dir() / "models"

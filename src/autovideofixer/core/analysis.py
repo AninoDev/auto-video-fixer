@@ -550,27 +550,107 @@ class VideoAnalyzer:
                 "vlm_request",
                 f"Sending {len(frames)} frame(s) to {provider} VLM provider (model={model})",
             )
-            if provider in ("local", "ollama"):
-                return _run_ollama_vlm(frames, model, api_url, system_prompt, user_prompt)
-            elif provider == "openai":
-                return _run_openai_vlm(frames, api_key, model, system_prompt, user_prompt)
-            elif provider == "api":
-                return _run_api_vlm(
-                    frames,
-                    api_key,
-                    api_url,
-                    model,
-                    system_prompt,
-                    user_prompt,
-                    allow_http=bool(vlm_config.get("allow_http", False)),
-                )
-            else:
-                return {"summary": "", "tags": [], "objects": []}
-        except Exception:
-            logger.warning(
-                "VLM analysis failed for %r (provider=%s)", filepath, provider, exc_info=True
+            return _dispatch_vlm(
+                frames,
+                provider,
+                model,
+                api_url,
+                api_key,
+                system_prompt,
+                user_prompt,
+                allow_http=bool(vlm_config.get("allow_http", False)),
+                max_tokens=int(vlm_config.get("max_tokens", 1024)),
+                context=filepath,
             )
-            return {"summary": "", "tags": [], "objects": []}
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    def run_vlm_analysis_for_scene(
+        self,
+        filepath: str,
+        scene: "SceneEvent",
+        prompt_append: str | None = None,
+        prompt_override: str | None = None,
+        system_prompt_override: str | None = None,
+        max_sample_frames: int | None = None,
+        sample_interval_sec: float | None = None,
+        model: str | None = None,
+        api_url: str | None = None,
+    ) -> dict[str, Any]:
+        """Run VLM analysis over only the frames within one scene's time range.
+
+        Used by scene-based processing (see core/scenes.py): samples fewer frames
+        for short scenes -- ``N = min(max_sample_frames, ceil(scene_duration /
+        sample_interval_sec))``, floored at 1 for any non-empty scene -- rather than
+        always sending ``max_sample_frames`` regardless of how short the scene is.
+        Shares the same provider config/dispatch as ``run_vlm_analysis`` (VLM
+        connection layer, HTTPS/allow_http gate, prompt handling); only the frame
+        sampling is scene-scoped.
+
+        Returns the same dict shape as ``run_vlm_analysis``: summary/tags/objects/
+        rating (empty on any failure -- this method never raises).
+        """
+        import math
+
+        vlm_config = self.config.get("analysis", "vlm", default={})
+        provider = vlm_config.get("provider", "local")
+        model = model if model is not None else vlm_config.get("model", "llava")
+        api_url = api_url if api_url is not None else vlm_config.get("api_url", "")
+        api_key = vlm_config.get("api_key", "")
+        max_frames_cfg = (
+            max_sample_frames
+            if max_sample_frames is not None
+            else vlm_config.get("max_sample_frames", 8)
+        )
+        interval = (
+            sample_interval_sec
+            if sample_interval_sec is not None
+            else vlm_config.get("sample_interval_sec", 10.0)
+        )
+
+        duration = max(scene.duration, 0.0)
+        if duration <= 0:
+            return {"summary": "", "tags": [], "objects": [], "rating": None}
+        scene_max_frames = max(1, min(max_frames_cfg, math.ceil(duration / max(interval, 0.1))))
+
+        resolved_append = (
+            prompt_append if prompt_append is not None else vlm_config.get("prompt_append", "")
+        ) or ""
+        resolved_override = (
+            prompt_override
+            if prompt_override is not None
+            else vlm_config.get("prompt_override", "")
+        ) or ""
+        resolved_system_override = (
+            system_prompt_override
+            if system_prompt_override is not None
+            else vlm_config.get("system_prompt_override", "")
+        ) or ""
+        system_prompt = resolved_system_override or _VLM_SYSTEM_PROMPT
+        user_prompt = resolved_override or _VLM_USER_PROMPT
+        if resolved_append:
+            user_prompt = f"{user_prompt}\n\n{resolved_append}"
+
+        frames = _extract_sample_frames_range(
+            filepath, scene.start_time, scene.end_time, interval, max_frames=scene_max_frames
+        )
+        if not frames:
+            return {"summary": "", "tags": [], "objects": [], "rating": None}
+
+        tmp_dir = os.path.dirname(frames[0])
+        try:
+            return _dispatch_vlm(
+                frames,
+                provider,
+                model,
+                api_url,
+                api_key,
+                system_prompt,
+                user_prompt,
+                allow_http=bool(vlm_config.get("allow_http", False)),
+                max_tokens=int(vlm_config.get("max_tokens", 1024)),
+                context=f"{filepath} scene[{scene.start_time:.1f}-{scene.end_time:.1f}]",
+            )
         finally:
             shutil.rmtree(tmp_dir, ignore_errors=True)
 
@@ -726,6 +806,7 @@ def _call_ollama(
     system_prompt: str,
     user_prompt: str,
     image_b64_list: list[str],
+    max_tokens: int = 1024,
 ) -> str:
     """Send a request to an Ollama API endpoint.
 
@@ -751,6 +832,7 @@ def _call_ollama(
         ],
         "stream": False,
         "format": "json",
+        "options": {"num_predict": max_tokens},
     }
 
     try:
@@ -776,6 +858,7 @@ def _call_openai(
     system_prompt: str,
     user_prompt: str,
     image_b64_list: list[str],
+    max_tokens: int = 1024,
 ) -> str:
     """Send a request to the OpenAI Vision API.
 
@@ -806,7 +889,7 @@ def _call_openai(
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": content},
         ],
-        "max_tokens": 1000,
+        "max_tokens": max_tokens,
         "response_format": {"type": "json_object"},
     }
 
@@ -838,6 +921,7 @@ def _call_custom_api(
     user_prompt: str,
     image_b64_list: list[str],
     allow_http: bool = False,
+    max_tokens: int = 1024,
 ) -> str:
     """Send a request to a custom API endpoint.
 
@@ -894,7 +978,7 @@ def _call_custom_api(
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": content},
         ],
-        "max_tokens": 1000,
+        "max_tokens": max_tokens,
         "response_format": {"type": "json_object"},
     }
 
@@ -919,12 +1003,58 @@ def _call_custom_api(
         return ""
 
 
+def _dispatch_vlm(
+    frames: list[str],
+    provider: str,
+    model: str,
+    api_url: str,
+    api_key: str,
+    system_prompt: str,
+    user_prompt: str,
+    allow_http: bool = False,
+    context: str = "",
+    max_tokens: int = 1024,
+) -> dict[str, Any]:
+    """Shared provider dispatch for both whole-video and per-scene VLM analysis.
+
+    Extracted out of ``run_vlm_analysis`` so ``run_vlm_analysis_for_scene`` doesn't
+    duplicate the provider routing/error handling. Never raises -- any exception
+    is logged at WARNING and degrades to an empty result.
+    """
+    try:
+        if provider in ("local", "ollama"):
+            return _run_ollama_vlm(
+                frames, model, api_url, system_prompt, user_prompt, max_tokens=max_tokens
+            )
+        elif provider == "openai":
+            return _run_openai_vlm(
+                frames, api_key, model, system_prompt, user_prompt, max_tokens=max_tokens
+            )
+        elif provider == "api":
+            return _run_api_vlm(
+                frames,
+                api_key,
+                api_url,
+                model,
+                system_prompt,
+                user_prompt,
+                allow_http=allow_http,
+                max_tokens=max_tokens,
+            )
+        else:
+            return {"summary": "", "tags": [], "objects": [], "rating": None}
+    except Exception:
+        logger.warning("VLM analysis failed for %r (provider=%s)", context, provider, exc_info=True)
+        return {"summary": "", "tags": [], "objects": [], "rating": None}
+
+
 def _run_ollama_vlm(
     frames: list[str],
     model: str,
     api_url: str,
     system_prompt: str = _VLM_SYSTEM_PROMPT,
     user_prompt: str = _VLM_USER_PROMPT,
+    max_tokens: int = 1024,
 ) -> dict[str, Any]:
     """Run analysis using Ollama."""
     image_b64 = _frames_to_base64(frames)
@@ -938,6 +1068,7 @@ def _run_ollama_vlm(
         system_prompt,
         user_prompt,
         image_b64,
+        max_tokens=max_tokens,
     )
     return _parse_vlm_response(response)
 
@@ -948,13 +1079,16 @@ def _run_openai_vlm(
     model: str,
     system_prompt: str = _VLM_SYSTEM_PROMPT,
     user_prompt: str = _VLM_USER_PROMPT,
+    max_tokens: int = 1024,
 ) -> dict[str, Any]:
     """Run analysis using OpenAI Vision API."""
     image_b64 = _frames_to_base64(frames)
     if not image_b64:
         return {"summary": "", "tags": [], "objects": []}
 
-    response = _call_openai(api_key, model, system_prompt, user_prompt, image_b64)
+    response = _call_openai(
+        api_key, model, system_prompt, user_prompt, image_b64, max_tokens=max_tokens
+    )
     return _parse_vlm_response(response)
 
 
@@ -966,6 +1100,7 @@ def _run_api_vlm(
     system_prompt: str = _VLM_SYSTEM_PROMPT,
     user_prompt: str = _VLM_USER_PROMPT,
     allow_http: bool = False,
+    max_tokens: int = 1024,
 ) -> dict[str, Any]:
     """Run analysis using a custom API endpoint (OpenAI-compatible)."""
     image_b64 = _frames_to_base64(frames)
@@ -980,6 +1115,7 @@ def _run_api_vlm(
         user_prompt,
         image_b64,
         allow_http=allow_http,
+        max_tokens=max_tokens,
     )
     return _parse_vlm_response(response)
 
@@ -1275,6 +1411,430 @@ def _extract_sample_frames(
         cap.release()
 
     return frames
+
+
+def _extract_sample_frames_range(
+    filepath: str,
+    start_time: float,
+    end_time: float,
+    interval_sec: float,
+    max_frames: int = 8,
+) -> list[str]:
+    """Extract evenly-spaced sample frames from within [start_time, end_time).
+
+    Same mechanics as ``_extract_sample_frames`` (frames written as JPEGs to a
+    fresh temp dir, caller is responsible for cleanup) but scoped to a scene's
+    time range instead of the whole file -- used by per-scene VLM sampling.
+    Always samples at least one frame (the scene's start) if the range is
+    non-empty and the video can be opened, even if ``interval_sec`` alone would
+    have produced zero samples for a very short scene.
+    """
+    import cv2
+
+    cap = cv2.VideoCapture(filepath)
+    if not cap.isOpened():
+        return []
+
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    duration = max(end_time - start_time, 0.0)
+    if duration <= 0 or max_frames <= 0:
+        cap.release()
+        return []
+
+    # Evenly space `max_frames` samples across the scene (at least 1), rather
+    # than stepping by interval_sec from the start -- for a short scene,
+    # interval_sec-stepping could land every sample on (near) the same frame.
+    n_samples = max(1, min(max_frames, int(duration / max(interval_sec, 0.1)) + 1))
+    if n_samples == 1:
+        sample_times = [start_time + duration / 2.0]
+    else:
+        step = duration / n_samples
+        sample_times = [start_time + i * step for i in range(n_samples)]
+
+    tmp_dir = tempfile.mkdtemp(prefix="avf_scene_samples_")
+    frames: list[str] = []
+    try:
+        for i, t in enumerate(sample_times):
+            frame_idx = int(t * fps)
+            cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+            ret, frame = cap.read()
+            if not ret:
+                continue
+            frame_path = os.path.join(tmp_dir, f"frame_{i:04d}.jpg")
+            cv2.imwrite(frame_path, frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
+            frames.append(frame_path)
+    finally:
+        cap.release()
+
+    return frames
+
+
+# ─── Scene Content Coordinator (drop non-content scenes) ───────────
+
+
+_COORDINATOR_SYSTEM_PROMPT = (
+    "You are a video-editing assistant. You will be given a list of scenes from a single "
+    "video, each with a per-scene visual description produced by a separate vision model. "
+    "Determine the video's main subject/purpose, then identify any scenes that are NOT part "
+    "of that main content -- for example a 'like and subscribe' interstitial, a channel "
+    "branding/promo bumper, or an unrelated clip spliced into the middle of the video. "
+    'Respond in valid JSON with keys: "main_content_summary" (string), "drop" (array of '
+    'scene index integers to drop), "reasons" (object mapping each dropped index, as a '
+    'string, to a short reason). If no scenes should be dropped, return an empty "drop" '
+    "array. Do not drop a scene unless you are confident it is not part of the main content."
+)
+
+
+def _build_coordinator_prompt(scene_summaries: list[dict[str, Any]]) -> str:
+    lines = [
+        "Scenes (index, time range, duration, VLM description):",
+    ]
+    for s in scene_summaries:
+        lines.append(
+            f"- index={s['index']} t={s['start_time']:.1f}s-{s['end_time']:.1f}s "
+            f"duration={s['duration']:.1f}s summary={s.get('summary', '') or '(none)'} "
+            f"tags={', '.join(s.get('tags', []) or [])}"
+        )
+    lines.append(
+        '\nReturn JSON: {"main_content_summary": ..., "drop": [indices], '
+        '"reasons": {"<index>": "..."}}'
+    )
+    return "\n".join(lines)
+
+
+def _parse_coordinator_response(response_text: str, num_scenes: int) -> dict[str, Any] | None:
+    """Parse the coordinator LLM's JSON response.
+
+    Returns None (fail-open signal to the caller) on any parse failure or if the
+    response isn't the expected shape -- e.g. "drop" isn't a list, or contains an
+    out-of-range index. Never raises.
+    """
+    import json
+
+    text = response_text.strip()
+    text = re.sub(r"^```(?:json)?\s*\n?", "", text)
+    text = re.sub(r"\n?```\s*$", "", text).strip()
+
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError, TypeError:
+        return None
+
+    if not isinstance(data, dict):
+        return None
+
+    drop = data.get("drop", [])
+    if not isinstance(drop, list):
+        return None
+
+    valid_drop: list[int] = []
+    for idx in drop:
+        if isinstance(idx, bool) or not isinstance(idx, int):
+            return None
+        if idx < 0 or idx >= num_scenes:
+            return None
+        valid_drop.append(idx)
+
+    reasons = data.get("reasons", {})
+    if not isinstance(reasons, dict):
+        reasons = {}
+
+    return {
+        "main_content_summary": data.get("main_content_summary", ""),
+        "drop": valid_drop,
+        "reasons": reasons,
+    }
+
+
+def run_scene_coordinator(
+    scene_summaries: list[dict[str, Any]],
+    config: Config,
+) -> dict[str, Any]:
+    """Run the coordinating text-LLM pass over all per-scene VLM summaries.
+
+    ``scene_summaries``: list of dicts with keys index/start_time/end_time/
+    duration/summary/tags (see ``_build_coordinator_prompt``).
+
+    Config: ``analysis.llm`` (provider/model/api_key/api_url/allow_http) -- see
+    ``Config.DEFAULTS``. Reuses the same provider dispatch as per-frame VLM calls
+    (``_dispatch_vlm`` with an empty image list, i.e. a text-only request), so the
+    same allow_http/HTTPS gate applies to a non-loopback ``api_url``.
+
+    Failure mode (R1.7 / the scene-drop spec's "fail open, never fail closed to
+    drop everything"): on ANY failure -- request error, timeout, malformed/
+    unparseable response, an out-of-range or non-integer index in "drop" -- this
+    returns ``{"drop": [], "reasons": {}, "failed": True, ...}``, i.e. keep every
+    scene. This function never raises and never returns a "drop everything"
+    result as a side effect of a parse failure.
+    """
+    llm_config = config.get("analysis", "llm", default={})
+    provider = llm_config.get("provider", "ollama")
+    model = llm_config.get("model", "llama3")
+    api_url = llm_config.get("api_url", "")
+    api_key = llm_config.get("api_key", "")
+    allow_http = bool(llm_config.get("allow_http", False))
+    max_tokens = int(llm_config.get("max_tokens", 4096))
+
+    if not scene_summaries:
+        return {"drop": [], "reasons": {}, "main_content_summary": "", "failed": False}
+
+    user_prompt = _build_coordinator_prompt(scene_summaries)
+
+    # Note: this calls the raw (unparsed) provider functions directly rather than
+    # _dispatch_vlm -- _dispatch_vlm runs the response through _parse_vlm_response,
+    # which expects the summary/tags/objects/rating shape, not the coordinator's
+    # own main_content_summary/drop/reasons shape (see _parse_coordinator_response).
+    raw_text = _call_coordinator_provider(
+        provider,
+        model,
+        api_url,
+        api_key,
+        _COORDINATOR_SYSTEM_PROMPT,
+        user_prompt,
+        allow_http,
+        max_tokens=max_tokens,
+    )
+    if raw_text is None:
+        logger.warning(
+            "Scene coordinator LLM call failed or was unavailable (provider=%s); "
+            "failing open -- keeping all %d scene(s)",
+            provider,
+            len(scene_summaries),
+        )
+        return {
+            "drop": [],
+            "reasons": {},
+            "main_content_summary": "",
+            "failed": True,
+        }
+
+    parsed = _parse_coordinator_response(raw_text, len(scene_summaries))
+    if parsed is None:
+        logger.warning(
+            "Scene coordinator LLM response could not be parsed (provider=%s); "
+            "failing open -- keeping all %d scene(s). Raw response: %.500r",
+            provider,
+            len(scene_summaries),
+            raw_text,
+        )
+        return {
+            "drop": [],
+            "reasons": {},
+            "main_content_summary": "",
+            "failed": True,
+        }
+
+    if parsed["drop"]:
+        logger.warning(
+            "Scene coordinator: dropping %d of %d scene(s): %s",
+            len(parsed["drop"]),
+            len(scene_summaries),
+            ", ".join(
+                f"#{idx} (t={scene_summaries[idx]['start_time']:.1f}-"
+                f"{scene_summaries[idx]['end_time']:.1f}s): "
+                f"{parsed['reasons'].get(str(idx), parsed['reasons'].get(idx, 'no reason given'))}"
+                for idx in parsed["drop"]
+            ),
+        )
+    else:
+        logger.info(
+            "Scene coordinator: keeping all %d scene(s) (no non-content scenes flagged)",
+            len(scene_summaries),
+        )
+
+    parsed["failed"] = False
+    return parsed
+
+
+def _call_coordinator_provider(
+    provider: str,
+    model: str,
+    api_url: str,
+    api_key: str,
+    system_prompt: str,
+    user_prompt: str,
+    allow_http: bool,
+    max_tokens: int = 4096,
+) -> str | None:
+    """Call the raw (unparsed) text-completion provider for the coordinator pass.
+
+    Returns the raw response text, or None on any failure (network error,
+    exception, refused non-HTTPS URL). Unlike ``_run_*_vlm``, this returns the
+    provider's raw text instead of running it through ``_parse_vlm_response``
+    (the coordinator has its own response shape/parser, see
+    ``_parse_coordinator_response``).
+    """
+    try:
+        if provider in ("local", "ollama"):
+            base_url = api_url or "http://localhost:11434"
+            text = _call_ollama(
+                base_url, model, system_prompt, user_prompt, [], max_tokens=max_tokens
+            )
+        elif provider == "openai":
+            text = _call_openai(
+                api_key, model, system_prompt, user_prompt, [], max_tokens=max_tokens
+            )
+        elif provider == "api":
+            text = _call_custom_api(
+                api_key,
+                api_url,
+                model,
+                system_prompt,
+                user_prompt,
+                [],
+                allow_http=allow_http,
+                max_tokens=max_tokens,
+            )
+        else:
+            return None
+    except Exception:
+        logger.warning("Scene coordinator provider call raised", exc_info=True)
+        return None
+    return text or None
+
+
+# ─── Auto-crop VLM assist (docs/REQUIREMENTS.md feature 3) ─────────
+
+_CROP_VLM_SYSTEM_PROMPT = (
+    "You help an automated video-cropping tool decide whether it is safe to "
+    "crop away the border region of a frame. You will be shown two images of "
+    "the same video frame: the plain frame, and the same frame with a red "
+    "rectangle drawn around the region the tool proposes to KEEP. Everything "
+    "outside the red rectangle would be cropped away and permanently lost."
+)
+
+_CROP_VLM_USER_PROMPT = (
+    "Look at the region OUTSIDE the red rectangle in the second image. Does it "
+    "contain meaningful content that belongs to the video -- a logo, "
+    "watermark, caption, or other text/graphic -- or is it only black/empty "
+    "space (letterboxing/pillarboxing)? "
+    'Respond with ONLY a JSON object: {"content_outside": true|false, '
+    '"reason": "brief explanation"}.'
+)
+
+
+def _parse_crop_vlm_response(response_text: str) -> dict[str, Any] | None:
+    """Parse the crop VLM check's response.
+
+    Tries strict JSON first (optionally fenced); falls back to a tolerant
+    yes/no scan of the raw text if the response isn't valid JSON, so a model
+    that ignores the "JSON only" instruction still yields a usable answer
+    instead of forcing a hard failure. Returns None only when neither parse
+    path can extract a clear answer -- the caller treats that as fail-open.
+    """
+    import json
+
+    original = response_text.strip()
+    if not original:
+        return None
+
+    text = re.sub(r"^```(?:json)?\s*\n?", "", original)
+    text = re.sub(r"\n?```\s*$", "", text).strip()
+
+    try:
+        data = json.loads(text)
+        if isinstance(data, dict) and "content_outside" in data:
+            return {
+                "content_outside": bool(data.get("content_outside")),
+                "reason": str(data.get("reason", "")),
+            }
+    except json.JSONDecodeError, TypeError:
+        pass
+
+    # Tolerant fallback: no valid/expected-shape JSON -- look for a clear
+    # yes/no signal near the start of the raw response.
+    lowered = original.lower()[:80]
+    if re.search(r"\b(true|yes)\b", lowered):
+        return {"content_outside": True, "reason": original[:300]}
+    if re.search(r"\b(false|no)\b", lowered):
+        return {"content_outside": False, "reason": original[:300]}
+    return None
+
+
+def run_crop_vlm_check(
+    full_frame_path: str,
+    boxed_frame_path: str,
+    config: Config,
+) -> dict[str, Any]:
+    """Ask the configured VLM whether meaningful content lies outside a
+    proposed crop box (see ``CropStage._run_vlm_check`` in
+    ``core/stages/crop.py``).
+
+    Uses ``analysis.vlm`` (provider/model/api_key/api_url/allow_http) --
+    the same connection layer and HTTPS/allow_http gate as
+    ``VideoAnalyzer.run_vlm_analysis``. This is an internal, fixed prompt
+    pair (system + user) -- ``analysis.vlm.prompt_override``/
+    ``prompt_append`` do NOT apply here.
+
+    Fails open on any error (unreachable endpoint, exception, unparseable
+    response): returns ``content_outside: False`` with ``failed: True`` and a
+    ``reason`` explaining why, so the caller can log a WARNING and proceed
+    with the plain cropdetect result rather than block on VLM availability.
+    Never raises.
+    """
+    vlm_config = config.get("analysis", "vlm", default={})
+    provider = vlm_config.get("provider", "local")
+    model = vlm_config.get("model", "llava")
+    api_url = vlm_config.get("api_url", "")
+    api_key = vlm_config.get("api_key", "")
+    allow_http = bool(vlm_config.get("allow_http", False))
+
+    images_b64 = _frames_to_base64([full_frame_path, boxed_frame_path])
+    if len(images_b64) < 2:
+        return {
+            "checked": False,
+            "content_outside": False,
+            "reason": "failed to read one or both check frames",
+            "failed": True,
+        }
+
+    try:
+        if provider in ("local", "ollama"):
+            base_url = api_url or "http://localhost:11434"
+            raw = _call_ollama(
+                base_url, model, _CROP_VLM_SYSTEM_PROMPT, _CROP_VLM_USER_PROMPT, images_b64
+            )
+        elif provider == "openai":
+            raw = _call_openai(
+                api_key, model, _CROP_VLM_SYSTEM_PROMPT, _CROP_VLM_USER_PROMPT, images_b64
+            )
+        elif provider == "api":
+            raw = _call_custom_api(
+                api_key,
+                api_url,
+                model,
+                _CROP_VLM_SYSTEM_PROMPT,
+                _CROP_VLM_USER_PROMPT,
+                images_b64,
+                allow_http=allow_http,
+            )
+        else:
+            raw = ""
+    except Exception as e:
+        logger.warning("Crop VLM check raised an exception (provider=%s)", provider, exc_info=True)
+        return {"checked": False, "content_outside": False, "reason": str(e), "failed": True}
+
+    if not raw:
+        return {
+            "checked": False,
+            "content_outside": False,
+            "reason": "VLM request failed or returned an empty response",
+            "failed": True,
+        }
+
+    parsed = _parse_crop_vlm_response(raw)
+    if parsed is None:
+        logger.warning("Crop VLM response could not be parsed; raw=%.500r", raw)
+        return {
+            "checked": False,
+            "content_outside": False,
+            "reason": "unparseable VLM response",
+            "failed": True,
+        }
+
+    parsed["checked"] = True
+    parsed["failed"] = False
+    return parsed
 
 
 # ─── Perceptual Hashing & Duplicate Detection ──────────────────────

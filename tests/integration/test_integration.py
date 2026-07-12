@@ -234,6 +234,207 @@ class TestStageIntegration:
 
 
 @pytest.mark.integration
+class TestCropIntegration:
+    """Real-ffmpeg tests for the auto-crop stage (docs/REQUIREMENTS.md feature 3).
+
+    Covers: (a) a letterboxed video crops back to its true content bounds with
+    no remaining border, (b) a video with no border is left uncropped, (c) a
+    letterboxed video with a "watermark" overlay sitting in the border area --
+    plain cropdetect crops it away regardless (a documented limitation: it has
+    no notion of "meaningful non-black content" vs. noise/overlay), while
+    crop.vlm_check with a mocked VLM response and vlm_policy=skip leaves the
+    video uncropped.
+    """
+
+    @staticmethod
+    def _make_letterboxed_video(tmp_path, name="letterboxed.mp4", extra_filter=None):
+        """640x360 test pattern padded into a 640x480 frame (60px black bars
+        top/bottom) -- true content bounds are crop=640:360:0:60."""
+        import subprocess
+
+        video_path = tmp_path / name
+        vf = "pad=640:480:0:60:black"
+        if extra_filter:
+            vf = f"{vf},{extra_filter}"
+        subprocess.run(
+            [
+                "ffmpeg",
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc2=size=640x360:rate=24:duration=2",
+                "-vf",
+                vf,
+                "-c:v",
+                "libx264",
+                "-pix_fmt",
+                "yuv420p",
+                str(video_path),
+            ],
+            capture_output=True,
+            check=True,
+        )
+        return str(video_path)
+
+    @staticmethod
+    def _make_borderless_video(tmp_path, name="borderless.mp4"):
+        import subprocess
+
+        video_path = tmp_path / name
+        subprocess.run(
+            [
+                "ffmpeg",
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc2=size=640x480:rate=24:duration=2",
+                "-c:v",
+                "libx264",
+                "-pix_fmt",
+                "yuv420p",
+                str(video_path),
+            ],
+            capture_output=True,
+            check=True,
+        )
+        return str(video_path)
+
+    @staticmethod
+    def _rescan_crop(video_path):
+        """Re-run raw cropdetect over a video, returning the last crop=w:h:x:y
+        window -- used to verify no meaningful border remains post-crop."""
+        from autovideofixer.core.stages.crop import _detect_crop
+
+        return _detect_crop(video_path, limit=24, round_=2, analyze_duration_sec=0)
+
+    def test_letterboxed_video_crops_to_content_bounds(self, tmp_path):
+        from autovideofixer.config import Config
+        from autovideofixer.core.ffmpeg_utils import probe
+        from autovideofixer.core.stages.crop import CropStage
+
+        video = self._make_letterboxed_video(tmp_path)
+        before = self._rescan_crop(video)
+        assert before is not None
+        # Before crop: detected content window should be ~640x360, well short
+        # of the padded 640x480 frame -- otherwise the fixture itself is bad.
+        assert before[1] <= 380  # h
+
+        config = Config(tmp_path / "nonexistent.yaml")
+        config.set(True, "stages", "crop", "enabled")
+        stage = CropStage(config)
+        output_path = str(tmp_path / "cropped.mp4")
+        result = stage.execute(video, output_path)
+
+        assert result.success, result.error
+        assert os.path.exists(output_path)
+
+        out_info = probe(output_path)
+        out_w, out_h = out_info.resolution
+        # Allow +/-2px rounding (round=2 keeps dimensions even).
+        assert out_w == 640
+        assert abs(out_h - 360) <= 2
+
+        after = self._rescan_crop(output_path)
+        assert after is not None
+        after_w, after_h, after_x, after_y = after
+        # No meaningful border left: the re-scanned crop window should cover
+        # (approximately) the whole cropped frame.
+        assert after_x == 0
+        assert after_y <= 2
+        assert after_w >= out_w - 2
+        assert after_h >= out_h - 2
+
+    def test_borderless_video_is_not_cropped(self, tmp_path):
+        from autovideofixer.config import Config
+        from autovideofixer.core.stages.crop import CropStage
+
+        video = self._make_borderless_video(tmp_path)
+        config = Config(tmp_path / "nonexistent.yaml")
+        config.set(True, "stages", "crop", "enabled")
+        stage = CropStage(config)
+
+        from autovideofixer.core.ffmpeg_utils import get_video_info
+
+        input_info = get_video_info(video)
+        should_run, quick_reason = stage.should_run(input_info)
+        if not should_run:
+            # should_run's quick pre-filter already caught it -- done.
+            assert quick_reason
+            return
+
+        output_path = str(tmp_path / "not_cropped.mp4")
+        result = stage.execute(video, output_path)
+        assert result.status.value == "skipped"
+        assert result.skipped_reason
+
+    def test_watermark_in_letterbox_plain_mode_crops_it_away(self, tmp_path):
+        """A dim overlay box sitting inside the black letterbox border, below
+        cropdetect's luma threshold -- plain (non-VLM) auto-crop has no notion
+        of "meaningful overlay" vs. background noise, so it crops the whole
+        border away, overlay included. This is the documented limitation R3.2
+        exists to address (see crop.vlm_check below)."""
+        from autovideofixer.config import Config
+        from autovideofixer.core.ffmpeg_utils import probe
+        from autovideofixer.core.stages.crop import CropStage
+
+        # A box at luma ~16 (0x101010), well under the default cropdetect
+        # limit=24, positioned inside the top 60px black bar.
+        watermark_filter = "drawbox=x=10:y=10:w=100:h=20:color=0x101010:t=fill"
+        video = self._make_letterboxed_video(
+            tmp_path, name="watermarked.mp4", extra_filter=watermark_filter
+        )
+
+        config = Config(tmp_path / "nonexistent.yaml")
+        config.set(True, "stages", "crop", "enabled")
+        stage = CropStage(config)
+        output_path = str(tmp_path / "watermark_cropped.mp4")
+        result = stage.execute(video, output_path)
+
+        assert result.success, result.error
+        out_w, out_h = probe(output_path).resolution
+        assert out_w == 640
+        assert abs(out_h - 360) <= 2  # the watermark did NOT save it from cropping
+
+    def test_watermark_vlm_skip_policy_leaves_video_uncropped(self, tmp_path, monkeypatch):
+        """Same watermarked input as above, but with crop.vlm_check enabled and
+        a mocked VLM response saying content lies outside the box -- with
+        vlm_policy=skip the stage must not crop at all."""
+        from autovideofixer.config import Config
+        from autovideofixer.core.stages.crop import CropStage
+
+        watermark_filter = "drawbox=x=10:y=10:w=100:h=20:color=0x101010:t=fill"
+        video = self._make_letterboxed_video(
+            tmp_path, name="watermarked2.mp4", extra_filter=watermark_filter
+        )
+
+        config = Config(tmp_path / "nonexistent.yaml")
+        config.set(True, "stages", "crop", "enabled")
+        config.set(True, "stages", "crop", "vlm_check")
+        config.set("skip", "stages", "crop", "vlm_policy")
+        config.set(True, "analysis", "vlm", "enabled")
+
+        monkeypatch.setattr(
+            "autovideofixer.core.analysis.run_crop_vlm_check",
+            lambda full, boxed, cfg: {
+                "checked": True,
+                "content_outside": True,
+                "reason": "mocked: watermark-like box detected outside the crop area",
+                "failed": False,
+            },
+        )
+
+        stage = CropStage(config)
+        output_path = str(tmp_path / "watermark_skip.mp4")
+        result = stage.execute(video, output_path)
+
+        assert result.status.value == "skipped"
+        assert "VLM flagged" in result.skipped_reason
+        assert not os.path.exists(output_path)
+
+
+@pytest.mark.integration
 class TestConfigIntegration:
     """Test configuration persistence and presets."""
 

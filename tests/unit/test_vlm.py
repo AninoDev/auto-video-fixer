@@ -18,7 +18,9 @@ from autovideofixer.core.analysis import (
     _call_openai,
     _extract_sample_frames,
     _frames_to_base64,
+    _parse_crop_vlm_response,
     _parse_vlm_response,
+    run_crop_vlm_check,
 )
 
 
@@ -428,3 +430,157 @@ class TestPromptCustomization:
         assert result["tags"] == []
         assert result["objects"] == []
         assert result["rating"] is None
+
+
+class TestParseCropVlmResponse:
+    """Tests for _parse_crop_vlm_response (docs/REQUIREMENTS.md feature 3's VLM
+    watermark/content disambiguation check)."""
+
+    def test_valid_json(self):
+        response = json.dumps({"content_outside": True, "reason": "a watermark logo"})
+        result = _parse_crop_vlm_response(response)
+        assert result == {"content_outside": True, "reason": "a watermark logo"}
+
+    def test_valid_json_false(self):
+        response = json.dumps({"content_outside": False, "reason": "just black bars"})
+        result = _parse_crop_vlm_response(response)
+        assert result["content_outside"] is False
+
+    def test_json_with_code_fences(self):
+        response = '```json\n{"content_outside": true, "reason": "logo"}\n```'
+        result = _parse_crop_vlm_response(response)
+        assert result["content_outside"] is True
+
+    def test_tolerant_fallback_yes(self):
+        result = _parse_crop_vlm_response("Yes, there is a watermark outside the box.")
+        assert result["content_outside"] is True
+
+    def test_tolerant_fallback_no(self):
+        result = _parse_crop_vlm_response("No, it's just empty black space.")
+        assert result["content_outside"] is False
+
+    def test_empty_response_unparseable(self):
+        assert _parse_crop_vlm_response("") is None
+
+    def test_ambiguous_response_unparseable(self):
+        assert _parse_crop_vlm_response("I cannot determine this from the image.") is None
+
+
+class TestRunCropVlmCheck:
+    """Tests for run_crop_vlm_check (core/analysis.py), called by CropStage's
+    optional VLM-assisted watermark/content disambiguation."""
+
+    @staticmethod
+    def _config_with_vlm(tmp_path, **vlm_overrides) -> Config:
+        config = Config(tmp_path / "nonexistent.yaml")
+        merged = dict(config.get("analysis", "vlm", default={}))
+        merged.update(vlm_overrides)
+        config.set(merged, "analysis", "vlm")
+        return config
+
+    def test_vlm_disabled_still_dispatches_when_called_directly(self, tmp_path):
+        # run_crop_vlm_check itself doesn't gate on analysis.vlm.enabled -- that
+        # check lives in CropStage._run_vlm_check (the caller) so the stage can
+        # short-circuit before ever extracting check frames. Calling this
+        # function directly always dispatches to the configured provider.
+        full = tmp_path / "full.jpg"
+        boxed = tmp_path / "boxed.jpg"
+        full.write_bytes(b"fake")
+        boxed.write_bytes(b"fake")
+        config = self._config_with_vlm(tmp_path, provider="bogus-provider")
+        result = run_crop_vlm_check(str(full), str(boxed), config)
+        assert result["checked"] is False
+        assert result["failed"] is True
+
+    def test_missing_frames_fails_open(self, tmp_path):
+        config = self._config_with_vlm(tmp_path, provider="ollama")
+        result = run_crop_vlm_check(
+            str(tmp_path / "missing_full.jpg"), str(tmp_path / "missing_boxed.jpg"), config
+        )
+        assert result["checked"] is False
+        assert result["content_outside"] is False
+        assert result["failed"] is True
+
+    @patch("urllib.request.urlopen")
+    def test_ollama_provider_content_outside_true(self, mock_urlopen, tmp_path):
+        full = tmp_path / "full.jpg"
+        boxed = tmp_path / "boxed.jpg"
+        full.write_bytes(b"fake")
+        boxed.write_bytes(b"fake")
+
+        mock_response = json.dumps(
+            {"message": {"content": json.dumps({"content_outside": True, "reason": "logo"})}}
+        )
+        mock_resp = MagicMock()
+        mock_resp.read.return_value = mock_response.encode()
+        mock_resp.__enter__ = MagicMock(return_value=mock_resp)
+        mock_resp.__exit__ = MagicMock(return_value=False)
+        mock_urlopen.return_value = mock_resp
+
+        config = self._config_with_vlm(tmp_path, provider="ollama")
+        result = run_crop_vlm_check(str(full), str(boxed), config)
+
+        assert result == {
+            "content_outside": True,
+            "reason": "logo",
+            "checked": True,
+            "failed": False,
+        }
+        # Both the plain and boxed frame were sent as images.
+        req = mock_urlopen.call_args[0][0]
+        payload = json.loads(req.data.decode("utf-8"))
+        assert len(payload["messages"][1]["images"]) == 2
+
+    @patch("urllib.request.urlopen")
+    def test_ollama_provider_content_outside_false(self, mock_urlopen, tmp_path):
+        full = tmp_path / "full.jpg"
+        boxed = tmp_path / "boxed.jpg"
+        full.write_bytes(b"fake")
+        boxed.write_bytes(b"fake")
+
+        mock_response = json.dumps(
+            {"message": {"content": json.dumps({"content_outside": False, "reason": "black bars"})}}
+        )
+        mock_resp = MagicMock()
+        mock_resp.read.return_value = mock_response.encode()
+        mock_resp.__enter__ = MagicMock(return_value=mock_resp)
+        mock_resp.__exit__ = MagicMock(return_value=False)
+        mock_urlopen.return_value = mock_resp
+
+        config = self._config_with_vlm(tmp_path, provider="ollama")
+        result = run_crop_vlm_check(str(full), str(boxed), config)
+        assert result["content_outside"] is False
+        assert result["checked"] is True
+
+    @patch("urllib.request.urlopen")
+    def test_provider_error_fails_open(self, mock_urlopen, tmp_path):
+        full = tmp_path / "full.jpg"
+        boxed = tmp_path / "boxed.jpg"
+        full.write_bytes(b"fake")
+        boxed.write_bytes(b"fake")
+        mock_urlopen.side_effect = OSError("connection refused")
+
+        config = self._config_with_vlm(tmp_path, provider="ollama")
+        result = run_crop_vlm_check(str(full), str(boxed), config)
+        assert result["checked"] is False
+        assert result["content_outside"] is False
+        assert result["failed"] is True
+
+    @patch("urllib.request.urlopen")
+    def test_unparseable_response_fails_open(self, mock_urlopen, tmp_path):
+        full = tmp_path / "full.jpg"
+        boxed = tmp_path / "boxed.jpg"
+        full.write_bytes(b"fake")
+        boxed.write_bytes(b"fake")
+
+        mock_response = json.dumps({"message": {"content": "I refuse to answer in JSON."}})
+        mock_resp = MagicMock()
+        mock_resp.read.return_value = mock_response.encode()
+        mock_resp.__enter__ = MagicMock(return_value=mock_resp)
+        mock_resp.__exit__ = MagicMock(return_value=False)
+        mock_urlopen.return_value = mock_resp
+
+        config = self._config_with_vlm(tmp_path, provider="ollama")
+        result = run_crop_vlm_check(str(full), str(boxed), config)
+        assert result["checked"] is False
+        assert result["failed"] is True

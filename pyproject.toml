@@ -37,8 +37,34 @@ ai = [
     "torch>=2.0",
     "torchvision>=0.15",
 ]
+ncnn = [
+    # Generic Tencent/ncnn Python bindings, used by ai/backends/ncnn_upscale.py (Real-ESRGAN)
+    # and ai/backends/ncnn_common.py. Portable Vulkan inference, no CUDA-matched torch build
+    # required.
+    "ncnn>=1.0.20221128",
+    # RIFE frame interpolation needs a different package: the official RIFE ncnn graph
+    # references a custom ncnn layer ("rife.Warp") that the generic `ncnn` package above does
+    # not register. rife-ncnn-vulkan-python (https://pypi.org/project/rife-ncnn-vulkan-python/)
+    # wraps the actual upstream rife-ncnn-vulkan C++ tool (github.com/K4YT3X/rife-ncnn-vulkan-python)
+    # via SWIG, including that custom layer, so it loads/runs correctly -- see
+    # ai/backends/ncnn_interpolate.py.
+    #
+    # As of this writing there is no prebuilt wheel for Python 3.14, so pip/uv builds its sdist
+    # from source. That build requires the `swig` system package (e.g. `apt install swig` /
+    # `dnf install swig` / `brew install swig`) to be installed *before* running the install.
+    # Additionally, the sdist's bundled ncnn snapshot has a stale `cmake_minimum_required()`
+    # that modern CMake (>=4) refuses to configure ("Compatibility with CMake < 3.5 has been
+    # removed"); work around this by setting CMAKE_POLICY_VERSION_MINIMUM=3.5 in the environment
+    # for the install command, e.g.:
+    #
+    #   CMAKE_POLICY_VERSION_MINIMUM=3.5 uv pip install --no-binary :all: rife-ncnn-vulkan-python
+    #
+    # (or the equivalent `pip install` invocation). Once installed it does not need to be
+    # rebuilt again for the same Python/platform combination.
+    "rife-ncnn-vulkan-python>=1.2.1",
+]
 all = [
-    "auto-video-fixer[gui,ai]",
+    "auto-video-fixer[gui,ai,ncnn]",
 ]
 dev = [
     "pytest>=7.0",

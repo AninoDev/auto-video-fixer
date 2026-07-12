@@ -294,9 +294,30 @@ class RIFEInterpolator:
         result = interpolator.interpolate(frame_a, frame_b, timestep=0.5)
     """
 
-    def __init__(self, model_name: str = "rife_v4.6", device_preference: str = "auto"):
+    def __init__(
+        self,
+        model_name: str = "rife_v4.6",
+        device_preference: str = "auto",
+        backend: str = "torch",
+        vulkan_device: int = 0,
+    ):
+        """
+        Args:
+            backend: "torch" (default -- unchanged existing behavior) or
+                "ncnn". "ncnn" delegates every method below to
+                `ai.backends.ncnn_interpolate.NcnnInterpolateBackend`
+                (which wraps the real `rife-ncnn-vulkan-python` package)
+                instead of running the torch/IFNet code in this class.
+                See ai/WIRING.md.
+            vulkan_device: ncnn backend only -- which Vulkan physical
+                device index to run on (see gpu.vulkan_device in
+                Config.DEFAULTS). Irrelevant to the torch backend.
+        """
         self.model_name = model_name
         self.device_preference = device_preference
+        self.backend = backend
+        self.vulkan_device = vulkan_device
+        self._ncnn_backend: Any = None
         self._model: IFNet | None = None
         self._device: Any = None
         self._half = False
@@ -311,11 +332,24 @@ class RIFEInterpolator:
 
         Args:
             model_path: Path to a `.pkl` checkpoint or a release `.zip`
-                bundling one. If None, uses the cached/registry model.
+                bundling one (torch backend). Ignored for the ncnn
+                backend, which resolves its own .param/.bin via the ncnn
+                model registry.
 
         Returns:
-            True if the model loaded successfully.
+            True if the model loaded successfully. Never raises: an
+            ncnn-specific failure is logged and returns False here, same
+            contract as every existing torch failure path below.
         """
+        if self.backend == "ncnn":
+            from autovideofixer.ai.backends.ncnn_interpolate import NcnnInterpolateBackend
+
+            self._ncnn_backend = NcnnInterpolateBackend(
+                model_name=self.model_name, vulkan_device=self.vulkan_device
+            )
+            self._loaded = self._ncnn_backend.load_model()
+            return self._loaded
+
         from autovideofixer.ai.torch_utils import get_device
 
         if model_path is None:
@@ -379,8 +413,14 @@ class RIFEInterpolator:
         Raises:
             RuntimeError: If model is not loaded.
         """
-        if not self._loaded or self._model is None:
+        if not self._loaded:
             raise RuntimeError("Model not loaded. Call load_model() first.")
+
+        if self.backend == "ncnn":
+            assert self._ncnn_backend is not None
+            return self._ncnn_backend.interpolate(frame0, frame1, timestep)
+
+        assert self._model is not None
 
         from autovideofixer.ai.torch_utils import frame_from_tensor, get_dtype, tensor_from_frame
 
@@ -470,6 +510,12 @@ class RIFEInterpolator:
 
     def unload(self) -> None:
         """Release model from memory."""
+        if self.backend == "ncnn":
+            if self._ncnn_backend is not None:
+                self._ncnn_backend.unload()
+                self._ncnn_backend = None
+            self._loaded = False
+            return
         if self._model is not None:
             del self._model
             self._model = None

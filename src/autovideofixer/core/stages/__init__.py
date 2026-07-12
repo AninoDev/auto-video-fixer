@@ -1,6 +1,7 @@
 """Auto Video Fixer - Core processing stages package."""
 
 from autovideofixer.core.stages.base import BaseStage, StageResult, StageStatus, register_stage
+from autovideofixer.core.stages.crop import CropStage
 from autovideofixer.core.stages.deblock import DeblockStage
 from autovideofixer.core.stages.denoise_video import DenoiseVideoStage
 from autovideofixer.core.stages.detect import DetectStage
@@ -16,6 +17,7 @@ from autovideofixer.core.stages.upscale import UpscaleStage
 # Register all stages
 register_stage(DetectStage)
 register_stage(StabilizeStage)
+register_stage(CropStage)
 register_stage(DeblockStage)
 register_stage(DenoiseVideoStage)
 register_stage(UpscaleStage)
@@ -33,6 +35,7 @@ __all__ = [
     "StageStatus",
     "DetectStage",
     "StabilizeStage",
+    "CropStage",
     "DeblockStage",
     "DenoiseVideoStage",
     "UpscaleStage",

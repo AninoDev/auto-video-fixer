@@ -236,6 +236,13 @@ class Pipeline:
         if speed_config.get("enabled", False):
             stages.append("speed")
 
+        # Auto-crop -- opt-in, off by default (see Config.DEFAULTS["stages"]["crop"]
+        # and docs/REQUIREMENTS.md feature 3). optimize_stage_order() places it
+        # right after "stabilize" regardless of insertion order here.
+        crop_config = self.config.get("stages", "crop", default={})
+        if crop_config.get("enabled", False):
+            stages.append("crop")
+
         # Final encoding
         stages.append("encode")
 
@@ -274,16 +281,24 @@ class Pipeline:
         Rules:
         1. Analysis/detection first
         2. Stabilization before enhancement (reduce noise from motion)
-        3. Denoising before upscaling (don't upscale noise)
-        4. Deblocking before denoising (remove compression artifacts first)
-        5. Upscaling before interpolation (higher res frames interpolate better)
-        6. Normalization near the end
-        7. Encoding last
+        3. Auto-crop right after stabilization: stabilize's zoom-out correction
+           can itself add a black border, so cropping after it removes both
+           the original letterboxing/pillarboxing AND any residual
+           stabilization border in a single pass -- and running it before
+           deblock/denoise/upscale/interpolate/encode means none of those
+           (especially the AI-capable ones) waste compute on pixels that are
+           about to be cropped away.
+        4. Denoising before upscaling (don't upscale noise)
+        5. Deblocking before denoising (remove compression artifacts first)
+        6. Upscaling before interpolation (higher res frames interpolate better)
+        7. Normalization near the end
+        8. Encoding last
         """
         # Default optimal order
         default_order = [
             "detect",
             "stabilize",
+            "crop",
             "deblock",
             "denoise_video",
             "upscale",
@@ -393,6 +408,65 @@ class Pipeline:
         errors: list[str] = []
         start_time = __import__("time").time()
 
+        # Scene mode (opt-in, config `scenes.enabled` / CLI `--scene-mode`): when
+        # on and this job's stage list includes stabilize and/or interpolate,
+        # run those two stages per-scene (never interpolating across a cut, and
+        # tiering stabilize strength per scene) and concatenate the result BEFORE
+        # the remaining whole-video stages run. See core/scenes.py. Zero effect
+        # on the stage list/behavior below when scenes.enabled is False (the
+        # default) -- this block is a strict no-op in that case.
+        scene_mode_temp_path: str | None = None
+        if self.config.get("scenes", "enabled", default=False) and (
+            "stabilize" in stage_names or "interpolate" in stage_names
+        ):
+            try:
+                from autovideofixer.core.scenes import run_scene_pipeline
+
+                quality_target = self.config.get("quality", "quality_target", default={})
+                scene_result = run_scene_pipeline(
+                    job.input_path,
+                    self.config,
+                    run_stabilize="stabilize" in stage_names,
+                    run_interpolate="interpolate" in stage_names,
+                    target_fps=quality_target.get("target_framerate"),
+                )
+            except Exception:
+                self.logger.warning(
+                    "Scene mode preprocessing raised an unexpected exception for %s; "
+                    "falling back to whole-video processing",
+                    job.input_path,
+                    exc_info=True,
+                )
+                scene_result = None
+
+            if scene_result is not None:
+                self.logger.info(
+                    "Scene mode: %d/%d scene(s) kept (%d dropped), stabilize tiers=%s, "
+                    "interpolated scene(s)=%s",
+                    scene_result.kept_scenes,
+                    scene_result.total_scenes,
+                    len(scene_result.dropped_scenes),
+                    scene_result.stabilize_tiers,
+                    scene_result.interpolated_scenes,
+                )
+                for dropped in scene_result.dropped_scenes:
+                    self.logger.warning(
+                        "Scene mode: dropped scene #%s (t=%.1f-%.1fs): %s",
+                        dropped["index"],
+                        dropped["start_time"],
+                        dropped["end_time"],
+                        dropped.get("reason", "no reason given"),
+                    )
+                current_path = scene_result.output_path
+                scene_mode_temp_path = scene_result.output_path
+                stage_names = [s for s in stage_names if s not in ("stabilize", "interpolate")]
+                # Stages after this point (e.g. upscale's should_run) read
+                # input_info for resolution/framerate/duration -- reprobe the
+                # reassembled file so they see its actual (possibly
+                # interpolated-to-a-higher-fps, possibly shorter after drops)
+                # properties instead of the original input's.
+                input_info = get_video_info(current_path)
+
         overwrite = self.config.get("general", "overwrite", default=False)
         if (
             not overwrite
@@ -426,6 +500,14 @@ class Pipeline:
         # no output_path) doesn't leave its partial temp file orphaned next to the
         # user's source video, and so cleanup still runs on cancel.
         generated_temp_paths: list[str] = []
+        if scene_mode_temp_path is not None:
+            # Reuses the same generated-temp-path cleanup as any other
+            # intermediate: kept alive as long as it's current_path (the input
+            # to the next stage), removed once superseded, and never removed if
+            # it ends up being promoted straight to job.output_path (e.g. a
+            # scene-mode-only run with stabilize/interpolate as the only
+            # requested stages).
+            generated_temp_paths.append(scene_mode_temp_path)
 
         # Whether the surviving-intermediate fallback below (final_output_path =
         # current_path) got moved onto job.output_path. Guards the outer finally's
@@ -536,7 +618,12 @@ class Pipeline:
             # was skipped/failed, fall back to the last successfully-produced path so a
             # "success" JobResult never carries a None output_path.
             final_output_path: str | None = None
-            if stage_names:
+            if not stage_names and scene_mode_temp_path is not None:
+                # Scene mode ran and there are no further stages (e.g. this job's
+                # only requested stages were stabilize/interpolate) -- current_path
+                # is scene mode's own output and IS the job's result.
+                final_output_path = current_path
+            elif stage_names:
                 final_result = stage_results.get(stage_names[-1])
                 final_stage = create_stage(stage_names[-1], self.config)
                 if final_result is not None and final_result.output_path:
