@@ -32,9 +32,114 @@ def get_data_dir() -> Path:
     return base / "auto-video-fixer"
 
 
+def get_state_dir() -> Path:
+    """Return platform-appropriate state directory (run-time logs, etc.).
+
+    Follows the same pattern as get_config_dir()/get_data_dir(): Linux uses
+    XDG_STATE_HOME (falling back to ~/.local/state) per the XDG base
+    directory spec; macOS/Windows don't have a separate "state" concept in
+    their platform conventions, so they reuse the data dir's base (Windows
+    LOCALAPPDATA, macOS Application Support) with a "logs" subdirectory
+    layered on top by get_log_dir().
+    """
+    if sys.platform == "win32":
+        base = Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData" / "Local"))
+    elif sys.platform == "darwin":
+        base = Path.home() / "Library" / "Application Support"
+    else:
+        base = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local" / "state"))
+    return base / "auto-video-fixer"
+
+
+def get_log_dir() -> Path:
+    """Return the directory automatic per-run log files are written to."""
+    return get_state_dir() / "logs"
+
+
+def prune_old_logs(log_dir: Path, keep: int = 50) -> None:
+    """Delete the oldest files in `log_dir` (by mtime) beyond `keep` newest.
+
+    Simple retention for the automatic per-run log file: called once at CLI
+    startup, before the current run's log file is created, so it never
+    counts (or deletes) the file about to be written.
+    """
+    if not log_dir.is_dir():
+        return
+    try:
+        files = sorted(
+            (p for p in log_dir.iterdir() if p.is_file()),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+    except OSError:
+        return
+    for stale in files[keep:]:
+        try:
+            stale.unlink()
+        except OSError:
+            pass
+
+
 def get_config_path() -> Path:
     """Return path to the main config file."""
     return get_config_dir() / "config.yaml"
+
+
+_SECRET_KEY_MARKERS = ("api_key", "apikey", "token", "password", "secret")
+
+
+def _looks_like_secret_key(key: str) -> bool:
+    lowered = key.lower()
+    return any(marker in lowered for marker in _SECRET_KEY_MARKERS)
+
+
+def redact_secrets(data: Any) -> Any:
+    """Return a deep copy of `data` with secret-looking values masked.
+
+    A dict key "looks like a secret" if it contains api_key/apikey/token/
+    password/secret (case-insensitive), e.g. "api_key", "API_KEY",
+    "openai_api_key". Non-empty values for such keys are replaced with
+    "***"; empty/falsy values are left as-is (nothing to leak).
+    """
+    if isinstance(data, dict):
+        out = {}
+        for k, v in data.items():
+            if isinstance(k, str) and _looks_like_secret_key(k) and v:
+                out[k] = "***"
+            else:
+                out[k] = redact_secrets(v)
+        return out
+    if isinstance(data, list):
+        return [redact_secrets(v) for v in data]
+    return data
+
+
+def diff_from_defaults(data: dict[str, Any], defaults: dict[str, Any]) -> dict[str, Any]:
+    """Return the subset of `data` whose values differ from `defaults`.
+
+    Recurses into nested dicts so only the actually-changed leaf keys show
+    up (unchanged sibling keys in a partially-overridden mapping are
+    omitted), used to produce a compact "settings that differ from
+    DEFAULTS" summary for startup logging.
+    """
+    diff: dict[str, Any] = {}
+    for k, v in data.items():
+        default_v = defaults.get(k, _MISSING)
+        if isinstance(v, dict) and isinstance(default_v, dict):
+            nested = diff_from_defaults(v, default_v)
+            if nested:
+                diff[k] = nested
+        elif default_v is _MISSING or v != default_v:
+            diff[k] = v
+    return diff
+
+
+class _Missing:
+    def __repr__(self) -> str:
+        return "<missing>"
+
+
+_MISSING = _Missing()
 
 
 class Config:
@@ -50,6 +155,15 @@ class Config:
             "log_level": "INFO",
             "overwrite": False,
             "use_ai": None,  # None=auto (preset/config), True=force AI, False=force traditional
+            # Global default for AI-capable stages (upscale, interpolate,
+            # denoise_video, deblock) when the AI path can't run (torch
+            # missing, model load failure, inference exception, CUDA OOM
+            # after tiling retries are exhausted). True (default) = fall
+            # back to the stage's traditional FFmpeg implementation with a
+            # WARNING log. False = fail the stage instead of silently
+            # producing traditional output. Per-stage
+            # stages.<name>.ai_fallback overrides this when not null.
+            "ai_fallback": True,
         },
         "gpu": {
             "auto_detect": True,
@@ -102,16 +216,26 @@ class Config:
                 "traditional_method": "superres",
                 "scale_factor": 4,
                 "tta_mode": 0,
+                # 0 = auto: tile only when a frame's resolution risks CUDA OOM
+                # (see RealESRGANUpscaler.AUTO_TILE_THRESHOLD_PX) or on a
+                # caught OOM. Set > 0 to always tile at that pixel size.
+                "tile_size": 0,
+                # None = inherit general.ai_fallback; True/False overrides it
+                # for this stage only.
+                "ai_fallback": None,
             },
             "interpolate": {
                 "enabled": True,
                 "ai_model": "rife_v4.6",
                 "traditional_method": "minterpolate",
+                "ai_fallback": None,  # see "upscale".ai_fallback above
             },
             "denoise_video": {
                 "enabled": True,
                 "ai_model": "RealESRGAN_x4plus",
                 "traditional_method": "hqdn3d",
+                "tile_size": 0,  # see "upscale".tile_size above
+                "ai_fallback": None,  # see "upscale".ai_fallback above
             },
             "denoise_audio": {
                 "enabled": True,
@@ -121,6 +245,8 @@ class Config:
             "deblock": {
                 "enabled": True,
                 "strength": "medium",  # low, medium, high
+                "tile_size": 0,  # see "upscale".tile_size above
+                "ai_fallback": None,  # see "upscale".ai_fallback above
             },
             "stabilize": {
                 "enabled": True,
@@ -172,8 +298,34 @@ class Config:
         },
     }
 
-    def __init__(self, path: Path | None = None):
-        self._path = path or get_config_path()
+    def __init__(
+        self,
+        path: str | Path | None = None,
+        *,
+        config_path: str | Path | None = None,
+        require_exists: bool = False,
+    ):
+        """Create a Config.
+
+        Args:
+            path: Explicit config file path (positional, pre-existing API).
+            config_path: Same as `path`, accepted as a keyword alias so
+                callers that pass an explicit path (e.g. the CLI's
+                `--config`/`AVF_CONFIG`) can be self-documenting about intent.
+                `path` wins if both are given.
+            require_exists: If True, the resolved path must already exist on
+                disk -- raises FileNotFoundError instead of silently falling
+                back to DEFAULTS. Used for an explicitly-requested config
+                path (CLI flag / env var), where a typo'd path should be a
+                hard error, not a silent no-op. The default platform config
+                path (neither `path` nor `config_path` given) is never
+                required to exist.
+        """
+        resolved = path or config_path
+        self._path = Path(resolved) if resolved is not None else get_config_path()
+        self._require_exists = require_exists and resolved is not None
+        if self._require_exists and not self._path.exists():
+            raise FileNotFoundError(f"Config file not found: {self._path}")
         self._data = self._merge()
         self._save_pending = False
 

@@ -1,0 +1,360 @@
+# Auto Video Fixer -- example configuration
+#
+# This file documents every key in Config.DEFAULTS (src/autovideofixer/config.py) with its
+# default value and an explanation. It is NOT loaded automatically -- copy the parts you want
+# into your real config file:
+#
+#   Linux:   ${XDG_CONFIG_HOME:-~/.config}/auto-video-fixer/config.yaml
+#   macOS:   ~/Library/Application Support/auto-video-fixer/config.yaml
+#   Windows: %APPDATA%\auto-video-fixer\config.yaml
+#
+# or point avf at a copy of this file directly with `avf --config /path/to/config.yaml ...`
+# (or the AVF_CONFIG environment variable) -- note that an explicitly-given --config/AVF_CONFIG
+# path MUST already exist; it is never silently created.
+#
+# You do not need to list every key: Config merges whatever you provide recursively on top of
+# Config.DEFAULTS, so an empty/partial file is valid and any key you omit keeps its default.
+# A preset (-p/--preset) further overrides on top of this at run time, without persisting to
+# disk (see AGENTS.md's "Configuration" section).
+#
+# Standing rule (see AGENTS.md): any change to a config key here MUST be reflected in
+# Config.DEFAULTS in config.py, and vice versa -- keep this file and the code in sync.
+
+general:
+  # Directory for auto-generated output filenames ({stem}_enhanced{ext}). null = same
+  # directory as the input file. Overridden per-run by `avf process -o DIR`.
+  output_dir: null
+
+  # Extension used for auto-generated output filenames, WITHOUT regard to the input's own
+  # extension -- e.g. a .mkv input with output_container: mp4 produces a .mp4 output. Accepts
+  # "mp4" or ".mp4" (leading dot optional). null/empty keeps the input's own extension instead.
+  output_container: mp4
+
+  # Directory for intermediate per-stage temp files (always written with a .mkv extension --
+  # see AGENTS.md's "Pipeline Behavior"). null = next to the input file.
+  temp_dir: null
+
+  # How many jobs Pipeline.execute_all() runs concurrently via a thread pool. Each job reads/
+  # writes distinct files so this is safe to raise for I/O-bound / traditional-only batches.
+  # KEEP THIS AT 1 if any job in the batch uses AI stages (upscale/interpolate/denoise_video/
+  # deblock with method=ai): concurrent AI jobs contend for the same GPU/VRAM and each runs FAR
+  # slower than if run sequentially -- raising this for AI batches is a false economy, not a
+  # speedup. Safe to raise for --no-ai / traditional-only batches on a multi-core machine.
+  max_concurrent_jobs: 1
+
+  # Default log level if not overridden by --verbose/--log-level. The automatic per-run log
+  # file (see AGENTS.md) always captures DEBUG regardless of this setting.
+  log_level: INFO
+
+  # Whether Pipeline.execute_job() is allowed to overwrite an existing file at the job's
+  # resolved output path. Overridden per-run by `avf process --overwrite`/`--no-overwrite`.
+  overwrite: false
+
+  # Global default for whether AI-capable stages (upscale, interpolate, denoise_video, deblock)
+  # use their AI or traditional implementation:
+  #   null  = auto (stage/preset decides per its own default -- e.g. deblock defaults to AI,
+  #           denoise_video defaults to traditional, upscale picks AI when scaling up)
+  #   true  = force AI everywhere (same as `avf process --ai`)
+  #   false = force traditional everywhere, no GPU/PyTorch required (same as `--no-ai`)
+  use_ai: null
+
+  # Default AI-fallback policy: whether an AI-capable stage may silently fall back to its
+  # traditional FFmpeg method when the AI path can't run (PyTorch missing, model load failure,
+  # inference exception, or CUDA OOM after tiling retries are exhausted).
+  #   true  (default) = fall back, log a WARNING, keep the job running with (lower-quality)
+  #           traditional output.
+  #   false = FAIL the stage instead, with a named cause, rather than silently downgrading.
+  # Per-stage stages.<name>.ai_fallback (below) overrides this when set to true/false; leave it
+  # null there to inherit this value. Overridden per-run by `avf process --ai-fallback` /
+  # `--no-ai-fallback`.
+  ai_fallback: true
+
+gpu:
+  # Whether to auto-detect GPU capability at all (informational; auto-detection itself happens
+  # in ai/torch_utils.py and core/ffmpeg_utils.py regardless -- this mainly gates whether
+  # detection results are trusted over an explicit preferred_device).
+  auto_detect: true
+
+  # PyTorch device preference for AI stages: auto, cpu, cuda, or metal (Apple Silicon MPS).
+  # Separate from ffmpeg.hwaccel below, which governs FFmpeg's own encode/decode acceleration,
+  # not PyTorch. Overridden per-run by `avf process --gpu-device`. Run `avf gpu-info` to see
+  # what PyTorch actually detects on this machine.
+  preferred_device: auto
+
+  # Optional VRAM cap in GB for AI stages, if you need to leave headroom for other GPU work.
+  # null = no explicit limit (PyTorch/CUDA's own allocator behavior applies).
+  memory_limit_gb: null
+
+ffmpeg:
+  # Path to the ffmpeg binary. null = auto-detect via `shutil.which` in PATH. ffprobe is
+  # located relative to this path (or also auto-detected via PATH) -- see get_ffprobe_path().
+  binary: null
+
+  # FFmpeg hardware acceleration for encode/decode: auto, cuda, vaapi, qsv, vulkan, d3d11,
+  # videotoolbox, or none. "auto" probes `ffmpeg -hwaccels` and picks the first available in
+  # preference order (cuda > vaapi > qsv > videotoolbox > d3d11 > vulkan). Overridden per-run by
+  # `avf process --hwaccel`. Independent of gpu.preferred_device above (that's PyTorch, this is
+  # FFmpeg) -- a system can have one working without the other.
+  hwaccel: auto
+
+  # FFmpeg thread count. 0 = let FFmpeg choose automatically.
+  threads: 0
+
+quality:
+  # VMAF model to use for estimate_vmaf() (core/quality.py).
+  vmaf_model: vmaf_v0.6.1
+
+  # VMAF feature set passed to libvmaf.
+  vmaf_features: "psnr,ssim,ms_ssim,fast"
+
+  quality_target:
+    # Whether/how Pipeline.execute_job()'s post-job quality gate checks output against a
+    # target: none (skip the check entirely), min, avg, or max. This is a best-effort,
+    # non-fatal check -- a failed/unmeasurable comparison never fails an otherwise-successful
+    # job, it only records job_result.quality_score / quality_meets_target for callers to act
+    # on (or leaves them as None/"not checked" if the FFmpeg comparison pass itself failed).
+    mode: none
+
+    # Target quality score (SSIM/PSNR-scale, or VMAF 0-100 depending on which estimator is
+    # used) the quality gate compares against when mode != none.
+    target: 95.0
+
+    # Maximum acceptable quality loss percentage -- used by presets like size_reduction to
+    # bound how much compression is allowed before the gate should flag it.
+    max_loss_pct: 5.0
+
+    # Target output resolution as [width, height], e.g. [3840, 2160]. null = no explicit
+    # target (upscale stage's should_run() then reports "No target resolution specified" and
+    # is skipped). Overridden per-run by `avf process --resolution WIDTHxHEIGHT`.
+    target_resolution: null
+
+    # Target output framerate, e.g. 60.0. null = no explicit target (interpolate stage is
+    # skipped). Overridden per-run by `avf process --fps`.
+    target_framerate: null
+
+    # Whether upscale (and any future resolution-changing stage) preserves the original
+    # video's aspect ratio when scaling toward target_resolution, rotating the target bounding
+    # box to match portrait/landscape input orientation rather than stretching to an exact
+    # target_resolution. See AGENTS.md's "Upscaling & Aspect Ratio" section for the algorithm.
+    keep_aspect_ratio: true
+
+pipeline:
+  # INFORMATIONAL ONLY. Pipeline.optimize_stage_order() hardcodes the actual execution order
+  # and does NOT read this list -- changing it here has no effect. Left in DEFAULTS to
+  # document the intended/actual order (which optimize_stage_order() matches) and because
+  # `stage name mismatch` note: this lists "denoise" but the registered stage name is
+  # "denoise_video" -- another reason this list must not be relied on programmatically.
+  default_order:
+    - detect
+    - stabilize
+    - deblock
+    - denoise_video
+    - upscale
+    - interpolate
+    - normalize_volume
+    - normalize_audio
+    - speed
+    - hdr
+    - encode
+
+  # Safety cap on how many stages a single job may run (guards against pathological --stage
+  # repetition, not normal preset/auto-determined pipelines -- must stay >= 11, the length of
+  # a full default run). Exceeding this fails the job outright rather than silently truncating
+  # (which could drop the always-last "encode" stage).
+  max_stages: 15
+
+  # Whether a stage that FAILS aborts the whole job (false) or is skipped, continuing the
+  # pipeline with the last successfully-produced intermediate as input to the next stage
+  # (true, the default -- more resilient for unattended batch runs).
+  skip_stage_on_error: true
+
+stages:
+  upscale:
+    enabled: true
+    # Real-ESRGAN checkpoint name from ai/model_cache.py's MODEL_REGISTRY, e.g.
+    # RealESRGAN_x4plus, RealESRGAN_x2plus, RealESRGAN_x4plus_anime_6B. x2plus is
+    # auto-substituted for x4plus whenever a given AI pass only needs <=2x scale (faster; see
+    # CHANGELOG).
+    ai_model: RealESRGAN_x4plus
+    # Traditional (non-AI) method identifier; currently only "superres" (FFmpeg lanczos scale)
+    # is implemented.
+    traditional_method: superres
+    # Scale factor per AI pass when not auto-derived from target_resolution (max 4 per Real-
+    # ESRGAN pass; multi-pass chaining handles larger totals).
+    scale_factor: 4
+    # Test-time augmentation mode (0 = off). Higher values trade speed for quality by averaging
+    # predictions over flipped/rotated variants of each frame.
+    tta_mode: 0
+    # Tile size in pixels for chunked GPU inference. 0 = auto: only tile when a frame's
+    # resolution risks CUDA OOM (see RealESRGANUpscaler.AUTO_TILE_THRESHOLD_PX) or reactively
+    # after a caught OOM. Set > 0 to always tile at that size (useful on VRAM-constrained GPUs
+    # to avoid ever hitting OOM in the first place).
+    tile_size: 0
+    # Per-stage AI-fallback override: null = inherit general.ai_fallback above; true/false
+    # overrides it for this stage only.
+    ai_fallback: null
+
+  interpolate:
+    enabled: true
+    # RIFE checkpoint name, e.g. rife_v4.6, rife_v4.11.
+    ai_model: rife_v4.6
+    # Traditional method: FFmpeg's minterpolate filter (motion-compensated frame blending).
+    traditional_method: minterpolate
+    ai_fallback: null  # see stages.upscale.ai_fallback above
+
+  denoise_video:
+    enabled: true
+    # Reuses the Real-ESRGAN registry (denoise runs the model at scale=1, i.e. no spatial
+    # upscaling -- artifact/noise removal as a side effect of super-resolution training).
+    ai_model: RealESRGAN_x4plus
+    # Traditional method: FFmpeg's hqdn3d filter.
+    traditional_method: hqdn3d
+    tile_size: 0        # see stages.upscale.tile_size above
+    ai_fallback: null    # see stages.upscale.ai_fallback above
+
+  denoise_audio:
+    # NOTE: this config block exists in Config.DEFAULTS but there is currently no registered
+    # "denoise_audio" stage (see core/stages/__init__.py) -- setting enabled/ai_model/
+    # traditional_method here has no effect yet. Documented as a known gap, not a working
+    # feature. Kept in DEFAULTS as a placeholder for when the stage is implemented.
+    enabled: true
+    ai_model: demucs
+    traditional_method: afftdn
+
+  deblock:
+    enabled: true
+    # low, medium, high -- controls both filter amount and kernel size for the traditional
+    # (unsharp-based) method.
+    strength: medium
+    tile_size: 0        # see stages.upscale.tile_size above
+    ai_fallback: null    # see stages.upscale.ai_fallback above
+
+  stabilize:
+    enabled: true
+    # Average shake magnitude (px) above which stabilization is applied; below this the stage
+    # copies the input through unchanged (see should_run()/_analyze_trf_file()).
+    threshold: 2.0
+    # vidstabtransform smoothing window in frames -- higher = smoother camera path but more
+    # lag/cropping at fast pans.
+    smoothness: 40
+    # Maximum pixel shift per frame vidstabtransform is allowed to apply (limits
+    # overcorrection on very shaky footage).
+    maxshift: 20
+    # vidstabtransform optimization algorithm: opt, gauss, or avg.
+    optalgo: gauss
+    # vidstabdetect motion-detection sensitivity, 1-10 (higher = more sensitive to small
+    # movements).
+    shakiness: 10
+    # Whether to let vidstabtransform apply its own optimal static zoom (optzoom=1) to hide
+    # borders introduced by stabilization on very shaky footage. See AGENTS.md/CHANGELOG for
+    # why this replaced an earlier hand-computed (and sign-inverted) zoom calculation.
+    zoom_enabled: true
+    # Minimum movement extent (px, from TRF analysis) required before zoom is applied at all --
+    # below this, borders are assumed small enough to leave alone.
+    zoom_threshold: 50.0
+    # "black" (leave letterbox/pillarbox borders visible when zoom isn't applied) or "keep"
+    # (crop mode passed to vidstabtransform's crop= option).
+    zoom_mode: black
+    # Whether to apply a mild unsharp pass after stabilization when stabilization was actually
+    # triggered (compensates for the slight softness stabilization/zoom can introduce).
+    sharpen_enabled: true
+
+  normalize_volume:
+    enabled: true
+    # EBU R128 integrated loudness target in LUFS.
+    target_db: -23.0
+    # True peak ceiling in dBTP.
+    true_peak_db: -2.0
+
+  hdr_to_sdr:
+    enabled: false
+    # Tone-mapping method; currently bt2020 is the only implemented value.
+    method: bt2020
+
+  speed:
+    enabled: false
+    # Playback speed multiplier (1.0 = unchanged, 2.0 = 2x faster, 0.5 = half speed).
+    factor: 1.0
+
+analysis:
+  vlm:
+    # Master switch for VLM (Vision Language Model) content analysis. Off by default -- costs
+    # API calls / requires a local Ollama instance. See docs/REQUIREMENTS.md's "Foundation"
+    # section: this is implemented but not independently verified end-to-end.
+    enabled: false
+
+    # Which backend to call: local, ollama, openai, or api.
+    #   local / ollama -- both currently route to the same Ollama-compatible chat endpoint.
+    #   openai         -- OpenAI Vision (chat completions with an image), requires api_key.
+    #   api            -- any OpenAI-compatible custom endpoint at api_url; requires api_key
+    #                      if the endpoint needs auth, refuses non-HTTPS for non-loopback hosts.
+    provider: local
+
+    # Model name passed to the provider, e.g. "llava" (Ollama), "gpt-4o" (OpenAI).
+    model: llava
+
+    # API key for openai/api providers. Leave empty for a local Ollama instance that doesn't
+    # require auth. NEVER commit a real key here -- this value is redacted ("***") in the
+    # startup settings banner and DEBUG config dumps because the key "api_key" matches
+    # config.py's secret-key heuristic, but the config.yaml file on disk is still plaintext.
+    api_key: ""
+
+    # --- Example: local Ollama (default provider) ---
+    # provider: ollama
+    # model: llava
+    # api_url: "http://localhost:11434"   # default if left empty
+    # api_key: ""                          # not needed for local Ollama
+    #
+    # --- Example: OpenAI Vision ---
+    # provider: openai
+    # model: gpt-4o
+    # api_key: "sk-..."                    # required
+    # api_url: ""                          # not used by the openai provider
+    #
+    # --- Example: custom OpenAI-compatible API ---
+    # provider: api
+    # model: your-vision-model
+    # api_url: "https://your-api.example.com/v1/chat/completions"
+    # api_key: "..."                       # sent as a Bearer token if non-empty
+
+    # Base URL override for ollama/api providers. Empty string = provider-specific default
+    # (http://localhost:11434 for ollama).
+    api_url: ""
+
+    # Max number of frames sampled from the video and sent to the VLM per analysis call.
+    max_sample_frames: 8
+
+    # Seconds between sampled frames (see _extract_sample_frames() in core/analysis.py).
+    sample_interval_sec: 10.0
+
+  event_detection:
+    enabled: true
+    # Frame-differencing correlation threshold below which a scene change is flagged
+    # (lower = more sensitive to detecting cuts).
+    scene_change_threshold: 0.3
+    # Minimum scene duration in seconds; shorter detected segments are merged with neighbors.
+    min_scene_duration_sec: 2.0
+    # Whether `avf analyze` runs VLM-based classification on each detected scene by default
+    # (also toggleable per-invocation with `avf analyze --classify`).
+    classify_events: false
+
+  duplicate_detection:
+    enabled: true
+    # Similarity threshold (0-1) above which two videos are considered duplicates/near-
+    # duplicates in find_duplicates()/find_similar().
+    similarity_threshold: 0.95
+    # Perceptual hash algorithm: "perceptual" (average hash / ahash), "dhash" (difference
+    # hash -- more robust to lighting differences), or "combined" (both).
+    hash_type: perceptual
+
+# --- Not part of Config.DEFAULTS, but read elsewhere and worth knowing about ---
+#
+# encoding:
+#   Written by Preset.to_config() (core/presets.py) and merged by Pipeline._apply_config_
+#   encoding_overrides() into the "encode" stage's overrides. Not itself in Config.DEFAULTS
+#   (so it's absent unless a preset sets it or you add it yourself), but recognized keys are:
+#     video_codec: libx264   # remapped to EncodeStage's "codec" kwarg
+#     audio_codec: aac
+#     crf: 18
+#     preset: medium         # encoder speed/quality preset, NOT the same as avf's -p/--preset
+#   Overridden per-run by `avf process --codec/--audio-codec/--crf/--encoder-preset`.

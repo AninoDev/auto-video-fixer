@@ -68,7 +68,8 @@ avf analyze video.mp4
 avf find-duplicates reference.mp4 ./library/
 
 # List available presets
-avf list-presets
+avf presets-cmd
+# (or: avf process --list-presets)
 
 # Show GPU info
 avf gpu-info
@@ -131,7 +132,7 @@ src/autovideofixer/
 5. **Register** in `src/autovideofixer/core/stages/__init__.py`: import the class and call `register_stage(MyStage)` at module level. Can use either decorator syntax (`@register_stage`) or bare function call (`register_stage(MyStage)`).
 6. Add config to `DEFAULTS["stages"][<name>]` in `src/autovideofixer/config.py`
 
-**CRITICAL - Stage ordering**: The pipeline does **not** use `DEFAULTS["pipeline"]["default_order"]` from config.py. The actual ordering is hardcoded in `Pipeline.optimize_stage_order()` in `pipeline.py:232`. Changing `DEFAULTS["pipeline"]["default_order"]` has **no effect** on execution order. To change order, modify `pipeline.py:optimize_stage_order()`.
+**CRITICAL - Stage ordering**: The pipeline does **not** use `DEFAULTS["pipeline"]["default_order"]` from config.py. The actual ordering is hardcoded in `Pipeline.optimize_stage_order()` in `core/pipeline.py`. Changing `DEFAULTS["pipeline"]["default_order"]` has **no effect** on execution order. To change order, modify `pipeline.py:optimize_stage_order()`.
 
 **`remux` is not in the default pipeline**. It is only added by `auto_determine_stages()` when the input is MKV (detected by the `detect` stage).
 
@@ -172,6 +173,11 @@ Configuration is stored at:
 - **Linux**: `~/.config/auto-video-fixer/config.yaml`
 - **macOS**: `~/Library/Application Support/auto-video-fixer/config.yaml`
 - **Windows**: `%APPDATA%\auto-video-fixer\config.yaml`
+
+Use `avf --config PATH ...` or the `AVF_CONFIG` environment variable to point at a different
+file (it must already exist). See [`docs/config.example.yaml`](docs/config.example.yaml) for a
+fully commented example covering every available config key, and `AGENTS.md` for CLI flags,
+stage/AI-fallback behavior, and other agent-facing details.
 
 ## Development
 

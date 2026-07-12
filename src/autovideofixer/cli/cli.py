@@ -3,21 +3,34 @@
 from __future__ import annotations
 
 import copy
+import logging
 import os
 import sys
+from datetime import datetime
 
 import click
 from rich.console import Console
 from rich.table import Table
 
 from autovideofixer import __version__
-from autovideofixer.config import Config
+from autovideofixer.config import (
+    Config,
+    diff_from_defaults,
+    get_log_dir,
+    prune_old_logs,
+    redact_secrets,
+)
 from autovideofixer.core.analysis import is_video_file, scan_directory
 from autovideofixer.core.pipeline import Pipeline
 from autovideofixer.core.presets import get_preset, list_presets
-from autovideofixer.logger import setup_logging
+from autovideofixer.logger import get_logger, setup_logging
 
 console = Console()
+
+# Max automatic per-run log files retained under get_log_dir() (see
+# config.prune_old_logs()). Oldest-by-mtime files beyond this count are
+# deleted at startup, before the current run's log file is created.
+MAX_RETAINED_LOGS = 50
 
 
 @click.group()
@@ -30,7 +43,11 @@ console = Console()
     help="Set logging level",
 )
 @click.option(
-    "--log-file", type=click.Path(), default=None, help="Log to file in addition to console"
+    "--log-file",
+    type=click.Path(),
+    default=None,
+    help="Write the run's log file to this path instead of the automatic "
+    "timestamped file in the platform log directory",
 )
 @click.option(
     "--file-log-level",
@@ -40,6 +57,16 @@ console = Console()
     "(e.g. keep the console at INFO but capture DEBUG detail, including full "
     "ffmpeg commands, to the file)",
 )
+@click.option(
+    "--config",
+    "config_path",
+    type=click.Path(),
+    default=None,
+    envvar="AVF_CONFIG",
+    help="Use this config file instead of the default platform config path. "
+    "Falls back to the AVF_CONFIG environment variable if not given. The file "
+    "must already exist (this never silently creates or ignores a missing path).",
+)
 @click.pass_context
 def main(
     ctx: click.Context,
@@ -47,6 +74,7 @@ def main(
     log_level: str | None,
     log_file: str | None,
     file_log_level: str | None,
+    config_path: str | None,
 ) -> None:
     """Auto Video Fixer - Automated video enhancement and processing.
 
@@ -56,15 +84,72 @@ def main(
     Logging:
       --verbose, -v          Enable DEBUG level logging (console and file)
       --log-level LEVEL      Set console logging level (DEBUG, INFO, WARNING, ERROR)
-      --log-file PATH        Log to file (in addition to console)
+      --log-file PATH        Write the run's log file here instead of the
+                             automatic location
       --file-log-level LEVEL Set file-only logging level, if different from console
+
+    Every run logs to a file at DEBUG level independent of console verbosity:
+    a timestamped file under the platform log directory by default (the exact
+    path is logged at startup), or the --log-file path when given.
     """
     ctx.ensure_object(dict)
 
     console_level = "DEBUG" if verbose else (log_level or "INFO")
-    setup_logging(console_level, log_file=log_file, file_level=file_log_level)
 
-    ctx.obj["config"] = Config()
+    # An explicit --log-file replaces the automatic state-dir log rather than
+    # adding a second file: the run's canonical log lives wherever the user
+    # pointed it, and it gets the same always-DEBUG treatment.
+    if log_file:
+        auto_log_file = log_file
+    else:
+        log_dir = get_log_dir()
+        log_dir.mkdir(parents=True, exist_ok=True)
+        prune_old_logs(log_dir, keep=MAX_RETAINED_LOGS)
+        auto_log_file = str(log_dir / f"avf-{datetime.now():%Y%m%d-%H%M%S}.log")
+
+    setup_logging(
+        console_level, log_file=None, file_level=file_log_level, auto_log_file=auto_log_file
+    )
+
+    logger = get_logger("autovideofixer.cli")
+    logger.info("avf %s -- log file: %s", __version__, auto_log_file)
+    logger.info("Invocation: %s", " ".join(sys.argv))
+
+    try:
+        if config_path:
+            ctx.obj["config"] = Config(config_path, require_exists=True)
+        else:
+            ctx.obj["config"] = Config()
+    except FileNotFoundError as e:
+        console.print(f"[red]{e}[/red]")
+        sys.exit(1)
+
+    ctx.obj["config_path_source"] = config_path
+
+    _log_effective_settings(logger, ctx.obj["config"], config_path)
+
+
+def _log_effective_settings(
+    logger: logging.Logger, config: Config, explicit_config_path: str | None
+) -> None:
+    """Log what config source/preset/settings this run is using.
+
+    At INFO: which config file (default vs explicit), and a compact diff of
+    effective settings vs Config.DEFAULTS (secrets redacted). At DEBUG: the
+    full effective config dump (also redacted).
+    """
+    if explicit_config_path:
+        logger.info("Config file: %s (explicit)", explicit_config_path)
+    else:
+        logger.info("Config file: %s (default)", config._path)
+
+    diff = redact_secrets(diff_from_defaults(config.data, Config.DEFAULTS))
+    if diff:
+        logger.info("Effective settings (differ from defaults): %s", diff)
+    else:
+        logger.info("Effective settings: all defaults")
+
+    logger.debug("Full effective config: %s", redact_secrets(config.data))
 
 
 @main.command()
@@ -110,6 +195,17 @@ def main(
     "--overwrite/--no-overwrite",
     default=None,
     help="Allow overwriting an existing output file (overrides general.overwrite in config)",
+)
+@click.option(
+    "--ai-fallback/--no-ai-fallback",
+    "ai_fallback",
+    default=None,
+    help="Allow (default) or forbid AI-capable stages (upscale/interpolate/denoise_video/"
+    "deblock) from silently falling back to their traditional FFmpeg method when the AI "
+    "path can't run -- torch missing, model load failure, inference exception, or CUDA OOM "
+    "after tiling retries. With --no-ai-fallback such a stage FAILS instead (overrides "
+    "general.ai_fallback in config for this run; does not override a per-stage "
+    "stages.<name>.ai_fallback set in config).",
 )
 @click.option(
     "--fps",
@@ -173,6 +269,7 @@ def process(
     threads: int | None,
     use_ai: bool | None,
     overwrite: bool | None,
+    ai_fallback: bool | None,
     fps: float | None,
     resolution: str | None,
     codec: str | None,
@@ -186,6 +283,9 @@ def process(
     if list_presets_flag:
         _list_presets()
         return
+
+    logger = get_logger("autovideofixer.cli")
+    logger.info("Preset: %s", preset or "(none -- auto-determined per-file)")
 
     config = ctx.obj["config"]
     if threads:
@@ -213,6 +313,9 @@ def process(
 
     if overwrite is not None:
         config.set(overwrite, "general", "overwrite")
+
+    if ai_fallback is not None:
+        config.set(ai_fallback, "general", "ai_fallback")
 
     if fps is not None:
         config.set(fps, "quality", "quality_target", "target_framerate")
@@ -256,6 +359,12 @@ def process(
         config.set(True, "stages", stage_name, "enabled")
     for stage_name in disable_stages:
         config.set(False, "stages", stage_name, "enabled")
+
+    # Re-log the effective settings now that the preset (if any) and every
+    # CLI override above have been merged in -- the group-level log in
+    # main() only reflects the config as loaded from disk, before any of
+    # this command's own overrides.
+    _log_effective_settings(logger, config, ctx.obj.get("config_path_source"))
 
     # Collect input files
     input_files = []

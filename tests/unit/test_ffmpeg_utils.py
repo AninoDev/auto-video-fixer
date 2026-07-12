@@ -8,6 +8,7 @@ import pytest
 from autovideofixer.core.ffmpeg_utils import (
     ProbeResult,
     StreamInfo,
+    _parse_fps,
     detect_hardware_acceleration,
     generate_temp_path,
     get_ffmpeg_path,
@@ -15,6 +16,41 @@ from autovideofixer.core.ffmpeg_utils import (
     probe,
     resolve_hwaccel,
 )
+
+
+class TestParseFps:
+    """Test the avg_frame_rate-first framerate selection rule.
+
+    avg_frame_rate is the honest "real frame count / real duration" rate.
+    r_frame_rate ("tbr") is ffmpeg's declared/theoretical rate and can be a
+    multiple of the true average for VFR or YouTube-origin sources (e.g.
+    avg_frame_rate=29.64 vs r_frame_rate=59.94 for the same file). Any code
+    that reads r_frame_rate where it should read avg_frame_rate will
+    mis-time piped/raw video relative to real frame count.
+    """
+
+    def test_prefers_avg_frame_rate_over_r_frame_rate(self):
+        # Real-world VFR/YouTube-origin case: r_frame_rate (tbr) is ~2x the
+        # true average rate.
+        s = {"avg_frame_rate": "2964/100", "r_frame_rate": "60000/1001"}
+        assert _parse_fps(s) == pytest.approx(29.64, abs=0.01)
+
+    def test_falls_back_to_r_frame_rate_when_avg_undefined(self):
+        # ffprobe emits "0/0" for avg_frame_rate when duration is unknown.
+        s = {"avg_frame_rate": "0/0", "r_frame_rate": "30/1"}
+        assert _parse_fps(s) == pytest.approx(30.0)
+
+    def test_falls_back_to_r_frame_rate_when_avg_missing(self):
+        s = {"r_frame_rate": "24/1"}
+        assert _parse_fps(s) == pytest.approx(24.0)
+
+    def test_matching_rates_simple_case(self):
+        s = {"avg_frame_rate": "30/1", "r_frame_rate": "30/1"}
+        assert _parse_fps(s) == pytest.approx(30.0)
+
+    def test_no_rate_info_returns_zero(self):
+        s = {"avg_frame_rate": "0/0", "r_frame_rate": "0/0"}
+        assert _parse_fps(s) == 0.0
 
 
 class TestFFmpegDetection:

@@ -5,7 +5,11 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from autovideofixer.ai.wrappers.interpolate import RIFEInterpolator
-from autovideofixer.ai.wrappers.upscale import RealESRGANUpscaler
+from autovideofixer.ai.wrappers.upscale import (
+    RealESRGANUpscaler,
+    compute_tile_grid,
+    run_tiled_inference,
+)
 
 
 def _real_esrgan_model_cached() -> str | None:
@@ -207,3 +211,120 @@ class TestRealESRGANNotBlackRegression:
             f"Output mean luma {mean_luma:.1f} is outside a sane range -- "
             "solid black (~0) or solid white (~255) both indicate broken inference"
         )
+
+
+class TestTileGrid:
+    """Tests for the tiled-inference grid math (compute_tile_grid), no GPU needed.
+
+    These validate the pure coordinate math used to avoid CUDA OOM on large
+    frames by splitting them into overlapping tiles: correct tile counts,
+    overlap padding present and clamped at image bounds, and full coverage
+    with no gaps/overlaps in the *output* placement regions.
+    """
+
+    def test_exact_multiple_grid_shape(self):
+        # 512x512 image, 256 tile -> exactly a 2x2 grid, no partial tiles.
+        tiles = compute_tile_grid(512, 512, tile_size=256, overlap=16, out_scale=1)
+        assert len(tiles) == 4
+
+    def test_non_multiple_grid_shape(self):
+        # 500x300 image, 256 tile -> ceil(500/256)=2 rows, ceil(300/256)=2 cols.
+        tiles = compute_tile_grid(500, 300, tile_size=256, overlap=16, out_scale=1)
+        assert len(tiles) == 4
+
+    def test_single_tile_when_smaller_than_tile_size(self):
+        tiles = compute_tile_grid(100, 100, tile_size=256, overlap=16, out_scale=1)
+        assert len(tiles) == 1
+        t = tiles[0]
+        assert (t.in_y0, t.in_y1, t.in_x0, t.in_x1) == (0, 100, 0, 100)
+        assert (t.out_y0, t.out_y1, t.out_x0, t.out_x1) == (0, 100, 0, 100)
+
+    def test_overlap_padding_present_and_clamped(self):
+        # A middle tile should be padded by `overlap` on every side; an edge
+        # tile's padding must be clamped to the image boundary (never go
+        # negative or past height/width).
+        tiles = compute_tile_grid(600, 600, tile_size=200, overlap=20, out_scale=1)
+        by_pos = {(t.out_y0, t.out_x0): t for t in tiles}
+
+        top_left = by_pos[(0, 0)]
+        assert top_left.in_y0 == 0  # clamped, can't pad above 0
+        assert top_left.in_x0 == 0
+        assert top_left.in_y1 == 220  # 200 + 20 overlap below
+        assert top_left.in_x1 == 220
+
+        middle = by_pos[(200, 200)]
+        assert middle.in_y0 == 180  # 200 - 20
+        assert middle.in_y1 == 420  # 400 + 20
+        assert middle.in_x0 == 180
+        assert middle.in_x1 == 420
+
+        bottom_right = by_pos[(400, 400)]
+        assert bottom_right.in_y1 == 600  # clamped, can't pad past image height
+        assert bottom_right.in_x1 == 600
+
+    def test_output_placement_covers_full_image_no_gaps_no_overlaps(self):
+        h, w, tile, overlap, scale = 517, 333, 128, 24, 2
+        tiles = compute_tile_grid(h, w, tile_size=tile, overlap=overlap, out_scale=scale)
+
+        canvas = [[0] * (w * scale) for _ in range(h * scale)]
+        for t in tiles:
+            for y in range(t.out_y0, t.out_y1):
+                for x in range(t.out_x0, t.out_x1):
+                    canvas[y][x] += 1
+
+        # Every output pixel must be covered by exactly one tile's placement
+        # region -- a gap (0) would leave holes in the stitched frame, an
+        # overlap (>1) means two tiles wrote the same pixel (a stitching bug,
+        # not the *input*-side overlap padding which is intentional).
+        flat = [v for row in canvas for v in row]
+        assert set(flat) == {1}
+
+    def test_crop_region_matches_out_region_size(self):
+        tiles = compute_tile_grid(517, 333, tile_size=128, overlap=24, out_scale=2)
+        for t in tiles:
+            assert (t.out_y1 - t.out_y0) == (t.crop_y1 - t.crop_y0)
+            assert (t.out_x1 - t.out_x0) == (t.crop_x1 - t.crop_x0)
+            # crop region must lie within the tile's own (padded) output size
+            tile_out_h = (t.in_y1 - t.in_y0) * 2
+            tile_out_w = (t.in_x1 - t.in_x0) * 2
+            assert 0 <= t.crop_y0 <= t.crop_y1 <= tile_out_h
+            assert 0 <= t.crop_x0 <= t.crop_x1 <= tile_out_w
+
+    def test_invalid_args_raise(self):
+        with pytest.raises(ValueError):
+            compute_tile_grid(100, 100, tile_size=0, overlap=8)
+        with pytest.raises(ValueError):
+            compute_tile_grid(100, 100, tile_size=64, overlap=-1)
+        with pytest.raises(ValueError):
+            compute_tile_grid(0, 100, tile_size=64, overlap=8)
+
+
+class TestRunTiledInference:
+    """Tests run_tiled_inference end-to-end on CPU tensors (no GPU needed)."""
+
+    def test_identity_reconstruction(self):
+        """Tiling an identity function must reconstruct the original tensor exactly."""
+        torch = pytest.importorskip("torch")
+
+        tensor = torch.arange(1 * 3 * 64 * 48, dtype=torch.float32).reshape(1, 3, 64, 48)
+
+        def identity(t):
+            return t
+
+        out = run_tiled_inference(tensor, tile_size=20, overlap=5, out_scale=1, infer_fn=identity)
+        assert out.shape == tensor.shape
+        assert torch.equal(out, tensor)
+
+    def test_scaling_reconstruction(self):
+        """A tile-wise 2x nearest-upsample must equal a whole-frame 2x upsample."""
+        torch = pytest.importorskip("torch")
+
+        tensor = torch.rand(1, 3, 50, 37, dtype=torch.float32)
+
+        def upsample2x(t):
+            return torch.nn.functional.interpolate(t, scale_factor=2, mode="nearest")
+
+        expected = upsample2x(tensor)
+        out = run_tiled_inference(tensor, tile_size=16, overlap=4, out_scale=2, infer_fn=upsample2x)
+        assert out.shape == expected.shape
+        assert torch.allclose(out, expected)

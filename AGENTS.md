@@ -1,5 +1,12 @@
 # Auto Video Fixer - Agent Instructions
 
+## Standing rule: keep docs in sync
+
+Any change to behavior, config keys, CLI flags, or stage semantics MUST update
+`AGENTS.md`, `CHANGELOG.md`, `docs/` (`ROADMAP.md`, `IMPLEMENTATION.md` as applicable), and
+`docs/config.example.yaml` in the **same** change. Docs that drift from the code are worse than
+no docs — the next agent (or human) will trust and propagate a stale claim.
+
 ## Setup & Commands
 
 ```bash
@@ -54,12 +61,27 @@ FFmpeg must be in PATH. Verify with `avf gpu-info`.
 
 ## Pipeline Behavior
 
-- **Stage ordering is hardcoded** in `Pipeline.optimize_stage_order()` (pipeline.py:238). Changing `DEFAULTS["pipeline"]["default_order"]` in config has **no effect**.
+- **Stage ordering is hardcoded** in `Pipeline.optimize_stage_order()` (`core/pipeline.py`). Changing `DEFAULTS["pipeline"]["default_order"]` in config has **no effect**.
 - **Stage name mismatch**: config `default_order` lists `"denoise"` but the registered name is `"denoise_video"`. Ignoring `default_order` avoids the bug.
 - `remux` is **not** in the default pipeline. It is only added by `auto_determine_stages()` when the input is MKV.
 - `detect` stage has `priority=1` (runs first) and `produces_output=False`.
 - Default: `skip_stage_on_error: true` — pipeline continues on failure using the original input.
-- Temp files: created in input directory, cleaned up after successful job.
+- **Temp files always use `.mkv`** (`generate_temp_path()` in `ffmpeg_utils.py`), regardless of
+  the input or final output container — intermediate stages hardcode `libx264`, which not every
+  container (e.g. WebM) permits, and MKV can hold essentially any codec. Written to
+  `general.temp_dir` if set, else next to the input file. Some AI stages additionally use their
+  own stage-internal `.mp4` temp file for the frame-extract/mux round trip (see
+  `ai/wrappers/*`/stage `_execute_ai()` methods) — unrelated to the pipeline-level `.mkv` temps.
+- **Final output extension** comes from `general.output_container` (default `"mp4"`), not from
+  the input's extension — set via `Pipeline.add_job()` when no explicit `output_path` is given.
+  `None`/empty keeps the input's own extension.
+- **Temp cleanup is unconditional**, including on failure/cancel (`_cleanup_temp_files` /
+  `_cleanup_generated_temp_paths` run in a `finally` in `Pipeline.execute_job()`). If the terminal
+  stage was skipped or produced no output but an earlier stage's temp file is the best available
+  result, that temp is *promoted* (moved, not copied — `_promote_temp_to_output()`) onto
+  `job.output_path` instead of being deleted.
+- `scan_directory()` (`core/analysis.py`) skips hidden files (dotfiles), including orphaned
+  `.avf_*` intermediate temp files that may be left next to an input after a crash.
 - Stage outputs chain: each stage's `output_path` becomes the next stage's `input_path`.
 
 ## Output Path Resolution
@@ -80,6 +102,28 @@ Stages with AI alternatives (upscale, denoise_video, interpolate, deblock) check
 
 CLI: `--ai` / `--no-ai` (mutually exclusive flag_value pattern). Without either flag, falls back to preset/config.
 
+### AI-fallback policy
+
+Separately from *whether* to use AI, each AI-capable stage (upscale, interpolate,
+denoise_video, deblock) has an **ai_fallback** policy controlling what happens when the AI path
+is selected but can't actually run — PyTorch not installed, model download/load failure,
+an inference exception, or CUDA OOM after tiling retries are exhausted:
+
+- `general.ai_fallback` (default `True`) is the global default.
+- `stages.<name>.ai_fallback` (default `null`) overrides it per-stage; `null` inherits the
+  global value.
+- `True` (default): silently fall back to the stage's traditional FFmpeg method, logged at
+  WARNING.
+- `False`: the stage FAILS outright with a named cause (e.g. `"AI processing unavailable for
+  stage 'upscale': model not available: ..."`) instead of silently downgrading output quality.
+- CLI: `--ai-fallback` / `--no-ai-fallback` overrides `general.ai_fallback` for the run; it does
+  **not** override an explicit per-stage `stages.<name>.ai_fallback` set in config.
+- Implemented via `BaseStage.is_ai_fallback_enabled()` / `BaseStage._ai_fallback_or_fail()`
+  (`core/stages/base.py`) — call `_ai_fallback_or_fail()` at every point the AI path can't
+  proceed; do NOT use it for a legitimate OOM-triggered tiling retry (still the AI path) or a
+  genuine post-AI failure (e.g. a mux error after AI frames were already produced) — those keep
+  failing regardless of this policy.
+
 ## Upscaling & Aspect Ratio
 
 The upscale stage respects `quality.quality_target.keep_aspect_ratio` (default `True`):
@@ -92,10 +136,34 @@ Example: 1080p60 preset (1920×1080) + 9:16 portrait input → scales to ~1080×
 
 ## Configuration
 
-- Config file: `~/.config/auto-video-fixer/config.yaml` (Linux), macOS/Windows paths in `config.py:get_config_dir()`.
-- Data dir (models, cache): `get_data_dir()`.
+- Config file: `~/.config/auto-video-fixer/config.yaml` (Linux, `$XDG_CONFIG_HOME` if set),
+  macOS/Windows paths in `config.py:get_config_dir()`.
+- Data dir (models, cache): `get_data_dir()` — `$XDG_DATA_HOME` or `~/.local/share` on Linux.
+- **State/log dir**: `get_state_dir()` — `$XDG_STATE_HOME` or `~/.local/state` on Linux
+  (macOS/Windows fall back to the same base as the data dir, since neither platform has a
+  distinct "state" convention). `get_log_dir()` = `<state_dir>/logs`.
+- **Automatic per-run DEBUG log file**: every CLI invocation writes a timestamped log file
+  (`avf-YYYYMMDD-HHMMSS.log`) to `get_log_dir()` at DEBUG level, independent of console
+  verbosity — always on, no flag needed. The exact path is printed/logged at startup. Retention:
+  newest 50 kept (`prune_old_logs()`, pruned at startup before the current run's file is
+  created); `--log-file PATH` *replaces* the automatic location for that run (same always-DEBUG
+  file logging, user-chosen path; no state-dir file is created).
+- **Startup settings banner**: on every invocation, the CLI logs (`_log_effective_settings()` in
+  `cli.py`) the version, full `sys.argv`, which config file is in use (default vs. explicit), and
+  a redacted diff of effective config vs. `Config.DEFAULTS` at INFO; the full effective config
+  dump (also redacted) at DEBUG. Secret-looking keys (containing `api_key`/`apikey`/`token`/
+  `password`/`secret`, case-insensitive) are masked as `"***"` via `config.redact_secrets()`.
+  Re-logged after `process`'s own preset/flag merging, since the group-level log only reflects
+  what was loaded from disk.
+- **`--config PATH`** (global flag, before the subcommand) / **`AVF_CONFIG`** env var select an
+  alternate config file. Precedence: `--config` flag > `AVF_CONFIG` env var > default platform
+  path. Unlike the default path (silently falls back to `Config.DEFAULTS` if missing), an
+  explicitly-given path (flag or env var) is a **hard error** if it doesn't exist — no silent
+  no-op.
 - Config is read-once at `Config()` construction; `config.set()` marks dirty and `config.save()` writes YAML.
 - Preset merging is recursive — preset values override config, but config values not in preset are preserved.
+- A full, commented example covering every `Config.DEFAULTS` key lives at
+  `docs/config.example.yaml`.
 
 ## Gotchas
 
@@ -109,27 +177,66 @@ Example: 1080p60 preset (1920×1080) + 9:16 portrait input → scales to ~1080×
 
 ## Known bugs / pitfalls to avoid
 
-- **`cb` scoping in chunked AI paths**: In `deblock.py`, `upscale.py`, `denoise_video.py`, and `interpolate.py`, the `cb` variable is defined inside the `else` branch (non-chunked) but referenced in the `if use_chunked` branch. When a video has ≥1001 frames the chunked branch executes, and `cb` is `UnboundLocalError`. Fix: define `cb` (accepts `(current, total, msg)` signature) before the chunked loop.
-- **`upscaled` vs `all_upscaled` typo** in `upscale.py:407` (was pre-existing). The variable that collects the frames is `all_upscaled`, but the `frames_to_video` call used `upscaled`.
-- **missing imports**: `deblock.py` uses `os.path.join`/`os.path.basename`/`os.unlink` without `import os` at top. `denoise_video.py` calls `probe(input_path)` without importing `probe` at top (only imported locally inside `_execute_traditional`).
-- **unused local import** in `denoise_video.py:80`: `from ... import run_ffmpeg` shadows the module-level `run_ffmpeg` import.
-- **`f"..."` without placeholders** triggers `F541`; the progress message strings like `f"Deblocking chunk..."` need no f-prefix.
-- **unused `fps_val`** in `upscale.py:331` (assigned but never read after that line).
+The bugs formerly listed here (`cb` scoping crash in chunked AI paths, `upscaled`/`all_upscaled`
+typo, missing `os`/`probe` imports in `deblock.py`/`denoise_video.py`, unused local `run_ffmpeg`
+shadow import, F541 f-string lint errors, unused `fps_val`) are **fixed** — verified directly
+against current `deblock.py`, `denoise_video.py`, `upscale.py`, `interpolate.py`: `cb` callbacks
+are defined before their chunked loops in all four stages, `os` is imported at the top of
+`deblock.py`, `denoise_video.py` imports `probe` at module level, and the AI upscale/deblock/
+denoise chunked paths all correctly reference the frame lists they build. Kept here only as a
+historical note in case of regression — do not assume these still need fixing.
+
+Remaining lint/style notes (still current):
 - **ruff I001** on `deblock.py` imports: blank line between `from __future__` and the stdlib imports is expected by the sort rule.
 - **ruff E501** line length is 100. Several stage files (stabilize, interpolate, upscale, cli) exceed it with long f-strings; plan around this.
 - **mypy `--ignore-missing-imports`** is required; `torch`/`cv2`/`rife` are optional and mypy will flag them without that flag.
 
 ## CLI Flags
 
-- `--verbose, -v`: Enable DEBUG level logging
-- `--log-level LEVEL`: Set logging level (DEBUG, INFO, WARNING, ERROR)
-- `--log-file PATH`: Log to file (in addition to console)
+Global (before the subcommand):
+- `--verbose, -v`: Enable DEBUG level logging (console and the always-on log file)
+- `--log-level LEVEL`: Set console logging level (DEBUG, INFO, WARNING, ERROR)
+- `--log-file PATH`: Write the run's log file here instead of the automatic timestamped file in
+  the platform log dir (see "Configuration" above)
+- `--file-log-level LEVEL`: Log level for the file log, if different from the console level
+- `--config PATH` (env: `AVF_CONFIG`): Use this config file instead of the default platform path;
+  must already exist (hard error if not)
+
+`avf process`:
 - `--preset, -p NAME`: Apply preset (e.g., `1080p60`, `4k60`, `size_reduction`)
-- `--stage NAME`: Run specific stage(s) (can repeat)
 - `--output, -o DIR`: Output directory
+- `--output-name NAME`: Explicit output filename (only valid with exactly one input file)
+- `--recursive, -r`: Scan directories recursively
+- `--stage NAME`: Run only these stage(s), replacing the preset/auto-determined list (can
+  repeat); also forces `stages.<name>.enabled=false` to be bypassed for explicitly-requested
+  stages (see `BaseStage._force_enabled` in `core/stages/base.py`)
+- `--enable-stage NAME` / `--disable-stage NAME`: force-enable/disable a stage on top of the
+  preset/default set (can repeat) — unlike `--stage`, this doesn't replace the whole stage list
 - `--dry-run`: Show what would be done without processing
 - `--list-presets`: List available presets
-- `--ai` / `--no-ai`: Force AI or traditional methods
-- `--events` / `--no-events`: Enable/disable event/scene detection in `analyze`
+- `--ai` / `--no-ai`: Force AI or traditional methods (`general.use_ai`)
+- `--ai-fallback` / `--no-ai-fallback`: Allow/forbid AI stages from silently falling back to
+  traditional methods when the AI path can't run (`general.ai_fallback`; see "AI-fallback
+  policy" above) — does not override a per-stage `stages.<name>.ai_fallback` in config
+- `--overwrite` / `--no-overwrite`: Allow overwriting an existing output file
+- `--fps FLOAT`: Target output framerate (`quality.quality_target.target_framerate`)
+- `--resolution WIDTHxHEIGHT`: Target output resolution, e.g. `3840x2160`
+  (`quality.quality_target.target_resolution`)
+- `--codec` / `--audio-codec` / `--crf` / `--encoder-preset`: encode-stage overrides
+  (`encoding.video_codec`/`audio_codec`/`crf`/`preset`) — `--encoder-preset` is NOT the same as
+  `--preset` (which selects a named avf processing bundle)
+- `--hwaccel {auto,none,cuda,vaapi,qsv,vulkan,videotoolbox}`: FFmpeg hwaccel for encode/decode
+  (`ffmpeg.hwaccel`)
+- `--gpu-device {auto,cpu,cuda,mps}`: PyTorch device for AI stages (`gpu.preferred_device`) —
+  separate from `--hwaccel`
+- `--threads N`: sets `general.max_concurrent_jobs`
+
+`avf analyze`:
+- `--vlm` / `--no-vlm`: Enable/disable VLM analysis
+- `--events` / `--no-events`: Enable/disable event/scene detection
 - `--classify`: Classify detected events with VLM
-- `--clip DIR`: Extract detected scenes as clips to a directory
+- `--clip DIR` / `--no-clip`: Extract detected scenes as clips to a directory
+
+Other subcommands: `avf find-duplicates REFERENCE DIRECTORY [--threshold FLOAT]`,
+`avf presets-cmd` (lists presets), `avf gpu-info`, `avf model-info [--model NAME]`,
+`avf model-download --model NAME [--url URL] [--force]`.

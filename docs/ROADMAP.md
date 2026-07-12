@@ -6,249 +6,107 @@ Auto Video Fixer aims to be the most intelligent, automated video enhancement to
 
 ## Current Status: v0.3.0 (Alpha)
 
-**Completed:**
-- ✅ Core pipeline architecture
-- ✅ CLI interface with full functionality
-- ✅ Configuration system with YAML storage
-- ✅ 12 processing stages (detect, stabilize, deblock, denoise, upscale, interpolate, normalize, encode, remux, speed, hdr)
-- ✅ Smart stage ordering and optimization
-- ✅ Preset system (7 built-in presets)
-- ✅ Video analysis and metadata extraction
-- ✅ FFmpeg integration with hardware acceleration support
-- ✅ AI upscaling with Real-ESRGAN (RRDBNet, x2/x4 scales, TTA, FP16 CUDA)
-- ✅ AI frame interpolation with RIFE (IFNet + EMD, multi-scale flow)
-- ✅ AI denoising via Real-ESRGAN (denoise mode)
-- ✅ AI model cache and download system
-- ✅ SSIM/PSNR quality estimation via FFmpeg
-- ✅ Comprehensive test suite (150+ tests)
-- ✅ CI/CD pipeline
+This section is written to be honest about what is *implemented and verified working* versus
+*implemented but not independently verified* versus *not built yet*. Earlier versions of this
+document marked AI upscaling as "completed" while it was, in fact, producing solid-black output
+on GPU due to a missing residual-scaling factor in the RRDB block — that bug (and several
+related ones) are now fixed and spot-checked on GPU, but the incident is why this document now
+draws an explicit VERIFIED / UNVERIFIED line instead of a flat done/not-done checklist.
 
-## Roadmap
+### Implemented and verified working
 
-### Phase 1: Core Enhancement (v0.2.0 - v0.3.0)
-**Timeline: Q3 2026**
+- **Core pipeline architecture** — stage registry, `Pipeline.execute_job()`/`execute_all()`,
+  hardcoded stage ordering (`optimize_stage_order()`), per-job temp file lifecycle (`.mkv`
+  intermediates, unconditional cleanup, orphan-temp promotion to output), quality gate
+  (SSIM/PSNR via FFmpeg with `measurement_failed` reported instead of a fake 0.0 score).
+- **Traditional (FFmpeg-only) processing end-to-end**: stabilize (vidstab, raw-pipe
+  decode→transform to avoid the vid.stab B-frame corruption bug, `optzoom=1` auto zoom-out for
+  shaky footage), deblock (`unsharp`), denoise (`hqdn3d`), upscale (`scale=...:flags=lanczos`),
+  interpolate (`minterpolate`), audio normalize (EBU R128), encode, remux, speed, HDR-to-SDR.
+- **AI upscaling — Real-ESRGAN (RRDBNet)**: x4plus/x2plus/anime_6B model support, x2plus
+  auto-selected for scale≤2 passes (upscale) and scale=1 passes (deblock/denoise) for a
+  measured ~4-5x speedup over running x4plus and discarding the extra resolution, tiled
+  inference with reactive CUDA-OOM retry and a `stages.<name>.tile_size` override,
+  `channels_last` memory format (measured ~1.6→11 fps for a 720p→1080p pass on the project's
+  target GPU), TTA, FP16 on CUDA. The previous black-output bug (missing `0.2` residual scaling
+  in the RRDB block → NaN collapse) is fixed and confirmed producing real output on GPU.
+- **AI frame interpolation — RIFE (IFNet + EMD)**: the previous fps bug (writing interpolated
+  output at the *input* fps instead of `input_fps * factor`, which stretched clip duration
+  instead of increasing framerate) is fixed.
+- **AI/traditional selection & fallback policy**: `--ai`/`--no-ai` override, plus a separate
+  `general.ai_fallback` / `stages.<name>.ai_fallback` policy and `--ai-fallback`/
+  `--no-ai-fallback` CLI flags — when fallback is disabled, an AI stage that can't run FAILS
+  with a named cause instead of silently downgrading to traditional output.
+- **Quality gate**: reference is scaled to the output's resolution before SSIM/PSNR (previously
+  a straight compare against differing resolutions would either error or silently no-op);
+  measurement failures are reported as "not checked" rather than a fake 0.0.
+- **CLI**: `process`, `analyze`, `find-duplicates`, `presets-cmd`, `gpu-info`, `model-info`,
+  `model-download`; global `--config`/`AVF_CONFIG`; automatic per-run DEBUG log file with
+  retention (newest 50) under the platform state dir; startup settings banner (redacted
+  effective-config diff at INFO, full dump at DEBUG).
+- **Preset system**: 7 built-in presets (`max_quality`, `4k60`, `4k30`, `1080p60`,
+  `size_reduction`, `remux_only`, `hdr_enhance`), recursive config merging (a preset no longer
+  clobbers unrelated user config under the same top-level key).
+- **VFR/YouTube-origin input handling**: `_parse_fps`/stabilize's framerate probing now prefer
+  `avg_frame_rate` over `r_frame_rate` ("tbr"), fixing a 2x-speed-then-freeze artifact on VFR
+  sources where the two rates diverge; hardened against ffprobe's `"0/0"` undefined-rate value.
 
-#### v0.2.0 - AI Integration (COMPLETED)
-- [x] Real-ESRGAN integration for AI upscaling
-  - Model: RealESRGAN_x4plus, x2plus, anime_6B
-  - GPU acceleration via PyTorch
-  - Support for multiple scale factors (2x, 4x)
-  - Test-time augmentation (TTA)
-  - FP16 inference on CUDA
-- [x] RIFE integration for frame interpolation
-  - Model: RIFE v4.6, v4.11
-  - Temporal interpolation with configurable factor
-  - Motion-aware interpolation via optical flow
-- [x] AI denoising models
-  - Real-ESRGAN-based denoise (scale=1 mode)
-- [x] Quality estimation improvements
-  - SSIM/PSNR via FFmpeg
-  - Per-frame and aggregate metrics
+### Implemented but not independently verified
 
-#### v0.3.0 - Intelligence & Analysis
-- [x] VLM (Vision Language Model) integration
-  - Ollama support (local models, localhost:11434)
-  - OpenAI Vision API support (GPT-4o)
-  - Custom API endpoint support (OpenAI-compatible)
-  - JSON response parsing with fallback
-- [x] Automated scene detection
-  - Frame differencing scene change detection
-  - Event highlighting (talking_head, action, landscape, text_overlay, transition)
-  - Clip extraction via FFmpeg (`--clip` flag)
-- [x] Duplicate detection improvements
-  - Perceptual hashing (ahash + dhash)
-  - Similarity scoring (Hamming distance)
-  - Batch deduplication (`find_duplicates`)
-- [ ] Smart quality adjustment
-  - Auto-tune parameters based on content
-  - Quality vs. performance balancing
+These have working code paths and existing unit tests, but have not been checked end-to-end
+against real-world inputs the way the traditional pipeline and the AI upscale/interpolate paths
+above have been. Treat their behavior as "probably correct, unconfirmed" rather than "done":
 
-### Phase 2: User Experience (v0.4.0 - v0.5.0)
-**Timeline: Q4 2026**
+- **VLM (Vision Language Model) classification** — Ollama, OpenAI Vision, and generic
+  OpenAI-compatible custom-API providers (`analysis.vlm.provider`) are implemented in
+  `core/analysis.py` with unit test coverage (`tests/unit/test_vlm.py`), but have not been run
+  against a live Ollama instance or OpenAI API key as part of this verification pass.
+- **Scene detection quality** — frame-differencing scene-change detection
+  (`_detect_scene_changes`) and heuristic event classification exist and are unit-tested
+  (`tests/unit/test_scene_detection.py`); detection accuracy/threshold tuning on real footage is
+  unverified.
+- **Duplicate detection accuracy** — ahash/dhash + Hamming-distance similarity scoring is
+  implemented; real-world false-positive/negative rates are unverified.
+- **The Qt (PySide6) GUI** (`gui/main_window.py`, `avf-gui` entry point) — has a test file
+  (`tests/unit/test_gui.py`) and basic job-queue/preset/progress wiring, but has not been
+  manually driven end-to-end as part of this pass.
 
-#### v0.4.0 - GUI Development
-- [ ] PySide6 Qt GUI
-  - Main window with job queue
-  - Real-time progress tracking
-  - Settings dialog
-  - Preset management
-- [ ] Video preview integration
-  - Before/after comparison
-  - Frame-by-frame analysis
-  - Quality metrics display
-- [ ] Batch processing UI
-  - Drag-and-drop file support
-  - Directory monitoring
-  - Job scheduling
+### Planned (not implemented)
 
-#### v0.5.0 - Advanced Features
-- [ ] Hardware encoding optimization
-  - NVENC (NVIDIA)
-  - QSV (Intel)
-  - VAAPI (Linux)
-  - VideoToolbox (macOS)
-- [ ] Multi-GPU support
-  - Distributed processing
-  - GPU load balancing
-- [ ] Plugin system
-  - Custom stage development
-  - Community stage marketplace
-  - Stage templating
-- [ ] Web interface (optional)
-  - Remote processing
-  - Cloud integration
+See `docs/REQUIREMENTS.md` for full detail on these — they are user-specified requirements with
+design considerations captured, not yet built:
 
-### Phase 3: Production Ready (v0.6.0 - v0.7.0)
-**Timeline: Q1 2027**
+1. **Scene-based processing pipeline** — per-scene VLM sampling + a coordinating LLM pass that
+   determines a video's main content and optionally drops non-content scenes (e.g. "like and
+   subscribe" interstitials). Strictly opt-in.
+2. **Per-scene processing strength** — stabilize shaky scenes more aggressively than stable
+   ones; never interpolate across a scene cut.
+3. **Auto-crop mode** — `cropdetect`-based true-content-bounds detection, with optional VLM
+   assistance to distinguish real content bounds from watermarks/overlays.
+4. **NCNN backend option** — in-process (no subprocess spawning) ncnn/Vulkan Real-ESRGAN/RIFE
+   as an alternative to the PyTorch/CUDA backend, selectable per-stage
+   (`stages.<name>.backend: torch|ncnn`).
 
-#### v0.6.0 - Stability & Performance
-- [ ] Performance optimization
-  - Parallel processing
-  - Memory optimization
-  - Streaming processing for large files
-- [ ] Error handling improvements
-  - Graceful degradation
-  - Recovery from failures
-  - Detailed error reporting
-- [ ] Cross-platform testing
-  - Windows native support
-  - macOS native support
-  - Linux distribution packaging
-- [ ] Documentation completion
-  - User guides
-  - API documentation
-  - Video tutorials
+Also still open from earlier planning and not superseded by the above:
+- Smart/auto-tuned quality parameters based on content analysis.
+- Hardware encoding paths beyond what FFmpeg's `-hwaccel` already covers opportunistically
+  (explicit NVENC/QSV/VAAPI/VideoToolbox encoder selection, distinct from decode-side hwaccel).
+- Multi-GPU support, plugin/custom-stage system, face restoration (GFPGAN/CodeFormer), audio
+  enhancement (Demucs-based denoise is a config stub — `stages.denoise_audio` exists in
+  `Config.DEFAULTS` but there is no corresponding registered stage implementing it), enterprise/
+  cloud/API-service features.
 
-#### v0.7.0 - Advanced AI Features
-- [ ] GAN-based enhancement
-  - Face restoration (GFPGAN, CodeFormer)
-  - Texture enhancement
-  - Colorization
-- [ ] Object-aware processing
-  - Face detection and enhancement
-  - Scene-specific optimization
-  - Content-aware upscaling
-- [ ] Audio enhancement
-  - AI noise reduction (Demucs)
-  - Speech enhancement
-  - Audio upmixing (stereo to surround)
-- [ ] Smart cropping and framing
-  - Auto-crop for social media
-  - Rule of thirds composition
-  - Object tracking
+## Contribution Areas
 
-### Phase 4: Enterprise & Cloud (v1.0.0)
-**Timeline: Q2 2027**
-
-#### v1.0.0 - Production Release
-- [ ] Enterprise features
-  - License management
-  - Team collaboration
-  - Audit logging
-- [ ] Cloud processing
-  - AWS/GCP/Azure integration
-  - Serverless processing
-  - Auto-scaling
-- [ ] API service
-  - REST API
-  - WebSocket for real-time updates
-  - SDK for multiple languages
-- [ ] Marketplace
-  - Community presets
-  - Custom models
-  - Processing templates
-
-## Technical Debt & Improvements
-
-### Immediate (v0.2.0)
-- [x] Fix deblock filter compatibility across FFmpeg versions
-- [x] Optimize temp file management
-- [x] Improve error messages and logging
-- [x] Add progress estimation for long operations
-
-### Short-term (v0.3.0 - v0.4.0)
-- [ ] Refactor stage execution for better performance
-- [ ] Implement stage caching for repeated operations
-- [ ] Add configuration validation
-- [ ] Improve test coverage to 90%+
-
-### Medium-term (v0.5.0 - v0.6.0)
-- [ ] Migrate to async processing where beneficial
-- [ ] Implement plugin architecture
-- [ ] Add configuration migration tools
-- [ ] Create development environment automation
-
-## Success Metrics
-
-### v0.2.0 Targets
-- [x] AI upscaling with Real-ESRGAN (GPU-accelerated, FP16)
-- [x] Frame interpolation with RIFE (optical flow-based)
-- [x] 100% test pass rate on all supported platforms (150+ tests)
-
-### v0.5.0 Targets
-- GUI launch time <2 seconds
-- Batch processing 100+ files without memory issues
-- 99% uptime for scheduled processing jobs
-
-### v1.0.0 Targets
-- Process 1000+ videos/day on single machine
-- Support 50+ video formats
-- 100+ community-created presets
-- <1% error rate in production
-
-## Community & Support
-
-### Contribution Areas
-1. **AI Models**: Help integrate and optimize AI models
-2. **GUI Development**: Assist with Qt interface design
-3. **Testing**: Cross-platform testing and bug reports
-4. **Documentation**: User guides and tutorials
+1. **AI Models**: Help integrate and optimize AI models (including the planned ncnn backend)
+2. **GUI Development**: Verify and extend the Qt interface
+3. **Testing**: Cross-platform testing and bug reports, especially around VLM providers and the
+   GUI, which are the least-verified surfaces today
+4. **Documentation**: Keep `AGENTS.md`, this file, and `docs/config.example.yaml` in sync with
+   code — see the standing rule at the top of `AGENTS.md`
 5. **Presets**: Create and share processing presets
 
-### Feedback Channels
+## Feedback Channels
+
 - GitHub Issues: Bug reports and feature requests
-- Discord: Community discussion and support
 - GitHub Discussions: Architecture decisions and planning
-
-## Maintenance Schedule
-
-- **Weekly**: Review issues and pull requests
-- **Monthly**: Release minor updates (v0.x.0)
-- **Quarterly**: Major feature releases (v0.x.0 → v0.(x+1).0)
-- **Annually**: Major version releases (v1.0.0)
-
-## Risk Mitigation
-
-### Technical Risks
-1. **AI Model Compatibility**
-   - Risk: Models may not work across all platforms
-   - Mitigation: Test on all target platforms, provide fallbacks
-
-2. **Performance Issues**
-   - Risk: AI processing may be too slow
-   - Mitigation: Optimize models, provide CPU fallbacks, cache results
-
-3. **FFmpeg Compatibility**
-   - Risk: Different FFmpeg versions have different features
-   - Mitigation: Feature detection, version-specific code paths
-
-### Resource Risks
-1. **Development Capacity**
-   - Risk: Limited development resources
-   - Mitigation: Prioritize features, seek contributors
-
-2. **Testing Infrastructure**
-   - Risk: Insufficient testing coverage
-   - Mitigation: Automated CI/CD, community testing program
-
-## Next Steps
-
-1. **Immediate**: v0.2.0 AI integration completed
-2. **This Month**: Gather user feedback on AI features
-3. **Next Quarter**: Begin v0.3.0 intelligence & analysis features
-4. **Next 6 Months**: Release v0.4.0 with GUI
-
----
-
-*Last updated: June 2026*
-*Next review: July 2026*

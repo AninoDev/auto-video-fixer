@@ -251,17 +251,38 @@ class UpscaleStage(BaseStage):
                 )
                 intermediate_files.append(pass_output)
 
-            # Run single AI pass
+            # Run single AI pass. fallback_ctx lets _run_single_ai_pass fall back
+            # to the traditional method for the WHOLE job (original input ->
+            # final output_path/target dims) rather than just this one pass, if
+            # the AI path can't run and ai_fallback is enabled -- chaining a
+            # partial traditional result into subsequent AI passes wouldn't make
+            # sense once the AI path has already proven unavailable.
             result = self._run_single_ai_pass(
                 current_input,
                 pass_output,
                 progress_callback,
                 start,
                 sf,
+                fallback_ctx={
+                    "input_path": input_path,
+                    "output_path": output_path,
+                    "target_width": final_target_w,
+                    "target_height": final_target_h,
+                },
             )
 
             if result.status != StageStatus.COMPLETED:
                 # Clean up intermediate files on failure
+                for f in intermediate_files:
+                    if os.path.exists(f):
+                        os.unlink(f)
+                return result
+
+            if result.metadata.get("method") == "traditional":
+                # AI became unavailable mid-run and ai_fallback allowed falling
+                # back; the traditional path already wrote the final output
+                # directly to output_path (bypassing pass chaining), so the
+                # remaining planned AI passes must not run.
                 for f in intermediate_files:
                     if os.path.exists(f):
                         os.unlink(f)
@@ -336,25 +357,55 @@ class UpscaleStage(BaseStage):
         progress_callback,
         start: float,
         scale_factor: float,
+        fallback_ctx: dict | None = None,
     ) -> StageResult:
-        """Run a single AI upscaling pass."""
+        """Run a single AI upscaling pass.
+
+        `fallback_ctx` (input_path/output_path/target_width/target_height for
+        the *whole* job, not just this pass), if given, is used to fall back
+        to a single traditional pass over the original input when the AI path
+        can't run and ai_fallback is enabled (see BaseStage._ai_fallback_or_fail).
+        Without it (fallback_ctx=None), AI-unavailability always fails outright
+        -- used by callers that don't have a well-defined traditional
+        equivalent to fall back to.
+        """
+
+        def _traditional_fallback() -> StageResult:
+            ctx = fallback_ctx or {}
+            return self._execute_traditional(
+                ctx.get("input_path", input_path),
+                ctx.get("output_path", output_path),
+                progress_callback,
+                start,
+                target_width=ctx.get("target_width"),
+                target_height=ctx.get("target_height"),
+            )
+
         try:
-            from autovideofixer.ai.frame_processor import FrameProcessor, StreamingVideoWriter
+            from autovideofixer.ai.frame_processor import (
+                AsyncVideoWriter,
+                FrameProcessor,
+                StreamingVideoWriter,
+            )
             from autovideofixer.ai.torch_utils import is_torch_available
             from autovideofixer.ai.wrappers.upscale import RealESRGANUpscaler
         except ImportError:
-            return StageResult(
-                status=StageStatus.FAILED,
-                error="PyTorch not available",
-                duration_sec=time.time() - start,
-            )
+            if fallback_ctx is None:
+                return StageResult(
+                    status=StageStatus.FAILED,
+                    error="PyTorch not available",
+                    duration_sec=time.time() - start,
+                )
+            return self._ai_fallback_or_fail("PyTorch not available", start, _traditional_fallback)
 
         if not is_torch_available():
-            return StageResult(
-                status=StageStatus.FAILED,
-                error="PyTorch not installed",
-                duration_sec=time.time() - start,
-            )
+            if fallback_ctx is None:
+                return StageResult(
+                    status=StageStatus.FAILED,
+                    error="PyTorch not installed",
+                    duration_sec=time.time() - start,
+                )
+            return self._ai_fallback_or_fail("PyTorch not installed", start, _traditional_fallback)
 
         try:
             from autovideofixer.ai.model_cache import ensure_model_available
@@ -387,10 +438,14 @@ class UpscaleStage(BaseStage):
                     pass_model = self._ai_model
                     success, msg = ensure_model_available(pass_model)
                 if not success:
-                    return StageResult(
-                        status=StageStatus.FAILED,
-                        error=f"Model not available: {msg}",
-                        duration_sec=time.time() - start,
+                    if fallback_ctx is None:
+                        return StageResult(
+                            status=StageStatus.FAILED,
+                            error=f"Model not available: {msg}",
+                            duration_sec=time.time() - start,
+                        )
+                    return self._ai_fallback_or_fail(
+                        f"model not available: {msg}", start, _traditional_fallback
                     )
 
             upscaler = RealESRGANUpscaler(
@@ -398,13 +453,18 @@ class UpscaleStage(BaseStage):
                 model_name=pass_model,
                 tta_mode=self._tt_mode,
                 device_preference=self.config.get("gpu", "preferred_device", default="auto"),
+                tile_size=self._stage_config.get("tile_size", 0),
             )
 
             if not upscaler.load_model():
-                return StageResult(
-                    status=StageStatus.FAILED,
-                    error="Failed to load model",
-                    duration_sec=time.time() - start,
+                if fallback_ctx is None:
+                    return StageResult(
+                        status=StageStatus.FAILED,
+                        error="Failed to load model",
+                        duration_sec=time.time() - start,
+                    )
+                return self._ai_fallback_or_fail(
+                    "failed to load model", start, _traditional_fallback
                 )
 
             proc = FrameProcessor()
@@ -430,7 +490,14 @@ class UpscaleStage(BaseStage):
             try:
                 if use_chunked:
                     chunk_size = 25
-                    writer = StreamingVideoWriter(temp_path, fps=fps)
+                    # AsyncVideoWriter hands the ffmpeg pipe write off to a
+                    # background thread so it doesn't block the next chunk's
+                    # GPU inference; stream_frames_prefetched decodes the next
+                    # chunk on a background thread while the current one is
+                    # being upscaled. Together these overlap CPU decode/write
+                    # with GPU compute instead of serializing all three per
+                    # chunk (read -> infer -> write -> read -> ...).
+                    writer = AsyncVideoWriter(StreamingVideoWriter(temp_path, fps=fps))
                     total_chunks = 0
                     processed_frames = 0
                     frames_written = 0
@@ -442,7 +509,7 @@ class UpscaleStage(BaseStage):
                             progress_callback,
                         )
 
-                    for chunk in proc.stream_frames(
+                    for chunk in proc.stream_frames_prefetched(
                         input_path, chunk_size=chunk_size, max_frames=total_est
                     ):
                         total_chunks += 1
@@ -553,10 +620,14 @@ class UpscaleStage(BaseStage):
                     os.unlink(temp_path)
 
         except Exception as e:
-            return StageResult(
-                status=StageStatus.FAILED,
-                error=f"AI upscaling failed: {e}",
-                duration_sec=time.time() - start,
+            if fallback_ctx is None:
+                return StageResult(
+                    status=StageStatus.FAILED,
+                    error=f"AI upscaling failed: {e}",
+                    duration_sec=time.time() - start,
+                )
+            return self._ai_fallback_or_fail(
+                f"inference exception: {e}", start, _traditional_fallback
             )
 
     def _get_input_resolution(self, path: str) -> tuple[int, int]:

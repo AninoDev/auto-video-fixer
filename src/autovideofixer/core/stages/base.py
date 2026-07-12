@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from enum import Enum
@@ -146,6 +147,67 @@ class BaseStage(ABC):
     ) -> None:
         if callback:
             callback(min(1.0, max(0.0, progress)), message)
+
+    def is_ai_fallback_enabled(self) -> bool:
+        """Whether this stage may silently fall back to its traditional
+        FFmpeg implementation when the AI path can't run.
+
+        Resolution order: stages.<name>.ai_fallback (True/False) if set,
+        else general.ai_fallback (default True). Both are populated from
+        Config.DEFAULTS, so `.get()` with a default here is just defensive.
+        """
+        per_stage = self._stage_config.get("ai_fallback", None)
+        if per_stage is not None:
+            return bool(per_stage)
+        return bool(self.config.get("general", "ai_fallback", default=True))
+
+    def _ai_fallback_or_fail(
+        self,
+        reason: str,
+        start: float,
+        traditional: Callable[[], "StageResult"],
+    ) -> "StageResult":
+        """Decide whether to fall back to the traditional method, or fail.
+
+        Call this at every point an AI-capable stage's AI path can't
+        proceed: torch missing, model load failure, an inference exception,
+        or CUDA OOM after tiling retries are exhausted. NOT for a
+        legitimate mid-retry step (e.g. OOM-triggered tiling retry itself
+        is still the AI path, not a fallback decision) or for a genuine
+        processing failure unrelated to AI availability (e.g. a mux/ffmpeg
+        error after AI frames were already produced) -- those should keep
+        failing outright regardless of ai_fallback.
+
+        Args:
+            reason: Human-readable cause, included in both the WARNING log
+                (fallback enabled) and the failure error message (disabled).
+            start: The stage's `execute()` start time (time.time()), used to
+                compute duration_sec on the disabled-fallback failure path.
+            traditional: Zero-arg callable that runs the stage's traditional
+                implementation and returns its StageResult.
+        """
+        if self.is_ai_fallback_enabled():
+            self.logger.warning(
+                "Stage '%s': AI method unavailable (%s); falling back to traditional method",
+                self.name,
+                reason,
+            )
+            return traditional()
+        self.logger.error(
+            "Stage '%s': AI method unavailable (%s); ai_fallback is disabled, failing stage",
+            self.name,
+            reason,
+        )
+        return StageResult(
+            status=StageStatus.FAILED,
+            error=(
+                f"AI processing unavailable for stage '{self.name}': {reason} "
+                "(ai_fallback is disabled for this run -- enable general.ai_fallback or "
+                f"stages.{self.name}.ai_fallback, or pass --ai-fallback, to allow falling "
+                "back to the traditional method instead)"
+            ),
+            duration_sec=time.time() - start,
+        )
 
 
 # Stage Registry - maps stage names to classes

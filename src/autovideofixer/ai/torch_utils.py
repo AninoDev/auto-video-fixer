@@ -131,7 +131,18 @@ def tensor_from_frame(
     arr = arr.transpose(2, 0, 1)
     # Ensure contiguous array (torch doesn't support negative strides)
     arr = np.ascontiguousarray(arr)
-    tensor = torch.from_numpy(arr).unsqueeze(0).to(device=device, dtype=dtype)
+    cpu_tensor = torch.from_numpy(arr).unsqueeze(0)
+
+    if device.type == "cuda":
+        # Copying from a pinned (page-locked) host buffer lets the CUDA driver
+        # DMA it directly instead of first staging through an intermediate
+        # pinned bounce buffer it allocates/frees per call -- non_blocking=True
+        # then lets this H2D copy overlap with other CUDA-stream work queued
+        # around it instead of forcing a host/device sync at every frame.
+        cpu_tensor = cpu_tensor.pin_memory()
+        tensor = cpu_tensor.to(device=device, dtype=dtype, non_blocking=True)
+    else:
+        tensor = cpu_tensor.to(device=device, dtype=dtype)
     return tensor
 
 

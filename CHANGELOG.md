@@ -8,6 +8,80 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **AI-fallback policy** for AI-capable stages (upscale, interpolate, denoise_video, deblock):
+  `general.ai_fallback` (default `true`) plus per-stage `stages.<name>.ai_fallback` (default
+  `null` = inherit) control whether a stage silently falls back to its traditional FFmpeg
+  method when the AI path can't run (PyTorch missing, model load failure, inference exception,
+  CUDA OOM after tiling retries), or FAILS outright with a named cause. New CLI flags
+  `--ai-fallback` / `--no-ai-fallback`.
+- **Startup settings banner**: every run now logs the avf version, full invocation (`argv`), which
+  config file is in use, and a redacted diff of effective config vs. defaults at INFO, plus the
+  full effective config at DEBUG.
+- **Automatic per-run DEBUG log file**: every invocation writes a timestamped log file under the
+  platform state directory (`~/.local/state/auto-video-fixer/logs/` on Linux), independent of
+  console verbosity; retains the newest 50 and prunes older ones at startup. `--log-file PATH`
+  redirects the run's log file to a custom path instead of the automatic location.
+- **Global `--config PATH` flag and `AVF_CONFIG` environment variable** to select an alternate
+  config file (flag > env var > default platform path); an explicitly-given path that doesn't
+  exist is now a hard error instead of a silent fallback to defaults.
+- Tiled AI inference with reactive CUDA-OOM retry and a per-stage `stages.<name>.tile_size`
+  override, for upscale/deblock/denoise_video.
+- `RealESRGAN_x2plus` added to the AI model registry, and auto-selected in place of x4plus
+  whenever a pass only needs scale ≤2 (upscale) or scale=1 (deblock/denoise) — measurably faster
+  since x2plus's architecture natively shrinks its working resolution instead of computing a
+  native 4x result and discarding most of it.
+
+### Changed
+- **Intermediate pipeline temp files always use `.mkv`**, regardless of input/output container
+  (MKV can hold any codec the pipeline's hardcoded intermediate encodes use; some source
+  containers, e.g. WebM, cannot). Final output extension is now driven by
+  `general.output_container` (default `"mp4"`) rather than always mirroring the input's
+  extension.
+- Temp file cleanup is now unconditional, including on stage failure or job cancellation; a
+  surviving intermediate temp file is promoted (moved) to the job's output path when the
+  terminal stage was skipped or produced no output, instead of being silently deleted.
+- `scan_directory()` now skips hidden files, including orphaned `.avf_*` intermediate temp files.
+- `--stage NAME` now overrides a stage's `enabled: false` in config for stages explicitly
+  requested by name, matching its documented "replaces the preset/auto-determined list"
+  behavior.
+- The quality gate (SSIM/PSNR) now scales the reference video to the output's resolution before
+  comparing, and reports "measurement failed" (leaving quality fields as "not checked") instead
+  of a fake `0.0` score when the FFmpeg comparison itself fails.
+- AI upscale/deblock/denoise now use the `channels_last` (NHWC) tensor memory format on CUDA,
+  measured at roughly 1.6→11 fps for a 720p→1080p pass on the project's target GPU.
+- Frame decode/GPU-inference/write are now overlapped via a prefetching decode thread and an
+  async writer thread instead of serializing read → infer → write per chunk.
+
+### Fixed
+- **AI upscaling produced solid-black output on GPU** — the Real-ESRGAN RRDB residual-dense
+  block was missing its `0.2` residual-scaling factor, causing activations to compound/explode
+  into NaNs on real (non-toy) inputs. Verified fixed: AI upscale now produces real, non-black
+  output on GPU.
+- **Real-ESRGAN x2 support**: added pixel-unshuffle preprocessing for genuine 2x-scale models
+  (`RealESRGAN_x2plus`) rather than only supporting native-4x checkpoints downscaled after the
+  fact.
+- **RIFE frame interpolation duration bug** — interpolated output was written at the *input*
+  video's fps instead of `input_fps * factor`, which stretched the clip's duration instead of
+  increasing its framerate while preserving duration.
+- **Stabilize zoom could only zoom OUT, never in** — the previous hand-computed zoom percentage
+  had an inverted sign and could not actually remove borders introduced by stabilization. Now
+  delegates the zoom *amount* to `vidstabtransform`'s own `optzoom=1` ("optimal static zoom")
+  when `stages.stabilize.zoom_enabled` is true, which operates on the filter's own smoothed
+  camera path instead of raw per-block motion vectors.
+- **VFR / YouTube-origin input played at ~2x speed then froze** — framerate probing (both
+  `ffmpeg_utils._parse_fps` and `stabilize.py`'s internal probe) now prefers `avg_frame_rate`
+  (the honest "frame count / duration" rate) over `r_frame_rate` ("tbr", ffmpeg's declared rate,
+  which can be double the true average for VFR/YouTube sources) anywhere frame count is
+  reconciled with wall-clock time, such as the stabilize stage's raw-pipe decode→transform
+  handoff. Both also now handle ffprobe's `"0/0"` (undefined rate) response without crashing.
+- Chunked AI code paths (upscale/deblock/denoise_video/interpolate, used for inputs with >1000
+  frames) no longer raise `UnboundLocalError` on the progress-callback variable.
+- Removed a stray reference to the wrong local variable name when muxing AI-upscaled frames back
+  to video.
+- Missing top-level imports in `deblock.py` (`os`) and `denoise_video.py` (`probe`) that only
+  worked by accident via a later local import.
+
+### Added (from earlier Unreleased entries, retained)
 - Initial project structure
 - Configuration system with YAML storage
 - Core pipeline engine

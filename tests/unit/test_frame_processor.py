@@ -2,7 +2,11 @@
 
 import pytest
 
-from autovideofixer.ai.frame_processor import FrameProcessor
+from autovideofixer.ai.frame_processor import (
+    AsyncVideoWriter,
+    FrameProcessor,
+    PrefetchIterator,
+)
 
 
 class TestFrameProcessor:
@@ -123,3 +127,74 @@ class TestFrameProcessorRealVideo:
         assert len(frames) > 0
         assert not isinstance(frames[0], list)
         assert frames[0].ndim == 3
+
+    def test_stream_frames_prefetched_matches_stream_frames(self, tmp_video_file):
+        """Prefetched decoding must yield identical chunks to the synchronous path."""
+        proc = FrameProcessor()
+        sync_chunks = list(proc.stream_frames(tmp_video_file, max_frames=7, chunk_size=3))
+
+        proc2 = FrameProcessor()
+        prefetched_chunks = list(
+            proc2.stream_frames_prefetched(tmp_video_file, max_frames=7, chunk_size=3)
+        )
+
+        assert [len(c) for c in prefetched_chunks] == [len(c) for c in sync_chunks]
+        for sync_chunk, prefetch_chunk in zip(sync_chunks, prefetched_chunks):
+            for sync_frame, prefetch_frame in zip(sync_chunk, prefetch_chunk):
+                assert (sync_frame == prefetch_frame).all()
+
+
+class TestPrefetchIterator:
+    """PrefetchIterator decodes/produces items on a background thread."""
+
+    def test_yields_items_in_order(self):
+        items = list(PrefetchIterator(iter([1, 2, 3, 4, 5]), maxsize=2))
+        assert items == [1, 2, 3, 4, 5]
+
+    def test_empty_source(self):
+        assert list(PrefetchIterator(iter([]), maxsize=2)) == []
+
+    def test_propagates_exception_from_source(self):
+        def bad_source():
+            yield 1
+            yield 2
+            raise ValueError("boom")
+
+        it = PrefetchIterator(bad_source(), maxsize=2)
+        collected = []
+        with pytest.raises(ValueError, match="boom"):
+            for item in it:
+                collected.append(item)
+        assert collected == [1, 2]
+
+
+class TestAsyncVideoWriter:
+    """AsyncVideoWriter defers writes to a background thread without dropping data."""
+
+    def test_forwards_all_chunks_to_underlying_writer(self):
+        from unittest.mock import MagicMock
+
+        underlying = MagicMock()
+        underlying.close.return_value = True
+
+        writer = AsyncVideoWriter(underlying)
+        writer.write([1, 2])
+        writer.write([3])
+        writer.write([])  # no-op, must not be forwarded
+        ok = writer.close()
+
+        assert ok is True
+        assert underlying.write.call_count == 2
+        underlying.write.assert_any_call([1, 2])
+        underlying.write.assert_any_call([3])
+
+    def test_close_reraises_write_exception(self):
+        from unittest.mock import MagicMock
+
+        underlying = MagicMock()
+        underlying.write.side_effect = RuntimeError("pipe broke")
+
+        writer = AsyncVideoWriter(underlying)
+        writer.write([1])
+        with pytest.raises(RuntimeError, match="pipe broke"):
+            writer.close()

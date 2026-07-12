@@ -220,18 +220,24 @@ Tasks:
 
 ### Phase 4: GUI Development (v0.4.0)
 
-**Timeline**: September 2026 (6 weeks)
+**Status**: Partially built, unverified end-to-end. `gui/main_window.py` (`avf-gui` entry point)
+already implements a `MainWindow` with a job-queue table, a `ProcessingThread` (QThread) wired to
+`Pipeline.execute_all()`'s `callback`/`progress_callback`, a preset combo box
+(`_on_preset_changed`), a `SettingsDialog`, add-files/add-directory actions, and start/cancel/
+clear-queue controls. `tests/unit/test_gui.py` exists. None of this has been manually driven
+(launched and clicked through) as part of the current documentation/verification pass — see
+`docs/ROADMAP.md`'s "Implemented but not independently verified" section.
 
 #### 4.1 GUI Foundation
 **Duration**: 1.5 weeks
 
 Tasks:
-- [ ] Design GUI layout
-- [ ] Create main window
-- [ ] Implement job queue widget
-- [ ] Add progress tracking
-- [ ] Create settings dialog
-- [ ] Write GUI tests
+- [x] Design GUI layout
+- [x] Create main window
+- [x] Implement job queue widget
+- [x] Add progress tracking
+- [x] Create settings dialog
+- [x] Write GUI tests (`tests/unit/test_gui.py`)
 
 Dependencies:
 - PySide6 installed
@@ -253,13 +259,15 @@ Dependencies:
 **Duration**: 1 week
 
 Tasks:
-- [ ] Add drag-and-drop support
+- [x] Add multi-file / add-directory support (`_on_add_files`, `_on_add_directory`) --
+      not drag-and-drop specifically
 - [ ] Implement directory monitoring
 - [ ] Add job scheduling
-- [ ] Create batch operations
-- [ ] Write batch tests
+- [x] Create batch operations (queue + `execute_all()` already supports multiple jobs)
+- [ ] Write batch-specific tests beyond the general GUI test file
 
-**Phase 4 Total**: 4 weeks
+**Phase 4 Total**: 4 weeks (foundation done; preview and directory-monitoring/scheduling
+remain)
 
 ---
 
@@ -528,5 +536,5 @@ Tasks:
 
 ---
 
-*Last updated: June 2026*
-*Next review: July 2026*
+*Last updated: July 2026 (GUI foundation section corrected to reflect actual `gui/main_window.py` state; see AGENTS.md's standing rule to keep this file in sync with code)*
+*Next review: as needed when stages/config/CLI change*

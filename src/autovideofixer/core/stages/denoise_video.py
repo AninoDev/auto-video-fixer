@@ -126,52 +126,89 @@ class DenoiseVideoStage(BaseStage):
         files are not available.
         """
         try:
-            from autovideofixer.ai.frame_processor import FrameProcessor, StreamingVideoWriter
+            from autovideofixer.ai.frame_processor import (
+                AsyncVideoWriter,
+                FrameProcessor,
+                StreamingVideoWriter,
+            )
             from autovideofixer.ai.torch_utils import is_torch_available
             from autovideofixer.ai.wrappers.upscale import RealESRGANUpscaler
         except ImportError:
-            self.logger.warning("PyTorch not available, falling back to traditional denoising")
-            return self._execute_traditional(
-                input_path, output_path, progress_callback, start, strength="medium"
+            return self._ai_fallback_or_fail(
+                "PyTorch not available",
+                start,
+                lambda: self._execute_traditional(
+                    input_path, output_path, progress_callback, start, strength="medium"
+                ),
             )
 
         if not is_torch_available():
-            self.logger.warning("PyTorch not installed, falling back to traditional denoising")
-            return self._execute_traditional(
-                input_path, output_path, progress_callback, start, strength="medium"
+            return self._ai_fallback_or_fail(
+                "PyTorch not installed",
+                start,
+                lambda: self._execute_traditional(
+                    input_path, output_path, progress_callback, start, strength="medium"
+                ),
             )
+
+        # Denoising, like deblocking, runs Real-ESRGAN at scale=1 -- the
+        # output is downscaled back down from whatever the checkpoint's
+        # native scale is. x4plus's RRDB body runs at FULL input resolution
+        # (native scale=4 means no pixel-unshuffle pre-shrink) and its
+        # upsample tail produces activations at 16x the pixel count before
+        # being discarded by the scale=1 downscale -- exactly what OOMs on
+        # 1080p+ input. x2plus pre-shrinks the body to half resolution and
+        # caps the tail at 4x pixel count instead of 16x, so prefer it here
+        # unless the user explicitly configured a different model (same
+        # optimization UpscaleStage/DeblockStage apply for their own
+        # scale<=2 / scale=1 passes).
+        configured_model = self._stage_config.get("ai_model", "RealESRGAN_x4plus")
+        ai_model_name = configured_model
+        if ai_model_name == "RealESRGAN_x4plus":
+            ai_model_name = "RealESRGAN_x2plus"
 
         try:
             from autovideofixer.ai.model_cache import ensure_model_available
 
-            success, msg = ensure_model_available(
-                self._stage_config.get("ai_model", "RealESRGAN_x4plus")
-            )
+            success, msg = ensure_model_available(ai_model_name)
             if not success:
-                self.logger.warning(f"Model not available ({msg}), falling back")
-                return self._execute_traditional(
-                    input_path, output_path, progress_callback, start, strength="medium"
-                )
+                if ai_model_name != configured_model:
+                    ai_model_name = configured_model
+                    success, msg = ensure_model_available(ai_model_name)
+                if not success:
+                    return self._ai_fallback_or_fail(
+                        f"model not available: {msg}",
+                        start,
+                        lambda: self._execute_traditional(
+                            input_path, output_path, progress_callback, start, strength="medium"
+                        ),
+                    )
 
         except Exception as e:
-            self.logger.warning(f"Model check failed ({e}), falling back to traditional")
-            return self._execute_traditional(
-                input_path, output_path, progress_callback, start, strength="medium"
+            return self._ai_fallback_or_fail(
+                f"model check failed: {e}",
+                start,
+                lambda: self._execute_traditional(
+                    input_path, output_path, progress_callback, start, strength="medium"
+                ),
             )
 
         # Use Real-ESRGAN at scale=1 (denoise mode - no upscaling)
-        ai_model_name = self._stage_config.get("ai_model", "RealESRGAN_x4plus")
         upscaler = RealESRGANUpscaler(
             scale=1,
             model_name=ai_model_name,
             tta_mode=self._stage_config.get("tta_mode", 0),
             device_preference=self.config.get("gpu", "preferred_device", default="auto"),
+            tile_size=self._stage_config.get("tile_size", 0),
         )
 
         if not upscaler.load_model():
-            self.logger.warning("Failed to load model for denoising, falling back")
-            return self._execute_traditional(
-                input_path, output_path, progress_callback, start, strength="medium"
+            return self._ai_fallback_or_fail(
+                "failed to load model",
+                start,
+                lambda: self._execute_traditional(
+                    input_path, output_path, progress_callback, start, strength="medium"
+                ),
             )
 
         probe_info = probe(input_path)
@@ -203,7 +240,10 @@ class DenoiseVideoStage(BaseStage):
             try:
                 if use_chunked:
                     chunk_size = 25
-                    writer = StreamingVideoWriter(temp_path, fps=fps)
+                    # See UpscaleStage._run_single_ai_pass for why: overlaps
+                    # CPU decode/write with GPU inference instead of
+                    # serializing read -> infer -> write per chunk.
+                    writer = AsyncVideoWriter(StreamingVideoWriter(temp_path, fps=fps))
                     processed = 0
                     frames_written = 0
 
@@ -212,7 +252,7 @@ class DenoiseVideoStage(BaseStage):
                             0.1 + (processed / total_est) * 0.9, msg, progress_callback
                         )
 
-                    for chunk in proc.stream_frames(
+                    for chunk in proc.stream_frames_prefetched(
                         input_path, chunk_size=chunk_size, max_frames=total_est
                     ):
                         chunk_denoised = upscaler.upscale_video(chunk, progress_callback=cb)
@@ -306,7 +346,7 @@ class DenoiseVideoStage(BaseStage):
                     output_path=output_path,
                     metadata={
                         "method": "ai",
-                        "model": self._stage_config.get("ai_model", "RealESRGAN_x4plus"),
+                        "model": ai_model_name,
                         "frames_processed": frames_written,
                     },
                     duration_sec=time.time() - start,
@@ -321,10 +361,12 @@ class DenoiseVideoStage(BaseStage):
 
         except Exception as e:
             self.logger.error(f"AI denoising failed: {e}")
-            return StageResult(
-                status=StageStatus.FAILED,
-                error=f"AI denoising failed: {e}",
-                duration_sec=time.time() - start,
+            return self._ai_fallback_or_fail(
+                f"inference exception: {e}",
+                start,
+                lambda: self._execute_traditional(
+                    input_path, output_path, progress_callback, start, strength="medium"
+                ),
             )
         finally:
             upscaler.unload()

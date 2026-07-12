@@ -34,10 +34,14 @@ def get_logger(name: str, level: Optional[int] = None) -> logging.Logger:
     return logger
 
 
+_PLAIN_FILE_FORMAT = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+
+
 def setup_logging(
     level: str = "INFO",
     log_file: str | None = None,
     file_level: str | None = None,
+    auto_log_file: str | None = None,
 ) -> None:
     """Configure the single shared "autovideofixer" logger.
 
@@ -48,10 +52,16 @@ def setup_logging(
 
     Args:
         level: Console log level (DEBUG/INFO/WARNING/ERROR).
-        log_file: If given, also log to this file.
-        file_level: Log level for the file handler. Defaults to `level` if
-            not given, so `--log-file` without `--file-log-level` behaves as
-            users would expect (same verbosity as the console).
+        log_file: If given, also log to this ADDITIONAL explicit file (e.g.
+            CLI --log-file), at `file_level`/`level`.
+        file_level: Log level for the `log_file` handler. Defaults to `level`
+            if not given, so `--log-file` without `--file-log-level` behaves
+            as users would expect (same verbosity as the console).
+        auto_log_file: Path to the automatic always-on per-run log file (see
+            config.get_log_dir()). Unlike `log_file`, this is always attached
+            at DEBUG regardless of the console level, with a plain (no Rich
+            markup) formatter, so an uploaded log is maximally useful
+            independent of what the user had the console set to.
     """
     numeric_level = getattr(logging, level.upper(), logging.INFO)
 
@@ -75,15 +85,24 @@ def setup_logging(
     console_handler.setLevel(numeric_level)
     root.addHandler(console_handler)
 
+    effective_root_level = numeric_level
+
+    if auto_log_file:
+        auto_handler = logging.FileHandler(auto_log_file)
+        auto_handler.setFormatter(logging.Formatter(_PLAIN_FILE_FORMAT))
+        auto_handler.setLevel(logging.DEBUG)
+        root.addHandler(auto_handler)
+        effective_root_level = min(effective_root_level, logging.DEBUG)
+
     if log_file:
         file_numeric_level = getattr(logging, (file_level or level).upper(), numeric_level)
         file_handler = logging.FileHandler(log_file)
-        file_handler.setFormatter(
-            logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s")
-        )
+        file_handler.setFormatter(logging.Formatter(_PLAIN_FILE_FORMAT))
         file_handler.setLevel(file_numeric_level)
         root.addHandler(file_handler)
-        # The root logger's effective level gates what reaches handlers at all,
-        # so if the file wants more verbosity than the console, the logger
-        # itself must be set to the more verbose of the two.
-        root.setLevel(min(numeric_level, file_numeric_level))
+        effective_root_level = min(effective_root_level, file_numeric_level)
+
+    # The root logger's effective level gates what reaches handlers at all,
+    # so if any attached file handler wants more verbosity than the console,
+    # the logger itself must be set to the most verbose of all of them.
+    root.setLevel(effective_root_level)

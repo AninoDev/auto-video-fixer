@@ -139,47 +139,87 @@ class DeblockStage(BaseStage):
         its super-resolution training, so we use scale=1 for pure deblocking.
         """
         try:
-            from autovideofixer.ai.frame_processor import FrameProcessor, StreamingVideoWriter
+            from autovideofixer.ai.frame_processor import (
+                AsyncVideoWriter,
+                FrameProcessor,
+                StreamingVideoWriter,
+            )
             from autovideofixer.ai.torch_utils import is_torch_available
             from autovideofixer.ai.wrappers.upscale import RealESRGANUpscaler
         except ImportError:
-            self.logger.warning("PyTorch not available, falling back to traditional deblocking")
-            return self._execute_traditional(
-                input_path, output_path, progress_callback, start, self._strength
+            return self._ai_fallback_or_fail(
+                "PyTorch not available",
+                start,
+                lambda: self._execute_traditional(
+                    input_path, output_path, progress_callback, start, self._strength
+                ),
             )
 
         if not is_torch_available():
-            self.logger.warning("PyTorch not installed, falling back to traditional deblocking")
-            return self._execute_traditional(
-                input_path, output_path, progress_callback, start, self._strength
+            return self._ai_fallback_or_fail(
+                "PyTorch not installed",
+                start,
+                lambda: self._execute_traditional(
+                    input_path, output_path, progress_callback, start, self._strength
+                ),
             )
 
         try:
             from autovideofixer.ai.model_cache import ensure_model_available
 
-            success, msg = ensure_model_available(self._ai_model)
+            # Deblocking runs Real-ESRGAN at scale=1 (no spatial upscaling): the
+            # output is downscaled back from whatever the checkpoint's native
+            # scale is. x4plus's RRDB body runs at FULL input resolution (its
+            # native scale=4 means no pixel-unshuffle pre-shrink -- see
+            # RRDBNet docstring in ai/wrappers/upscale.py), and its upsample
+            # tail then produces activations at 4x width/height (16x the pixel
+            # count) before being thrown away by the scale=1 downscale. That
+            # tail is exactly what OOMs on 1080p+ input. x2plus pre-shrinks the
+            # body to half resolution AND caps the tail at 2x/4x pixel count
+            # instead of 4x/16x, so prefer it here whenever the user hasn't
+            # explicitly configured a different model -- same optimization
+            # UpscaleStage already applies for its own scale<=2 passes.
+            deblock_model = self._ai_model
+            if deblock_model == "RealESRGAN_x4plus":
+                deblock_model = "RealESRGAN_x2plus"
+
+            success, msg = ensure_model_available(deblock_model)
             if not success:
-                self.logger.warning(f"Model not available ({msg}), falling back")
-                return self._execute_traditional(
-                    input_path, output_path, progress_callback, start, self._strength
-                )
+                if deblock_model != self._ai_model:
+                    deblock_model = self._ai_model
+                    success, msg = ensure_model_available(deblock_model)
+                if not success:
+                    return self._ai_fallback_or_fail(
+                        f"model not available: {msg}",
+                        start,
+                        lambda: self._execute_traditional(
+                            input_path, output_path, progress_callback, start, self._strength
+                        ),
+                    )
         except Exception as e:
-            self.logger.warning(f"Model check failed ({e}), falling back to traditional")
-            return self._execute_traditional(
-                input_path, output_path, progress_callback, start, self._strength
+            return self._ai_fallback_or_fail(
+                f"model check failed: {e}",
+                start,
+                lambda: self._execute_traditional(
+                    input_path, output_path, progress_callback, start, self._strength
+                ),
             )
 
         upscaler = RealESRGANUpscaler(
             scale=1,
-            model_name=self._ai_model,
+            model_name=deblock_model,
             tta_mode=self._stage_config.get("tta_mode", 0),
             device_preference=self.config.get("gpu", "preferred_device", default="auto"),
+            tile_size=self._stage_config.get("tile_size", 0),
         )
 
         if not upscaler.load_model():
-            self.logger.warning("Failed to load model for deblocking, falling back")
-            return self._execute_traditional(
-                input_path, output_path, progress_callback, start, self._strength
+            return self._ai_fallback_or_fail(
+                "failed to load model",
+                start,
+                lambda: self._execute_traditional(
+                    input_path, output_path, progress_callback, start, self._strength
+                ),
             )
 
         probe_info = probe(input_path)
@@ -204,7 +244,10 @@ class DeblockStage(BaseStage):
             try:
                 if use_chunked:
                     chunk_size = 25
-                    writer = StreamingVideoWriter(temp_path, fps=fps)
+                    # See UpscaleStage._run_single_ai_pass for why: overlaps
+                    # CPU decode/write with GPU inference instead of
+                    # serializing read -> infer -> write per chunk.
+                    writer = AsyncVideoWriter(StreamingVideoWriter(temp_path, fps=fps))
                     processed = 0
                     frames_written = 0
 
@@ -213,7 +256,7 @@ class DeblockStage(BaseStage):
                             0.1 + (processed / total_est) * 0.9, msg, progress_callback
                         )
 
-                    for chunk in proc.stream_frames(
+                    for chunk in proc.stream_frames_prefetched(
                         input_path, chunk_size=chunk_size, max_frames=total_est
                     ):
                         chunk_out = upscaler.upscale_video(chunk, progress_callback=cb)
@@ -314,7 +357,7 @@ class DeblockStage(BaseStage):
                     output_path=output_path,
                     metadata={
                         "method": "ai",
-                        "model": self._ai_model,
+                        "model": deblock_model,
                         "frames_processed": frames_written,
                     },
                     duration_sec=time.time() - start,
@@ -330,10 +373,12 @@ class DeblockStage(BaseStage):
         except Exception as e:
             self.logger.error(f"AI deblocking failed: {e}")
             upscaler.unload()
-            return StageResult(
-                status=StageStatus.FAILED,
-                error=f"AI deblocking failed: {e}",
-                duration_sec=time.time() - start,
+            return self._ai_fallback_or_fail(
+                f"inference exception: {e}",
+                start,
+                lambda: self._execute_traditional(
+                    input_path, output_path, progress_callback, start, self._strength
+                ),
             )
 
     def _get_input_fps(self, path: str) -> float:

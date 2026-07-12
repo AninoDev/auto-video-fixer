@@ -9,8 +9,10 @@ chunked/streaming extraction (for long videos).
 from __future__ import annotations
 
 import os
+import queue
 import tempfile
-from typing import Any, Generator, Iterator
+import threading
+from typing import Any, Generator, Iterable, Iterator
 
 import cv2
 
@@ -24,6 +26,99 @@ def _get_logger():
 
         _logger = get_logger("autovideofixer.ai.frame_processor")
     return _logger
+
+
+class PrefetchIterator:
+    """Runs a source iterable on a background thread with a bounded lookahead queue.
+
+    In the chunked AI-processing loop (see core/stages/{upscale,deblock,
+    denoise_video}.py), decoding the next chunk of frames (OpenCV
+    ``VideoCapture.read()``) was happening synchronously on the main thread
+    in between GPU inference calls -- the GPU sat idle during every decode,
+    and the CPU sat idle during every inference. ``cv2.VideoCapture.read()``
+    releases the GIL while it decodes (it's a C/C++ call into libavcodec),
+    so running it on a separate thread lets that decode genuinely overlap
+    with GPU inference happening on the main thread, rather than just being
+    interleaved by the GIL.
+
+    A bounded queue (``maxsize``) caps how many chunks of frames can be
+    decoded ahead of the consumer, so a slow consumer doesn't let the
+    prefetch thread buffer the entire video in memory.
+    """
+
+    _SENTINEL = object()
+
+    def __init__(self, source: Iterable[Any], maxsize: int = 2):
+        self._queue: "queue.Queue[Any]" = queue.Queue(maxsize=maxsize)
+        self._exception: BaseException | None = None
+        self._thread = threading.Thread(
+            target=self._run, args=(source,), daemon=True, name="avf-frame-prefetch"
+        )
+        self._thread.start()
+
+    def _run(self, source: Iterable[Any]) -> None:
+        try:
+            for item in source:
+                self._queue.put(item)
+        except BaseException as exc:  # noqa: BLE001 - propagated to consumer thread
+            self._exception = exc
+        finally:
+            self._queue.put(self._SENTINEL)
+
+    def __iter__(self) -> "PrefetchIterator":
+        return self
+
+    def __next__(self) -> Any:
+        item = self._queue.get()
+        if item is self._SENTINEL:
+            self._thread.join()
+            if self._exception is not None:
+                raise self._exception
+            raise StopIteration
+        return item
+
+
+class AsyncVideoWriter:
+    """Wraps a ``StreamingVideoWriter`` so ``write()`` never blocks the caller.
+
+    The chunked AI-processing loop previously called
+    ``StreamingVideoWriter.write(chunk)`` synchronously right after each
+    chunk finished inference, blocking the main thread (and therefore
+    delaying the *next* chunk's GPU inference) on the ffmpeg pipe write.
+    Handing the chunk to a background writer thread lets the next chunk's
+    inference start immediately instead of waiting for that write to land.
+    """
+
+    def __init__(self, writer: "StreamingVideoWriter"):
+        self._writer = writer
+        self._queue: "queue.Queue[Any]" = queue.Queue(maxsize=4)
+        self._exception: BaseException | None = None
+        self._thread = threading.Thread(target=self._run, daemon=True, name="avf-frame-writer")
+        self._thread.start()
+
+    def _run(self) -> None:
+        while True:
+            chunk = self._queue.get()
+            if chunk is None:
+                return
+            try:
+                self._writer.write(chunk)
+            except BaseException as exc:  # noqa: BLE001 - re-raised on close()
+                self._exception = exc
+                return
+
+    def write(self, frames: list[Any]) -> None:
+        if not frames:
+            return
+        self._queue.put(frames)
+
+    def close(self) -> bool:
+        """Wait for all queued writes to flush, then finalize the file."""
+        self._queue.put(None)
+        self._thread.join()
+        if self._exception is not None:
+            raise self._exception
+        return self._writer.close()
 
 
 class FrameProcessor:
@@ -148,6 +243,27 @@ class FrameProcessor:
                 yield chunk
         finally:
             cap.release()
+
+    def stream_frames_prefetched(
+        self,
+        video_path: str,
+        start_sec: float = 0.0,
+        end_sec: float | None = None,
+        max_frames: int | None = None,
+        chunk_size: int | None = None,
+        lookahead: int = 2,
+    ) -> Iterator[list[Any]]:
+        """Like :meth:`stream_frames`, but decodes on a background thread.
+
+        Decoding the next chunk overlaps with whatever the caller does with
+        the current chunk (typically GPU inference) instead of happening
+        serially in between each call. See ``PrefetchIterator`` for why this
+        achieves real overlap despite the GIL.
+        """
+        source = self._stream_frames(
+            video_path, start_sec, end_sec, max_frames, chunk_size=chunk_size
+        )
+        yield from PrefetchIterator(source, maxsize=max(1, lookahead))
 
     def extract_frame_pairs(
         self,

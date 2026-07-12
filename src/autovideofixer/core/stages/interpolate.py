@@ -180,25 +180,31 @@ class InterpolateStage(BaseStage):
             from autovideofixer.ai.torch_utils import is_torch_available
             from autovideofixer.ai.wrappers.interpolate import RIFEInterpolator
         except ImportError:
-            self.logger.warning("PyTorch not available, falling back to traditional interpolation")
-            return self._execute_traditional(
-                input_path,
-                output_path,
-                progress_callback,
+            return self._ai_fallback_or_fail(
+                "PyTorch not available",
                 start,
-                target_fps=target_fps,
-                current_fps=current_fps,
+                lambda: self._execute_traditional(
+                    input_path,
+                    output_path,
+                    progress_callback,
+                    start,
+                    target_fps=target_fps,
+                    current_fps=current_fps,
+                ),
             )
 
         if not is_torch_available():
-            self.logger.warning("PyTorch not installed, falling back to traditional interpolation")
-            return self._execute_traditional(
-                input_path,
-                output_path,
-                progress_callback,
+            return self._ai_fallback_or_fail(
+                "PyTorch not installed",
                 start,
-                target_fps=target_fps,
-                current_fps=current_fps,
+                lambda: self._execute_traditional(
+                    input_path,
+                    output_path,
+                    progress_callback,
+                    start,
+                    target_fps=target_fps,
+                    current_fps=current_fps,
+                ),
             )
 
         try:
@@ -206,25 +212,31 @@ class InterpolateStage(BaseStage):
 
             success, msg = ensure_model_available(self._ai_model)
             if not success:
-                self.logger.warning(f"Model not available ({msg}), falling back")
-                return self._execute_traditional(
+                return self._ai_fallback_or_fail(
+                    f"model not available: {msg}",
+                    start,
+                    lambda: self._execute_traditional(
+                        input_path,
+                        output_path,
+                        progress_callback,
+                        start,
+                        target_fps=target_fps,
+                        current_fps=current_fps,
+                    ),
+                )
+
+        except Exception as e:
+            return self._ai_fallback_or_fail(
+                f"model check failed: {e}",
+                start,
+                lambda: self._execute_traditional(
                     input_path,
                     output_path,
                     progress_callback,
                     start,
                     target_fps=target_fps,
                     current_fps=current_fps,
-                )
-
-        except Exception as e:
-            self.logger.warning(f"Model check failed ({e}), falling back to traditional")
-            return self._execute_traditional(
-                input_path,
-                output_path,
-                progress_callback,
-                start,
-                target_fps=target_fps,
-                current_fps=current_fps,
+                ),
             )
 
         # Validate resolution - RIFE model expects input frames around 256x256 or larger
@@ -251,14 +263,17 @@ class InterpolateStage(BaseStage):
         )
 
         if not interpolator.load_model():
-            self.logger.warning("Failed to load RIFE model, falling back")
-            return self._execute_traditional(
-                input_path,
-                output_path,
-                progress_callback,
+            return self._ai_fallback_or_fail(
+                "failed to load RIFE model",
                 start,
-                target_fps=target_fps,
-                current_fps=current_fps,
+                lambda: self._execute_traditional(
+                    input_path,
+                    output_path,
+                    progress_callback,
+                    start,
+                    target_fps=target_fps,
+                    current_fps=current_fps,
+                ),
             )
 
         try:
@@ -413,10 +428,17 @@ class InterpolateStage(BaseStage):
 
         except Exception as e:
             self.logger.error(f"RIFE processing failed: {e}")
-            return StageResult(
-                status=StageStatus.FAILED,
-                error=f"AI interpolation failed: {e}",
-                duration_sec=time.time() - start,
+            return self._ai_fallback_or_fail(
+                f"inference exception: {e}",
+                start,
+                lambda: self._execute_traditional(
+                    input_path,
+                    output_path,
+                    progress_callback,
+                    start,
+                    target_fps=target_fps,
+                    current_fps=current_fps,
+                ),
             )
         finally:
             interpolator.unload()

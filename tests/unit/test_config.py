@@ -2,6 +2,7 @@
 
 from pathlib import Path
 
+import pytest
 import yaml
 
 from autovideofixer.config import Config
@@ -113,3 +114,97 @@ class TestConfig:
         assert isinstance(data_dir, Path)
         assert "auto-video-fixer" in str(config_dir)
         assert "auto-video-fixer" in str(data_dir)
+
+    def test_state_and_log_dirs(self):
+        """Test platform-specific state/log directory detection."""
+        from autovideofixer.config import get_log_dir, get_state_dir
+
+        state_dir = get_state_dir()
+        log_dir = get_log_dir()
+
+        assert isinstance(state_dir, Path)
+        assert isinstance(log_dir, Path)
+        assert "auto-video-fixer" in str(state_dir)
+        assert log_dir == state_dir / "logs"
+
+
+class TestConfigExplicitPath:
+    """Tests for Config's explicit-path / --config support (Feature 3)."""
+
+    def test_explicit_path_loads_file_values(self, tmp_path):
+        """An explicit config_path loads that file's values."""
+        config_path = tmp_path / "custom.yaml"
+        with open(config_path, "w") as f:
+            yaml.dump({"general": {"max_concurrent_jobs": 7}}, f)
+
+        config = Config(config_path=config_path)
+        assert config.get("general", "max_concurrent_jobs") == 7
+        assert config._path == config_path
+
+    def test_positional_path_still_works(self, tmp_path):
+        """Existing positional `path` API keeps working unchanged."""
+        config_path = tmp_path / "custom.yaml"
+        with open(config_path, "w") as f:
+            yaml.dump({"general": {"max_concurrent_jobs": 3}}, f)
+
+        config = Config(config_path)
+        assert config.get("general", "max_concurrent_jobs") == 3
+
+    def test_require_exists_missing_path_errors(self, tmp_path):
+        """require_exists=True with a missing path fails loudly instead of
+        silently falling back to defaults."""
+        missing = tmp_path / "does_not_exist.yaml"
+        with pytest.raises(FileNotFoundError):
+            Config(missing, require_exists=True)
+
+    def test_require_exists_existing_path_ok(self, tmp_path):
+        config_path = tmp_path / "custom.yaml"
+        with open(config_path, "w") as f:
+            yaml.dump({"general": {"max_concurrent_jobs": 2}}, f)
+
+        config = Config(config_path, require_exists=True)
+        assert config.get("general", "max_concurrent_jobs") == 2
+
+    def test_default_path_not_required_to_exist(self, tmp_path, monkeypatch):
+        """Without an explicit path, require_exists is a no-op -- the default
+        platform config path is never mandatory."""
+        monkeypatch.setattr("autovideofixer.config.get_config_path", lambda: tmp_path / "nope.yaml")
+        config = Config(require_exists=True)
+        assert config is not None
+
+
+class TestRedactSecrets:
+    def test_redacts_api_key(self):
+        from autovideofixer.config import redact_secrets
+
+        data = {"analysis": {"vlm": {"api_key": "sk-supersecret", "provider": "openai"}}}
+        redacted = redact_secrets(data)
+        assert redacted["analysis"]["vlm"]["api_key"] == "***"
+        assert redacted["analysis"]["vlm"]["provider"] == "openai"
+
+    def test_leaves_empty_secret_values_alone(self):
+        from autovideofixer.config import redact_secrets
+
+        data = {"api_key": ""}
+        assert redact_secrets(data)["api_key"] == ""
+
+    def test_leaves_non_secret_keys_alone(self):
+        from autovideofixer.config import redact_secrets
+
+        data = {"general": {"output_dir": "/tmp/out"}}
+        assert redact_secrets(data) == data
+
+
+class TestDiffFromDefaults:
+    def test_no_changes_yields_empty_diff(self):
+        from autovideofixer.config import diff_from_defaults
+
+        assert diff_from_defaults(Config.DEFAULTS, Config.DEFAULTS) == {}
+
+    def test_changed_leaf_surfaces_in_diff(self):
+        from autovideofixer.config import diff_from_defaults
+
+        data = Config.DEFAULTS.copy()
+        data["general"] = {**data["general"], "max_concurrent_jobs": 8}
+        diff = diff_from_defaults(data, Config.DEFAULTS)
+        assert diff == {"general": {"max_concurrent_jobs": 8}}

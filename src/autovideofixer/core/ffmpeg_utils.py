@@ -232,17 +232,43 @@ def _parse_probe_result(data: dict, filepath: str) -> ProbeResult:
     )
 
 
-def _parse_fps(s: dict) -> float:
-    """Parse framerate from stream info, handling both avg_frame_rate and r_frame_rate."""
-    fps_str = s.get("avg_frame_rate") or s.get("r_frame_rate", "0/1")
+def _rate_str_to_float(rate_str: str | None) -> float:
+    """Convert an ffprobe "N/D" (or plain numeric) rate string to a float.
+
+    Returns 0.0 for missing/undefined rates (including ffprobe's "0/0",
+    which it emits when the rate can't be determined -- e.g. duration
+    unknown), so callers can treat 0.0 uniformly as "not available".
+    """
+    if not rate_str:
+        return 0.0
     try:
-        if "/" in fps_str:
-            num, den = fps_str.split("/")
+        if "/" in rate_str:
+            num, den = rate_str.split("/")
             num, den = float(num), float(den)
             return num / den if den else 0.0
-        return float(fps_str)
+        return float(rate_str)
     except ValueError, ZeroDivisionError:
         return 0.0
+
+
+def _parse_fps(s: dict) -> float:
+    """Parse framerate from stream info, preferring avg_frame_rate.
+
+    avg_frame_rate is the honest "real frame count / real duration" rate.
+    r_frame_rate ("tbr") is ffmpeg's declared/theoretical rate and, for VFR
+    or YouTube-origin sources, can be a multiple of the true average (e.g.
+    r_frame_rate=59.94 vs avg_frame_rate=29.64 for the same file). Using
+    r_frame_rate anywhere frame count is reconciled with wall-clock time
+    (e.g. as the input `-r` for a headerless/raw pipe) silently halves the
+    apparent duration of the real frames.
+
+    Falls back to r_frame_rate only when avg_frame_rate is missing or
+    undefined (ffprobe emits "0/0" when duration is unknown).
+    """
+    avg_fps = _rate_str_to_float(s.get("avg_frame_rate"))
+    if avg_fps > 0:
+        return avg_fps
+    return _rate_str_to_float(s.get("r_frame_rate", "0/1"))
 
 
 def _safe_float(val: Any) -> float:

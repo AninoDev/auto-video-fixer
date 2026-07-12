@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable, NamedTuple
 
 import torch
 
@@ -25,6 +25,137 @@ def _get_logger() -> logging.Logger:
     if _logger is None:
         _logger = logging.getLogger("autovideofixer.ai.upscale")
     return _logger
+
+
+class TileSpec(NamedTuple):
+    """One tile's input crop (with overlap padding) and its placement in the output canvas.
+
+    All coordinates are half-open ranges [start, end) in pixels. `in_*` locate the
+    (overlap-padded) crop to feed the model; `out_*` locate where the *unpadded*
+    portion of that tile's output belongs in the full-resolution output canvas;
+    `crop_*` locate that same unpadded portion within the tile's own output (i.e.
+    after running the padded input tile through the model at `out_scale`, crop
+    `tensor[..., crop_y0:crop_y1, crop_x0:crop_x1]` before placing it at
+    `out_y0:out_y1, out_x0:out_x1`).
+    """
+
+    in_y0: int
+    in_y1: int
+    in_x0: int
+    in_x1: int
+    out_y0: int
+    out_y1: int
+    out_x0: int
+    out_x1: int
+    crop_y0: int
+    crop_y1: int
+    crop_x0: int
+    crop_x1: int
+
+
+def compute_tile_grid(
+    height: int, width: int, tile_size: int, overlap: int, out_scale: int = 1
+) -> list[TileSpec]:
+    """Compute a grid of overlapping tiles covering a `height` x `width` image.
+
+    Standard tiled-inference layout (matches the approach used by the official
+    Real-ESRGAN CLI's ``tile`` option): the image is divided into a grid of
+    `tile_size` x `tile_size` cells (the last row/column may be smaller), each
+    cell is padded by `overlap` pixels on every side (clamped to the image
+    bounds) before being fed to the model, and only the unpadded center portion
+    of each tile's output is kept when stitching -- this avoids the seam
+    artifacts that plain non-overlapping tiling produces at tile boundaries
+    (the model has no receptive-field context right at a hard-cropped edge).
+
+    Args:
+        height: Full input image height in pixels.
+        width: Full input image width in pixels.
+        tile_size: Target size (pixels) of each tile's non-overlap region.
+            Must be > 0.
+        overlap: Padding (pixels) added on each side of a tile before
+            inference. Must be >= 0.
+        out_scale: The model's own output scale factor (e.g. 4 for x4plus,
+            2 for x2plus) -- output/placement coordinates are `out_scale`
+            times the input coordinates.
+
+    Returns:
+        List of TileSpec, row-major order, covering the whole image with no
+        gaps and no overlaps in the *output* placement regions.
+    """
+    if tile_size <= 0:
+        raise ValueError(f"tile_size must be > 0, got {tile_size}")
+    if overlap < 0:
+        raise ValueError(f"overlap must be >= 0, got {overlap}")
+    if height <= 0 or width <= 0:
+        raise ValueError(f"height/width must be > 0, got {height}x{width}")
+
+    tiles: list[TileSpec] = []
+    tiles_y = -(-height // tile_size)  # ceil div
+    tiles_x = -(-width // tile_size)
+
+    for ty in range(tiles_y):
+        out_y0 = ty * tile_size
+        out_y1 = min(out_y0 + tile_size, height)
+        in_y0 = max(out_y0 - overlap, 0)
+        in_y1 = min(out_y1 + overlap, height)
+        for tx in range(tiles_x):
+            out_x0 = tx * tile_size
+            out_x1 = min(out_x0 + tile_size, width)
+            in_x0 = max(out_x0 - overlap, 0)
+            in_x1 = min(out_x1 + overlap, width)
+
+            # Where the unpadded region sits within this tile's own
+            # (padded-input-sized) output, scaled by the model's output factor.
+            crop_y0 = (out_y0 - in_y0) * out_scale
+            crop_y1 = crop_y0 + (out_y1 - out_y0) * out_scale
+            crop_x0 = (out_x0 - in_x0) * out_scale
+            crop_x1 = crop_x0 + (out_x1 - out_x0) * out_scale
+
+            tiles.append(
+                TileSpec(
+                    in_y0=in_y0,
+                    in_y1=in_y1,
+                    in_x0=in_x0,
+                    in_x1=in_x1,
+                    out_y0=out_y0 * out_scale,
+                    out_y1=out_y1 * out_scale,
+                    out_x0=out_x0 * out_scale,
+                    out_x1=out_x1 * out_scale,
+                    crop_y0=crop_y0,
+                    crop_y1=crop_y1,
+                    crop_x0=crop_x0,
+                    crop_x1=crop_x1,
+                )
+            )
+
+    return tiles
+
+
+def run_tiled_inference(
+    tensor: "torch.Tensor",
+    tile_size: int,
+    overlap: int,
+    out_scale: int,
+    infer_fn: Callable[["torch.Tensor"], "torch.Tensor"],
+) -> "torch.Tensor":
+    """Run `infer_fn` over `tensor` (N,C,H,W) tile-by-tile and stitch the result.
+
+    Each tile is padded by `overlap` pixels (clamped at image bounds), passed
+    through `infer_fn` individually (so each forward pass only ever holds one
+    tile's activations in memory instead of the whole frame's), and the
+    unpadded center of its output is written into the full-size output canvas.
+    """
+    n, c, h, w = tensor.shape
+    grid = compute_tile_grid(h, w, tile_size, overlap, out_scale=out_scale)
+
+    out = tensor.new_empty((n, c, h * out_scale, w * out_scale))
+    for spec in grid:
+        tile_in = tensor[..., spec.in_y0 : spec.in_y1, spec.in_x0 : spec.in_x1]
+        tile_out = infer_fn(tile_in)
+        out[..., spec.out_y0 : spec.out_y1, spec.out_x0 : spec.out_x1] = tile_out[
+            ..., spec.crop_y0 : spec.crop_y1, spec.crop_x0 : spec.crop_x1
+        ]
+    return out
 
 
 class ResidualDenseBlock(torch.nn.Module):
@@ -197,6 +328,20 @@ class RealESRGANUpscaler:
         result = upscaler.upscale(frame, tta_mode=7)
     """
 
+    # Below this many input pixels, a whole-frame forward pass is safe on a
+    # 16GB-class card even at native x4 (tail activations reach 16x this
+    # pixel count at 64 channels). Above it, tile automatically rather than
+    # rely solely on the reactive OOM handler -- proactively avoiding the
+    # OOM is strictly cheaper than triggering, catching, and retrying one.
+    # ~1280x720 (921,600px) at x4plus's 16x tail comfortably fits; this
+    # threshold (2,097,152 = 2048x1024) leaves headroom below the point
+    # 1920x1080 (2,073,600px) would auto-tile through x4plus, matching the
+    # resolution at which OOM was actually observed.
+    AUTO_TILE_THRESHOLD_PX = 2_097_152
+
+    DEFAULT_TILE_SIZE = 512
+    DEFAULT_TILE_OVERLAP = 32
+
     def __init__(
         self,
         scale: float = 4,
@@ -204,12 +349,22 @@ class RealESRGANUpscaler:
         tta_mode: int = 0,
         batch_size: int = 1,
         device_preference: str = "auto",
+        tile_size: int = 0,
+        tile_overlap: int = DEFAULT_TILE_OVERLAP,
     ):
         self.scale = scale
         self.model_name = model_name
         self.tta_mode = tta_mode
         self.batch_size = batch_size
         self.device_preference = device_preference
+        # tile_size semantics:
+        #   0 (default): "auto" -- no fixed tiling is forced, but a large
+        #     enough frame (see AUTO_TILE_THRESHOLD_PX) or a caught CUDA OOM
+        #     still triggers tiling automatically at DEFAULT_TILE_SIZE (or
+        #     smaller, on a second OOM).
+        #   > 0: always tile at this size (skips the auto-threshold check).
+        self.tile_size = tile_size
+        self.tile_overlap = max(0, tile_overlap)
         self._model: Any = None
         self._device: Any = None
         self._loaded = False
@@ -363,28 +518,67 @@ class RealESRGANUpscaler:
             # every call anyway, defeating the point.
             tensor = tensor.to(memory_format=torch.channels_last)
 
-        def _infer() -> Any:
+        def _infer_whole(t: Any) -> Any:
             with torch.no_grad():
                 if tta_mode and tta_mode >= 1:
-                    return apply_tta(self._model, tensor, mode=tta_mode)
-                return self._model(tensor)
+                    return apply_tta(self._model, t, mode=tta_mode)
+                return self._model(t)
+
+        def _infer_tiled(t: Any, tile_size: int, overlap: int) -> Any:
+            from autovideofixer.ai.wrappers.upscale import run_tiled_inference
+
+            return run_tiled_inference(
+                t,
+                tile_size=tile_size,
+                overlap=overlap,
+                out_scale=int(self._native_scale),
+                infer_fn=_infer_whole,
+            )
+
+        _, _, tensor_h, tensor_w = tensor.shape
+        forced_tile = self.tile_size if self.tile_size > 0 else 0
+        auto_tile = (
+            forced_tile == 0
+            and self._device.type == "cuda"
+            and tensor_h * tensor_w > self.AUTO_TILE_THRESHOLD_PX
+        )
+        use_tile_size = forced_tile or (self.DEFAULT_TILE_SIZE if auto_tile else 0)
 
         try:
-            output = _infer()
+            if use_tile_size > 0:
+                output = _infer_tiled(tensor, use_tile_size, self.tile_overlap)
+            else:
+                output = _infer_whole(tensor)
         except torch.cuda.OutOfMemoryError:
             # A single oversized/high-res frame can exceed VRAM even though prior
-            # frames fit; clear the allocator cache and retry once instead of
-            # aborting the whole video on one frame.
-            _get_logger().warning("CUDA OOM upscaling a frame; clearing cache and retrying once")
+            # frames fit (or a static resolution-based auto-tile threshold didn't
+            # trigger for this particular frame's actual peak usage). Clear the
+            # allocator cache and retry with tiling instead of aborting the whole
+            # video on one frame -- start from whatever tile size was already in
+            # play (or the default), halved, and halve again once more if it's
+            # still not enough.
+            _get_logger().warning(
+                "CUDA OOM upscaling a frame; clearing cache and retrying with tiling"
+            )
             torch.cuda.empty_cache()
-            try:
-                output = _infer()
-            except torch.cuda.OutOfMemoryError:
-                torch.cuda.empty_cache()
+            retry_tile = (use_tile_size or self.DEFAULT_TILE_SIZE) // 2
+            retry_tile = max(retry_tile, 64)
+            output = None
+            last_exc: BaseException | None = None
+            for _attempt in range(2):
+                try:
+                    output = _infer_tiled(tensor, retry_tile, self.tile_overlap)
+                    break
+                except torch.cuda.OutOfMemoryError as exc:
+                    last_exc = exc
+                    torch.cuda.empty_cache()
+                    retry_tile = max(retry_tile // 2, 64)
+            if output is None:
                 raise RuntimeError(
                     "CUDA out of memory upscaling frame even after cache clear + "
-                    "retry; try a smaller scale_factor or --no-ai"
-                ) from None
+                    "tiled retries; try a smaller scale_factor, a smaller "
+                    "tile_size, or --no-ai"
+                ) from last_exc
 
         if self._use_fp16:
             output = output.float()

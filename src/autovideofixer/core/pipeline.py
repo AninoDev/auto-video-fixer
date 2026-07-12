@@ -7,13 +7,14 @@ intelligent stage selection based on input/output requirements.
 
 from __future__ import annotations
 
+import logging
 import os
 import shutil
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Callable
 
-from autovideofixer.config import Config
+from autovideofixer.config import Config, redact_secrets
 from autovideofixer.core.ffmpeg_utils import (
     generate_temp_path,
     get_video_info,
@@ -367,6 +368,14 @@ class Pipeline:
             return job_result
 
         self.logger.info(f"Processing {os.path.basename(job.input_path)}: stages={stage_names}")
+        if self.logger.isEnabledFor(logging.DEBUG):  # avoid building the dump otherwise
+            for stage_name in stage_names:
+                stage_cfg = self.config.get("stages", stage_name, default={})
+                overrides = job.stage_overrides.get(stage_name, {})
+                effective = {**stage_cfg, **overrides} if overrides else dict(stage_cfg)
+                self.logger.debug(
+                    "Stage '%s' effective config: %s", stage_name, redact_secrets(effective)
+                )
 
         input_info = get_video_info(job.input_path)
         job.input_info = input_info

@@ -1,0 +1,57 @@
+Fix stabilize borders and VFR speed bug; OOM tiling; fallback policy; logging and config CLI
+
+Stabilization:
+- Zoom compensation had a sign bug: the computed zoom was always negative
+  (zoom OUT in vidstabtransform terms), structurally unable to remove
+  borders. zoom_enabled now uses vidstabtransform optzoom=1 (optimal
+  static zoom covering the worst frame). Verified: synthetic shaky
+  1080x1920 clip went from an 80px cropdetect-union border to exact
+  full-frame output.
+- 2x-speed-then-freeze on VFR/YouTube inputs: the raw YUV pipe declared
+  r_frame_rate (tbr, e.g. 59.94) for timestamp-less frames whose true
+  rate was avg_frame_rate (29.64), halving the video duration against
+  intact audio. Framerate reads now prefer avg_frame_rate with fallback
+  on 0/0; _parse_fps hardened the same way.
+
+AI stages:
+- CUDA OOM on deblock/denoise fixed twice over: scale=1 work now uses
+  RealESRGAN_x2plus instead of running the x4 body+tail at full input
+  resolution, and tiled inference (overlap-padded, configurable
+  stages.<name>.tile_size, auto above 2048x1024, reactive retry with
+  halving tiles on caught OOM) handles large frames. Verified 1080p and
+  1440p deblock with no OOM while a concurrent job held 6.4GB VRAM.
+- Frame I/O now overlaps inference (prefetch decode thread, async
+  writer, pinned-memory H2D); honest measurement: inference dominates,
+  so gains are small — GPU contention from concurrent jobs is the main
+  real-world slowdown (keep max_concurrent_jobs=1 for AI batches).
+
+AI-fallback policy (user-specified):
+- general.ai_fallback (default true) + per-stage stages.<name>.ai_fallback
+  (null = inherit), CLI --ai-fallback/--no-ai-fallback. Disabled =>
+  AI failure fails the stage naming the exact cause; enabled => uniform
+  loud warning before traditional fallback. Upscale previously had no
+  fallback at all; OOM-after-retries was previously an unconditional
+  hard failure in all stages.
+
+Logging and CLI:
+- Startup banner: version, full invocation, config source, active
+  preset, redacted diff of effective settings vs defaults (full dump at
+  DEBUG). Secrets (api_key/token/password) always redacted.
+- Automatic per-run DEBUG log file under the platform state dir
+  (~/.local/state/auto-video-fixer/logs, newest 50 kept, path logged at
+  startup). --log-file PATH now replaces the automatic location for the
+  run rather than adding a second file.
+- Global --config PATH / AVF_CONFIG env var for an alternate config
+  file (flag > env > default; missing explicit path is a hard error).
+
+Docs: AGENTS.md refreshed (fixed-bugs list pruned, all current CLI
+flags, docs-sync rule added); ROADMAP rewritten as verified/unverified/
+planned; new docs/REQUIREMENTS.md (scene-based pipeline with VLM scene
+classification and interstitial dropping, per-scene stabilization
+strength, no interpolation across scene cuts, auto-crop with watermark
+awareness, NCNN/Vulkan backend); new fully-commented
+docs/config.example.yaml; CHANGELOG and README corrections.
+
+Tests: 284 unit + 21 integration passing; ruff check/format clean.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>

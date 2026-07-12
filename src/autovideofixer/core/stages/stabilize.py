@@ -124,7 +124,23 @@ class StabilizeStage(BaseStage):
         return 1920, 1080
 
     def _get_video_framerate(self, input_path: str) -> float:
-        """Get video framerate from ffprobe."""
+        """Get video framerate from ffprobe.
+
+        Reads avg_frame_rate, not r_frame_rate. r_frame_rate is ffmpeg's
+        "declared"/tbr rate, which for VFR or YouTube-origin sources can be
+        a multiple of the true average rate (e.g. r_frame_rate=59.94 tbr vs.
+        avg_frame_rate=29.64 for a real-world 29.64fps-average clip). This
+        value is fed to the raw-pipe decode->transform handoff as an input
+        `-r`, which forcibly re-times the piped (timestamp-less) raw frames.
+        Using the inflated r_frame_rate there compresses N real frames into
+        N/2 seconds of output -- the video plays back at ~2x speed and, once
+        muxed against the original (correctly-timed) audio track, freezes on
+        the last frame for the remainder of the audio. avg_frame_rate is the
+        honest "real frame count / real duration" rate and is what must be
+        used any time frame count is being reconciled with wall-clock time.
+        Falls back to r_frame_rate only if avg_frame_rate is unavailable
+        (e.g. "0/0", which ffprobe emits when duration is unknown).
+        """
         try:
             import subprocess
 
@@ -136,7 +152,7 @@ class StabilizeStage(BaseStage):
                     "-select_streams",
                     "v:0",
                     "-show_entries",
-                    "stream=r_frame_rate",
+                    "stream=avg_frame_rate,r_frame_rate",
                     "-of",
                     "csv=p=0",
                     input_path,
@@ -146,10 +162,20 @@ class StabilizeStage(BaseStage):
                 text=True,
             )
 
-            if result.stdout and "/" in result.stdout:
-                num, den = result.stdout.strip().split("/")
-                num, den = float(num), float(den)
-                return num / den if den else 30.0
+            if not result.stdout:
+                return 30.0
+
+            # csv order matches -show_entries order: avg_frame_rate,r_frame_rate.
+            # Prefer avg_frame_rate; fall back to r_frame_rate only if avg is
+            # missing/undefined (e.g. "0/0").
+            fields = result.stdout.strip().split(",")
+            for field in fields:
+                if "/" not in field:
+                    continue
+                num_str, den_str = field.split("/")
+                num, den = float(num_str), float(den_str)
+                if den and num:
+                    return num / den
             return 30.0
         except Exception:
             return 30.0
@@ -243,47 +269,43 @@ class StabilizeStage(BaseStage):
             self.logger.warning(f"TRF cleaning failed: {e}")
             return trf_path
 
-    def _calculate_zoom(self, trf_path: str, video_width: int, video_height: int) -> float:
-        """Calculate required zoom percentage based on movement extent in TRF file.
+    def _movement_extent(self, trf_path: str) -> float:
+        """Return the max dx/dy excursion (pixels) across all LM entries in a TRF file.
 
-        Returns:
-            Zoom percentage (negative = zoom out, positive = zoom in).
-            Returns 0 if zoom is not needed.
+        This is only used to *gate* whether digital zoom compensation is
+        worthwhile at all (via ``zoom_threshold``) -- not to compute the zoom
+        amount itself. vidstabtransform's own ``optzoom`` (see
+        ``execute()``) is used for the actual zoom amount: it operates on the
+        smoothed camera path it computes internally, which is what actually
+        determines the visible border, whereas the raw per-block LM
+        dx/dy values parsed here are frame-to-frame local-motion estimates
+        that don't reflect the cumulative/smoothed excursion vidstabtransform
+        will apply. Hand-deriving a zoom percentage from them (the previous
+        implementation) both used the wrong signal and had an inverted sign
+        (it produced values in [-20, 0], i.e. it could only zoom OUT or do
+        nothing -- vidstabtransform's `zoom` option is >0 = zoom in, <0 =
+        zoom out -- so it was structurally incapable of ever removing a
+        border).
         """
         try:
             with open(trf_path, "r") as f:
                 content = f.read()
 
-            # Extract all LM entries: (LM dx dy x y w h contrast magnitude)
             lm_pattern = r"\(LM\s+(-?\d+)\s+(-?\d+)\s+"
             matches = re.findall(lm_pattern, content)
 
             if not matches:
                 return 0.0
 
-            # Calculate movement ranges
             dx_values = [float(m[0]) for m in matches]
             dy_values = [float(m[1]) for m in matches]
 
             max_dx = max(dx_values) - min(dx_values)
             max_dy = max(dy_values) - min(dy_values)
-            max_movement = max(max_dx, max_dy)
-
-            # Only zoom if movement exceeds threshold
-            if max_movement < self._zoom_threshold:
-                return 0.0
-
-            # Calculate zoom percentage based on movement relative to frame size
-            # Aim to keep at least 80% of frame visible
-            zoom_percent = -((max_movement / min(video_width, video_height)) * 100 * 0.75)
-
-            # Clamp zoom to reasonable range (-20% to 0%)
-            zoom_percent = max(-20.0, min(0.0, zoom_percent))
-
-            return zoom_percent
+            return max(max_dx, max_dy)
 
         except Exception as e:
-            self.logger.warning(f"Zoom calculation failed: {e}")
+            self.logger.warning(f"Movement extent calculation failed: {e}")
             return 0.0
 
     def _detect_scenes(self, input_path: str, scene_threshold: float = 0.98) -> list[float]:
@@ -413,10 +435,18 @@ class StabilizeStage(BaseStage):
             # Step 2.6: Calculate zoom if needed
             self._report_progress(0.25, "Analyzing movement extent...", progress_callback)
             video_width, video_height = self._get_video_dimensions(input_path)
-            zoom_value = 0.0
+            # Whether to let vidstabtransform apply its own optimal zoom
+            # (see the `zoom_param` construction below for why we delegate
+            # the actual zoom *amount* to vidstabtransform's optzoom rather
+            # than hand-computing a percentage).
+            apply_zoom = False
             if self._zoom_enabled and needs_stab:
-                zoom_value = self._calculate_zoom(trf_path, video_width, video_height)
-                self.logger.debug(f"Zoom calculated: {zoom_value:.2f}%")
+                movement = self._movement_extent(trf_path)
+                apply_zoom = movement >= self._zoom_threshold
+                self.logger.debug(
+                    f"Movement extent: {movement:.2f}px, threshold={self._zoom_threshold}, "
+                    f"apply_zoom={apply_zoom}"
+                )
             else:
                 self.logger.debug(
                     f"Zoom skipped: enabled={self._zoom_enabled}, needs_stab={needs_stab}"
@@ -469,7 +499,23 @@ class StabilizeStage(BaseStage):
             framerate = self._get_video_framerate(input_path)
 
             crop_mode = "black" if self._zoom_mode == "black" else "keep"
-            zoom_param = f":zoom={zoom_value}:optzoom=2" if zoom_value != 0.0 else ""
+            # Delegate the actual zoom amount to vidstabtransform's built-in
+            # optzoom rather than a hand-computed percentage: optzoom
+            # operates on vidstabtransform's own smoothed camera path (the
+            # thing that actually determines the visible border after
+            # smoothing/maxshift/optalgo are applied), so it reliably
+            # eliminates borders regardless of how the raw per-block LM
+            # values in the TRF relate to the final transform. optzoom=1
+            # ("optimal static zoom") picks a single constant zoom factor
+            # sufficient to cover the worst frame in the whole clip -- no
+            # borders can ever appear, at the cost of being not-as-tight as
+            # a per-frame adaptive zoom. zoom=0 leaves the zoom amount to
+            # optzoom to decide; explicit optzoom=0 disables zoom entirely
+            # when zoom_enabled=False or movement is below zoom_threshold,
+            # preserving prior "no zoom, borders acceptable" behavior for
+            # zoom_enabled=False (vidstabtransform's own default is
+            # optzoom=1, so it must be explicitly zeroed here).
+            zoom_param = ":zoom=0:optzoom=1" if apply_zoom else ":zoom=0:optzoom=0"
 
             # Build filter chain with optional sharpening
             stab_filter = (
@@ -492,7 +538,7 @@ class StabilizeStage(BaseStage):
             self.logger.debug(
                 f"Config: smoothness={self._smoothness}, maxshift={self._maxshift}, "
                 f"zoom_enabled={self._zoom_enabled}, zoom_mode={self._zoom_mode}, "
-                f"zoom_value={zoom_value}"
+                f"apply_zoom={apply_zoom}"
             )
 
             # Use subprocess to pipe decode stdout → transform stdin
