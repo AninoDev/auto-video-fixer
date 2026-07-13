@@ -7,7 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Added
+### Changed
+- **`frame_from_tensor`/`tensor_from_frame` (`ai/torch_utils.py`) now do their elementwise
+  pre/post-processing on the GPU tensor instead of CPU numpy**, moving the device transfer to the
+  end (post-process) or start (pre-process) of each conversion instead of the middle. Found via
+  live `py-spy` profiling of a real upscale run: the CPU-side numpy postprocessing (NaN sanitize,
+  scale, clip, uint8 cast, channel reorder) was pinning a full CPU core between GPU inference
+  calls, starving the GPU (high utilization%, low effective occupancy). Bit-exact (postprocess)
+  / ULP-level-equivalent (preprocess, ~5.96e-8 max diff -- ordinary GPU-vs-CPU float rounding,
+  not a precision loss) output verified against the old implementation before landing, including
+  NaN/Inf/out-of-range edge cases. Real measured impact (old-vs-new A/B, RTX 5060 Ti): `upscale`
+  stage ~11% faster end-to-end (a 2304x1280 output frame's postprocessing alone dropped from
+  41.4ms to 2.9ms in isolation); `denoise_video`/`deblock` (scale=1, native-resolution output)
+  ~4% faster -- a smaller win since the postprocessing array is 16x smaller at native resolution
+  than at a 4x-upscaled output. See `docs/REQUIREMENTS.md`'s R5.3 for the follow-up: the
+  remaining bottleneck is architectural (frames processed fully serially, so the existing
+  prefetch/write helper threads have nothing to overlap with a frame's GPU-sync wait), not
+  further op-level tuning.
 - **`gpu.vulkan_device` (default `0`)**: selects which Vulkan physical device index the ncnn
   backend (`stages.upscale.backend: ncnn`, `stages.interpolate.backend: ncnn`) runs on. Both
   `RealESRGANUpscaler`/`RIFEInterpolator` and the stages constructing them now thread this

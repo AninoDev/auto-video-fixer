@@ -427,6 +427,41 @@ matter how many threads are spun up.
   clips, signalstats non-black checks, before/after fps numbers) — this candidate's whole
   justification is a performance number, so it needs one, not just "should be faster in theory."
 
+**Evidence backing this scope (2026-07-12, real hardware — RTX 5060 Ti)**: `frame_from_tensor`/
+`tensor_from_frame` in `ai/torch_utils.py` were rewritten first (GPU-side elementwise
+post/pre-processing instead of CPU-side numpy, before/after the H2D/D2H transfer respectively —
+bit-exact/ULP-level output verified, see the module's docstrings and `tests/unit/
+test_torch_utils.py`). Isolated timing: `frame_from_tensor` at a real 2304x1280 (4x-upscaled)
+output size went from 41.4ms to 2.9ms/call (~14x). Real end-to-end impact, both measured via an
+old-vs-new A/B at identical config (git-stashing just the fix, nothing else varying):
+- `upscale` stage, 1080p60 preset, 576x320→1920x1066 input: 300 frames, 121.4s → 108.1s
+  (**~11% faster**).
+- `denoise_video` stage (scale=1, no spatial upscaling, native 576x320 output — the "ESRGAN
+  stage" the user originally reported as CPU-bottlenecked at 14-15fps): 300 frames, 23.2s → 22.3s
+  (**~4% faster** with both `frame_from_tensor` and `tensor_from_frame` fixed) — a real but much
+  smaller win than `upscale`, because the postprocessing array is 16x smaller at native
+  resolution than at a 4x-upscaled output, so the *absolute* CPU time saved per frame is smaller
+  even though the isolated per-call speedup is the same ~14x.
+
+Five `py-spy dump` samples against the live (fixed-code) `denoise_video` process (sudo, real PID,
+zero-overhead sampling) landed: 2/5 in genuine GPU compute (`torch/nn/modules/conv.py`'s
+`_conv_forward`, i.e. the RRDBNet convolutions actually running), 2/5 in `frame_from_tensor`,
+1/5 in `tensor_from_frame` — with **both helper threads idle in every single sample** (the
+prefetch thread blocked on a full queue's `put()`, meaning it decoded ahead and is waiting for
+the main thread to consume; the writer thread blocked on an empty queue's `get()`, meaning it has
+nothing new to write). Given the isolated timing already proved `frame_from_tensor`'s own CPU
+math is now ~2.9ms, landing samples there is most plausibly catching the mandatory GPU-sync wait
+at `.cpu()` (blocking until all previously-queued CUDA kernels, including the model's own
+convolutions, finish) rather than leftover CPU-bound work — i.e. the CPU thread is idle *waiting
+for GPU compute*, with nothing scheduled to fill that wait. This is the concrete confirmation
+R5.3 targets the right problem: the existing prefetch/writer threads can't help because the main
+loop never hands them frame N+1's decode or frame N-1's write to do *while* frame N sits on the
+GPU — it processes one frame fully serially (decode→H2D→forward→sync→postprocess→write) before
+starting the next, so there's structurally nothing for the helper threads to overlap with. This
+is exactly the "true multi-stage pipeline" shape scoped above, not a numpy/torch-op-level fix —
+the two op-level fixes above are already merged and are a distinct, smaller, already-realized
+win.
+
 ### Rejected candidates (revisit only if a new non-performance reason emerges)
 
 Two other pieces of the codebase were considered during scoping and explicitly set aside — not

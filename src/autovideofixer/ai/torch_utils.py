@@ -124,13 +124,16 @@ def tensor_from_frame(
     if dtype is None:
         dtype = torch.float32
 
-    arr = frame.astype("float32", copy=False) / 255.0
-    # BGR -> RGB
-    arr = arr[:, :, ::-1]
-    # HWC -> CHW
-    arr = arr.transpose(2, 0, 1)
-    # Ensure contiguous array (torch doesn't support negative strides)
-    arr = np.ascontiguousarray(arr)
+    # Transfer the raw uint8 BGR HWC frame as-is (smallest possible payload --
+    # 1 byte/channel) and do the cast/normalize/BGR->RGB/HWC->CHW conversion on
+    # the GPU tensor AFTER the H2D copy, not before: the mirror-image fix of
+    # frame_from_tensor's GPU-side postprocessing below, for the same reason --
+    # a CPU-bound numpy elementwise pass here was profiled (py-spy against a
+    # live process) contributing to the same single-core CPU pinning that
+    # starved the GPU between inference calls. Values differ from the old
+    # CPU-numpy path by up to ~1 float32 ULP (GPU vs CPU division rounding),
+    # not a real precision loss -- see torch_utils tests.
+    arr = np.ascontiguousarray(frame)
     cpu_tensor = torch.from_numpy(arr).unsqueeze(0)
 
     if device.type == "cuda":
@@ -140,9 +143,13 @@ def tensor_from_frame(
         # then lets this H2D copy overlap with other CUDA-stream work queued
         # around it instead of forcing a host/device sync at every frame.
         cpu_tensor = cpu_tensor.pin_memory()
-        tensor = cpu_tensor.to(device=device, dtype=dtype, non_blocking=True)
+        tensor = cpu_tensor.to(device=device, non_blocking=True)
     else:
-        tensor = cpu_tensor.to(device=device, dtype=dtype)
+        tensor = cpu_tensor.to(device=device)
+
+    tensor = tensor[:, :, :, [2, 1, 0]]  # BGR -> RGB
+    tensor = tensor.permute(0, 3, 1, 2).contiguous()  # HWC -> CHW
+    tensor = tensor.to(dtype=dtype).div(255.0)
     return tensor
 
 
@@ -154,23 +161,37 @@ def frame_from_tensor(tensor: Any, scale: float = 1.0) -> "Any":  # numpy array
         scale: Output scale factor (output_h = input_h * scale).
 
     Returns:
-        numpy array of shape (H_out, W_out, 3) in RGB, uint8.
+        numpy array of shape (H_out, W_out, 3) in BGR, uint8.
     """
-    import numpy as np
     import torch
 
-    tensor = tensor.detach().cpu()
     if scale != 1.0:
         tensor = torch.nn.functional.interpolate(
             tensor, scale_factor=scale, mode="bilinear", align_corners=False
         )
 
-    arr = tensor.squeeze(0).numpy().transpose(1, 2, 0)
-    # RGB -> BGR for OpenCV
-    arr = arr[:, :, ::-1]
-    # Sanitize NaN/Inf before clipping
-    arr = np.nan_to_num(arr, nan=0.0, posinf=1.0, neginf=0.0)
-    arr = np.clip(arr * 255.0, 0.0, 255.0).astype("uint8")
+    # All elementwise post-processing (NaN/Inf sanitize, [0,1]->[0,255] scale+clip,
+    # uint8 cast, RGB->BGR channel reorder, NCHW->NHWC layout) runs on the GPU tensor
+    # BEFORE the device-to-host transfer, not after -- profiling a real upscale run
+    # (py-spy dump against a live process) showed this function's old numpy-based
+    # postprocessing pinning a full CPU core between inference calls, starving the GPU
+    # (high utilization%, but low "effective" SM occupancy in nvtop -- the GPU was idle
+    # waiting for the CPU-bound conversion of the PREVIOUS frame before the next
+    # inference call could be issued). Two wins from moving this to torch/GPU ops:
+    # the elementwise math itself runs across thousands of CUDA cores instead of one
+    # CPU core running un-vectorized numpy passes over a negative-stride (reversed
+    # channel) view, and the eventual .cpu() transfer moves 1 byte/channel (uint8)
+    # instead of 4 (float32), cutting the PCIe transfer volume 4x too. Op order
+    # (interpolate -> nan_to_num -> clamp+scale+cast -> channel/layout reorder)
+    # matches the previous numpy implementation exactly, including nan_to_num's
+    # posinf/neginf substitution values being in normalized [0,1] space (applied
+    # before the *255 scale, same as before) and the uint8 cast truncating rather
+    # than rounding (matching numpy .astype("uint8")'s truncation, not round-to-nearest).
+    tensor = torch.nan_to_num(tensor, nan=0.0, posinf=1.0, neginf=0.0)
+    tensor = tensor.clamp(0.0, 1.0).mul(255.0).to(torch.uint8)
+    tensor = tensor[:, [2, 1, 0], :, :].permute(0, 2, 3, 1).contiguous().squeeze(0)
+
+    arr = tensor.detach().cpu().numpy()
     return arr
 
 
