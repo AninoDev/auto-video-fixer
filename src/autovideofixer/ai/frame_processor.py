@@ -12,6 +12,8 @@ import os
 import queue
 import tempfile
 import threading
+import time
+from contextlib import contextmanager
 from typing import Any, Generator, Iterable, Iterator
 
 import cv2
@@ -19,13 +21,164 @@ import cv2
 _logger: Any = None
 
 
-def _get_logger():
+def _get_logger() -> Any:
     global _logger
     if _logger is None:
         from autovideofixer.logger import get_logger
 
         _logger = get_logger("autovideofixer.ai.frame_processor")
     return _logger
+
+
+class StageTimer:
+    """Lightweight per-phase timing + throughput logging for the AI stage frame loop.
+
+    Shared by the `upscale`/`deblock`/`denoise_video` stages, which all use one
+    common chunked-streaming loop shape: decode-wait (blocked pulling the next
+    chunk from the prefetch iterator) -> H2D+preprocess (`tensor_from_frame(s)`)
+    -> GPU-forward (the model call itself) -> D2H+postprocess
+    (`frame_from_tensor(s)`) -> write-wait (blocked handing the chunk to the
+    async writer). Deliberately cheap: `time.perf_counter()` only, no
+    allocation-heavy machinery, safe to leave on unconditionally.
+
+    Per-chunk phase breakdown logs at DEBUG. An aggregate percentage-of-total
+    breakdown logs at INFO once via `summary()` when the stage finishes.
+    Periodic throughput (`frames_done`, `elapsed_sec`, `current_fps`) logs at
+    INFO roughly every `interval_sec` seconds or `interval_chunks` chunks,
+    whichever comes first -- specifically so a run killed early (e.g. by an
+    external timeout, as happened to a since-retracted 4K benchmark -- see
+    docs/REQUIREMENTS.md's R5.3 note) still yields a valid frames/sec curve
+    instead of nothing.
+    """
+
+    PHASES = ("decode_wait", "h2d_preprocess", "gpu_forward", "d2h_postprocess", "write_wait")
+
+    def __init__(
+        self,
+        stage_name: str,
+        logger: Any = None,
+        interval_sec: float = 10.0,
+        interval_chunks: int = 10,
+    ):
+        self._stage_name = stage_name
+        self._logger = logger if logger is not None else _get_logger()
+        self._interval_sec = interval_sec
+        self._interval_chunks = interval_chunks
+        self._totals: dict[str, float] = dict.fromkeys(self.PHASES, 0.0)
+        self._cur: dict[str, float] = {}
+        self._frames_done = 0
+        self._chunks_done = 0
+        self._t_start = time.perf_counter()
+        self._t_last_report = self._t_start
+        self._chunks_since_report = 0
+
+    @contextmanager
+    def phase(self, name: str) -> Generator[None, None, None]:
+        """Time a block of code and attribute it to phase `name`."""
+        t0 = time.perf_counter()
+        try:
+            yield
+        finally:
+            self.record(name, time.perf_counter() - t0)
+
+    def record(self, name: str, seconds: float) -> None:
+        """Attribute an already-measured duration (e.g. a CUDA-event delta) to phase `name`."""
+        self._totals[name] = self._totals.get(name, 0.0) + seconds
+        self._cur[name] = self._cur.get(name, 0.0) + seconds
+
+    def end_chunk(self, n_frames: int) -> None:
+        """Call once per chunk after all its phases have been recorded."""
+        self._frames_done += n_frames
+        self._chunks_done += 1
+        self._chunks_since_report += 1
+
+        if self._cur:
+            detail = ", ".join(f"{k}={v * 1000:.1f}ms" for k, v in self._cur.items())
+            self._logger.debug(
+                "%s chunk #%d (%d frames): %s",
+                self._stage_name,
+                self._chunks_done,
+                n_frames,
+                detail,
+            )
+        self._cur = {}
+
+        now = time.perf_counter()
+        if (
+            now - self._t_last_report >= self._interval_sec
+            or self._chunks_since_report >= self._interval_chunks
+        ):
+            elapsed = now - self._t_start
+            fps = self._frames_done / elapsed if elapsed > 0 else 0.0
+            self._logger.info(
+                "%s throughput: frames_done=%d elapsed_sec=%.1f current_fps=%.2f",
+                self._stage_name,
+                self._frames_done,
+                elapsed,
+                fps,
+            )
+            self._t_last_report = now
+            self._chunks_since_report = 0
+
+    def summary(self) -> None:
+        """Log an aggregate percentage-of-total phase breakdown at INFO. Call once, at the end."""
+        elapsed = time.perf_counter() - self._t_start
+        total = sum(self._totals.values())
+        fps = self._frames_done / elapsed if elapsed > 0 else 0.0
+        if total > 0:
+            breakdown = ", ".join(
+                f"{k}={v:.1f}s ({100.0 * v / total:.0f}%)" for k, v in self._totals.items()
+            )
+        else:
+            breakdown = "no phase data recorded"
+        self._logger.info(
+            "%s finished: frames=%d elapsed_sec=%.1f avg_fps=%.2f phase_breakdown: %s",
+            self._stage_name,
+            self._frames_done,
+            elapsed,
+            fps,
+            breakdown,
+        )
+
+
+@contextmanager
+def gpu_forward_timer(device: Any) -> Generator[Any, None, None]:
+    """Bracket a GPU forward pass, yielding an object whose `.elapsed_sec` is set on exit.
+
+    Uses a `torch.cuda.Event` pair for honest device-side timing when `device`
+    is a CUDA device (the event pair straddles the actual queued GPU work and
+    the trailing `.synchronize()` waits for it to really finish, unlike a bare
+    wall-clock measurement which would just measure kernel-launch/enqueue
+    time). Falls back to plain `time.perf_counter()` wall time for CPU/MPS
+    devices or when `device` is None.
+    """
+
+    class _Result:
+        elapsed_sec = 0.0
+
+    result = _Result()
+    is_cuda = device is not None and getattr(device, "type", None) == "cuda"
+    if is_cuda:
+        import torch
+
+        # torch's compiled Event class isn't typed as a callable constructor
+        # in the installed stubs -- these are ordinary CUDA event objects,
+        # not a typing problem with the logic itself.
+        start_evt: Any = torch.cuda.Event(enable_timing=True)  # type: ignore[no-untyped-call]
+        end_evt: Any = torch.cuda.Event(enable_timing=True)  # type: ignore[no-untyped-call]
+        start_evt.record()
+        try:
+            yield result
+        finally:
+            end_evt.record()
+            end_evt.synchronize()
+            result.elapsed_sec = start_evt.elapsed_time(end_evt) / 1000.0
+    else:
+        t0 = time.perf_counter()
+        try:
+            yield result
+        finally:
+            result.elapsed_sec = time.perf_counter() - t0
 
 
 class PrefetchIterator:
@@ -314,6 +467,8 @@ class FrameProcessor:
         output_path: str,
         fps: float = 30.0,
         codec: str = "libx264",
+        crf: int | None = None,
+        preset: str | None = None,
     ) -> bool:
         """Write frames to a video file using FFmpeg.
 
@@ -322,6 +477,13 @@ class FrameProcessor:
             output_path: Path to output video file.
             fps: Frames per second.
             codec: FFmpeg video codec.
+            crf: Explicit CRF (quality) to pass to the encoder. `None` leaves
+                it unset, i.e. the encoder's own default (libx264: CRF 23) --
+                see AI stages' `temp_crf` config, which pass this explicitly
+                so the internal temp encode isn't a hidden low-quality
+                generation ahead of the stage's mux pass.
+            preset: Explicit encoder preset (e.g. "medium"). `None` leaves it
+                unset (encoder default).
 
         Returns:
             True if successful.
@@ -350,6 +512,12 @@ class FrameProcessor:
             "-",
             "-c:v",
             codec,
+        ]
+        if crf is not None:
+            cmd += ["-crf", str(crf)]
+        if preset is not None:
+            cmd += ["-preset", preset]
+        cmd += [
             "-pix_fmt",
             "yuv420p",
             output_path,
@@ -453,10 +621,29 @@ class StreamingVideoWriter:
         ok = writer.close()
     """
 
-    def __init__(self, output_path: str, fps: float = 30.0, codec: str = "libx264"):
+    def __init__(
+        self,
+        output_path: str,
+        fps: float = 30.0,
+        codec: str = "libx264",
+        crf: int | None = None,
+        preset: str | None = None,
+    ):
+        """
+        Args:
+            crf: Explicit CRF (quality) to pass to the encoder. `None` leaves
+                it unset (encoder default, e.g. libx264's CRF 23) -- AI
+                stages pass `stages.<name>.temp_crf` explicitly here so this
+                internal temp encode isn't a hidden low-quality generation
+                ahead of the stage's own mux pass.
+            preset: Explicit encoder preset (e.g. "medium"). `None` leaves it
+                unset (encoder default).
+        """
         self._output_path = output_path
         self._fps = fps
         self._codec = codec
+        self._crf = crf
+        self._preset = preset
         self._proc: Any = None
         self._failed = False
 
@@ -486,6 +673,12 @@ class StreamingVideoWriter:
                 "-",
                 "-c:v",
                 self._codec,
+            ]
+            if self._crf is not None:
+                cmd += ["-crf", str(self._crf)]
+            if self._preset is not None:
+                cmd += ["-preset", self._preset]
+            cmd += [
                 "-pix_fmt",
                 "yuv420p",
                 self._output_path,

@@ -27,6 +27,8 @@ dependencies = [
     "rich>=13.0",
     "opencv-python-headless>=4.8",
     "numpy>=1.24",
+    "avf-scenes",
+    "avf-hashing",
 ]
 
 [project.optional-dependencies]
@@ -109,3 +111,13 @@ ignore_missing_imports = true
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/autovideofixer"]
+
+[tool.uv.workspace]
+members = [
+    "rust/avf_scenes",
+    "rust/avf_hashing",
+]
+
+[tool.uv.sources]
+avf-scenes = { workspace = true, editable = true }
+avf-hashing = { workspace = true, editable = true }

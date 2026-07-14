@@ -329,7 +329,33 @@ a pure-Python fallback path kept ONLY if compiling the extension turns out to me
 complicate the install story on a target platform (decide per-target during implementation, not
 speculatively now).
 
-### R5.1 Scene-detection frame differencing
+### R5.1 Scene-detection frame differencing [IMPLEMENTED 2026-07-13]
+
+**Landed as**: `rust/avf_scenes/` (PyO3 + maturin crate, `uv.lock` workspace member) exposing
+`avf_scenes.detect_scene_changes_rs(filepath, threshold, min_duration_sec, ffmpeg_path,
+ffprobe_path, progress_callback) -> (scenes, cut_scores, near_misses)`. `_detect_scene_changes()`
+in `core/analysis.py` dispatches to it when the extension imports successfully
+(`_detect_scene_changes_rust`), otherwise falls back to the original pure-Python/OpenCV loop
+(renamed `_detect_scene_changes_python`, kept verbatim) — both share the same cut-score/near-miss
+logging in the dispatcher. Decode is a piped `ffmpeg -f rawvideo -pix_fmt gray` subprocess
+(`-vf format=gray,scale=320:180:flags=bilinear`) rather than an `ffmpeg-next`/`ac-ffmpeg` binding,
+per this section's stated preference — zero new runtime dependencies, consistent with the rest of
+the project's FFmpeg-subprocess architecture. The Rust side releases the GIL for the whole
+decode/diff loop (`Python::detach`) and only reacquires it (`Python::attach`) to fire the
+progress callback, matching the "true multithreaded decode+diff, not GIL-bound" motivation below.
+
+**Verification performed**: `TestRustPythonParity` (`tests/unit/test_scene_detection.py`) is a
+direct differential test — same calibration fixture plus a synthetic pan+hard-cut motion clip,
+asserting identical scene boundary counts/timestamps (0.05s tolerance) and confidence values
+(0.01 tolerance) between `_detect_scene_changes_python` and `_detect_scene_changes_rust`. Measured
+per-cut `diff_score` divergence: at most ~0.002 on the calibration fixture (decode/scale path
+difference: ffmpeg's bilinear `scale`+`format=gray` vs. OpenCV's `INTER_LINEAR` `resize` + BT.601
+`cvtColor` — both approximate the same luma transform slightly differently). Real-world speed on a
+54s/1620-frame 1080p60 clip (`avf analyze`, single-shot content): Python 2.55s (~635 fps) vs. Rust
+1.73s (~936 fps), ~1.5x wall-clock. `cargo clippy`/`cargo fmt --check` clean.
+
+**Original scope** (for reference — target file/line, current-shape rationale, interface, and
+verification bar as originally planned; see "Landed as" above for what actually shipped):
 
 **Target**: `_detect_scene_changes()` in `core/analysis.py` (~line 1140) — the per-frame loop
 backing `avf analyze`'s scene detection and the scene-based processing pipeline's (`core/
@@ -358,7 +384,72 @@ directly gates how usable that whole feature is on long videos.
   recently-calibrated, security/correctness-adjacent path (scene-based processing depends on it
   being right, not just fast), so a rewrite must not silently drift the detection behavior.
 
-### R5.2 Perceptual hashing / duplicate detection
+### R5.2 Perceptual hashing / duplicate detection [IMPLEMENTED 2026-07-13]
+
+**Landed as**: `rust/avf_hashing/` (PyO3 + maturin crate, `[tool.uv.workspace]` member, same
+build/lazy-import/fallback pattern as `avf_scenes`/R5.1) exposing `avf_hashing.compute_phash_rs
+(filepath, num_frames, ffmpeg_path, ffprobe_path) -> str` and `avf_hashing.hash_similarity_rs
+(hash1, hash2) -> float`. `compute_video_hash()`/`compute_video_dhash()`/`hash_similarity()` in
+`core/analysis.py` are **replaced wholesale** (not kept alongside) by `compute_video_phash()`
+(dispatches to the Rust extension when importable, else a pure-NumPy fallback implementing the
+identical algorithm) and an updated `hash_similarity()` operating on 16-character hex pHash
+strings.
+
+**Algorithm deviation from the original scope (the significant design decision here)**: the
+section below originally scoped a straight ahash/dhash *port*, evaluating the `img_hash` crate as
+a pre-built implementation. Since this feature has never shipped hash values anyone depends on
+(confirmed with the user 2026-07-12), the port constraint was dropped in favor of picking the best
+algorithm outright: **pHash** (DCT-based perceptual hash), hand-rolled in Rust rather than via
+`img_hash`. Two reasons:
+
+1. **Accuracy**: ahash (mean-threshold) and dhash (adjacent-pixel gradient) are spatial-domain
+   hashes, sensitive to exactly the pixel-level noise real near-duplicate video files have
+   (re-encode artifacts, resize/crop shifts, color-grading tweaks). pHash instead thresholds the
+   low-frequency 2D DCT coefficients of the downscaled frame, which encode coarse picture
+   structure and are naturally robust to that kind of high-frequency noise — the standard choice
+   when accuracy, not raw speed, is the goal (and speed stopped being a real constraint the moment
+   this became compiled Rust code, regardless of which algorithm was picked).
+2. **`img_hash` was evaluated and rejected**: it operates on `image::GenericImageView`, so using
+   it would pull in the `image` crate and its per-format codec dependencies (~24 transitive crates
+   as of this writing) purely to wrap raw grayscale bytes this crate already gets from its own
+   ffmpeg pipe — image *decoding* isn't a need here, ffmpeg already handles it upstream. pHash
+   itself is small and well-understood enough (downscale, 2D DCT, threshold the low-frequency
+   block against its own mean) that hand-rolling it avoided that dependency weight for no loss of
+   correctness. See `rust/avf_hashing/src/lib.rs`'s module docstring for the full writeup.
+
+Frame sampling stays conceptually the same as before (`num_frames`, default 30, evenly spaced
+across the video), and per-frame hashes still combine into one video-level hash via majority-vote
+bit combination — both were kept because they're still reasonable choices with no format to
+preserve, not because of a compatibility requirement.
+
+**Config**: `analysis.duplicate_detection.hash_type` (`perceptual`/`dhash`/`combined` in
+`config.py`/`docs/config.example.yaml`) is **removed** — it was never read by any call site
+(`find_similar()`/`find_duplicates()`/the CLI only ever used `similarity_threshold`), and doesn't
+map onto a single-algorithm design. `similarity_threshold`'s default changed from `0.95` to
+`0.85`, recalibrated against real measured pHash similarity scores (see "Verification performed"
+below) rather than carried over from the old ahash/dhash-tuned default.
+
+**Verification performed**: `tests/unit/test_hashing.py` — real ffmpeg-generated fixtures, not
+just hash-math unit tests. `TestHashSeparation` builds genuine near-duplicates (one `testsrc2`
+source re-encoded at CRF 18 vs. CRF 32, at 320x240 vs. 160x120, and trimmed ~0.3s off the start)
+and genuine non-duplicates (four distinct lavfi sources: `testsrc2`, `smptebars`, solid red,
+`mandelbrot`), asserting the near-duplicate pairs score >= the 0.85 default threshold and the
+non-duplicate pairs (including cross-comparing each source's own near-duplicate variants against
+each other, not just against their own base) score below it. Measured similarity scores: near-
+duplicate pairs ranged 0.9375-1.0; non-duplicate pairs ranged 0.3438-0.5781 — a wide margin on
+both sides of 0.85. `TestRustPythonHashParity` confirms the Rust extension and pure-Python
+fallback agree closely (>= 0.85 similarity hashing the same video) despite decoding frames via
+different paths (ffmpeg `select` filter vs. `cv2.VideoCapture` seeking) that land on slightly
+different sampled frames — full bit-for-bit equality isn't the right bar here, unlike R5.1's
+frame-differencing parity test, since neither decode path is "the reference" the other must match
+exactly. Speed (secondary to accuracy per this section's original verification bar): comparable
+between the Rust and Python paths for small (a few seconds, num_frames=30) test clips — both are
+dominated by ffmpeg/OpenCV subprocess and decode overhead at this scale rather than the hash math
+itself, which is cheap either way once frames are in hand.
+
+**Original scope** (for reference — target file/line and originally-planned interface/verification
+bar; see "Landed as" and the algorithm-deviation writeup above for what actually shipped and why it
+differs):
 
 **Target**: `compute_video_hash()` (ahash, ~line 1843) and `compute_video_dhash()` (dhash, ~line
 1900) in `core/analysis.py`, backing `avf find-duplicates`. Both build their hash bit-string with
@@ -403,6 +494,53 @@ of a literal ahash/dhash port:
   threshold. Don't just benchmark speed; confirm the accuracy case this feature exists for.
 
 ### R5.3 Chunked AI frame I/O overlap
+
+> **2026-07-13 reprioritization note**: live-monitoring a real production job (RTX 5060 Ti,
+> `nvidia-smi --query-gpu=utilization.gpu` sampled every second for 40s during `deblock`) found
+> GPU utilization pinned near 100% almost continuously, meaning there's little idle GPU time left
+> for R5.3's I/O-overlap approach to reclaim for *that* stage. Separately, the actual real-world
+> job that prompted this investigation was a single 4K (3840x2160) input stuck in `deblock` for
+> hours -- at that resolution every frame takes the tiled-inference path (`run_tiled_inference`,
+> `ai/wrappers/upscale.py`), which at the default `tile_size=512` needs a 5x8=40-tile grid
+> processed one tile at a time: 40 small sequential forward passes per frame, each paying Python/
+> kernel-launch/host-device-sync overhead. That -- not I/O overlap -- is almost certainly the
+> dominant real-world cost for large-resolution jobs, and was closed by adding
+> `tile_batch_size` (batches same-shaped tiles from `compute_tile_grid` into fewer, larger forward
+> calls; see `RealESRGANUpscaler`/`run_tiled_inference` in `ai/wrappers/upscale.py` and the
+> `stages.{upscale,deblock,denoise_video}.tile_batch_size` config key) plus a whole-*frame*
+> `batch_size` for videos small enough to skip tiling entirely (`RealESRGANUpscaler.upscale_batch`/
+> `upscale_video`). R5.3 is not superseded -- 100% GPU utilization with only ~70-80% SM occupancy
+> (per `nvtop`) is still consistent with I/O/CPU-side stalls between kernel launches on top of the
+> now-fixed small-batch-launch overhead -- but it's de-prioritized below the tile/frame batching
+> fix above, which was the higher-leverage, lower-complexity win for the actual reported workload.
+>
+> **2026-07-13 correction -- the "real-4K benchmark result" below was invalid; retracted**: the
+> A/B described in the previous version of this note (tile_batch_size 1/4/8 against a real
+> 3840x2160/150-frame clip through `deblock --ai`) was run under `timeout 400` (6m40s). All three
+> runs were killed by that timeout at exactly 6m40.3-6m40.4s -- none of them reached a completion
+> marker, and all three output directories were empty. The "virtually identical wall-clock time"
+> finding was therefore an artifact of the runs being cut off at the same external time limit, not
+> a measurement of anything about tile batching's effect on throughput. **The throughput
+> conclusions in that note (tile/frame batching "did not measurably help" a real 4K workload) are
+> void and must not be relied on.** A corrected, untruncated 4K measurement is tracked as Phase 0
+> item 3 of the R5.3 quick-wins-then-Rust plan; do not re-cite the numbers below as evidence until
+> that rerun lands.
+>
+> What remains valid from those three (truncated) runs, since it doesn't depend on how long they
+> ran: (a) `sys` time was a high share (~3m50-3m55s out of the ~6m40s each run reached) across all
+> three -- worth investigating, but the previous note's attribution of that share to raw-frame
+> I/O/marshalling overhead was speculation, not measurement; CUDA's blocking-sync driver ioctls
+> also show up as `sys` time and haven't been ruled out as a contributor. (b) The batched runs
+> (`tile_batch_size` 4 and 8) both hit CUDA OOM cascades roughly 4 minutes in, while the unbatched
+> baseline (`tile_batch_size=1`) ran clean up to the point it too was killed at 6m40s. That
+> asymmetry is real and is consistent with (not proof of, but a useful lead toward) the OOM-retry
+> tensor-lifetime defect fixed in Phase 1.2 of the R5.3 plan (`_infer_group` keeping the failed
+> batch tensor alive across the halving retry, and remainder-batch shape fragmentation).
+>
+> R5.3 (the Rust `avf_framepipe` transport rewrite) is not decided by this note either way --
+> its case rests on the architecture gap (Python `threading`/GIL vs. real OS threads) documented
+> above, not on the retracted A/B. A valid conclusion about whether transport or compute dominates
+> the real 4K budget requires the corrected, untruncated measurement.
 
 **Target**: `PrefetchIterator` and `AsyncVideoWriter` in `ai/frame_processor.py` (`stream_frames_prefetched`,
 ~line 247), the background-thread decode-prefetch / async-write machinery added to keep the GPU

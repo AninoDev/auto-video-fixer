@@ -6,6 +6,8 @@ from autovideofixer.ai.frame_processor import (
     AsyncVideoWriter,
     FrameProcessor,
     PrefetchIterator,
+    StageTimer,
+    gpu_forward_timer,
 )
 
 
@@ -198,3 +200,89 @@ class TestAsyncVideoWriter:
         writer.write([1])
         with pytest.raises(RuntimeError, match="pipe broke"):
             writer.close()
+
+
+class TestStageTimer:
+    """Tests for the AI-stage per-phase timing + periodic throughput helper."""
+
+    def test_phase_records_wall_time(self):
+        import time as _time
+
+        timer = StageTimer("test_stage", interval_sec=9999, interval_chunks=9999)
+        with timer.phase("decode_wait"):
+            _time.sleep(0.01)
+        timer.end_chunk(5)
+        assert timer._totals["decode_wait"] >= 0.01
+        assert timer._frames_done == 5
+        assert timer._chunks_done == 1
+
+    def test_record_accumulates_across_chunks(self):
+        timer = StageTimer("test_stage", interval_sec=9999, interval_chunks=9999)
+        timer.record("gpu_forward", 0.1)
+        timer.end_chunk(2)
+        timer.record("gpu_forward", 0.2)
+        timer.end_chunk(3)
+        assert timer._totals["gpu_forward"] == pytest.approx(0.3)
+        assert timer._frames_done == 5
+
+    def test_end_chunk_logs_debug_and_throughput_at_interval(self, caplog):
+        logger = __import__("logging").getLogger("test.stage_timer")
+        caplog.set_level("DEBUG", logger="test.stage_timer")
+        # interval_chunks=1 forces an INFO throughput line on every chunk.
+        timer = StageTimer("test_stage", logger=logger, interval_sec=9999, interval_chunks=1)
+        timer.record("decode_wait", 0.01)
+        timer.end_chunk(10)
+
+        debug_records = [r for r in caplog.records if r.levelname == "DEBUG"]
+        info_records = [r for r in caplog.records if r.levelname == "INFO"]
+        assert any("chunk #1" in r.getMessage() for r in debug_records)
+        assert any("throughput" in r.getMessage() for r in info_records)
+        assert any("frames_done=10" in r.getMessage() for r in info_records)
+
+    def test_summary_logs_percentage_breakdown(self, caplog):
+        logger = __import__("logging").getLogger("test.stage_timer.summary")
+        caplog.set_level("INFO", logger="test.stage_timer.summary")
+        timer = StageTimer("test_stage", logger=logger)
+        timer.record("decode_wait", 1.0)
+        timer.record("gpu_forward", 3.0)
+        timer.end_chunk(4)
+        timer.summary()
+
+        summary_records = [
+            r for r in caplog.records if r.levelname == "INFO" and "finished" in r.getMessage()
+        ]
+        assert len(summary_records) == 1
+        msg = summary_records[0].getMessage()
+        assert "frames=4" in msg
+        assert "gpu_forward=3.0s (75%)" in msg
+        assert "decode_wait=1.0s (25%)" in msg
+
+    def test_summary_with_no_phase_data_does_not_crash(self):
+        timer = StageTimer("test_stage")
+        timer.summary()  # must not raise (division-by-zero guarded)
+
+
+class TestGpuForwardTimer:
+    """Tests for gpu_forward_timer's CPU/no-device wall-time fallback path.
+
+    The CUDA-Event branch is exercised indirectly by
+    TestPinnedStagingPoolCudaCorrectness / the real-model integration tests
+    elsewhere -- this only covers the always-available fallback.
+    """
+
+    def test_none_device_uses_wall_time(self):
+        import time as _time
+
+        with gpu_forward_timer(None) as result:
+            _time.sleep(0.01)
+        assert result.elapsed_sec >= 0.01
+
+    def test_cpu_device_uses_wall_time(self):
+        import time as _time
+
+        class _FakeDevice:
+            type = "cpu"
+
+        with gpu_forward_timer(_FakeDevice()) as result:
+            _time.sleep(0.01)
+        assert result.elapsed_sec >= 0.01

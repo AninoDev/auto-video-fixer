@@ -6,6 +6,13 @@ resolution-markers = [
     "python_full_version < '3.15'",
 ]
 
+[manifest]
+members = [
+    "auto-video-fixer",
+    "avf-hashing",
+    "avf-scenes",
+]
+
 [[package]]
 name = "ast-serialize"
 version = "0.6.0"
@@ -52,6 +59,8 @@ name = "auto-video-fixer"
 version = "0.3.0"
 source = { editable = "." }
 dependencies = [
+    { name = "avf-hashing" },
+    { name = "avf-scenes" },
     { name = "click" },
     { name = "numpy" },
     { name = "opencv-python-headless" },
@@ -89,6 +98,8 @@ ncnn = [
 [package.metadata]
 requires-dist = [
     { name = "auto-video-fixer", extras = ["gui", "ai", "ncnn"], marker = "extra == 'all'" },
+    { name = "avf-hashing", editable = "rust/avf_hashing" },
+    { name = "avf-scenes", editable = "rust/avf_scenes" },
     { name = "click", specifier = ">=8.0" },
     { name = "mypy", marker = "extra == 'dev'", specifier = ">=1.0" },
     { name = "ncnn", marker = "extra == 'ncnn'", specifier = ">=1.0.20221128" },
@@ -106,6 +117,14 @@ requires-dist = [
     { name = "torchvision", marker = "extra == 'ai'", specifier = ">=0.15" },
 ]
 provides-extras = ["gui", "ai", "ncnn", "all", "dev"]
+
+[[package]]
+name = "avf-hashing"
+source = { editable = "rust/avf_hashing" }
+
+[[package]]
+name = "avf-scenes"
+source = { editable = "rust/avf_scenes" }
 
 [[package]]
 name = "certifi"

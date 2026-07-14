@@ -633,7 +633,10 @@ class InterpolateStage(BaseStage):
                 source_fps = current_fps if current_fps else self._get_input_fps(input_path)
                 fps = source_fps * factor
                 proc2 = FrameProcessor()
-                if not proc2.frames_to_video(interpolated, temp_path, fps=fps):
+                temp_crf = self._stage_config.get("temp_crf", 16)
+                if not proc2.frames_to_video(
+                    interpolated, temp_path, fps=fps, crf=temp_crf, preset="medium"
+                ):
                     proc2.close()
                     return StageResult(
                         status=StageStatus.FAILED,
@@ -648,13 +651,21 @@ class InterpolateStage(BaseStage):
                 # previously never checked, so that failure was silently
                 # reported as a completed job after deleting the only rendered
                 # content. Branch on whether an audio stream actually exists.
+                #
+                # -c:v copy: the temp file above was already encoded once (at
+                # temp_crf/"medium") -- re-encoding it AGAIN here at a
+                # different crf (this used to be "-crf 18") was a second
+                # lossy generation plus a wasted full x264 pass over the
+                # whole video. Stream-copying the already-encoded video track
+                # makes this mux bit-identical to the temp file's video
+                # stream.
                 has_audio = probe_info.has_audio
                 mux_args = ["-i", input_path, "-i", temp_path]
                 if has_audio:
                     mux_args += ["-map", "0:a:0", "-map", "1:v:0"]
                 else:
                     mux_args += ["-map", "1:v:0"]
-                mux_args += ["-c:v", "libx264", "-crf", "18", "-c:a", "copy", "-y", output_path]
+                mux_args += ["-c:v", "copy", "-c:a", "copy", "-y", output_path]
 
                 mux_result = run_ffmpeg(mux_args, timeout=600)
 

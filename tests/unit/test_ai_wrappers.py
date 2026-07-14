@@ -213,6 +213,115 @@ class TestRealESRGANNotBlackRegression:
         )
 
 
+@pytest.mark.integration
+class TestBatchedInferenceRealGPUCorrectness:
+    """Real-GPU numeric-equivalence checks for batch_size and tile_batch_size.
+
+    Skips (does not fail) if no cached checkpoint or no CUDA device is
+    available -- same pattern as TestRealESRGANNotBlackRegression above.
+    Verifies, on a real forward pass through the real model:
+      - Frame order is preserved exactly through the batch/split round-trip
+        (distinguishable per-frame colors).
+      - Tail handling (frame count not evenly divisible by batch size).
+      - batch_size > 1 output is numerically close to batch_size=1 (small
+        floating-point differences from different cuDNN algorithm selection
+        are expected and fine; a structural/order-scrambling bug is not).
+    """
+
+    def _distinguishable_frames(self, n: int, size: int = 64):
+        import numpy as np
+
+        frames = []
+        for i in range(n):
+            f = np.zeros((size, size, 3), dtype="uint8")
+            f[:, :, 0] = (i * 23) % 256
+            f[:, :, 1] = (i * 47 + 7) % 256
+            f[:, :, 2] = (i * 91 + 13) % 256
+            frames.append(f)
+        return frames
+
+    def test_whole_frame_batch_size_matches_single_frame_path(self):
+        model_name = _real_esrgan_model_cached()
+        if model_name is None:
+            pytest.skip("No cached Real-ESRGAN checkpoint available for a real forward pass")
+        import torch
+
+        if not torch.cuda.is_available():
+            pytest.skip("CUDA not available for real batched-inference verification")
+        import numpy as np
+
+        frames = self._distinguishable_frames(10)  # not evenly divisible by 4 or 8
+
+        outputs: dict[int, list] = {}
+        for bs in (1, 4, 8):
+            upscaler = RealESRGANUpscaler(
+                scale=2, model_name=model_name, device_preference="cuda", batch_size=bs
+            )
+            assert upscaler.load_model(), f"Failed to load {model_name}"
+            try:
+                outputs[bs] = upscaler.upscale_video(frames)
+            finally:
+                upscaler.unload()
+            assert len(outputs[bs]) == 10, f"batch_size={bs}: frame count changed"
+
+        baseline = outputs[1]
+        for bs in (4, 8):
+            max_diffs = [
+                int(np.abs(a.astype(int) - b.astype(int)).max())
+                for a, b in zip(baseline, outputs[bs])
+            ]
+            overall_max = max(max_diffs)
+            print(f"[whole-frame batch_size={bs}] max-abs-diff vs batch_size=1: {overall_max}")
+            # "Small enough" = a handful of uint8 levels from cuDNN algorithm
+            # selection differences, not a structural/order-scrambling bug.
+            assert overall_max <= 12, (
+                f"batch_size={bs} output diverged too far from batch_size=1 "
+                f"(max_diff={overall_max}) -- looks like a correctness bug, not FP noise"
+            )
+
+    def test_tile_batch_size_matches_single_tile_path(self):
+        model_name = _real_esrgan_model_cached()
+        if model_name is None:
+            pytest.skip("No cached Real-ESRGAN checkpoint available for a real forward pass")
+        import torch
+
+        if not torch.cuda.is_available():
+            pytest.skip("CUDA not available for real batched-inference verification")
+        import numpy as np
+
+        # Force tiling on a frame well above AUTO_TILE_THRESHOLD_PX so the
+        # tile_batch_size path is actually exercised.
+        frame = np.zeros((1200, 1600, 3), dtype="uint8")
+        frame[:600, :, 0] = 180
+        frame[600:, :, 1] = 160
+        frame[:, 700:900, 2] = 255
+
+        outputs = {}
+        for tbs in (1, 4, 8):
+            upscaler = RealESRGANUpscaler(
+                scale=1,
+                model_name=model_name,
+                device_preference="cuda",
+                tile_size=256,
+                tile_overlap=16,
+                tile_batch_size=tbs,
+            )
+            assert upscaler.load_model(), f"Failed to load {model_name}"
+            try:
+                outputs[tbs] = upscaler.upscale(frame)
+            finally:
+                upscaler.unload()
+
+        baseline = outputs[1]
+        for tbs in (4, 8):
+            diff = int(np.abs(baseline.astype(int) - outputs[tbs].astype(int)).max())
+            print(f"[tile_batch_size={tbs}] max-abs-diff vs tile_batch_size=1: {diff}")
+            assert diff <= 12, (
+                f"tile_batch_size={tbs} output diverged too far from tile_batch_size=1 "
+                f"(max_diff={diff}) -- looks like a correctness bug, not FP noise"
+            )
+
+
 class TestTileGrid:
     """Tests for the tiled-inference grid math (compute_tile_grid), no GPU needed.
 
@@ -328,3 +437,315 @@ class TestRunTiledInference:
         out = run_tiled_inference(tensor, tile_size=16, overlap=4, out_scale=2, infer_fn=upsample2x)
         assert out.shape == expected.shape
         assert torch.allclose(out, expected)
+
+    def test_tile_batching_matches_unbatched(self):
+        """Batched-tile output must equal one-tile-at-a-time output for a real per-call fn."""
+        torch = pytest.importorskip("torch")
+
+        # 96x96 @ tile_size=16/overlap=4 gives a grid with a 16-tile group of
+        # uniform (interior) padded shape -- large enough for tile_batch_size
+        # batching to actually kick in and reduce call count (see
+        # compute_tile_grid's shape distribution for this size).
+        tensor = torch.rand(1, 3, 96, 96, dtype=torch.float32)
+        calls: list[int] = []
+
+        def infer_fn(t):
+            calls.append(t.shape[0])
+            return t * 2.0 + 1.0
+
+        out_unbatched = run_tiled_inference(
+            tensor, tile_size=16, overlap=4, out_scale=1, infer_fn=infer_fn, tile_batch_size=1
+        )
+        unbatched_call_count = len(calls)
+        calls.clear()
+
+        out_batched = run_tiled_inference(
+            tensor, tile_size=16, overlap=4, out_scale=1, infer_fn=infer_fn, tile_batch_size=4
+        )
+        batched_call_count = len(calls)
+
+        assert torch.allclose(out_unbatched, out_batched)
+        # Batching must actually reduce the number of forward-pass calls.
+        assert batched_call_count < unbatched_call_count
+        assert max(calls) > 1  # at least one call actually received >1 stacked tiles
+
+    def test_tile_batching_falls_back_when_frame_batch_dim_not_one(self):
+        """A tensor with its own N>1 (whole-frame) batch dim must skip tile batching."""
+        torch = pytest.importorskip("torch")
+
+        tensor = torch.rand(2, 3, 64, 48, dtype=torch.float32)
+        calls: list[int] = []
+
+        def infer_fn(t):
+            calls.append(t.shape[0])
+            return t
+
+        run_tiled_inference(
+            tensor, tile_size=20, overlap=5, out_scale=1, infer_fn=infer_fn, tile_batch_size=4
+        )
+        # Every call still carries the original 2-frame batch dim (unchanged
+        # per-tile loop), never stacked with other tiles.
+        assert all(c == 2 for c in calls)
+        assert len(calls) > 1
+
+    def test_tile_batching_oom_halves_and_recovers(self):
+        """A tile-batch OOM must recursively halve and still reconstruct the exact result."""
+        torch = pytest.importorskip("torch")
+
+        tensor = torch.arange(1 * 3 * 64 * 64, dtype=torch.float32).reshape(1, 3, 64, 64)
+        seen: list[int] = []
+
+        def flaky_identity(t):
+            seen.append(t.shape[0])
+            if t.shape[0] > 2:
+                raise torch.cuda.OutOfMemoryError("simulated OOM")
+            return t
+
+        with patch("autovideofixer.ai.wrappers.upscale.torch.cuda.empty_cache"):
+            out = run_tiled_inference(
+                tensor,
+                tile_size=16,
+                overlap=0,
+                out_scale=1,
+                infer_fn=flaky_identity,
+                tile_batch_size=8,
+            )
+
+        assert torch.equal(out, tensor)
+        # Confirms the halving path was actually exercised (some call saw >2
+        # tiles and OOM'd before a later, smaller call succeeded).
+        assert max(seen) > 2
+        assert min(seen) <= 2
+
+    def test_tile_batching_oom_releases_failed_batch_before_retry(self):
+        """The OOM'd batched input tensor must be released before cuda.empty_cache()/retry.
+
+        Regression test for the OOM-retry defect: previously the failed
+        batch's `batched_in` tensor stayed alive (referenced by the
+        recursing stack frame) through the entire halving retry, so every
+        retry ran with LESS free VRAM than the attempt that had just failed
+        instead of getting back what that failed attempt would have freed.
+        """
+        torch = pytest.importorskip("torch")
+        import gc
+        import weakref
+
+        tensor = torch.arange(1 * 3 * 64 * 64, dtype=torch.float32).reshape(1, 3, 64, 64)
+        weak_holder: dict[str, object] = {}
+        release_observed: list[bool] = []
+
+        def fake_infer(t):
+            if t.shape[0] > 2:
+                # `t` IS the `batched_in` tensor passed straight through by
+                # run_tiled_inference -- weakref it so empty_cache() (called
+                # right after `del batched_in`, before the retry) can check
+                # whether that tensor's last reference is already gone.
+                weak_holder["ref"] = weakref.ref(t)
+                raise torch.cuda.OutOfMemoryError("simulated OOM")
+            return t
+
+        def checking_empty_cache():
+            ref = weak_holder.get("ref")
+            if ref is not None:
+                gc.collect()
+                release_observed.append(ref() is None)  # True == already released
+
+        with patch(
+            "autovideofixer.ai.wrappers.upscale.torch.cuda.empty_cache",
+            side_effect=checking_empty_cache,
+        ):
+            out = run_tiled_inference(
+                tensor,
+                tile_size=16,
+                overlap=0,
+                out_scale=1,
+                infer_fn=fake_infer,
+                tile_batch_size=8,
+            )
+
+        assert torch.equal(out, tensor)
+        # empty_cache() must actually have run on at least one OOM'd batch,
+        # and every time it ran, the failed batch tensor must already have
+        # been released (del'd) -- not merely about to be, after the retry.
+        assert release_observed
+        assert all(release_observed)
+
+    def test_tile_batching_groups_by_shape(self):
+        """Tiles with different padded shapes (edge/corner tiles) must not be batched together."""
+        torch = pytest.importorskip("torch")
+
+        # 50x37 with tile_size=16 produces a non-uniform grid: interior tiles
+        # are 16x16 (plus overlap), the last row/column are smaller.
+        tensor = torch.rand(1, 3, 50, 37, dtype=torch.float32)
+        seen_shapes: list[tuple[int, int]] = []
+
+        def infer_fn(t):
+            seen_shapes.append((t.shape[2], t.shape[3]))
+            return t
+
+        run_tiled_inference(
+            tensor, tile_size=16, overlap=4, out_scale=1, infer_fn=infer_fn, tile_batch_size=8
+        )
+        # Every batched call's tiles were verified same-shape by construction
+        # (torch.cat would raise otherwise) -- getting here without an
+        # exception is itself the correctness check; also sanity-check more
+        # than one shape group existed (edge tiles differ from interior ones).
+        assert len(set(seen_shapes)) > 1
+
+
+class TestUpscaleBatchWholeFrame:
+    """Tests RealESRGANUpscaler.upscale_batch()/upscale_video() whole-frame batching.
+
+    Uses a fake identity `_model` (scale=1, native_scale=1, tile_size=0 so no
+    frame in these small test images ever needs tiling) on CPU -- no real
+    GPU or checkpoint needed to validate the batching/splitting/ordering
+    logic itself. Real-model numeric-equivalence verification lives in the
+    GPU-gated integration tests below.
+    """
+
+    def _make_upscaler(self, batch_size=4, tile_size=0, tta_mode=0):
+        import torch
+
+        upscaler = RealESRGANUpscaler(
+            scale=1,
+            model_name="fake",
+            tta_mode=tta_mode,
+            tile_size=tile_size,
+            batch_size=batch_size,
+        )
+        upscaler._loaded = True
+        upscaler._device = torch.device("cpu")
+        upscaler._use_fp16 = False
+        upscaler._native_scale = 1
+        upscaler.backend = "torch"
+        return upscaler
+
+    def test_order_preserved_and_matches_single_frame_path(self):
+        pytest.importorskip("torch")
+        import numpy as np
+
+        upscaler = self._make_upscaler(batch_size=4)
+        upscaler._model = lambda t: t  # identity: output must equal input exactly
+
+        frames = [
+            np.full((8, 8, 3), fill_value=v, dtype="uint8")
+            for v in (0, 25, 50, 75, 100, 125, 150, 175, 200, 225)
+        ]  # 10 frames, not evenly divisible by batch_size=4
+
+        batched_results = upscaler.upscale_video(frames)
+        single_results = [upscaler.upscale(f) for f in frames]
+
+        assert len(batched_results) == 10
+        for i, (out_frame, in_frame) in enumerate(zip(batched_results, frames)):
+            assert (out_frame == in_frame).all(), f"frame {i} order/content mismatch"
+        for out_frame, single_frame in zip(batched_results, single_results):
+            assert (out_frame == single_frame).all()
+
+    def test_tail_chunking_ten_frames_batch_four(self):
+        """10 frames / batch_size=4 must chunk as 4, 4, 2 -- no dropped/duplicated frames."""
+        pytest.importorskip("torch")
+        import numpy as np
+
+        upscaler = self._make_upscaler(batch_size=4)
+        seen_batch_sizes: list[int] = []
+
+        def fake_model(t):
+            seen_batch_sizes.append(t.shape[0])
+            return t
+
+        upscaler._model = fake_model
+        frames = [np.zeros((8, 8, 3), dtype="uint8") for _ in range(10)]
+
+        results = upscaler.upscale_video(frames)
+
+        assert len(results) == 10
+        assert seen_batch_sizes == [4, 4, 2]
+
+    def test_oom_batch_split_in_half(self):
+        """A batched-forward-pass OOM must recursively halve down to single frames."""
+        pytest.importorskip("torch")
+        import numpy as np
+        import torch
+
+        upscaler = self._make_upscaler(batch_size=4)
+        call_sizes: list[int] = []
+
+        def fake_model(t):
+            call_sizes.append(t.shape[0])
+            if t.shape[0] > 1:
+                raise torch.cuda.OutOfMemoryError("simulated OOM")
+            return t
+
+        upscaler._model = fake_model
+        frames = [np.full((8, 8, 3), fill_value=i * 10, dtype="uint8") for i in range(4)]
+
+        with patch("autovideofixer.ai.wrappers.upscale.torch.cuda.empty_cache"):
+            results = upscaler.upscale_batch(frames)
+
+        assert len(results) == 4
+        for i, (out_frame, in_frame) in enumerate(zip(results, frames)):
+            assert (out_frame == in_frame).all(), f"frame {i} mismatch after OOM recovery"
+        assert max(call_sizes) > 1  # the OOM path was actually exercised
+
+    def test_falls_back_to_per_frame_when_any_frame_needs_tiling(self):
+        """Whole-frame batching must never combine with tiling -- falls back per-frame."""
+        pytest.importorskip("torch")
+        import numpy as np
+
+        upscaler = self._make_upscaler(batch_size=4, tile_size=4)  # force tiling
+        seen_sizes: list[int] = []
+
+        def fake_model(t):
+            seen_sizes.append(t.shape[0])
+            return t
+
+        upscaler._model = fake_model
+        frames = [np.zeros((8, 8, 3), dtype="uint8") for _ in range(3)]
+
+        results = upscaler.upscale_batch(frames)
+
+        assert len(results) == 3
+        # Per-tile calls always carry a batch dim of 1 (whole-frame batching
+        # never reaches the model here -- upscale() -> tiled inference path).
+        assert all(s == 1 for s in seen_sizes)
+        assert len(seen_sizes) > 1  # confirms tiling (not a trivial no-op) happened
+
+    def test_falls_back_to_per_frame_when_tta_enabled(self):
+        """Whole-frame batching must never combine with TTA -- falls back per-frame."""
+        pytest.importorskip("torch")
+        import numpy as np
+
+        upscaler = self._make_upscaler(batch_size=4, tta_mode=7)
+        seen_sizes: list[int] = []
+
+        def fake_model(t):
+            seen_sizes.append(t.shape[0])
+            return t
+
+        upscaler._model = fake_model
+        frames = [np.zeros((8, 8, 3), dtype="uint8") for _ in range(4)]
+
+        results = upscaler.upscale_batch(frames)
+
+        assert len(results) == 4
+        # apply_tta calls the model multiple times per SINGLE frame (batch=1
+        # each), never with N different frames stacked together.
+        assert all(s == 1 for s in seen_sizes)
+        assert len(seen_sizes) > 4  # tta_mode=7 -> 4 augmented forward passes/frame
+
+    def test_single_frame_chunk_uses_upscale_directly(self):
+        pytest.importorskip("torch")
+        import numpy as np
+
+        upscaler = self._make_upscaler(batch_size=4)
+        upscaler._model = lambda t: t
+
+        results = upscaler.upscale_batch([np.full((8, 8, 3), 42, dtype="uint8")])
+        assert len(results) == 1
+        assert (results[0] == 42).all()
+
+    def test_empty_chunk_returns_empty(self):
+        pytest.importorskip("torch")
+
+        upscaler = self._make_upscaler(batch_size=4)
+        assert upscaler.upscale_batch([]) == []

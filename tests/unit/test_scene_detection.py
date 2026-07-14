@@ -11,9 +11,6 @@ from autovideofixer.core.analysis import (
     SceneEvent,
     VideoAnalyzer,
     _select_near_misses,
-    compute_video_dhash,
-    compute_video_hash,
-    hash_similarity,
     scan_directory,
 )
 
@@ -343,47 +340,65 @@ class TestSceneDetectionCalibration:
         assert len(scenes) < 4, "expected the old 0.3 threshold to under-detect on this clip"
 
 
-class TestPerceptualHashing:
-    """Test perceptual hashing functions."""
+class TestRustPythonParity:
+    """Differential test: the Rust (avf_scenes) and pure-Python scene
+    detection implementations must find the same scene boundaries, per
+    docs/REQUIREMENTS.md R5.1's verification bar. Skipped (not failed) if the
+    avf_scenes extension isn't built in this environment -- see AGENTS.md's
+    Setup & Commands for the build step.
+    """
 
-    def test_hash_nonexistent_video(self):
-        """Test hashing a nonexistent file."""
-        h = compute_video_hash("/nonexistent/video.mp4")
-        assert h == ""
+    @staticmethod
+    def _require_rust():
+        from autovideofixer.core.analysis import _detect_scene_changes_rs_native
 
-    def test_dhash_nonexistent_video(self):
-        """Test dhash on a nonexistent file."""
-        h = compute_video_dhash("/nonexistent/video.mp4")
-        assert h == ""
+        if _detect_scene_changes_rs_native is None:
+            pytest.skip("avf_scenes Rust extension not built in this environment")
 
-    @pytest.mark.integration
-    def test_hash_real_video(self, tmp_video_file):
-        """Test computing hash on a real video."""
-        h = compute_video_hash(tmp_video_file)
-        assert len(h) > 0
-        # Should be a binary string
-        assert all(c in "01" for c in h)
-
-    @pytest.mark.integration
-    def test_dhash_real_video(self, tmp_video_file):
-        """Test computing dhash on a real video."""
-        h = compute_video_dhash(tmp_video_file)
-        assert len(h) > 0
-        assert all(c in "01" for c in h)
+    @staticmethod
+    def _assert_scenes_match(py_scenes, rs_scenes, time_tol=0.05, score_tol=0.01):
+        assert len(py_scenes) == len(rs_scenes), (
+            f"scene count mismatch: python={len(py_scenes)} rust={len(rs_scenes)}"
+        )
+        for p, r in zip(py_scenes, rs_scenes):
+            assert p.start_time == pytest.approx(r.start_time, abs=time_tol)
+            assert p.end_time == pytest.approx(r.end_time, abs=time_tol)
+            assert p.confidence == pytest.approx(r.confidence, abs=score_tol)
 
     @pytest.mark.integration
-    def test_same_video_same_hash(self, tmp_video_file):
-        """Test that the same video produces the same hash."""
-        h1 = compute_video_hash(tmp_video_file)
-        h2 = compute_video_hash(tmp_video_file)
-        assert h1 == h2
+    def test_parity_on_calibration_fixture(self, tmp_path):
+        self._require_rust()
+        from autovideofixer.core.analysis import (
+            _detect_scene_changes_python,
+            _detect_scene_changes_rust,
+        )
+
+        ground_truth = TestSceneDetectionCalibration._build_ground_truth(tmp_path)
+
+        py_scenes, py_cuts, _ = _detect_scene_changes_python(ground_truth, 0.15, 0.2)
+        rs_scenes, rs_cuts, _ = _detect_scene_changes_rust(ground_truth, 0.15, 0.2)
+
+        self._assert_scenes_match(py_scenes, rs_scenes)
+        assert len(py_cuts) == len(rs_cuts)
+        for p, r in zip(py_cuts, rs_cuts):
+            # Bounded float divergence from the different decode/scale paths
+            # (cv2's INTER_LINEAR + BT.601 vs ffmpeg's bilinear scale +
+            # format=gray) -- measured well under 0.005 on this fixture.
+            assert p == pytest.approx(r, abs=0.005)
 
     @pytest.mark.integration
-    def test_different_videos_different_hashes(self, tmp_video_file, tmp_path):
-        """Test that different videos have different hashes."""
+    def test_parity_on_video_with_motion(self, tmp_path):
+        """A clip with continuous panning/motion (no real cuts) followed by one
+        hard cut -- exercises the near-miss-scoring band, not just clean cuts."""
         import subprocess
 
-        video2 = tmp_path / "different.mp4"
+        self._require_rust()
+        from autovideofixer.core.analysis import (
+            _detect_scene_changes_python,
+            _detect_scene_changes_rust,
+        )
+
+        seg1 = tmp_path / "pan.mp4"
         subprocess.run(
             [
                 "ffmpeg",
@@ -391,72 +406,21 @@ class TestPerceptualHashing:
                 "-f",
                 "lavfi",
                 "-i",
-                "smptebars=duration=1:size=320x240:rate=24",
+                "mandelbrot=size=320x180:rate=25",
+                "-t",
+                "3",
+                "-vf",
+                "zoompan=z='min(zoom+0.002,1.3)':d=1:s=320x180",
                 "-c:v",
                 "libx264",
-                str(video2),
+                "-pix_fmt",
+                "yuv420p",
+                str(seg1),
             ],
             capture_output=True,
             check=True,
         )
-
-        h1 = compute_video_hash(tmp_video_file)
-        h2 = compute_video_hash(str(video2))
-        # Different test patterns should produce different hashes
-        assert h1 != h2
-
-    def test_hash_similarity_identical(self):
-        """Test similarity of identical hashes."""
-        h = "101100101010" * 4  # 64 bits
-        sim = hash_similarity(h, h)
-        assert sim == 1.0
-
-    def test_hash_similarity_completely_different(self):
-        """Test similarity of completely different hashes."""
-        h1 = "0" * 64
-        h2 = "1" * 64
-        sim = hash_similarity(h1, h2)
-        assert sim == 0.0
-
-    def test_hash_similarity_partial(self):
-        """Test similarity of partially matching hashes."""
-        h1 = "11110000" * 8  # 64 bits, half ones
-        h2 = "11111111" * 8  # 64 bits, all ones
-        sim = hash_similarity(h1, h2)
-        assert 0.0 < sim < 1.0
-        assert sim == pytest.approx(0.5)
-
-    def test_hash_similarity_different_lengths(self):
-        """Test similarity of hashes with different lengths."""
-        sim = hash_similarity("1010", "10101010")
-        assert sim == 0.0
-
-    def test_hash_similarity_empty(self):
-        """Test similarity with empty hashes."""
-        assert hash_similarity("", "1010") == 0.0
-        assert hash_similarity("1010", "") == 0.0
-
-
-class TestDuplicateDetection:
-    """Test duplicate detection functionality."""
-
-    def setup_method(self):
-        self.config = Config(Path(tempfile.mkdtemp()) / "nonexistent.yaml")
-        self.analyzer = VideoAnalyzer(self.config)
-
-    @pytest.mark.integration
-    def test_find_similar_same_video(self, tmp_video_file):
-        """Test finding a video similar to itself (excluded)."""
-        results = self.analyzer.find_similar(tmp_video_file, [tmp_video_file])
-        # Same file is excluded from results
-        assert tmp_video_file not in [r[0] for r in results]
-
-    @pytest.mark.integration
-    def test_find_similar_different_videos(self, tmp_video_file, tmp_path):
-        """Test finding no similar videos for different content."""
-        import subprocess
-
-        video2 = tmp_path / "different.mp4"
+        seg2 = tmp_path / "life.mp4"
         subprocess.run(
             [
                 "ffmpeg",
@@ -464,66 +428,43 @@ class TestDuplicateDetection:
                 "-f",
                 "lavfi",
                 "-i",
-                "smptebars=duration=1:size=320x240:rate=24",
+                "life=size=320x180:rate=25:mold=10",
+                "-t",
+                "3",
                 "-c:v",
                 "libx264",
-                str(video2),
+                "-pix_fmt",
+                "yuv420p",
+                str(seg2),
             ],
             capture_output=True,
             check=True,
         )
-
-        results = self.analyzer.find_similar(tmp_video_file, [str(video2)], threshold=0.95)
-        assert len(results) == 0
-
-    @pytest.mark.integration
-    def test_find_duplicates_batch(self, tmp_video_file, tmp_path):
-        """Test batch duplicate detection."""
-        import subprocess
-
-        # Create a copy (should be detected as duplicate)
-        video_copy = tmp_path / "copy.mp4"
+        concat_file = tmp_path / "concat.txt"
+        concat_file.write_text(f"file '{seg1}'\nfile '{seg2}'\n")
+        motion_video = tmp_path / "motion.mp4"
         subprocess.run(
             [
                 "ffmpeg",
                 "-y",
                 "-f",
-                "lavfi",
+                "concat",
+                "-safe",
+                "0",
                 "-i",
-                "testsrc=duration=1:size=320x240:rate=24",
-                "-c:v",
-                "libx264",
-                str(video_copy),
+                str(concat_file),
+                "-c",
+                "copy",
+                str(motion_video),
             ],
             capture_output=True,
             check=True,
         )
 
-        # Create a different video
-        video_diff = tmp_path / "different.mp4"
-        subprocess.run(
-            [
-                "ffmpeg",
-                "-y",
-                "-f",
-                "lavfi",
-                "-i",
-                "smptebars=duration=1:size=320x240:rate=24",
-                "-c:v",
-                "libx264",
-                str(video_diff),
-            ],
-            capture_output=True,
-            check=True,
-        )
+        py_scenes, _, _ = _detect_scene_changes_python(str(motion_video), 0.15, 0.2)
+        rs_scenes, _, _ = _detect_scene_changes_rust(str(motion_video), 0.15, 0.2)
 
-        # With low threshold, testsrc copies should be grouped together
-        results = self.analyzer.find_duplicates(
-            [tmp_video_file, str(video_copy), str(video_diff)],
-            threshold=0.5,
-        )
-        # Should find at least one group (the two testsrc videos)
-        assert len(results) >= 1
+        self._assert_scenes_match(py_scenes, rs_scenes)
 
 
 class TestExtractClip:

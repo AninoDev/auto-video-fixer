@@ -137,24 +137,145 @@ def run_tiled_inference(
     overlap: int,
     out_scale: int,
     infer_fn: Callable[["torch.Tensor"], "torch.Tensor"],
+    tile_batch_size: int = 1,
 ) -> "torch.Tensor":
     """Run `infer_fn` over `tensor` (N,C,H,W) tile-by-tile and stitch the result.
 
     Each tile is padded by `overlap` pixels (clamped at image bounds), passed
-    through `infer_fn` individually (so each forward pass only ever holds one
-    tile's activations in memory instead of the whole frame's), and the
-    unpadded center of its output is written into the full-size output canvas.
+    through `infer_fn`, and the unpadded center of its output is written into
+    the full-size output canvas.
+
+    Args:
+        tile_batch_size: When 1 (default), tiles are processed one at a time
+            in a plain loop -- today's behavior, unchanged (each forward pass
+            holds only one tile's activations in memory). When > 1, and
+            `tensor`'s own batch dim is 1 (a single frame -- the tiling path
+            only ever runs on one frame at a time), tiles sharing the same
+            padded input shape (`compute_tile_grid` gives interior tiles a
+            uniform shape; only the last row/column clamped at the image
+            boundary can differ) are grouped and stacked into batches of up
+            to `tile_batch_size`, each batch going through ONE `infer_fn`
+            call instead of one-per-tile. This is the primary win for large
+            frames (e.g. 4K, which at the default tile_size=512 needs a 5x8
+            = 40-tile grid): 40 small sequential forward passes each pay
+            Python/kernel-launch/host-device-sync overhead that a handful of
+            larger batched passes mostly avoid. If `tensor`'s batch dim is
+            not 1 (the whole-frame-batching path in
+            RealESRGANUpscaler.upscale_batch never reaches here -- it
+            deliberately falls back to per-frame processing whenever any
+            frame in the chunk needs tiling, precisely to avoid this
+            unsupported N>1-frames-plus-tiling combination), tile batching
+            is skipped and the original one-tile-at-a-time loop runs
+            instead. On a caught CUDA OOM during a tile batch, the batch is
+            recursively halved and retried (mirroring the tile-size halving
+            retry already used elsewhere in this file), down to batch=1
+            which is exactly today's per-tile call.
     """
     n, c, h, w = tensor.shape
     grid = compute_tile_grid(h, w, tile_size, overlap, out_scale=out_scale)
 
     out = tensor.new_empty((n, c, h * out_scale, w * out_scale))
-    for spec in grid:
+
+    def _infer_one(spec: TileSpec) -> None:
         tile_in = tensor[..., spec.in_y0 : spec.in_y1, spec.in_x0 : spec.in_x1]
         tile_out = infer_fn(tile_in)
         out[..., spec.out_y0 : spec.out_y1, spec.out_x0 : spec.out_x1] = tile_out[
             ..., spec.crop_y0 : spec.crop_y1, spec.crop_x0 : spec.crop_x1
         ]
+
+    if tile_batch_size <= 1 or n != 1:
+        for spec in grid:
+            _infer_one(spec)
+        return out
+
+    import torch as _torch
+
+    def _infer_group(specs: list[TileSpec]) -> None:
+        if len(specs) == 1:
+            _infer_one(specs[0])
+            return
+        tile_ins = [tensor[..., s.in_y0 : s.in_y1, s.in_x0 : s.in_x1] for s in specs]
+        batched_in = _torch.cat(tile_ins, dim=0)
+        oom = False
+        batched_out = None
+        try:
+            batched_out = infer_fn(batched_in)
+        except _torch.cuda.OutOfMemoryError:
+            # Only set a flag here (nothing else) -- the actual cleanup/
+            # recursion happens AFTER this try/except block, not inside the
+            # except clause itself. While still inside an except clause,
+            # Python keeps the exception's traceback alive (sys.exc_info()),
+            # which transitively keeps the raising frame's own locals alive
+            # too -- including infer_fn's own reference to this same batched
+            # tensor -- so a `del batched_in` executed HERE would not
+            # actually drop the tensor's last reference yet. Moving the
+            # cleanup below, after the try/except has fully exited (and the
+            # exception/traceback has been cleared), makes the release real
+            # and immediate instead of merely appearing to happen.
+            oom = True
+
+        if oom:
+            _get_logger().warning(
+                f"CUDA OOM on a batch of {len(specs)} tiles; clearing cache and "
+                "retrying with the tile batch split in half"
+            )
+            # Release the failed batch's input tensor BEFORE clearing the
+            # allocator cache and recursing -- previously this stayed alive
+            # through the entire halving recursion below it, so every retry
+            # ran with LESS free VRAM than the attempt that just failed,
+            # instead of getting back what the failed attempt would have
+            # freed.
+            del batched_in
+            _torch.cuda.empty_cache()
+            mid = len(specs) // 2
+            _infer_group(specs[:mid])
+            _infer_group(specs[mid:])
+            return
+
+        # oom is False here, so infer_fn() above returned normally and
+        # batched_out was assigned -- this assert only narrows the type for
+        # mypy (which can't otherwise see that `oom`/`batched_out` are set
+        # together), it's not reachable as a real failure.
+        assert batched_out is not None
+        for j, spec in enumerate(specs):
+            tile_out = batched_out[j : j + 1]
+            out[..., spec.out_y0 : spec.out_y1, spec.out_x0 : spec.out_x1] = tile_out[
+                ..., spec.crop_y0 : spec.crop_y1, spec.crop_x0 : spec.crop_x1
+            ]
+        # Release the successfully-stitched batch's tensors immediately
+        # rather than waiting for the next iteration's rebinding to drop the
+        # last reference -- keeps peak VRAM usage tighter across a long run
+        # of many tile groups, same rationale as the OOM-path release above.
+        del batched_in, batched_out
+
+    # Group tiles by their padded input shape -- most interior tiles share
+    # one shape; only the last row/column (clamped at the image boundary)
+    # may be smaller and end up in their own group(s).
+    groups: dict[tuple[int, int], list[TileSpec]] = {}
+    for spec in grid:
+        shape_key = (spec.in_y1 - spec.in_y0, spec.in_x1 - spec.in_x0)
+        groups.setdefault(shape_key, []).append(spec)
+
+    for specs in groups.values():
+        n = len(specs)
+        full_batches = (n // tile_batch_size) * tile_batch_size
+        for i in range(0, full_batches, tile_batch_size):
+            _infer_group(specs[i : i + tile_batch_size])
+        # Remainder tiles (fewer than tile_batch_size left in this shape
+        # group) go through the single-tile path instead of one last
+        # partial-size batch: a partial batch produces a batched tensor
+        # whose N differs from every other batched call made during this
+        # run, and the CUDA caching allocator buckets by exact tensor shape
+        # -- a one-off N fragments the allocator instead of reusing blocks
+        # already sized for the uniform tile_batch_size batches. Processing
+        # the remainder tile-by-tile (each call reuses the existing
+        # single-tile-shape bucket) keeps every allocation shape seen during
+        # tiled inference uniform. Simpler than padding the remainder up to
+        # tile_batch_size with dummy tiles and slicing them back off, with
+        # no difference in the stitched output either way.
+        for spec in specs[full_batches:]:
+            _infer_one(spec)
+
     return out
 
 
@@ -351,6 +472,7 @@ class RealESRGANUpscaler:
         device_preference: str = "auto",
         tile_size: int = 0,
         tile_overlap: int = DEFAULT_TILE_OVERLAP,
+        tile_batch_size: int = 1,
         backend: str = "torch",
         vulkan_device: int = 0,
     ):
@@ -378,6 +500,17 @@ class RealESRGANUpscaler:
         #   > 0: always tile at this size (skips the auto-threshold check).
         self.tile_size = tile_size
         self.tile_overlap = max(0, tile_overlap)
+        # Number of tiles (sharing the same padded input shape) batched into
+        # one forward pass inside run_tiled_inference(). 1 (default) = today's
+        # behavior, one tile per forward call. This is the primary batching
+        # knob for large (e.g. 4K) frames, which always take the tiling path
+        # regardless of `batch_size` below -- see run_tiled_inference's
+        # docstring. Separate from `batch_size` (whole-*frame* batching,
+        # N different frames in one forward pass) since the two batch along
+        # different axes and are mutually exclusive per call (upscale_batch()
+        # falls back to per-frame processing -- which is where tile batching
+        # kicks in -- whenever any frame in the chunk needs tiling).
+        self.tile_batch_size = max(1, tile_batch_size)
         self.backend = backend
         self.vulkan_device = vulkan_device
         self._ncnn_backend: Any = None
@@ -512,10 +645,28 @@ class RealESRGANUpscaler:
         _get_logger().info(f"Loaded {self.model_name} ({num_block} RRDB blocks) on {self._device}")
         return True
 
+    def _needs_tiling(self, height: int, width: int) -> bool:
+        """Whether a frame of this size would take the tiled-inference path.
+
+        Shared by `upscale()` (per-frame) and `upscale_batch()` (whole-frame
+        batching, which must fall back to per-frame processing -- not attempt
+        to combine whole-frame batching with tiling -- whenever any frame in
+        a chunk needs this).
+        """
+        forced_tile = self.tile_size if self.tile_size > 0 else 0
+        auto_tile = (
+            forced_tile == 0
+            and self._device is not None
+            and self._device.type == "cuda"
+            and height * width > self.AUTO_TILE_THRESHOLD_PX
+        )
+        return bool(forced_tile or auto_tile)
+
     def upscale(
         self,
         frame: Any,  # numpy array (H, W, 3) BGR uint8
         tta_mode: int | None = None,
+        timer: Any = None,
     ) -> Any:
         """Upscale a single frame using Real-ESRGAN.
 
@@ -523,6 +674,13 @@ class RealESRGANUpscaler:
             frame: Input frame as numpy array (H, W, 3) in BGR, uint8.
             tta_mode: Test-time augmentation mode (0=off, 1, 2, 4, 7, 8, 15, etc.).
                       If None, uses the configured tta_mode.
+            timer: Optional `ai.frame_processor.StageTimer` -- when given,
+                H2D+preprocess (`tensor_from_frame`), GPU-forward (every
+                model forward call, whole-frame or tiled -- honest
+                `torch.cuda.Event`-based device time on CUDA), and
+                D2H+postprocess (`frame_from_tensor`) durations are recorded
+                into it. `None` (default) skips all instrumentation
+                overhead entirely.
 
         Returns:
             Upscaled frame as numpy array (H*scale, W*scale, 3) in BGR, uint8.
@@ -539,6 +697,7 @@ class RealESRGANUpscaler:
 
         import torch
 
+        from autovideofixer.ai.frame_processor import gpu_forward_timer
         from autovideofixer.ai.torch_utils import (
             apply_tta,
             frame_from_tensor,
@@ -548,7 +707,11 @@ class RealESRGANUpscaler:
         if tta_mode is None:
             tta_mode = self.tta_mode
 
-        tensor = tensor_from_frame(frame, device=self._device)
+        if timer is not None:
+            with timer.phase("h2d_preprocess"):
+                tensor = tensor_from_frame(frame, device=self._device)
+        else:
+            tensor = tensor_from_frame(frame, device=self._device)
         if self._use_fp16:
             tensor = tensor.half()
         if self._device.type == "cuda":
@@ -560,6 +723,14 @@ class RealESRGANUpscaler:
 
         def _infer_whole(t: Any) -> Any:
             with torch.no_grad():
+                if timer is not None:
+                    with gpu_forward_timer(self._device) as gt:
+                        if tta_mode and tta_mode >= 1:
+                            result = apply_tta(self._model, t, mode=tta_mode)
+                        else:
+                            result = self._model(t)
+                    timer.record("gpu_forward", gt.elapsed_sec)
+                    return result
                 if tta_mode and tta_mode >= 1:
                     return apply_tta(self._model, t, mode=tta_mode)
                 return self._model(t)
@@ -573,16 +744,17 @@ class RealESRGANUpscaler:
                 overlap=overlap,
                 out_scale=int(self._native_scale),
                 infer_fn=_infer_whole,
+                # TTA is a different batching axis (8 augmented views of ONE
+                # tile) than batching N different tiles -- keep tile batching
+                # off when TTA is enabled rather than trying to combine them.
+                tile_batch_size=1 if (tta_mode and tta_mode >= 1) else self.tile_batch_size,
             )
 
         _, _, tensor_h, tensor_w = tensor.shape
         forced_tile = self.tile_size if self.tile_size > 0 else 0
-        auto_tile = (
-            forced_tile == 0
-            and self._device.type == "cuda"
-            and tensor_h * tensor_w > self.AUTO_TILE_THRESHOLD_PX
+        use_tile_size = forced_tile or (
+            self.DEFAULT_TILE_SIZE if self._needs_tiling(tensor_h, tensor_w) else 0
         )
-        use_tile_size = forced_tile or (self.DEFAULT_TILE_SIZE if auto_tile else 0)
 
         try:
             if use_tile_size > 0:
@@ -638,19 +810,141 @@ class RealESRGANUpscaler:
         # .cpu() transfer in frame_from_tensor) down/up to what was asked
         # for.
         correction = self.scale / self._native_scale
-        result = frame_from_tensor(output, scale=correction)
+        if timer is not None:
+            with timer.phase("d2h_postprocess"):
+                result = frame_from_tensor(output, scale=correction)
+        else:
+            result = frame_from_tensor(output, scale=correction)
         return result
+
+    def upscale_batch(
+        self,
+        frames: list[Any],  # list of numpy arrays (H, W, 3) BGR uint8
+        tta_mode: int | None = None,
+        timer: Any = None,
+    ) -> list[Any]:
+        """Upscale N different frames in one batched forward pass.
+
+        Secondary/parallel deliverable to the primary tile-batching change in
+        run_tiled_inference() -- this batches along a different axis (N
+        different frames in one call) and only helps videos whose frames are
+        small enough to skip the tiled path (a 4K frame ALWAYS takes tiling
+        at the default AUTO_TILE_THRESHOLD_PX, so this path never even
+        triggers for that case -- see upscale_video()).
+
+        Falls back to the existing proven one-frame-at-a-time `upscale()`
+        loop (unchanged) for every case explicitly out of scope for a first
+        pass:
+          - A chunk of a single frame (no batching benefit anyway).
+          - The ncnn backend (not in scope -- torch path only).
+          - TTA enabled (`tta_mode >= 1`): that's 8 forward passes on
+            augmented views of ONE frame, a different batching axis than
+            batching N frames; not combined here.
+          - ANY frame in the chunk would need tiled inference (checked via
+            `_needs_tiling` before building a batch tensor): tiling and
+            whole-frame batching are not combined in this pass -- that
+            combination is exactly what the tile_batch_size mechanism in
+            run_tiled_inference() now handles per-frame instead.
+
+        On a caught CUDA OOM while running the batched forward pass, the
+        batch is recursively split in half and retried (mirroring the
+        tile-size/tile-batch halving-retry pattern used elsewhere in this
+        file), down to a single-frame chunk which then goes through the
+        existing `upscale()` OOM/tiling-retry path unchanged.
+
+        Args:
+            frames: List of numpy arrays (H, W, 3) in BGR, uint8. May all be
+                the same shape (required for the batched tensor path) or not
+                (falls back to per-frame processing if shapes differ).
+            tta_mode: Test-time augmentation mode. If None, uses the
+                configured tta_mode.
+
+        Returns:
+            List of upscaled numpy arrays, same length and order as `frames`
+            (output[i] corresponds to frames[i]).
+        """
+        if not self._loaded:
+            raise RuntimeError("Model not loaded. Call load_model() first.")
+        if not frames:
+            return []
+
+        if tta_mode is None:
+            tta_mode = self.tta_mode
+
+        if (
+            len(frames) == 1
+            or self.backend == "ncnn"
+            or (tta_mode and tta_mode >= 1)
+            or any(self._needs_tiling(f.shape[0], f.shape[1]) for f in frames)
+        ):
+            return [self.upscale(f, tta_mode=tta_mode, timer=timer) for f in frames]
+
+        shapes = {f.shape for f in frames}
+        if len(shapes) != 1:
+            # tensor_from_frames() requires a uniform shape to stack; a mixed
+            # chunk (shouldn't normally happen -- frames in one video share a
+            # resolution -- but don't assume it) falls back per-frame too.
+            return [self.upscale(f, tta_mode=tta_mode, timer=timer) for f in frames]
+
+        import torch
+
+        from autovideofixer.ai.frame_processor import gpu_forward_timer
+        from autovideofixer.ai.torch_utils import frames_from_tensor, tensor_from_frames
+
+        def _infer(chunk: list[Any]) -> list[Any]:
+            if len(chunk) == 1:
+                return [self.upscale(chunk[0], tta_mode=tta_mode, timer=timer)]
+
+            if timer is not None:
+                with timer.phase("h2d_preprocess"):
+                    tensor = tensor_from_frames(chunk, device=self._device)
+            else:
+                tensor = tensor_from_frames(chunk, device=self._device)
+            if self._use_fp16:
+                tensor = tensor.half()
+            if self._device.type == "cuda":
+                tensor = tensor.to(memory_format=torch.channels_last)
+
+            try:
+                with torch.no_grad():
+                    if timer is not None:
+                        with gpu_forward_timer(self._device) as gt:
+                            output = self._model(tensor)
+                        timer.record("gpu_forward", gt.elapsed_sec)
+                    else:
+                        output = self._model(tensor)
+            except torch.cuda.OutOfMemoryError:
+                _get_logger().warning(
+                    f"CUDA OOM on a batch of {len(chunk)} frames; clearing cache "
+                    "and retrying with the batch split in half"
+                )
+                torch.cuda.empty_cache()
+                mid = len(chunk) // 2
+                return _infer(chunk[:mid]) + _infer(chunk[mid:])
+
+            if self._use_fp16:
+                output = output.float()
+            correction = self.scale / self._native_scale
+            if timer is not None:
+                with timer.phase("d2h_postprocess"):
+                    return frames_from_tensor(output, scale=correction)
+            return frames_from_tensor(output, scale=correction)
+
+        return _infer(frames)
 
     def upscale_video(
         self,
         frames: list[Any],
         progress_callback=None,
+        timer: Any = None,
     ) -> list[Any]:
         """Upscale a sequence of frames.
 
         Args:
             frames: List of numpy arrays (H, W, 3) in BGR, uint8.
             progress_callback: Optional callback(current, total, message).
+            timer: Optional `ai.frame_processor.StageTimer`, forwarded to
+                `upscale()`/`upscale_batch()` -- see `upscale()`'s docstring.
 
         Returns:
             List of upscaled numpy arrays.
@@ -658,12 +952,26 @@ class RealESRGANUpscaler:
         results = []
         total = len(frames)
 
-        for i, frame in enumerate(frames):
-            result = self.upscale(frame)
-            results.append(result)
+        if self.batch_size <= 1:
+            # Today's behavior, unchanged.
+            for i, frame in enumerate(frames):
+                result = self.upscale(frame, timer=timer)
+                results.append(result)
+
+                if progress_callback and total > 0:
+                    progress_callback(i + 1, total, f"Upscaling frame {i + 1}/{total}")
+
+            return results
+
+        processed = 0
+        for i in range(0, total, self.batch_size):
+            chunk = frames[i : i + self.batch_size]
+            chunk_results = self.upscale_batch(chunk, timer=timer)
+            results.extend(chunk_results)
+            processed += len(chunk)
 
             if progress_callback and total > 0:
-                progress_callback(i + 1, total, f"Upscaling frame {i + 1}/{total}")
+                progress_callback(processed, total, f"Upscaling frame {processed}/{total}")
 
         return results
 

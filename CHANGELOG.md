@@ -7,6 +7,122 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **`stages.stabilize.zoom_coverage`** (float, 0.0-1.0, default `1.0`): tunes how aggressively the
+  stabilize stage's zoom compensates for stabilization-introduced borders, once
+  `zoom_enabled`/`zoom_threshold`'s movement-extent gate has decided zoom applies at all (the gate
+  itself is unchanged). `1.0` = today's exact `optzoom=1` behavior (zoom sized to the single worst
+  frame -- guaranteed no border on any frame). `0.0` = no zoom at all (every border stays
+  visible). In between: `optzoom=0` plus a static `zoom=<pct>` computed as the `zoom_coverage`-th
+  quantile of per-frame required-zoom estimates (`StabilizeStage._compute_static_zoom_pct()`,
+  built from the already-parsed TRF local-motion data plus a local moving-average matching
+  `smoothness`) instead of the max -- trades the "no border, ever" guarantee for a less aggressive
+  crop with occasional brief borders during the most extreme motion (e.g. a violent-motion
+  ending), addressing real user feedback that `optzoom=1` (added to fix the opposite problem --
+  see the "Stabilize zoom could only zoom OUT, never in" fix below) now over-zooms and crops
+  content that should stay visible, when some borders would be an acceptable tradeoff. This is an
+  **approximation** of vidstabtransform's own internally-computed smoothed camera path, not an
+  exact read of it (stated explicitly in code comments/AGENTS.md); verified via a synthetic shaky
+  clip with cropdetect: `coverage=1.0` shows zero border on any sampled frame, `coverage=0.0`
+  reproduces the fully-unzoomed baseline's borders, and `coverage=0.6`'s computed zoom quantile is
+  measurably smaller than the same function's `coverage=1.0` quantile (10.4% vs. 25.5% on the test
+  clip) -- see AGENTS.md's "Stabilization zoom coverage" section for the full verification
+  writeup and the accuracy caveat. CLI: `--zoom-coverage FLOAT`.
+- **Rust perceptual-hash duplicate detection (`rust/avf_hashing/`, docs/REQUIREMENTS.md R5.2)**:
+  `compute_video_hash()`/`compute_video_dhash()`/`hash_similarity()` (`core/analysis.py`) --
+  Python-loop-heavy ahash/dhash implementations backing `avf find-duplicates` -- are replaced
+  wholesale by `compute_video_phash()`/`hash_similarity()`, a DCT-based **pHash** implementation
+  backed by a new PyO3/`maturin` extension (`avf_hashing`), following the exact same
+  `[tool.uv.workspace]`/lazy-import-with-fallback pattern as `avf_scenes` (R5.1) -- see AGENTS.md's
+  "Mixed Python/Rust" section. This feature has never been used in production (confirmed with the
+  user 2026-07-12), so there was no bit-for-bit compatibility constraint; pHash was chosen over a
+  literal ahash/dhash port because it hashes low-frequency 2D DCT coefficients rather than raw
+  pixel values, making it substantially more robust to the re-encodes/resolution changes/trims
+  that make up real-world near-duplicate video variation (see `rust/avf_hashing/src/lib.rs`'s
+  module docstring for the full rationale, including why the `img_hash` crate was evaluated and
+  rejected in favor of a small hand-rolled implementation). Frames are sampled the same way as
+  before (`num_frames`, default 30, evenly spaced), pHashed individually, and combined into one
+  video-level hash via majority-vote bit combination. The pure-Python fallback (used when the
+  compiled extension isn't available) implements the *identical* pHash algorithm in NumPy, not the
+  retired ahash/dhash, so results no longer depend on which path runs. `analysis.duplicate_
+  detection.hash_type` (`perceptual`/`dhash`/`combined`) is removed from `config.py`/`docs/
+  config.example.yaml` -- it's no longer meaningful with a single algorithm -- and `analysis.
+  duplicate_detection.similarity_threshold`'s default drops from `0.95` to `0.85`, recalibrated
+  against real measured near-duplicate/non-duplicate pHash similarity scores (see `tests/unit/
+  test_hashing.py::TestHashSeparation`'s docstring for the actual numbers: near-duplicate pairs --
+  same source re-encoded at a different CRF/resolution or trimmed -- scored >= 0.9375; distinct
+  lavfi sources, including cross-comparing each source's own near-duplicate variants, scored <=
+  0.5781). Verified with real ffmpeg-generated fixtures, not just unit-level hash math.
+- **Rust scene-detection extension (`rust/avf_scenes/`, docs/REQUIREMENTS.md R5.1)**: the first
+  Rust code in this project. `_detect_scene_changes()`'s per-frame decode/diff loop (`core/
+  analysis.py`) is now backed by a PyO3/`maturin` extension (`avf_scenes`) that pipes video
+  through `ffmpeg -f rawvideo` (grayscale, downscaled to 320x180) instead of `cv2.VideoCapture`,
+  computes the same mean-absolute-luma-diff `diff_score` metric, and releases the GIL for the
+  whole decode/diff loop. `avf_scenes` is a normal (non-optional) dependency built automatically
+  by `uv sync` via a `[tool.uv.workspace]` member at `rust/avf_scenes/` -- see AGENTS.md's Setup &
+  Commands. If the compiled extension isn't importable for any reason, `_detect_scene_changes()`
+  falls back to the original pure-Python/OpenCV implementation (kept in place, unchanged, as
+  `_detect_scene_changes_python`) with a DEBUG log line. Verified via a new differential test
+  (`TestRustPythonParity`, `tests/unit/test_scene_detection.py`) that the Rust and Python paths
+  find identical scene boundaries on the calibration fixture and a synthetic motion+cut clip, with
+  per-cut `diff_score` divergence under 0.002 (decode/scale path rounding differences between
+  ffmpeg's `scale`+`format=gray` and OpenCV's `resize`+`cvtColor`). Real-world speed on a
+  54s/1620-frame 1080p60 clip: ~1.5x wall-clock (2.55s Python vs. 1.73s Rust; ~635 vs. ~936 fps).
+- **Batched Real-ESRGAN inference (`upscale`/`deblock`/`denoise_video`, torch backend)**: two new
+  opt-in (default `1` = today's behavior, unchanged) per-stage config keys,
+  `stages.<name>.batch_size` and `stages.<name>.tile_batch_size`, plus matching `--batch-size`/
+  `--tile-batch-size` CLI flags on `avf process`. Root cause: `RealESRGANUpscaler`/
+  `FrameProcessor` accepted a `batch_size` constructor arg that was never actually read anywhere
+  -- every frame (and, when tiling, every tile) went through the model one at a time. Two
+  independent batching axes were added:
+  - `tile_batch_size` batches N tiles of the SAME frame (sharing `compute_tile_grid`'s padded
+    input shape) into one forward pass inside `run_tiled_inference()` (`ai/wrappers/upscale.py`).
+    This is the primary real-world fix: a 4K (3840x2160) input always takes the tiled path at the
+    default `tile_size=512` (5x8=40 tiles/frame), so a multi-hour `deblock` job stuck on a real 4K
+    video was paying 40 small sequential forward passes per frame, each with its own Python/
+    kernel-launch/host-device-sync overhead -- confirmed via `nvidia-smi` showing GPU utilization
+    pinned near 100% (no idle time for I/O overlap) alongside `nvtop`-reported SM occupancy of
+    only ~70-80%, the classic signature of small serialized kernel launches.
+  - `batch_size` batches N different frames into one forward pass
+    (`RealESRGANUpscaler.upscale_batch()`/`upscale_video()`, plus new
+    `tensor_from_frames`/`frames_from_tensor` batched-tensor helpers in `ai/torch_utils.py`,
+    siblings of the existing single-frame `tensor_from_frame`/`frame_from_tensor`). Secondary to
+    tile batching -- only helps frames small enough to skip tiled inference in the first place.
+  - Both axes fall back to today's one-at-a-time processing for tiling+whole-frame-batching
+    combinations, TTA (`tta_mode >= 1`, a different batching axis -- 8 augmented passes of ONE
+    item), and the ncnn backend; on a caught `torch.cuda.OutOfMemoryError` the batch is
+    recursively halved and retried (mirroring the existing tile-size OOM-retry pattern), down to
+    a single item which then goes through the existing proven single-item OOM/tiling-retry path
+    unchanged.
+  - Verified: order preservation (distinguishable per-frame content), non-evenly-divisible tail
+    chunking (e.g. 10 frames / batch_size=4 -> 4,4,2), and TTA/tiling fallback all covered by new
+    mocked-torch unit tests (`tests/unit/test_ai_wrappers.py`, `tests/unit/test_torch_utils.py`);
+    numeric equivalence against the existing one-at-a-time path is covered by new GPU-gated
+    integration tests (skip without a cached checkpoint or CUDA) asserting max-abs-diff <= 12
+    uint8 levels at batch_size/tile_batch_size 4 and 8 vs 1 -- ran once against real hardware
+    (passed) but full A/B throughput benchmarking against a real 4K clip is still pending: the
+    user's own multi-hour production job was actively using the GPU (`nvidia-smi
+    --query-compute-apps` non-empty, ~100% utilization) throughout this change, so the timed
+    before/after benchmark was deliberately deferred rather than contend with it -- see
+    `docs/REQUIREMENTS.md`'s R5.3 note for the full context and re-run instructions.
+- **`stages.{upscale,deblock,denoise_video,interpolate}.temp_crf`** (default `16`): CRF for
+  each AI stage's internal temp-file encode (the chunked write to a temp `.mp4` before the
+  final mux pass), now passed explicitly instead of the temp encode getting no `-crf`/`-preset`
+  at all (silently landing on libx264's own default, CRF 23). The mux pass's preset is a fixed
+  `"medium"` (not itself configurable). See "Fixed" below for why this matters (double-encode
+  quality bug).
+- **AI-stage per-phase timing + periodic throughput instrumentation** (`ai/frame_processor.py`'s
+  `StageTimer`/`gpu_forward_timer()`, threaded through `RealESRGANUpscaler.upscale()`/
+  `upscale_batch()`/`upscale_video()` via an optional `timer=` kwarg): the chunked AI loop shared
+  by `upscale`/`deblock`/`denoise_video` now times `decode_wait`, `h2d_preprocess`, `gpu_forward`
+  (honest `torch.cuda.Event`-bracketed device time on CUDA, wall-clock fallback otherwise),
+  `d2h_postprocess`, and `write_wait` per chunk (DEBUG) plus an aggregate percentage breakdown at
+  stage end (INFO). Independently, INFO-level throughput (`frames_done`, `elapsed_sec`,
+  `current_fps`) logs every ~10s/10 chunks regardless of the phase breakdown, specifically so a
+  run killed early by an external timeout still yields a valid frames/sec curve -- see
+  `docs/REQUIREMENTS.md`'s R5.3 note on the 4K benchmark this was retroactively needed for. No
+  behavior change; always-on but cheap (`time.perf_counter()`/CUDA events only).
+
 ### Changed
 - **`frame_from_tensor`/`tensor_from_frame` (`ai/torch_utils.py`) now do their elementwise
   pre/post-processing on the GPU tensor instead of CPU numpy**, moving the device transfer to the
@@ -250,6 +366,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   async writer thread instead of serializing read → infer → write per chunk.
 
 ### Fixed
+- **Upscale stage ran a full AI pass on a video already at its target resolution** — a portrait
+  input already exactly at its orientation-rotated target (e.g. 1080x1920 against a `1080p60`
+  preset's `[1920, 1080]` target, which rotates to 1080x1920 for a portrait input) was not
+  recognized as "already at target" and ran a wasted `RealESRGAN_x2plus` pass, producing a
+  2160x3840 output (~1fps, over an hour for a 63-second clip; confirmed via GPU-forward
+  instrumentation as ~99% wasted compute). Root cause was three separate spots comparing the input
+  against the *unrotated* preset target instead of the orientation-aware rotated target: `Upscale
+  Stage.should_run()`'s "already at target?" check, `execute()`'s AI-vs-traditional method
+  selection, and — the actual mechanism that produced exactly a 2x output — `_execute_ai()`'s
+  per-pass scale-factor rounding (`2 ** round(log2(sf)) if sf > 1 else 2`), which silently
+  substituted a forced 2x scale whenever a pass's own needed scale computed to `<=1` (already
+  at/past target) instead of doing nothing. Fixed at all three levels via a shared
+  `_effective_target_bounds()` helper and a new `_SKIP_SCALE_THRESHOLD = 1.05` (5% linear, ~10%
+  area — chosen to also cover the "crop stage shaved a few px off before upscale ran" case, e.g.
+  1072x1908 vs. a 1080x1920 rotated target, without masking a genuine upscale need): at/below the
+  threshold, the stage now skips (already exact) or does a cheap lanczos resize (near target, not
+  exact) instead of ever running a wasted AI pass. See AGENTS.md's "Upscaling & Aspect Ratio"
+  section for the full root-cause writeup.
 - **`avf analyze`'s per-scene console listing was silently dropping its `[event_type]` prefix**
   (e.g. `[scene_change]`, `[talking_head]`) — Rich's console markup parser (on by default)
   swallows any `[...]` segment that isn't a recognized style tag instead of erroring, so the tag
@@ -283,6 +417,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   to video.
 - Missing top-level imports in `deblock.py` (`os`) and `denoise_video.py` (`probe`) that only
   worked by accident via a later local import.
+- **Double lossy encode in every AI stage** (`upscale`/`deblock`/`denoise_video`/`interpolate`):
+  each AI stage wrote its internal temp file with no `-crf`/`-preset` (silently libx264's default,
+  CRF 23), then re-encoded that temp file again during the mux pass at `-crf 18` -- two lossy
+  generations plus a wasted full x264 pass over the whole video for no quality benefit. Fixed by
+  giving the temp encode an explicit `-crf <stages.<name>.temp_crf>` (new config key, default 16)
+  `-preset medium`, and switching every AI stage's mux pass to `-c:v copy` (stream-copy, since the
+  temp file is now the only real encode). Verified: mux output's video stream is bit-identical to
+  the temp file's video stream (ffmpeg stream-hash comparison, `-map 0:v -c copy -f md5`) across
+  `deblock`/`denoise_video`/`upscale`, all against a real ffmpeg-generated clip through the actual
+  AI path (cached `RealESRGAN_x2plus` checkpoint, not mocked).
+- **Tile-batch OOM retry held the failed batch tensor alive across the halving recursion**
+  (`run_tiled_inference()`'s `_infer_group`, `ai/wrappers/upscale.py`): every retry after a caught
+  `torch.cuda.OutOfMemoryError` ran with LESS free VRAM than the attempt that had just failed,
+  instead of getting back the memory that attempt would have freed, because `batched_in` (and,
+  implicitly, `infer_fn`'s own reference to it via the live exception traceback) stayed referenced
+  through the whole recursion. Fixed by moving the `del batched_in` + cache-clear + recursion
+  OUTSIDE the `except` clause (an in-flight exception's traceback keeps the raising frame's locals
+  alive for as long as the `except` block is still executing, so a `del` inside it doesn't
+  actually drop the reference yet). Also: remainder tiles in a shape group (fewer than
+  `tile_batch_size` left over) now go through the single-tile path instead of one last
+  partial-size batch, avoiding a batched-tensor shape that differs from every other call in the
+  run and fragments the CUDA caching allocator. Verified via a new mocked-torch regression test
+  (`tests/unit/test_ai_wrappers.py::TestRunTiledInference::
+  test_tile_batching_oom_releases_failed_batch_before_retry`) that weakref-tracks the failed batch
+  tensor and asserts it's already released by the time `torch.cuda.empty_cache()` runs -- confirmed
+  to actually fail against the pre-fix code (moving the `del` back inside the recursion makes the
+  test fail as expected).
+- **≤1000-frame videos buffered ALL frames into RAM before AI inference**
+  (`upscale`/`deblock`/`denoise_video`): a frame-count-only threshold (`total_est > 1000`) was
+  resolution-blind, so a short but large-resolution clip (e.g. a 33s 4K clip, ~25GB uncompressed)
+  could still fall under 1000 frames while materializing its entire frame set via
+  `extract_frames()` before a single inference call, with zero decode/inference/write overlap. All
+  three stages now go through the chunked streaming path unconditionally (`use_chunked` branch and
+  its full-buffer `extract_frames()`/`frames_to_video()` route removed); streaming has no
+  measurable downside for short clips. Verified: a 30-frame real clip end-to-end through each of
+  the three stages' AI path still produces valid, correctly-encoded output via the streaming path.
 
 ### Added (from earlier Unreleased entries, retained)
 - Initial project structure

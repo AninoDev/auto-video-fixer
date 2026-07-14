@@ -24,6 +24,17 @@ class UpscaleStage(BaseStage):
     priority = 30
     supports_gpu = True
 
+    # If the orientation-aware target scale (see _effective_target_bounds())
+    # is at or below this, treat the input as "already at target" -- skip the
+    # AI path entirely rather than running a full extra AI pass (min 2x, see
+    # _run_single_ai_pass's power-of-2 rounding) for a negligible gain. 1.05
+    # (5% linear, ~10% area) comfortably covers the "crop stage shaved a few
+    # px off before upscale ran" case (e.g. 1072x1908 vs. a 1080x1920 target
+    # is a 1.0075x scale) without masking any real upscale need -- a genuine
+    # "needs upscaling" input is almost always well above this (e.g. 540x960
+    # -> 1080x1920 is 2.0x).
+    _SKIP_SCALE_THRESHOLD = 1.05
+
     def __init__(self, config):
         super().__init__(config)
         self._ai_model = self._stage_config.get("ai_model", "RealESRGAN_x4plus")
@@ -43,7 +54,22 @@ class UpscaleStage(BaseStage):
         if not target:
             return False, "No target resolution specified"
         w, h = input_info.get("resolution", (0, 0))
-        if w >= target[0] and h >= target[1]:
+        if w > 0 and h > 0:
+            # Compare against the ORIENTATION-AWARE target bounding box, not
+            # the raw preset target: a portrait input (e.g. 1080x1920) vs. a
+            # landscape preset target (e.g. [1920, 1080]) must be compared
+            # against the target rotated to 1080x1920, or a portrait input
+            # already at its target gets misjudged as needing a 2x upscale
+            # (real bug: RealESRGAN_x2plus ran on a 1080x1920 input already
+            # at target, producing a wasted 2160x3840 output -- see
+            # AGENTS.md's "Upscaling & Aspect Ratio" section and CHANGELOG).
+            bound_w, bound_h = self._effective_target_bounds(w, h, target[0], target[1])
+            scale_needed = max(bound_w / w, bound_h / h)
+            if scale_needed <= self._SKIP_SCALE_THRESHOLD:
+                return False, "Already at target resolution"
+        elif w >= target[0] and h >= target[1]:
+            # No usable resolution info -- fall back to the old, non-rotated
+            # comparison rather than blocking the stage outright.
             return False, "Already at target resolution"
         self._input_info = input_info
         return True, None
@@ -72,7 +98,16 @@ class UpscaleStage(BaseStage):
         if method is None:
             info = getattr(self, "_input_info", {})
             w, h = info.get("resolution", (0, 0))
-            if target_width and w < target_width:
+            if target_width and target_height and w > 0 and h > 0:
+                # Orientation-aware, same as should_run(): comparing raw w
+                # against the unrotated target_width alone (the previous
+                # behavior) picked "ai" for a portrait input against a
+                # landscape target even when the rotated target was already
+                # met.
+                bound_w, bound_h = self._effective_target_bounds(w, h, target_width, target_height)
+                needed_scale = max(bound_w / w, bound_h / h)
+                method = "ai" if needed_scale > self._SKIP_SCALE_THRESHOLD else "traditional"
+            elif target_width and w < target_width:
                 method = "ai"
             else:
                 method = "traditional"
@@ -193,6 +228,42 @@ class UpscaleStage(BaseStage):
         else:
             final_target_w, final_target_h = target_width, target_height
 
+        # Defense in depth against should_run()'s "already at target" gate:
+        # if this pass's own needed scale is within the skip threshold (e.g.
+        # _execute_ai() invoked directly via --stage upscale, bypassing
+        # should_run() entirely), don't run a full AI pass over a negligible
+        # difference. Real-ESRGAN passes are quantized to powers of 2 (see
+        # the per-pass scale-factor rounding below), so anything at/near 1x
+        # would otherwise force a full, wasted 2x AI pass -- exactly the
+        # reported bug (1080x1920 input already at its rotated 1920x1080
+        # target ran RealESRGAN_x2plus anyway, producing a 2160x3840
+        # output). Use a cheap lanczos resize (or a straight stream copy if
+        # dimensions already match exactly) instead of an AI pass here.
+        if final_target_w and final_target_h and input_w > 0 and input_h > 0:
+            needed_scale = max(final_target_w / input_w, final_target_h / input_h)
+            if needed_scale <= self._SKIP_SCALE_THRESHOLD:
+                if (input_w, input_h) == (final_target_w, final_target_h):
+                    copy_result = self._copy_stream(input_path, output_path, start)
+                    if copy_result.status != StageStatus.COMPLETED:
+                        return copy_result
+                    return StageResult(
+                        status=StageStatus.COMPLETED,
+                        output_path=output_path,
+                        metadata={"method": "copy", "reason": "already at target resolution"},
+                        duration_sec=time.time() - start,
+                    )
+                resize_result = self._resize_to_exact(
+                    input_path, output_path, final_target_w, final_target_h, start
+                )
+                if resize_result.status != StageStatus.COMPLETED:
+                    return resize_result
+                return StageResult(
+                    status=StageStatus.COMPLETED,
+                    output_path=output_path,
+                    metadata={"method": "resize", "reason": "within skip-scale threshold"},
+                    duration_sec=time.time() - start,
+                )
+
         # Calculate how many AI passes we need
         if final_target_w and final_target_h and input_w > 0 and input_h > 0:
             # Calculate total scale needed (based on longest side)
@@ -226,8 +297,26 @@ class UpscaleStage(BaseStage):
                         scale_w = final_target_w / current_w
                         scale_h = final_target_h / current_h
                         sf = max(scale_w, scale_h)
-                        # Round to nearest power of 2 for AI
-                        sf = 2 ** round(math.log2(sf)) if sf > 1 else 2
+                        # Round to the nearest power of 2 for AI (models only
+                        # support discrete scales). ROOT CAUSE of the
+                        # "upscale runs on a video already at target"
+                        # bug: this used to be `2 ** round(log2(sf)) if
+                        # sf > 1 else 2` -- i.e. whenever this pass's
+                        # own needed scale computed to <=1 (already at or
+                        # past target, e.g. a portrait 1080x1920 input
+                        # against its rotated 1080x1920 target), it
+                        # silently substituted a forced 2x scale instead of
+                        # doing nothing, producing a wasted full AI pass at
+                        # exactly input*2. Preserved <=1 as-is here; the
+                        # sf<=1 branch below now does a cheap resize/copy
+                        # instead of an AI pass. (The top-of-function
+                        # skip-threshold guard normally short-circuits before
+                        # this loop is ever reached for a whole-job scale
+                        # that's already at target; this is the equally-
+                        # important per-pass case, since a *chain* of passes
+                        # can still land here with sf<=1 on its final pass
+                        # even when the overall job needed > 1 pass.)
+                        sf = 2 ** round(math.log2(sf)) if sf > 1 else sf
                     else:
                         sf = max_ai_scale
                 else:
@@ -251,25 +340,48 @@ class UpscaleStage(BaseStage):
                 )
                 intermediate_files.append(pass_output)
 
-            # Run single AI pass. fallback_ctx lets _run_single_ai_pass fall back
-            # to the traditional method for the WHOLE job (original input ->
-            # final output_path/target dims) rather than just this one pass, if
-            # the AI path can't run and ai_fallback is enabled -- chaining a
-            # partial traditional result into subsequent AI passes wouldn't make
-            # sense once the AI path has already proven unavailable.
-            result = self._run_single_ai_pass(
-                current_input,
-                pass_output,
-                progress_callback,
-                start,
-                sf,
-                fallback_ctx={
-                    "input_path": input_path,
-                    "output_path": output_path,
-                    "target_width": final_target_w,
-                    "target_height": final_target_h,
-                },
-            )
+            if sf <= 1:
+                # Nothing meaningful for an AI pass to add at this point in
+                # the chain (already at/past the needed resolution) -- do a
+                # cheap resize/copy instead of a wasted AI forward pass.
+                current_dims = self._get_input_resolution(current_input)
+                if is_last_pass and final_target_w and final_target_h:
+                    if current_dims == (final_target_w, final_target_h):
+                        result = self._copy_stream(current_input, pass_output, start)
+                    else:
+                        result = self._resize_to_exact(
+                            current_input, pass_output, final_target_w, final_target_h, start
+                        )
+                else:
+                    result = self._copy_stream(current_input, pass_output, start)
+                if result.status == StageStatus.COMPLETED:
+                    result = StageResult(
+                        status=StageStatus.COMPLETED,
+                        output_path=pass_output,
+                        metadata={"method": "resize", "scale": sf},
+                        duration_sec=time.time() - start,
+                    )
+            else:
+                # Run single AI pass. fallback_ctx lets _run_single_ai_pass fall
+                # back to the traditional method for the WHOLE job (original
+                # input -> final output_path/target dims) rather than just this
+                # one pass, if the AI path can't run and ai_fallback is enabled
+                # -- chaining a partial traditional result into subsequent AI
+                # passes wouldn't make sense once the AI path has already
+                # proven unavailable.
+                result = self._run_single_ai_pass(
+                    current_input,
+                    pass_output,
+                    progress_callback,
+                    start,
+                    sf,
+                    fallback_ctx={
+                        "input_path": input_path,
+                        "output_path": output_path,
+                        "target_width": final_target_w,
+                        "target_height": final_target_h,
+                    },
+                )
 
             if result.status != StageStatus.COMPLETED:
                 # Clean up intermediate files on failure
@@ -311,7 +423,7 @@ class UpscaleStage(BaseStage):
                 )
             ):
                 fix_result = self._resize_to_exact(
-                    output_path, final_target_w, final_target_h, start
+                    output_path, output_path, final_target_w, final_target_h, start
                 )
                 if fix_result.status != StageStatus.COMPLETED:
                     return fix_result
@@ -324,13 +436,21 @@ class UpscaleStage(BaseStage):
         )
 
     def _resize_to_exact(
-        self, video_path: str, target_w: int, target_h: int, start: float
+        self, input_path: str, output_path: str, target_w: int, target_h: int, start: float
     ) -> StageResult:
-        """Resize `video_path` in place to exactly target_w x target_h."""
-        tmp_path = f"{video_path}.resize_tmp.mp4"
+        """Resize `input_path` to exactly target_w x target_h, writing `output_path`.
+
+        `input_path` and `output_path` may be the same file (in-place
+        correction of an AI pass's off-spec resolution) or different (a
+        direct cheap resize from the original input when the AI path is
+        being skipped for a near-target scale, see _execute_ai()) -- either
+        way this always goes through a distinct temp file first so an
+        in-place call never reads from a file it's concurrently truncating.
+        """
+        tmp_path = f"{output_path}.resize_tmp.mp4"
         args = [
             "-i",
-            video_path,
+            input_path,
             "-vf",
             f"scale={target_w}:{target_h}",
             "-c:a",
@@ -347,8 +467,25 @@ class UpscaleStage(BaseStage):
                 error=f"Final resize to {target_w}x{target_h} failed: {result.stderr[:300]}",
                 duration_sec=time.time() - start,
             )
-        os.replace(tmp_path, video_path)
-        return StageResult(status=StageStatus.COMPLETED, output_path=video_path)
+        os.replace(tmp_path, output_path)
+        return StageResult(status=StageStatus.COMPLETED, output_path=output_path)
+
+    def _copy_stream(self, input_path: str, output_path: str, start: float) -> StageResult:
+        """Stream-copy `input_path` to `output_path` with no re-encode.
+
+        Used when the AI upscale path is skipped because the input is
+        already exactly at the target resolution -- avoids both a wasted AI
+        pass and a needless re-encode generation loss.
+        """
+        args = ["-i", input_path, "-c", "copy", "-y", output_path]
+        result = run_ffmpeg(args, timeout=600)
+        if result.returncode != 0:
+            return StageResult(
+                status=StageStatus.FAILED,
+                error=f"Stream copy failed: {result.stderr[:300]}",
+                duration_sec=time.time() - start,
+            )
+        return StageResult(status=StageStatus.COMPLETED, output_path=output_path)
 
     def _run_single_ai_pass(
         self,
@@ -385,6 +522,7 @@ class UpscaleStage(BaseStage):
             from autovideofixer.ai.frame_processor import (
                 AsyncVideoWriter,
                 FrameProcessor,
+                StageTimer,
                 StreamingVideoWriter,
             )
             from autovideofixer.ai.torch_utils import is_torch_available
@@ -462,6 +600,8 @@ class UpscaleStage(BaseStage):
                 tta_mode=self._tt_mode,
                 device_preference=self.config.get("gpu", "preferred_device", default="auto"),
                 tile_size=self._stage_config.get("tile_size", 0),
+                batch_size=self._stage_config.get("batch_size", 1),
+                tile_batch_size=self._stage_config.get("tile_batch_size", 1),
                 backend=backend,
                 vulkan_device=self.config.get("gpu", "vulkan_device", default=0),
             )
@@ -478,12 +618,14 @@ class UpscaleStage(BaseStage):
                 )
 
             proc = FrameProcessor()
-            # Stream frames in chunks to avoid loading the entire video into memory.
-            # For short clips (<= 1000 frames) we load all at once for simplicity.
+            # Stream frames in chunks to avoid loading the entire video into
+            # memory -- ALL videos go through this path regardless of frame
+            # count (see DeblockStage._execute_ai for why the old frame-
+            # count-only `use_chunked` threshold and its full-buffer
+            # extract_frames()/frames_to_video() route were removed).
             fps = self._get_input_fps(input_path)
             probe_info = probe(input_path)
             total_est = int(probe_info.frame_count) if probe_info.frame_count else 0
-            use_chunked = total_est > 1000
 
             # The temp file's extension must NOT be derived from output_path's
             # extension: frames_to_video()/StreamingVideoWriter always mux
@@ -498,95 +640,80 @@ class UpscaleStage(BaseStage):
             )
 
             try:
-                if use_chunked:
-                    chunk_size = 25
-                    # AsyncVideoWriter hands the ffmpeg pipe write off to a
-                    # background thread so it doesn't block the next chunk's
-                    # GPU inference; stream_frames_prefetched decodes the next
-                    # chunk on a background thread while the current one is
-                    # being upscaled. Together these overlap CPU decode/write
-                    # with GPU compute instead of serializing all three per
-                    # chunk (read -> infer -> write -> read -> ...).
-                    writer = AsyncVideoWriter(StreamingVideoWriter(temp_path, fps=fps))
-                    total_chunks = 0
-                    processed_frames = 0
-                    frames_written = 0
+                chunk_size = 25
+                temp_crf = self._stage_config.get("temp_crf", 16)
+                # AsyncVideoWriter hands the ffmpeg pipe write off to a
+                # background thread so it doesn't block the next chunk's
+                # GPU inference; stream_frames_prefetched decodes the next
+                # chunk on a background thread while the current one is
+                # being upscaled. Together these overlap CPU decode/write
+                # with GPU compute instead of serializing all three per
+                # chunk (read -> infer -> write -> read -> ...).
+                writer = AsyncVideoWriter(
+                    StreamingVideoWriter(temp_path, fps=fps, crf=temp_crf, preset="medium")
+                )
+                total_chunks = 0
+                processed_frames = 0
+                frames_written = 0
+                timer = StageTimer("upscale")
 
-                    def cb(current, total, msg):
-                        self._report_progress(
-                            0.1 + (processed_frames / (total_est * self._scale_factor)) * 0.9,
-                            msg,
-                            progress_callback,
-                        )
+                def cb(current, total, msg):
+                    self._report_progress(
+                        0.1 + (processed_frames / (total_est * self._scale_factor)) * 0.9,
+                        msg,
+                        progress_callback,
+                    )
 
-                    for chunk in proc.stream_frames_prefetched(
+                chunk_iter = iter(
+                    proc.stream_frames_prefetched(
                         input_path, chunk_size=chunk_size, max_frames=total_est
-                    ):
-                        total_chunks += 1
-                        chunk_upscaled = upscaler.upscale_video(chunk, progress_callback=cb)
-                        # Write each chunk's output straight to the ffmpeg pipe
-                        # instead of buffering the whole video's frames in memory.
-                        writer.write(chunk_upscaled)
-                        frames_written += len(chunk_upscaled)
-                        processed_frames += len(chunk)
+                    )
+                )
+                while True:
+                    t0 = time.time()
+                    try:
+                        chunk = next(chunk_iter)
+                    except StopIteration:
+                        break
+                    timer.record("decode_wait", time.time() - t0)
 
-                        self._report_progress(
-                            0.1 + (processed_frames / (total_est * self._scale_factor)) * 0.9,
-                            f"Processing chunk {total_chunks}...",
-                            progress_callback,
-                        )
-                    proc.close()
-                    write_ok = writer.close()
+                    total_chunks += 1
+                    chunk_upscaled = upscaler.upscale_video(
+                        chunk, progress_callback=cb, timer=timer
+                    )
+                    # Write each chunk's output straight to the ffmpeg pipe
+                    # instead of buffering the whole video's frames in memory.
+                    t0 = time.time()
+                    writer.write(chunk_upscaled)
+                    timer.record("write_wait", time.time() - t0)
+                    timer.end_chunk(len(chunk_upscaled))
 
-                    if frames_written == 0:
-                        upscaler.unload()
-                        return StageResult(
-                            status=StageStatus.FAILED,
-                            error="No frames produced",
-                            duration_sec=time.time() - start,
-                        )
-                    if not write_ok:
-                        upscaler.unload()
-                        return StageResult(
-                            status=StageStatus.FAILED,
-                            error="Failed to write upscaled frames",
-                            duration_sec=time.time() - start,
-                        )
-                else:
-                    frames = proc.extract_frames(input_path)
-                    proc.close()
+                    frames_written += len(chunk_upscaled)
+                    processed_frames += len(chunk)
 
-                    if not frames:
-                        upscaler.unload()
-                        return StageResult(
-                            status=StageStatus.FAILED,
-                            error="No frames extracted",
-                            duration_sec=time.time() - start,
-                        )
+                    self._report_progress(
+                        0.1 + (processed_frames / (total_est * self._scale_factor)) * 0.9,
+                        f"Processing chunk {total_chunks}...",
+                        progress_callback,
+                    )
+                proc.close()
+                write_ok = writer.close()
+                timer.summary()
 
-                    def cb(current, total, msg):
-                        self._report_progress(0.1 + (current / total) * 0.9, msg, progress_callback)
-
-                    all_upscaled = upscaler.upscale_video(frames, progress_callback=cb)
-
-                    if not all_upscaled:
-                        upscaler.unload()
-                        return StageResult(
-                            status=StageStatus.FAILED,
-                            error="No frames produced",
-                            duration_sec=time.time() - start,
-                        )
-
-                    proc2 = FrameProcessor()
-                    if not proc2.frames_to_video(all_upscaled, temp_path, fps=fps):
-                        proc2.close()
-                        upscaler.unload()
-                        return StageResult(
-                            status=StageStatus.FAILED,
-                            error="Failed to write frames",
-                            duration_sec=time.time() - start,
-                        )
-                    proc2.close()
+                if frames_written == 0:
+                    upscaler.unload()
+                    return StageResult(
+                        status=StageStatus.FAILED,
+                        error="No frames produced",
+                        duration_sec=time.time() - start,
+                    )
+                if not write_ok:
+                    upscaler.unload()
+                    return StageResult(
+                        status=StageStatus.FAILED,
+                        error="Failed to write upscaled frames",
+                        duration_sec=time.time() - start,
+                    )
 
                 # Mux processed video back with the original audio (if any).
                 # The input may have no audio stream at all - mapping
@@ -600,9 +727,15 @@ class UpscaleStage(BaseStage):
                 except Exception:
                     has_audio = False
 
+                # -c:v copy: the temp file was already encoded once (at
+                # temp_crf/"medium" above) -- re-encoding it again here at a
+                # DIFFERENT crf (this used to be "-crf 18") was a second lossy
+                # generation plus a wasted full x264 pass. Stream-copying the
+                # already-encoded video track makes this mux bit-identical to
+                # the temp file's video stream.
                 mux_args = ["-i", input_path, "-i", temp_path]
                 mux_args += ["-map", "0:a:0", "-map", "1:v:0"] if has_audio else ["-map", "1:v:0"]
-                mux_args += ["-c:v", "libx264", "-crf", "18", "-c:a", "copy", "-y", output_path]
+                mux_args += ["-c:v", "copy", "-c:a", "copy", "-y", output_path]
                 mux_result = run_ffmpeg(mux_args, timeout=600)
 
                 upscaler.unload()
@@ -673,13 +806,9 @@ class UpscaleStage(BaseStage):
         if not self._keep_aspect_ratio:
             return self._round_to_even(target_width, target_height)
 
-        # Rotate preset bounding box to match input orientation
-        if input_height > input_width:  # Portrait input
-            bound_w, bound_h = target_height, target_width
-        elif input_width > input_height:  # Landscape input
-            bound_w, bound_h = target_width, target_height
-        else:  # Square input
-            bound_w = bound_h = min(target_width, target_height)
+        bound_w, bound_h = self._effective_target_bounds(
+            input_width, input_height, target_width, target_height
+        )
 
         # Scale to fit within the (possibly rotated) bounding box
         scale_w = bound_w / input_width if input_width > 0 else 1.0
@@ -690,6 +819,28 @@ class UpscaleStage(BaseStage):
         new_height = int(input_height * scale_factor)
 
         return self._round_to_even(new_width, new_height)
+
+    def _effective_target_bounds(
+        self, input_width: int, input_height: int, target_width: int, target_height: int
+    ) -> tuple[int, int]:
+        """Return the target bounding box, rotated to match input orientation.
+
+        Shared by should_run() (the target-reached check), execute()'s
+        method selection (ai vs. traditional), and
+        _calculate_target_dimensions() (the actual scale computation) so all
+        three agree on what "already at target" means for a given input's
+        orientation. If keep_aspect_ratio is False, returns the target
+        unrotated (matching _calculate_target_dimensions' non-aspect path).
+        """
+        if not self._keep_aspect_ratio:
+            return target_width, target_height
+        if input_height > input_width:  # Portrait input
+            return target_height, target_width
+        elif input_width > input_height:  # Landscape input
+            return target_width, target_height
+        else:  # Square input
+            side = min(target_width, target_height)
+            return side, side
 
     @staticmethod
     def _round_to_even(width: int, height: int) -> tuple[int, int]:

@@ -674,16 +674,16 @@ class VideoAnalyzer:
         """
         if threshold is None:
             threshold = self.config.get(
-                "analysis", "duplicate_detection", "similarity_threshold", default=0.95
+                "analysis", "duplicate_detection", "similarity_threshold", default=0.85
             )
 
-        ref_hash = compute_video_hash(filepath)
+        ref_hash = compute_video_phash(filepath)
         results: list[tuple[str, float]] = []
 
         for candidate in candidates:
             if candidate == filepath:
                 continue
-            cand_hash = compute_video_hash(candidate)
+            cand_hash = compute_video_phash(candidate)
             similarity = hash_similarity(ref_hash, cand_hash)
             if similarity >= threshold:
                 results.append((candidate, similarity))
@@ -710,13 +710,13 @@ class VideoAnalyzer:
         """
         if threshold is None:
             threshold = self.config.get(
-                "analysis", "duplicate_detection", "similarity_threshold", default=0.95
+                "analysis", "duplicate_detection", "similarity_threshold", default=0.85
             )
 
         # Compute hashes for all files
         hashes: dict[str, str] = {}
         for f in files:
-            h = compute_video_hash(f)
+            h = compute_video_phash(f)
             if h:
                 hashes[f] = h
 
@@ -1122,6 +1122,40 @@ def _run_api_vlm(
 
 # ─── Scene Detection ───────────────────────────────────────────────
 
+# Lazily-imported PyO3/maturin Rust extension implementing the frame-
+# differencing hot loop (docs/REQUIREMENTS.md R5.1). Not available means the
+# compiled wheel wasn't built for this environment/platform -- fall back to
+# the pure-Python implementation below rather than hard-failing. See
+# rust/avf_scenes/src/lib.rs for the Rust side.
+try:
+    from avf_scenes import detect_scene_changes_rs as _detect_scene_changes_rs_native
+except ImportError:
+    _detect_scene_changes_rs_native = None
+    logger.debug(
+        "avf_scenes Rust extension not available; falling back to pure-Python "
+        "scene detection (see rust/avf_scenes/ and AGENTS.md's Setup & Commands "
+        "for the build step)."
+    )
+
+# Lazily-imported PyO3/maturin Rust extension implementing perceptual-hash
+# duplicate detection (docs/REQUIREMENTS.md R5.2). Same fallback contract as
+# avf_scenes above: falls back to a pure-NumPy implementation of the *same*
+# pHash algorithm (not the old ahash/dhash) when the compiled wheel isn't
+# available, so results are consistent regardless of whether the extension
+# is built. See rust/avf_hashing/src/lib.rs for the Rust side and algorithm
+# rationale.
+try:
+    from avf_hashing import compute_phash_rs as _compute_phash_rs_native
+    from avf_hashing import hash_similarity_rs as _hash_similarity_rs_native
+except ImportError:
+    _compute_phash_rs_native = None
+    _hash_similarity_rs_native = None
+    logger.debug(
+        "avf_hashing Rust extension not available; falling back to pure-Python/"
+        "NumPy pHash (see rust/avf_hashing/ and AGENTS.md's Setup & Commands "
+        "for the build step)."
+    )
+
 
 def _select_near_misses(
     near_misses: list[tuple[float, float]], limit: int = 10
@@ -1173,12 +1207,106 @@ def _detect_scene_changes(
     scenes (fast cuts under ~2s apart), lower this too or short scenes will
     be silently merged into their neighbor even though the underlying cuts
     were both correctly detected.
+
+    Backed by a compiled Rust extension (``avf_scenes``, see
+    ``rust/avf_scenes/``) when available, with an automatic fallback to the
+    pure-Python/OpenCV implementation (``_detect_scene_changes_python``)
+    otherwise -- both produce the same ``SceneEvent`` boundaries (see
+    ``docs/REQUIREMENTS.md`` R5.1 for the verification bar) and share the
+    cut-score/near-miss logging below.
     """
+    if _detect_scene_changes_rs_native is not None:
+        scenes, cut_scores, near_misses = _detect_scene_changes_rust(
+            filepath, threshold, min_duration_sec, progress_callback
+        )
+    else:
+        scenes, cut_scores, near_misses = _detect_scene_changes_python(
+            filepath, threshold, min_duration_sec, progress_callback
+        )
+
+    if cut_scores:
+        logger.info(
+            "scene detection for %s: %d cut(s) found (threshold=%.3f), "
+            "cut score min=%.3f median=%.3f max=%.3f",
+            filepath,
+            len(cut_scores),
+            threshold,
+            min(cut_scores),
+            statistics.median(cut_scores),
+            max(cut_scores),
+        )
+    else:
+        logger.info(
+            "scene detection for %s: no cuts found above threshold %.3f", filepath, threshold
+        )
+
+    if near_misses:
+        near_miss_floor = threshold / 4.0
+        top_near_misses = _select_near_misses(near_misses)
+        near_miss_str = ", ".join(f"{score:.3f} @ {t:.1f}s" for t, score in top_near_misses)
+        logger.info(
+            "near-miss scores for %s below threshold %.3f (above %.3f): %s",
+            filepath,
+            threshold,
+            near_miss_floor,
+            near_miss_str,
+        )
+
+    return scenes
+
+
+def _detect_scene_changes_rust(
+    filepath: str,
+    threshold: float,
+    min_duration_sec: float,
+    progress_callback: ProgressCallback | None = None,
+) -> tuple[list[SceneEvent], list[float], list[tuple[float, float]]]:
+    """Rust-backed implementation. See ``_detect_scene_changes``'s docstring
+    for the metric and ``rust/avf_scenes/src/lib.rs`` for the algorithm --
+    it must match ``_detect_scene_changes_python`` below exactly (bounded
+    float divergence from the decode path aside)."""
+    from autovideofixer.core.ffmpeg_utils import get_ffmpeg_path, get_ffprobe_path
+
+    try:
+        ffmpeg_path = get_ffmpeg_path()
+        ffprobe_path = get_ffprobe_path()
+    except FileNotFoundError:
+        return [], [], []
+
+    def _cb(phase: str, detail: str) -> None:
+        if progress_callback is not None:
+            progress_callback(phase, detail)
+
+    assert _detect_scene_changes_rs_native is not None
+    raw_scenes, cut_scores, near_misses = _detect_scene_changes_rs_native(
+        filepath,
+        threshold,
+        min_duration_sec,
+        ffmpeg_path,
+        ffprobe_path,
+        _cb if progress_callback is not None else None,
+    )
+    scenes = [
+        SceneEvent(start_time=start, end_time=end, confidence=confidence)
+        for start, end, confidence in raw_scenes
+    ]
+    return scenes, cut_scores, near_misses
+
+
+def _detect_scene_changes_python(
+    filepath: str,
+    threshold: float,
+    min_duration_sec: float,
+    progress_callback: ProgressCallback | None = None,
+) -> tuple[list[SceneEvent], list[float], list[tuple[float, float]]]:
+    """Pure-Python/OpenCV implementation, kept as the fallback for
+    environments without the compiled ``avf_scenes`` Rust extension. See
+    ``_detect_scene_changes``'s docstring for the metric this must match."""
     import cv2
 
     cap = cv2.VideoCapture(filepath)
     if not cap.isOpened():
-        return []
+        return [], [], []
 
     scenes: list[SceneEvent] = []
     prev_frame: Any = None
@@ -1272,34 +1400,7 @@ def _detect_scene_changes(
                 )
             )
 
-    if cut_scores:
-        logger.info(
-            "scene detection for %s: %d cut(s) found (threshold=%.3f), "
-            "cut score min=%.3f median=%.3f max=%.3f",
-            filepath,
-            len(cut_scores),
-            threshold,
-            min(cut_scores),
-            statistics.median(cut_scores),
-            max(cut_scores),
-        )
-    else:
-        logger.info(
-            "scene detection for %s: no cuts found above threshold %.3f", filepath, threshold
-        )
-
-    if near_misses:
-        top_near_misses = _select_near_misses(near_misses)
-        near_miss_str = ", ".join(f"{score:.3f} @ {t:.1f}s" for t, score in top_near_misses)
-        logger.info(
-            "near-miss scores for %s below threshold %.3f (above %.3f): %s",
-            filepath,
-            threshold,
-            near_miss_floor,
-            near_miss_str,
-        )
-
-    return scenes
+    return scenes, cut_scores, near_misses
 
 
 def _classify_events(
@@ -1838,131 +1939,149 @@ def run_crop_vlm_check(
 
 
 # ─── Perceptual Hashing & Duplicate Detection ──────────────────────
+#
+# Algorithm: pHash (DCT-based perceptual hash), backed by the ``avf_hashing``
+# Rust extension when available (rust/avf_hashing/src/lib.rs -- see that
+# module's docstring for the full algorithm rationale and why it replaces
+# the old ahash/dhash implementation wholesale rather than sitting alongside
+# it, per docs/REQUIREMENTS.md R5.2). This section's pure-Python/NumPy
+# functions are the fallback used when the compiled extension isn't
+# available -- they implement the *identical* pHash algorithm (32x32
+# downscale -> 2D DCT -> 8x8 low-frequency block -> threshold against the
+# mean excluding the DC term -> 64-bit hash, combined across sampled frames
+# via majority vote), not the retired ahash/dhash, so results are consistent
+# regardless of which path runs.
+
+_PHASH_SIDE = 32
+_PHASH_LOW_FREQ = 8
 
 
-def compute_video_hash(filepath: str, num_frames: int = 30) -> str:
-    """Compute a perceptual hash of a video for similarity comparison.
+def _dct_matrix(n: int) -> Any:
+    """Build the NxN orthonormal DCT-II basis matrix (``matrix[u][x]``),
+    matching ``dct_matrix()`` in rust/avf_hashing/src/lib.rs exactly."""
+    import numpy as np
 
-    Uses average hash (ahash) on evenly-spaced frames. Each frame is
-    resized to 16x16 grayscale, hashed via the ahash algorithm, and
-    all frame hashes are combined via majority voting per bit position.
+    x = np.arange(n).reshape(1, -1)
+    u = np.arange(n).reshape(-1, 1)
+    basis = np.cos(np.pi / n * (x + 0.5) * u)
+    alpha = np.full(n, np.sqrt(2.0 / n))
+    alpha[0] = np.sqrt(1.0 / n)
+    return basis * alpha.reshape(-1, 1)
+
+
+def _phash_frame_python(gray: Any, dct: Any, dct_t: Any) -> int:
+    """pHash a single ``_PHASH_SIDE``x``_PHASH_SIDE`` grayscale frame (as a
+    NumPy array) into a 64-bit integer. Mirrors ``phash_frame()`` in
+    rust/avf_hashing/src/lib.rs bit-for-bit."""
+    import numpy as np
+
+    coeffs = dct @ gray.astype(np.float64) @ dct_t
+    low = coeffs[:_PHASH_LOW_FREQ, :_PHASH_LOW_FREQ].flatten()
+    mean = (low.sum() - low[0]) / (low.size - 1)
+
+    hash_bits = 0
+    for i, value in enumerate(low):
+        if value > mean:
+            hash_bits |= 1 << (63 - i)
+    return hash_bits
+
+
+def _compute_video_phash_python(filepath: str, num_frames: int = 30) -> str:
+    """Pure-Python/OpenCV/NumPy pHash implementation, kept as the fallback
+    for environments without the compiled ``avf_hashing`` Rust extension.
+    See the module docstring above and rust/avf_hashing/src/lib.rs for the
+    algorithm this must match."""
+    import cv2
+
+    cap = cv2.VideoCapture(filepath)
+    if not cap.isOpened():
+        return ""
+
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    if total_frames == 0:
+        cap.release()
+        return ""
+
+    step = max(1, total_frames // max(1, num_frames))
+    dct = _dct_matrix(_PHASH_SIDE)
+    dct_t = dct.T
+    per_frame_hashes: list[int] = []
+
+    for i in range(0, total_frames, step):
+        if len(per_frame_hashes) >= num_frames:
+            break
+        cap.set(cv2.CAP_PROP_POS_FRAMES, i)
+        ret, frame = cap.read()
+        if not ret:
+            # A single transient decode glitch shouldn't truncate all
+            # subsequent sampling -- skip this frame and keep going.
+            continue
+
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        gray = cv2.resize(gray, (_PHASH_SIDE, _PHASH_SIDE))
+        per_frame_hashes.append(_phash_frame_python(gray, dct, dct_t))
+
+    cap.release()
+
+    if not per_frame_hashes:
+        return ""
+
+    # Majority-vote bit combination across sampled frames (ties -> 0),
+    # matching combine_majority() in rust/avf_hashing/src/lib.rs.
+    n = len(per_frame_hashes)
+    combined = 0
+    for bit in range(64):
+        mask = 1 << bit
+        ones = sum(1 for h in per_frame_hashes if h & mask)
+        if ones * 2 > n:
+            combined |= mask
+
+    return f"{combined:016x}"
+
+
+def compute_video_phash(filepath: str, num_frames: int = 30) -> str:
+    """Compute a pHash (DCT-based perceptual hash) of a video for
+    similarity comparison.
+
+    Samples ``num_frames`` evenly-spaced frames, computes a 64-bit DCT-based
+    perceptual hash of each, and combines them into one video-level hash via
+    majority-vote bit combination. Backed by the ``avf_hashing`` Rust
+    extension when available, with an automatic fallback to the pure-Python
+    implementation above otherwise (see that function's docstring and
+    rust/avf_hashing/src/lib.rs for why pHash was chosen over the retired
+    ahash/dhash implementation).
 
     Args:
         filepath: Path to the video file
         num_frames: Number of frames to sample
 
     Returns:
-        Binary hash string (e.g., '10110010...')
+        16-character lowercase hex string (64-bit hash), or "" if the video
+        couldn't be opened/decoded.
     """
-    import cv2
+    if _compute_phash_rs_native is not None:
+        from autovideofixer.core.ffmpeg_utils import get_ffmpeg_path, get_ffprobe_path
 
-    cap = cv2.VideoCapture(filepath)
-    if not cap.isOpened():
-        return ""
+        try:
+            ffmpeg_path = get_ffmpeg_path()
+            ffprobe_path = get_ffprobe_path()
+        except FileNotFoundError:
+            return ""
+        return str(_compute_phash_rs_native(filepath, num_frames, ffmpeg_path, ffprobe_path))
 
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    if total_frames == 0:
-        cap.release()
-        return ""
-
-    step = max(1, total_frames // num_frames)
-    hashes: list[str] = []
-
-    for i in range(0, total_frames, step):
-        cap.set(cv2.CAP_PROP_POS_FRAMES, i)
-        ret, frame = cap.read()
-        if not ret:
-            # A single transient decode glitch shouldn't truncate all
-            # subsequent sampling — skip this frame and keep going.
-            continue
-
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        gray = cv2.resize(gray, (16, 16))
-        mean = gray.mean()
-        h = "".join("1" if p > mean else "0" for p in gray.flatten())
-        hashes.append(h)
-
-    cap.release()
-
-    if not hashes:
-        return ""
-
-    # Combine all frame hashes via majority vote per bit position
-    hash_len = len(hashes[0])
-    combined = []
-    for i in range(hash_len):
-        bits = [h[i] for h in hashes if i < len(h)]
-        combined.append("1" if bits.count("1") > len(bits) / 2 else "0")
-
-    return "".join(combined)
-
-
-def compute_video_dhash(filepath: str, width: int = 16) -> str:
-    """Compute a difference hash (dhash) of a video.
-
-    Dhash compares adjacent pixels to detect structural patterns,
-    which is more robust than ahash for videos with similar
-    content but different lighting/contrast.
-
-    Args:
-        filepath: Path to the video file
-        width: Hash width in pixels (default 16)
-
-    Returns:
-        Binary hash string
-    """
-    import cv2
-
-    cap = cv2.VideoCapture(filepath)
-    if not cap.isOpened():
-        return ""
-
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    if total_frames == 0:
-        cap.release()
-        return ""
-
-    step = max(1, total_frames // 10)  # Sample fewer frames for dhash
-    hashes: list[str] = []
-
-    for i in range(0, total_frames, step):
-        cap.set(cv2.CAP_PROP_POS_FRAMES, i)
-        ret, frame = cap.read()
-        if not ret:
-            continue
-
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        gray = cv2.resize(gray, (width, width + 1))
-
-        # Dhash: compare each pixel to its right neighbor
-        bits = []
-        for row in range(gray.shape[0]):
-            for col in range(gray.shape[1] - 1):
-                bits.append("1" if gray[row, col] > gray[row, col + 1] else "0")
-        hashes.append("".join(bits))
-
-    cap.release()
-
-    if not hashes:
-        return ""
-
-    hash_len = len(hashes[0])
-    combined = []
-    for i in range(hash_len):
-        bits = [h[i] for h in hashes if i < len(h)]
-        combined.append("1" if bits.count("1") > len(bits) / 2 else "0")
-
-    return "".join(combined)
+    return _compute_video_phash_python(filepath, num_frames)
 
 
 def hash_similarity(hash1: str, hash2: str) -> float:
-    """Compute similarity between two perceptual hashes (0-1).
+    """Compute similarity between two pHash hex strings (0-1).
 
-    Uses Hamming distance: percentage of matching bits.
+    Uses Hamming distance over the underlying 64-bit hash: fraction of
+    matching bits. Backed by the ``avf_hashing`` Rust extension when
+    available, with a pure-Python fallback otherwise.
 
     Args:
-        hash1: First hash string
-        hash2: Second hash string
+        hash1: First hash (16-character hex string)
+        hash2: Second hash (16-character hex string)
 
     Returns:
         Similarity score between 0.0 and 1.0
@@ -1970,5 +2089,17 @@ def hash_similarity(hash1: str, hash2: str) -> float:
     if not hash1 or not hash2 or len(hash1) != len(hash2):
         return 0.0
 
-    matching = sum(a == b for a, b in zip(hash1, hash2))
-    return matching / len(hash1)
+    if _hash_similarity_rs_native is not None:
+        try:
+            return float(_hash_similarity_rs_native(hash1, hash2))
+        except ValueError:
+            return 0.0
+
+    try:
+        a = int(hash1, 16)
+        b = int(hash2, 16)
+    except ValueError:
+        return 0.0
+
+    distance = bin(a ^ b).count("1")
+    return 1.0 - (distance / 64.0)

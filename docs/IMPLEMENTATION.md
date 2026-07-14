@@ -208,7 +208,8 @@ Dependencies:
 **Duration**: 0.5 weeks
 
 Tasks:
-- [x] Improve perceptual hashing (ahash + dhash)
+- [x] Improve perceptual hashing (ahash + dhash) -- superseded 2026-07-13 by a Rust-backed pHash
+  (`rust/avf_hashing/`, docs/REQUIREMENTS.md R5.2); see CHANGELOG/ROADMAP.
 - [x] Add similarity scoring (`hash_similarity` with Hamming distance)
 - [x] Implement batch deduplication (`find_duplicates`)
 - [x] Write duplicate detection tests

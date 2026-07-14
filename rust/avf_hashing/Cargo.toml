@@ -1,0 +1,30 @@
+[package]
+name = "avf_hashing"
+version = "0.1.0"
+edition = "2024"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+[lib]
+name = "avf_hashing"
+crate-type = ["cdylib"]
+
+[dependencies]
+pyo3 = { version = "0.29.0" }
+
+# `extension-module` links against libpython lazily (symbols resolved by the
+# embedding CPython interpreter at dlopen time) -- correct for the cdylib
+# maturin builds, but it means a standalone `cargo test` binary (which needs
+# to link libpython for real, since nothing is embedding it) fails with
+# undefined-symbol errors if the feature is unconditionally enabled. Gating
+# it behind a default-on feature lets `cargo test --no-default-features`
+# build a working test binary while `cargo build`/`maturin develop` (which
+# use the default feature set) still get the extension-module behavior
+# required for the module to load inside CPython. This crate has real Rust
+# unit tests (see `mod tests` below), unlike `avf_scenes`, which is why this
+# split exists here but not there.
+[features]
+default = ["extension-module"]
+extension-module = ["pyo3/extension-module"]
+
+[profile.release]
+lto = true

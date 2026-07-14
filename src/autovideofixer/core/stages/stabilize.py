@@ -35,6 +35,12 @@ class StabilizeStage(BaseStage):
         self._zoom_enabled = self._stage_config.get("zoom_enabled", True)
         self._zoom_mode = self._stage_config.get("zoom_mode", "black")
         self._zoom_threshold = self._stage_config.get("zoom_threshold", 50.0)  # pixels
+        # 1.0 = today's optzoom=1 behavior (fill frame for every frame); 0.0 = no
+        # zoom; in between = a static zoom sized to the zoom_coverage-quantile of
+        # per-frame required-zoom estimates. See _compute_static_zoom_pct().
+        self._zoom_coverage = max(
+            0.0, min(1.0, float(self._stage_config.get("zoom_coverage", 1.0)))
+        )
         self._sharpen_enabled = self._stage_config.get("sharpen_enabled", True)
         self._optalgo = self._stage_config.get("optalgo", "gauss")
         self._shakiness = self._stage_config.get("shakiness", 10)
@@ -308,6 +314,139 @@ class StabilizeStage(BaseStage):
             self.logger.warning(f"Movement extent calculation failed: {e}")
             return 0.0
 
+    def _compute_static_zoom_pct(
+        self, trf_path: str, video_width: int, video_height: int, coverage: float
+    ) -> float:
+        """Approximate the static vidstabtransform ``zoom=<pct>`` needed so that
+        ``coverage`` fraction of frames end up border-free.
+
+        LIMITATION (state this honestly, do not treat this as exact): what
+        actually determines each frame's visible border is
+        vidstabtransform's own internally-computed SMOOTHED camera path (a
+        function of smoothing/maxshift/optalgo/interpol), which this method
+        has no access to. All it can see is the raw per-block local-motion
+        (LM) values in the TRF file -- frame-to-frame motion estimates, not
+        the smoothed path -- which are integrated here into an approximate
+        cumulative camera-path position. The quantile of these raw,
+        un-smoothed excursions is a DIRECTIONALLY CORRECT approximation of
+        the quantile of the true smoothed-path excursions, not an exact
+        match: individual frames' actual post-smoothing border requirements
+        can come out higher or lower than this estimate. This is exactly
+        why zoom_coverage is a tunable dial and not a guarantee once
+        coverage < 1.0 -- at coverage=1.0 the exact optzoom=1 delegation is
+        used instead (no approximation involved). This also does NOT
+        account for rotation's contribution to border size -- the TRF's
+        rotation component, if present, is ignored here, same limitation as
+        _movement_extent().
+
+        Returns a zoom percentage suitable for vidstabtransform's
+        ``zoom=`` option (>0 = zoom in), or 0.0 if the TRF can't be parsed
+        or has no LM data.
+        """
+        try:
+            with open(trf_path, "r") as f:
+                content = f.read()
+
+            # Real vidstabdetect TRF output puts a frame's "Frame N (List M
+            # [...])" header and its LM entries on ONE line (as all the
+            # existing TRF-derived tests in this file build their fixtures);
+            # the LM search below runs on every line unconditionally
+            # (not `elif`) so it still finds entries whether they're on the
+            # same line as the "Frame N" header or, hypothetically, a
+            # continuation line.
+            frames_data: dict[int, list[tuple[float, float]]] = {}
+            current_frame = None
+            for line in content.split("\n"):
+                match = re.match(r"Frame (\d+)", line)
+                if match:
+                    current_frame = int(match.group(1))
+                    frames_data.setdefault(current_frame, [])
+                if current_frame is not None:
+                    for dx, dy in re.findall(r"\(LM\s+(-?\d+)\s+(-?\d+)\s+", line):
+                        frames_data[current_frame].append((float(dx), float(dy)))
+
+            if not frames_data:
+                return 0.0
+
+            ordered_frames = sorted(frames_data)
+            avg_dx = []
+            avg_dy = []
+            for fr in ordered_frames:
+                lms = frames_data[fr]
+                if lms:
+                    avg_dx.append(sum(d[0] for d in lms) / len(lms))
+                    avg_dy.append(sum(d[1] for d in lms) / len(lms))
+                else:
+                    avg_dx.append(0.0)
+                    avg_dy.append(0.0)
+
+            if not avg_dx:
+                return 0.0
+
+            # Integrate frame-to-frame local motion into an approximate raw
+            # cumulative camera-path position -- see the LIMITATION note
+            # above for why this is an approximation of vidstabtransform's
+            # actual path, not the path itself.
+            cum_x = []
+            cum_y = []
+            cx = cy = 0.0
+            for dx, dy in zip(avg_dx, avg_dy):
+                cx += dx
+                cy += dy
+                cum_x.append(cx)
+                cum_y.append(cy)
+
+            # What actually determines the visible border per frame is the
+            # GAP between the raw path and vidstabtransform's SMOOTHED
+            # path -- not the raw path's deviation from a single global
+            # center. A plain global median (an earlier version of this
+            # method) treats the whole clip as one static reference point,
+            # which lets the raw path's own random-walk-like drift over a
+            # long clip inflate every frame's "required zoom" far past what
+            # vidstabtransform actually needs (verified empirically: it
+            # overshot vidstabtransform's own logged "Final zoom" for
+            # optzoom=1 by ~4-5x on a synthetic test clip). A local moving
+            # average over a window matching `smoothness` (the same
+            # smoothing window vidstabtransform itself uses, see __init__)
+            # approximates that smoothed path much more directly, so the
+            # deviation used below is close to the actual quantity
+            # vidstabtransform computes -- still an approximation (see the
+            # LIMITATION note above), but a substantially tighter one.
+            window = max(1, self._smoothness)
+            n_frames = len(cum_x)
+
+            def _local_avg(series: list[float], i: int) -> float:
+                lo = max(0, i - window // 2)
+                hi = min(n_frames, i + window // 2 + 1)
+                return sum(series[lo:hi]) / (hi - lo)
+
+            smoothed_x = [_local_avg(cum_x, i) for i in range(n_frames)]
+            smoothed_y = [_local_avg(cum_y, i) for i in range(n_frames)]
+
+            # For a frame shifted by `shift` px off the smoothed path along a
+            # dimension of size `dim`, vidstabtransform's zoom=Z% scales the
+            # frame by (1 + Z/100) around its center; the shifted edge is
+            # only fully covered once (Z/100) * dim/2 >= shift, i.e. Z >=
+            # 200 * shift / dim. Required zoom for a frame is the max of its
+            # x/y needs (zoom is applied uniformly, not per-axis).
+            required_pct = []
+            for x, sx, y, sy in zip(cum_x, smoothed_x, cum_y, smoothed_y):
+                shift_x = abs(x - sx)
+                shift_y = abs(y - sy)
+                pct_x = (200.0 * shift_x / video_width) if video_width else 0.0
+                pct_y = (200.0 * shift_y / video_height) if video_height else 0.0
+                required_pct.append(max(pct_x, pct_y))
+
+            required_pct.sort()
+            n = len(required_pct)
+            coverage = max(0.0, min(1.0, coverage))
+            idx = min(n - 1, int(round(coverage * (n - 1))))
+            return max(0.0, required_pct[idx])
+
+        except Exception as e:
+            self.logger.warning(f"Static zoom computation failed: {e}")
+            return 0.0
+
     def _detect_scenes(self, input_path: str, scene_threshold: float = 0.98) -> list[float]:
         """Detect scene changes by comparing consecutive frames.
 
@@ -515,7 +654,33 @@ class StabilizeStage(BaseStage):
             # preserving prior "no zoom, borders acceptable" behavior for
             # zoom_enabled=False (vidstabtransform's own default is
             # optzoom=1, so it must be explicitly zeroed here).
-            zoom_param = ":zoom=0:optzoom=1" if apply_zoom else ":zoom=0:optzoom=0"
+            #
+            # zoom_coverage (0.0-1.0) shapes WHAT zoom is applied once
+            # apply_zoom (the movement-extent gate above) has already
+            # decided zoom applies at all -- it does not change the gate
+            # itself. 1.0 (default) = today's exact optzoom=1 behavior
+            # (guaranteed no border on any frame). 0.0 = no zoom (all
+            # borders visible, same as apply_zoom=False). In between: a
+            # static zoom= percentage computed from the zoom_coverage-th
+            # quantile of per-frame required-zoom estimates (see
+            # _compute_static_zoom_pct's docstring for the accuracy
+            # limitation -- it approximates vidstabtransform's own smoothed
+            # camera path from the raw TRF, it does not read it directly).
+            static_zoom_pct = None
+            if not apply_zoom:
+                zoom_param = ":zoom=0:optzoom=0"
+            elif self._zoom_coverage >= 1.0:
+                zoom_param = ":zoom=0:optzoom=1"
+            elif self._zoom_coverage <= 0.0:
+                zoom_param = ":zoom=0:optzoom=0"
+            else:
+                static_zoom_pct = self._compute_static_zoom_pct(
+                    clean_trf_path, video_width, video_height, self._zoom_coverage
+                )
+                zoom_param = f":zoom={static_zoom_pct:.4f}:optzoom=0"
+                self.logger.debug(
+                    f"zoom_coverage={self._zoom_coverage} -> static zoom={static_zoom_pct:.4f}%"
+                )
 
             # Build filter chain with optional sharpening
             stab_filter = (
@@ -753,6 +918,9 @@ class StabilizeStage(BaseStage):
                     "scene_changes": scene_changes,
                     "num_scenes": len(scene_changes) + 1 if scene_changes else 1,
                     "pixel_format": pixel_format,
+                    "apply_zoom": apply_zoom,
+                    "zoom_coverage": self._zoom_coverage,
+                    "static_zoom_pct": static_zoom_pct,
                 },
                 duration_sec=time.time() - start,
             )

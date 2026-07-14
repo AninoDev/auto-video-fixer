@@ -21,6 +21,65 @@ uv run avf process video.mp4 -p 1080p60   # CLI entry
 
 CI runs: `ruff check` -> `ruff format --check` -> `mypy` -> `pytest tests/unit/` -> `pytest -m integration` (3.14 only).
 
+### Mixed Python/Rust: this is now a mixed-language project
+
+`rust/avf_scenes/` is a PyO3/`maturin` Rust crate (scene-detection frame differencing, see
+`docs/REQUIREMENTS.md` R5.1) — the first of the Rust rewrite candidates to land, and the pattern
+future Rust work here should follow. It is a `[tool.uv.workspace]` member of the root
+`pyproject.toml`, declared as a normal dependency (`avf-scenes`, `[tool.uv.sources]` pointing at
+it as an editable workspace path) — **plain `uv sync --all-extras` builds and installs it
+automatically**, no separate manual step needed. `rust/avf_scenes/pyproject.toml`'s
+`build-system.requires = ["maturin>=1.14,<2.0"]` means uv fetches `maturin` itself into an
+isolated PEP 517 build environment on demand (standard build-isolation behavior) — it does **not**
+need to be pre-installed in the project's own venv for `uv sync` to work. The one thing that *does*
+need to be present on `PATH` at sync time is a Rust toolchain (`cargo`/`rustc`, e.g. via `rustup`
+or a system package) — `maturin` shells out to `cargo` to actually compile. If it's missing, `uv
+sync` fails outright rather than silently skipping the extension, since `avf-scenes` is a required
+dependency of the package, not an optional extra, matching REQUIREMENTS.md's R5.1 integration
+plan. (For manual iteration, `uv pip install maturin` puts a runnable `maturin` CLI in the venv --
+see the "iterate on the Rust side" note below -- but that's a convenience for `maturin develop`,
+not something plain `uv sync` requires.)
+
+At the Python call site, `core/analysis.py`'s `_detect_scene_changes()` still tries `import
+avf_scenes` in a `try/except ImportError` and falls back to the original pure-Python/OpenCV
+implementation (`_detect_scene_changes_python`) if that import fails for any reason (e.g. a
+platform where the wheel didn't build) — this is a defense-in-depth fallback, not the primary way
+the extension is expected to be missing day-to-day, since `uv sync` normally guarantees it's
+built. `uv run pytest tests/unit/` does **not** need a separate Rust build step beyond the normal
+`uv sync` — if you've run that, the extension is already installed into the venv.
+
+To iterate on the Rust side without a full `uv sync` round-trip: `cd rust/avf_scenes && uv run
+maturin develop --release` rebuilds and reinstalls just that crate into the current venv.
+`cargo test` / `cargo clippy` / `cargo fmt --check` run from `rust/avf_scenes/` for Rust-side
+gates (no Rust unit tests exist yet for this crate — correctness is verified via the Python-side
+differential test `TestRustPythonParity` in `tests/unit/test_scene_detection.py`, which compares
+the Rust and Python implementations' output directly).
+
+A second crate, `rust/avf_hashing/` (perceptual-hash duplicate detection, `docs/REQUIREMENTS.md`
+R5.2), followed the same workspace/build pattern (`[tool.uv.workspace]` member, `avf-hashing`
+dependency + `[tool.uv.sources]` editable-workspace entry, built automatically by `uv sync
+--all-extras`) with one structural difference worth knowing about: **it has real Rust unit tests**
+(`cargo test` — DCT-matrix orthonormality, deterministic/distinguishing hashes, majority-vote
+tie-breaking), unlike `avf_scenes`. A pyo3 crate built with the `extension-module` feature can't
+link into a normal `cargo test` binary (that feature assumes libpython is provided by an embedding
+CPython process, not the test harness itself) — undefined-symbol linker errors result if you try.
+`rust/avf_hashing/Cargo.toml` works around this by making `extension-module` a Cargo feature
+that's default-on (so `cargo build`/`maturin develop`/`uv sync` all still produce a real Python
+extension) but can be turned off for testing: `cd rust/avf_hashing && cargo test
+--no-default-features`. Do the same for `cargo clippy --no-default-features` if you touch that
+crate's tests. `avf_scenes` doesn't need this because it has no Rust-level tests, only the
+Python-side differential test described above — if it ever grows `cargo test` cases, apply the
+same feature-flag split there too, for consistency.
+
+At the Python call site, `core/analysis.py`'s `compute_video_phash()`/`hash_similarity()` follow
+the identical lazy-import-with-fallback pattern as scene detection: `try: from avf_hashing import
+...` / `except ImportError`, falling back to a pure-NumPy implementation of the *same* pHash
+algorithm (not a different one) so results don't depend on whether the extension is built. See
+that module's "Perceptual Hashing & Duplicate Detection" section and `rust/avf_hashing/src/lib.rs`
+for the algorithm and why it replaced the old ahash/dhash implementation wholesale rather than
+sitting alongside it (no backward-compatibility constraint — see R5.2 in
+`docs/REQUIREMENTS.md`).
+
 ## Architecture
 
 ```
@@ -169,6 +228,122 @@ ncnn models (.param/.bin) have their own registry in `ai/model_cache.py`
 (`NCNN_MODEL_REGISTRY` / `ensure_ncnn_model_available()`), separate from the torch `.pth`
 registry — stage pre-flight model checks must not gate an ncnn run on the torch registry.
 
+### Batched inference (torch backend only)
+
+`RealESRGANUpscaler` (`ai/wrappers/upscale.py`, used by `upscale`/`deblock`/`denoise_video` at
+the torch backend) supports two independent, opt-in batching axes, both default `1` (today's
+one-at-a-time behavior, unchanged unless configured):
+
+- **`stages.<name>.batch_size`** — N different *frames* stacked into one forward pass
+  (`RealESRGANUpscaler.upscale_batch()`/`upscale_video()`, `ai/torch_utils.py`'s
+  `tensor_from_frames`/`frames_from_tensor`). Only applies when a frame is small enough to skip
+  tiled inference — falls back to one-frame-at-a-time whenever any frame in a chunk would need
+  tiling, `tta_mode` is enabled, or the ncnn backend is in use (none of those combine with
+  whole-frame batching in this implementation).
+- **`stages.<name>.tile_batch_size`** — N *tiles of one frame* stacked into one forward pass
+  inside `run_tiled_inference()`, when a frame's resolution triggers tiled inference (see
+  `tile_size`/`AUTO_TILE_THRESHOLD_PX` above). This is the batching knob that matters for large
+  (e.g. 4K) input: at the default `tile_size=512`, a 4K frame needs a 5x8=40-tile grid, so 40
+  small sequential forward passes (each paying Python/kernel-launch/host-device-sync overhead)
+  collapse into a handful of larger batched calls. `compute_tile_grid()`'s interior tiles mostly
+  share one padded input shape (only the last row/column, clamped at the image boundary, differ),
+  so tiles are grouped by shape before being stacked — never mixes shapes into one `torch.cat`.
+
+Both: on a caught `torch.cuda.OutOfMemoryError`, the batch is recursively halved and retried
+(mirroring the existing tile-size halving-retry pattern), down to batch=1, which then goes
+through the existing single-item OOM/tiling-retry path unchanged. Neither axis is combined with
+the other in this pass — a chunk needing both is out of scope (whole-frame batching defers to
+per-frame processing, where tile batching then applies per-frame instead). CLI: `--batch-size` /
+`--tile-batch-size` set both keys across `upscale`/`deblock`/`denoise_video` at once (no
+per-stage CLI override, matching the `--crop-limit` precedent's single-flag-multiple-keys shape
+where a per-stage split isn't worth a flag each).
+
+`run_tiled_inference()`'s OOM path (`_infer_group`) releases the failed batch's input tensor
+(`del batched_in`) BEFORE clearing the CUDA allocator cache and recursing into the halved retry —
+done outside the `except` clause itself (a flag is set inside `except`, the actual cleanup runs
+after the `try/except` has fully exited), because an in-flight exception's traceback keeps the
+raising frame's own locals alive, including `infer_fn`'s reference to that same tensor; a `del`
+executed while still inside the `except` block would not actually drop the last reference yet.
+Previously the tensor stayed alive through the entire halving recursion, so every retry ran with
+LESS free VRAM than the attempt that had just failed. Remainder tiles in a shape group (fewer
+than `tile_batch_size` left over) are now processed through the single-tile path (`_infer_one`)
+rather than one last partial-size batch, keeping every batched-tensor shape seen during a run
+uniform instead of fragmenting the CUDA caching allocator with a one-off `N`.
+
+### AI stage temp-encode quality and the chunked streaming path
+
+`upscale`/`deblock`/`denoise_video`/`interpolate`'s AI paths each write AI-processed frames to an
+internal temp `.mp4` (`StreamingVideoWriter` or `FrameProcessor.frames_to_video()`), then mux that
+temp file's video track against the original audio to produce the stage's real output. Both the
+temp encode and the mux pass now take **explicit** `crf`/`preset` args instead of relying on
+implicit defaults:
+- The temp encode passes `stages.<name>.temp_crf` (new config key, default `16`) and the
+  hardcoded preset `"medium"` (not itself a config key). Previously this write had NO `-crf`/
+  `-preset` at all, silently landing on libx264's own default (CRF 23).
+- The mux pass now uses `-c:v copy` (verified bit-identical to the temp file's video stream via
+  stream-hash comparison), NOT a second `-crf 18` re-encode. Previously every AI stage muxed with
+  `-c:v libx264 -crf 18`, meaning AI-processed frames were encoded TWICE at two different quality
+  levels — a real quality bug (the temp's CRF-23 generation was baked in before the mux's CRF-18
+  pass ever saw it) plus a wasted full x264 pass over the whole video for no benefit.
+- `interpolate`'s AI/RIFE path had the identical double-encode pattern in its own internal temp +
+  mux and got the same fix (also gained its own `stages.interpolate.temp_crf`, default 16) — it's
+  architecturally separate from the other three (still buffers frames in a list before writing,
+  not the streaming path below) but shared the exact same bug.
+
+All AI-capable videos (`upscale`/`deblock`/`denoise_video`) now go through the chunked streaming
+path (`stream_frames_prefetched` + `AsyncVideoWriter(StreamingVideoWriter(...))`, `chunk_size=25`)
+regardless of frame count — the old `total_est > 1000` frame-count threshold and its full-buffer
+`extract_frames()` → flat list → `frames_to_video()` route are gone from these three stages'
+`_execute_ai()`/`_run_single_ai_pass()`. That threshold was resolution-blind: a short but
+large-resolution (e.g. 4K) clip could still fall under 1000 frames while materializing its ENTIRE
+frame set in RAM (a 33s 4K clip is ~25GB uncompressed), with zero decode/inference/write overlap.
+Streaming has no measurable downside for short clips either, so there's no longer a reason to keep
+two code paths. `extract_frames()`/`frames_to_video()` themselves are untouched in
+`ai/frame_processor.py` — other callers (`interpolate`'s AI path, `frames_to_temp_video()`) still
+use them, and they remain the eventual Phase-3 fallback machinery for a planned Rust frame-pipe
+rewrite (see `docs/REQUIREMENTS.md` R5.3).
+
+### Pinned staging pool (torch backend, CUDA only)
+
+`ai/torch_utils.py`'s `PinnedStagingPool` (module-level singleton via `get_pinned_staging_pool()`)
+holds a small, capped set of persistent `torch.empty(..., pin_memory=True)` CPU tensors, keyed by
+`(shape, dtype)`, `SLOTS_PER_KEY=2` round-robin slots per key, `MAX_KEYS=2` (4 pinned tensors
+total, LRU-evicted by key). `tensor_from_frame`/`tensor_from_frames` (`ai/torch_utils.py`) copy
+the incoming numpy frame bytes into a pool slot (`copy_()`) and do the same `non_blocking=True`
+H2D `.to(device)` as before, instead of calling `.pin_memory()` fresh (page-locking a brand-new
+host buffer) on every single call — a real per-call cost at e.g. 4K (~25MB/frame). CPU-only
+callers (`device.type != "cuda"`) don't touch the pool at all.
+
+**Correctness-critical**: a pool slot is *reused*, and a `non_blocking=True` H2D copy reads from
+its pinned host tensor asynchronously — the read is not guaranteed to have finished by the time
+the Python call that queued it returns. `get_slot()` therefore records a `torch.cuda.Event` right
+after each slot's H2D copy is queued (`record_copy()`) and `synchronize()`s on that event before
+handing the same slot out again, so a later `copy_()` can never overwrite host memory the device
+is still reading from. Do not remove or weaken this without understanding why — an
+overwrite-before-copy race here would corrupt frames silently and nondeterministically, not
+crash. See `tests/unit/test_torch_utils.py::TestPinnedStagingPoolCudaCorrectness` (real CUDA,
+`@pytest.mark.integration`) and `TestPinnedStagingPoolKeying` (mocked, no GPU needed).
+
+### AI-stage instrumentation (`ai/frame_processor.py`)
+
+`StageTimer` and `gpu_forward_timer()` provide lightweight, always-on timing for the chunked AI
+stage loop shared by `upscale`/`deblock`/`denoise_video` — instantiated once per stage run
+(`StageTimer("upscale")` etc.) and threaded through as an optional `timer=` kwarg into
+`RealESRGANUpscaler.upscale()`/`upscale_batch()`/`upscale_video()` (`ai/wrappers/upscale.py`).
+Phases tracked: `decode_wait` (time blocked pulling the next chunk out of
+`stream_frames_prefetched`, measured at the stage loop via manual `next()` calls instead of a
+plain `for` loop), `h2d_preprocess`/`d2h_postprocess` (`tensor_from_frame(s)`/`frame_from_tensor(s)`
+call time), `gpu_forward` (every model forward call — bracketed with `torch.cuda.Event` pairs via
+`gpu_forward_timer()` for honest device-side time on CUDA, wall-clock fallback on CPU/MPS),
+`write_wait` (time blocked in `AsyncVideoWriter.write()`). Per-chunk breakdown logs at DEBUG
+(`StageTimer.end_chunk()`); an aggregate percentage-of-total breakdown logs at INFO once at stage
+end (`StageTimer.summary()`). Independently, periodic throughput (`frames_done`, `elapsed_sec`,
+`current_fps`) logs at INFO every ~10s or 10 chunks (whichever first) — this exists specifically
+so a run killed early by an external timeout (e.g. a truncating `timeout` wrapper) still yields a
+valid frames/sec curve instead of nothing; see `docs/REQUIREMENTS.md`'s R5.3 note on the 4K
+benchmark this was retroactively needed for. `interpolate`'s RIFE path is NOT instrumented (it
+doesn't share this loop shape — see "Kill the ≤1000-frame full-buffering path" below).
+
 ## Upscaling & Aspect Ratio
 
 The upscale stage respects `quality.quality_target.keep_aspect_ratio` (default `True`):
@@ -178,6 +353,37 @@ The upscale stage respects `quality.quality_target.keep_aspect_ratio` (default `
 - Dimensions are rounded to even values (H.264 requirement)
 
 Example: 1080p60 preset (1920×1080) + 9:16 portrait input → scales to ~1080×1920 (portrait).
+
+`UpscaleStage._effective_target_bounds()` (`core/stages/upscale.py`) is the single shared
+implementation of this rotation, used by `should_run()`'s "already at target?" gate, `execute()`'s
+AI-vs-traditional method selection, and `_calculate_target_dimensions()`'s actual scale
+computation — all three must agree on what "at target" means for a given input's orientation.
+Previously `should_run()` and the method-selection logic each compared the input's raw resolution
+against the *unrotated* preset target directly, while only `_calculate_target_dimensions()` did
+the rotation. This meant a portrait input already at its rotated target (e.g. a 1080×1920 input
+against a `[1920, 1080]` preset target) was misjudged as needing upscaling: `should_run()` let the
+stage proceed, `execute()` picked the AI method, and `_execute_ai()`'s per-pass scale computation
+— which rounds each pass to a power of 2 via `2 ** round(log2(sf)) if sf > 1 else 2` — silently
+substituted a forced 2x scale whenever a pass's own needed scale computed to `<=1` (i.e. already
+at/past target), instead of doing nothing. Real production repro: a 1080×1920 portrait 60fps
+input against the `1080p60` preset (target `[1920, 1080]`, `keep_aspect_ratio: true`) ran
+`RealESRGAN_x2plus` at 2x anyway, producing a wasted 2160×3840 output (~1fps, over an hour for a
+63-second clip, ~99% GPU-forward time per instrumentation — pure wasted compute, since the input
+was already exactly at target).
+
+Fixed at three levels, all keyed off `UpscaleStage._SKIP_SCALE_THRESHOLD = 1.05` (5% linear, ~10%
+area): `should_run()` and `execute()`'s method selection both compute the orientation-aware needed
+scale (`max(bound_w/w, bound_h/h)` against the rotated bound) and treat `<= 1.05` as "already at
+target" (skip / pick traditional over AI); `_execute_ai()` additionally guards itself directly
+(defense in depth for `_execute_ai()` being invoked outside `should_run()`, e.g. `--stage
+upscale`) and, within the per-pass loop, does a cheap `_resize_to_exact()` lanczos resize (or a
+zero-loss `_copy_stream()` stream-copy if dimensions already match exactly) instead of an AI pass
+whenever a pass's own computed `sf <= 1`. The 1.05 threshold specifically covers the "crop stage
+shaved a few px off before upscale ran" case (e.g. 1072×1908 vs. a 1080×1920 rotated target is a
+1.0075x scale) without masking any genuine upscale need (a real "needs upscaling" input is almost
+always well above 1.05, e.g. 540×960 → 1080×1920 is 2.0x) — chosen to skip/resize rather than
+still running a (much smaller, non-power-of-2) AI pass, since Real-ESRGAN's minimum discrete scale
+is already 2x and a genuine sub-2x need this close to target isn't worth a full AI forward pass.
 
 ## Configuration
 
@@ -301,6 +507,63 @@ after `current_path = job.input_path`, before the main stage loop).
   Verified within ~1-2% on a synthetic multi-scene clip, with zero blend/ghosting artifacts at any
   scene boundary (the actual correctness-critical property) -- see CHANGELOG.
 
+## Stabilization zoom coverage
+
+`stages.stabilize.zoom_coverage` (float, default `1.0`) tunes how aggressively the stabilize
+stage's zoom compensates for borders introduced by stabilization, once `zoom_enabled` /
+`zoom_threshold`'s movement-extent gate (`apply_zoom` in `StabilizeStage.execute()`) has already
+decided zoom applies at all -- `zoom_coverage` does NOT change that gate, only what zoom is used
+once it fires:
+
+- `1.0` (default, unchanged behavior): `vidstabtransform`'s own `optzoom=1` ("optimal static
+  zoom"), sized to the single worst frame in the clip -- guaranteed no visible border on any
+  frame, at the cost of being the least tight/most-cropped option.
+- `0.0`: no zoom at all (`optzoom=0`, `zoom=0`) -- every border from camera motion stays visible,
+  equivalent to `zoom_enabled=False`'s zoom behavior but without disabling the rest of the gate
+  logic (movement is still analyzed, `apply_zoom` is still computed and reported in metadata).
+- In between: `optzoom=0` plus a static `zoom=<pct>` computed by
+  `StabilizeStage._compute_static_zoom_pct()` from the TRF vidstabdetect already parses
+  (`_analyze_trf_file`/`_movement_extent`'s TRF-reading lineage) -- the `zoom_coverage`-th
+  quantile of PER-FRAME required-zoom estimates, not the max. This lets a user trade "guaranteed
+  no border, ever" for "less aggressive crop, with occasional brief borders on the most extreme
+  motion" -- e.g. a violent-motion ending gets a border for a second or two while the rest of the
+  clip stays zoomed less than the `1.0` case would force.
+
+**Accuracy limitation (state honestly, this is not exact)**: what actually determines a frame's
+visible border is `vidstabtransform`'s own internally-computed SMOOTHED camera path (a function of
+`smoothing`/`maxshift`/`optalgo`/`interpol`), which this code has no access to -- it only sees the
+raw per-block local-motion (LM) values in the TRF. `_compute_static_zoom_pct()` integrates those
+into an approximate raw cumulative camera-path position, then applies a local moving-average
+smoothing window (matching `stages.stabilize.smoothness`, the same window vidstabtransform itself
+uses) to approximate the smoothed path, and measures each frame's deviation from that local
+average as its "required zoom" (`zoom_pct = 200 * shift_px / dimension_px`, derived from
+`vidstabtransform`'s `zoom=Z%` scaling the frame by `1+Z/100` around center). This is
+**directionally correct and tunable** (verified: monotonically increasing with `coverage`,
+verified via a synthetic shaky clip) but not an exact match to vidstabtransform's internal
+computation -- empirically, on one synthetic test clip, this method's own `coverage=1.0` quantile
+(the theoretical max) came out ~3x higher than vidstabtransform's own logged `optzoom=1` "Final
+zoom" value, i.e. the approximation is conservative/over-corrects rather than under-corrects for
+that clip. Individual frames' actual post-smoothing border requirements can come out higher or
+lower than this estimate. This also does NOT account for rotation's contribution to border size
+(same limitation as `_movement_extent()` -- no new rotation math was added).
+
+**Verification methodology** (ffmpeg/CPU only, no GPU needed): a synthetic clip was generated with
+`ffmpeg -f lavfi -i testsrc2=...` piped through a time-varying `crop=` filter simulating handheld
+shake (sinusoidal jitter) plus one abrupt high-velocity displacement late in the clip (the
+"violent-motion ending" scenario). Verified via whole-video-union `cropdetect=limit:round:reset=0`
+(same methodology as the auto-crop stage) and per-frame `cropdetect=limit:round:reset=1` box
+sampling: `zoom_coverage=1.0` produced zero border on any of 178 sampled frames (matches
+`optzoom=1`'s guarantee); `zoom_coverage=0.0` reproduced the same borders as the fully-unzoomed
+baseline (~43% of frames showing a small border, matching `crop_mode: black`'s border-fill
+behavior); `zoom_coverage=0.6`'s computed static zoom quantile was measurably smaller than the
+`coverage=1.0` quantile computed by the same function (10.4% vs. 25.5% on the test clip) while
+still fully covering that particular clip's (small, ~2-4px) actual borders -- demonstrating the
+dial responds correctly to `coverage` even though this specific synthetic clip's real border
+requirement was too small to show a visible difference in cropdetect output at 0.6 vs. 1.0.
+
+CLI: `--zoom-coverage FLOAT` (`stages.stabilize.zoom_coverage`), following the `--crop-limit`
+precedent of a single per-stage override flag.
+
 ## Auto-crop
 
 Opt-in, off by default (`stages.crop.enabled: false`). See `core/stages/crop.py`,
@@ -356,12 +619,13 @@ Opt-in, off by default (`stages.crop.enabled: false`). See `core/stages/crop.py`
   which is almost always what's wanted (the user wants the *content* at the target resolution, not
   the pre-crop letterboxed frame).
 
-## Rust rewrite candidates (planned, not started)
+## Rust rewrite candidates
 
 Three CPU-hot-path targets are scoped for PyO3/`maturin`-based Rust rewrites, prioritized soon on
-the roadmap: scene-detection frame differencing (`_detect_scene_changes()`, `core/analysis.py`),
-perceptual-hash duplicate detection (`compute_video_hash`/`compute_video_dhash`, `core/
-analysis.py`), and the chunked AI frame prefetch/writer threading (`ai/frame_processor.py`). See
+the roadmap. **Scene-detection frame differencing** (`_detect_scene_changes()`, `core/
+analysis.py`) is **implemented** — see "Mixed Python/Rust" above and `rust/avf_scenes/`. Still
+planned: perceptual-hash duplicate detection (`compute_video_hash`/`compute_video_dhash`, `core/
+analysis.py`) and the chunked AI frame prefetch/writer threading (`ai/frame_processor.py`). See
 `docs/REQUIREMENTS.md`'s "5. Rust rewrite candidates" section for full scope, interface
 signatures, and verification bars per target, and `docs/ROADMAP.md`'s "Planned" section for
 priority context. Two other pieces (FFmpeg subprocess orchestration, AI inference calls
@@ -415,6 +679,11 @@ Global (before the subcommand):
 - `--crop-limit INT`: cropdetect luma threshold override for the auto-crop stage
   (`stages.crop.limit`) — auto-crop itself is still opt-in, enable it via `--enable-stage crop`
   or `stages.crop.enabled: true` in config; see "Auto-crop" above
+- `--zoom-coverage FLOAT`: fraction of frames (0.0-1.0) that should end up border-free once the
+  stabilize stage's zoom gate decides zoom applies at all (`stages.stabilize.zoom_coverage`) —
+  see "Stabilization zoom coverage" above
+- `--batch-size INT` / `--tile-batch-size INT`: set `stages.{upscale,deblock,denoise_video}.
+  batch_size`/`tile_batch_size` (all three at once) — see "Batched inference" above
 
 `avf analyze PATHS...`: like `process`, accepts multiple files and/or directories (directories
 scanned via `scan_directory`, hidden files skipped) and analyzes each in sequence; a per-file

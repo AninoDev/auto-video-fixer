@@ -114,9 +114,14 @@ above have been. Treat their behavior as "probably correct, unconfirmed" rather 
 - **Scene detection quality** — frame-differencing scene-change detection
   (`_detect_scene_changes`) and heuristic event classification exist and are unit-tested
   (`tests/unit/test_scene_detection.py`); detection accuracy/threshold tuning on real footage is
-  unverified.
-- **Duplicate detection accuracy** — ahash/dhash + Hamming-distance similarity scoring is
-  implemented; real-world false-positive/negative rates are unverified.
+  unverified. The frame-differencing hot loop itself is now a Rust extension (see "Rust rewrites"
+  below) with a verified-identical pure-Python fallback — that part is no longer unverified
+  plumbing, just the threshold-tuning-on-real-footage question above.
+- **Duplicate detection accuracy** — the ahash/dhash implementation was replaced by a Rust-backed
+  pHash (see "Rust rewrites" below); accuracy verified against a real ffmpeg-generated near-
+  duplicate/non-duplicate test set (`tests/unit/test_hashing.py::TestHashSeparation`), not just
+  real-world usage. Genuinely-unverified real-world false-positive/negative rates on arbitrary
+  user footage remain an open question, same caveat as scene detection above.
 - **The Qt (PySide6) GUI** (`gui/main_window.py`, `avf-gui` entry point) — has a test file
   (`tests/unit/test_gui.py`) and basic job-queue/preset/progress wiring, but has not been
   manually driven end-to-end as part of this pass.
@@ -127,28 +132,51 @@ See `docs/REQUIREMENTS.md` for full detail on the original design considerations
 (scene-based processing, per-scene strength, auto-crop) have all moved to "Implemented and
 verified working" above; nothing remains in this list.
 
-**Next up, prioritized soon (2026-07-12):** three Rust rewrite targets, scoped in full in
-`docs/REQUIREMENTS.md`'s "5. Rust rewrite candidates" section:
+**Rust rewrite targets**, scoped in full in `docs/REQUIREMENTS.md`'s "5. Rust rewrite candidates"
+section. Integration approach for all three: PyO3 + `maturin`, narrow per-function bindings (not a
+wholesale module port) so existing call sites change minimally. Two other pieces were considered
+and explicitly rejected for now (FFmpeg subprocess orchestration, AI model inference calls
+themselves) — see REQUIREMENTS.md for why.
 
-1. **Scene-detection frame differencing** (`_detect_scene_changes()`, `core/analysis.py`) —
-   eliminate per-frame Python/GIL overhead and enable true pipelined decode+diff; directly gates
-   how usable the scene-based processing feature is on long videos.
+1. **Scene-detection frame differencing** (`_detect_scene_changes()`, `core/analysis.py`) — **IMPLEMENTED
+   2026-07-13.** New crate `rust/avf_scenes/` (PyO3 + maturin, workspace member of the root
+   `pyproject.toml`/`uv.lock` via `[tool.uv.workspace]`/`[tool.uv.sources]`, so `uv sync` builds
+   and installs it automatically). Decodes via a piped `ffmpeg -f rawvideo` subprocess
+   (`format=gray,scale=320:180:flags=bilinear`) instead of `cv2.VideoCapture`, computes the same
+   mean-absolute-luma-diff metric, and releases the GIL for the whole decode/diff loop
+   (`Python::detach`), re-acquiring only to fire the progress callback. `_detect_scene_changes()`
+   in `core/analysis.py` now dispatches to the Rust path when `avf_scenes` imports successfully,
+   falling back to the original pure-Python/OpenCV implementation
+   (`_detect_scene_changes_python`) with a DEBUG log line otherwise — see AGENTS.md's Setup &
+   Commands for the build step. Verified: identical scene boundaries and cut counts to the Python
+   implementation on the calibration fixture and a synthetic pan+hard-cut motion clip
+   (`TestRustPythonParity` in `tests/unit/test_scene_detection.py`), with per-cut `diff_score`
+   divergence under 0.002 (decode/scale path differences: ffmpeg's bilinear scale + `format=gray`
+   vs. OpenCV's `INTER_LINEAR` + BT.601 `cvtColor`). Real-world speed on a 54s/1620-frame 1080p60
+   test clip: Python 2.55s (~635 fps) vs. Rust 1.73s (~936 fps), ~1.5x.
 2. **Perceptual hashing / duplicate detection** (`compute_video_hash`/`compute_video_dhash`,
-   `core/analysis.py`) — never used in production (confirmed by user 2026-07-12: no stored hash
-   values exist anywhere), so this is free to pick the best algorithm rather than port ahash/dhash
-   as-is; evaluate pHash (more robust to re-encodes/crops than ahash/dhash) and existing Rust
-   crates (e.g. `img_hash`) before hand-rolling. Verification is behavioral (separates a
-   near-duplicate test set correctly), not bit-identical output.
+   `core/analysis.py`) — **IMPLEMENTED 2026-07-13.** New crate `rust/avf_hashing/` (same
+   workspace/build pattern as `avf_scenes` above). Never used in production (confirmed by user
+   2026-07-12: no stored hash values exist anywhere), so this was free to pick the best algorithm
+   rather than port ahash/dhash as-is: landed as **pHash** (DCT-based), hand-rolled in Rust rather
+   than via the `img_hash` crate (evaluated and rejected -- it would pull in the `image` crate's
+   ~24 transitive codec dependencies just to wrap raw bytes this crate already gets from its own
+   ffmpeg pipe). `compute_video_hash()`/`compute_video_dhash()`/`hash_similarity()` are replaced
+   wholesale by `compute_video_phash()`/`hash_similarity()` (hex-string 64-bit hashes); the
+   pure-Python fallback implements the identical pHash algorithm in NumPy, not the retired ahash/
+   dhash. `analysis.duplicate_detection.hash_type` config key removed (no longer meaningful with
+   one algorithm); `similarity_threshold` default changed 0.95 -> 0.85, recalibrated against real
+   measured scores. Verified behaviorally against a real ffmpeg-generated near-duplicate/non-
+   duplicate test set (`tests/unit/test_hashing.py::TestHashSeparation`): near-duplicate pairs
+   (same source, different CRF/resolution/trim) scored 0.9375-1.0 similarity; non-duplicate pairs
+   (distinct lavfi sources, including cross-comparing near-duplicate variants of different
+   sources) scored 0.3438-0.5781 -- a wide margin either side of the 0.85 threshold. See
+   `docs/REQUIREMENTS.md` R5.2 for the full algorithm-choice writeup.
 3. **Chunked AI frame I/O overlap** (`PrefetchIterator`/`AsyncVideoWriter`,
    `ai/frame_processor.py`) — replace GIL-bound Python threading with real OS-thread parallelism
    for CPU-side frame marshalling, now that GPU inference itself is fast enough (7-92 fps
    depending on backend) that CPU-side handling is an increasingly real bottleneck. Most
    architecturally involved of the three; needs its own design pass before implementation.
-
-Integration approach for all three: PyO3 + `maturin`, narrow per-function bindings (not a
-wholesale module port) so existing call sites change minimally. Two other pieces were considered
-and explicitly rejected for now (FFmpeg subprocess orchestration, AI model inference calls
-themselves) — see REQUIREMENTS.md for why.
 
 Feature 4 (NCNN backend) is now implemented: `stages.upscale.backend: ncnn` runs Real-ESRGAN
 in-process over Vulkan. Output parity with torch is confirmed on a real frame. Re-verified after

@@ -99,6 +99,112 @@ def get_dtype(preferred: str = "fp32") -> Any:
     return torch.float32
 
 
+class PinnedStagingPool:
+    """A small pool of persistent pinned (page-locked) CPU staging tensors.
+
+    `tensor_from_frame`/`tensor_from_frames` copy the incoming numpy frame
+    bytes into a reused pinned tensor from this pool instead of calling
+    `.pin_memory()` fresh on a brand-new tensor every call -- page-locking a
+    fresh host buffer is a real per-call cost (a full 4K BGR frame is
+    ~25MB), and only needs to happen once per distinct (shape, dtype) as
+    long as a pool slot isn't reused before its previous async H2D copy has
+    actually finished reading from it.
+
+    Keyed by `(shape, dtype)`. Capped at a small number of slots total
+    (`MAX_KEYS * SLOTS_PER_KEY`) -- simple LRU-by-key eviction, not meant to
+    cache many distinct resolutions simultaneously, just to avoid
+    re-page-locking on every single frame/chunk of one video.
+
+    Correctness (READ BEFORE CHANGING): a `non_blocking=True` H2D copy off a
+    pinned tensor is asynchronous -- the CUDA driver DMAs directly out of
+    that host memory on its own schedule, so the copy is NOT guaranteed to
+    have finished reading by the time the Python call that queued it
+    returns. If this pool's slot were overwritten (via a plain host-side
+    `copy_()`, which is NOT ordered against a still-in-flight device read)
+    before that read completes, the device would receive a torn/wrong
+    frame -- silent, nondeterministic corruption, not a crash. This class
+    avoids that by round-robining >= 2 slots per key and recording a
+    `torch.cuda.Event` right after each slot's H2D copy is queued; before a
+    slot is handed out again, `synchronize()` is called on the event
+    recorded for its PREVIOUS use (a cheap no-op if that copy already
+    finished, otherwise it blocks -- correctly -- until it has). CPU-only
+    callers never use this pool at all (see `tensor_from_frame`/
+    `tensor_from_frames`), so no event bookkeeping happens there.
+    """
+
+    SLOTS_PER_KEY = 2
+    MAX_KEYS = 2  # cap: MAX_KEYS * SLOTS_PER_KEY == 4 pinned tensors total
+
+    class _Slot:
+        __slots__ = ("tensor", "event")
+
+        def __init__(self, tensor: Any):
+            self.tensor = tensor
+            self.event: Any = None
+
+    def __init__(self) -> None:
+        import collections
+
+        self._pools: collections.OrderedDict[tuple[Any, Any], dict[str, Any]] = (
+            collections.OrderedDict()
+        )
+
+    def get_slot(self, shape: tuple[int, ...], dtype: Any) -> "PinnedStagingPool._Slot":
+        """Return the next round-robin slot for `(shape, dtype)`, allocating the key if new.
+
+        Blocks (via `torch.cuda.Event.synchronize()`) until this specific
+        slot's previous H2D copy, if any, has completed -- see the class
+        docstring's correctness note. Safe to call even if no previous copy
+        was ever recorded for this slot (no-op in that case).
+        """
+        import torch
+
+        key = (shape, dtype)
+        entry = self._pools.get(key)
+        if entry is None:
+            while len(self._pools) >= self.MAX_KEYS:
+                self._pools.popitem(last=False)  # evict least-recently-used key
+            slots = [
+                self._Slot(torch.empty(shape, dtype=dtype, pin_memory=True))
+                for _ in range(self.SLOTS_PER_KEY)
+            ]
+            entry = {"slots": slots, "next": 0}
+            self._pools[key] = entry
+        else:
+            self._pools.move_to_end(key)
+
+        slot: "PinnedStagingPool._Slot" = entry["slots"][entry["next"]]
+        entry["next"] = (entry["next"] + 1) % self.SLOTS_PER_KEY
+
+        if slot.event is not None:
+            slot.event.synchronize()
+        return slot
+
+    @staticmethod
+    def record_copy(slot: "PinnedStagingPool._Slot") -> None:
+        """Record a CUDA event marking "the H2D copy just queued off this slot".
+
+        Call immediately after the `.to(device, non_blocking=True)` call
+        that reads from `slot.tensor`.
+        """
+        import torch
+
+        evt: Any = torch.cuda.Event()  # type: ignore[no-untyped-call]
+        evt.record()
+        slot.event = evt
+
+
+_pinned_staging_pool: PinnedStagingPool | None = None
+
+
+def get_pinned_staging_pool() -> PinnedStagingPool:
+    """Return the process-wide `PinnedStagingPool` singleton, creating it on first use."""
+    global _pinned_staging_pool
+    if _pinned_staging_pool is None:
+        _pinned_staging_pool = PinnedStagingPool()
+    return _pinned_staging_pool
+
+
 def tensor_from_frame(
     frame: "Any",  # numpy array (H, W, C) in BGR
     device: Any = None,
@@ -142,8 +248,19 @@ def tensor_from_frame(
         # pinned bounce buffer it allocates/frees per call -- non_blocking=True
         # then lets this H2D copy overlap with other CUDA-stream work queued
         # around it instead of forcing a host/device sync at every frame.
-        cpu_tensor = cpu_tensor.pin_memory()
-        tensor = cpu_tensor.to(device=device, non_blocking=True)
+        #
+        # Reuse a persistent pinned staging tensor from the pool instead of
+        # calling .pin_memory() fresh (which page-locks a brand-new host
+        # buffer every call -- a real cost at e.g. 4K, ~25MB/frame) --
+        # get_slot() already blocks until that specific slot's PREVIOUS H2D
+        # copy has finished reading from it, so overwriting it here via
+        # copy_() is safe. See PinnedStagingPool's docstring for why this
+        # is NOT safe to do without that synchronization.
+        pool = get_pinned_staging_pool()
+        slot = pool.get_slot(tuple(cpu_tensor.shape), cpu_tensor.dtype)
+        slot.tensor.copy_(cpu_tensor)
+        tensor = slot.tensor.to(device=device, non_blocking=True)
+        pool.record_copy(slot)
     else:
         tensor = cpu_tensor.to(device=device)
 
@@ -193,6 +310,96 @@ def frame_from_tensor(tensor: Any, scale: float = 1.0) -> "Any":  # numpy array
 
     arr = tensor.detach().cpu().numpy()
     return arr
+
+
+def tensor_from_frames(
+    frames: list[Any],  # list of numpy arrays (H, W, C) in BGR, all same shape
+    device: Any = None,
+    dtype: Any = None,
+) -> Any:
+    """Convert a list of numpy frames to a single batched PyTorch tensor.
+
+    Genuinely batched sibling of `tensor_from_frame` above (stacks N frames
+    along dim 0 instead of unsqueeze(0)-ing a single one), for the batched
+    Real-ESRGAN inference path in ai/wrappers/upscale.py. NOT used by
+    ncnn backends or RIFE interpolation -- those still call
+    `tensor_from_frame` per-frame unchanged.
+
+    Args:
+        frames: List of numpy arrays, each (H, W, 3) in BGR, uint8, all the
+            same H/W (caller's responsibility -- np.stack below raises if not).
+        device: torch.device to place tensor on.
+        dtype: torch dtype for the tensor.
+
+    Returns:
+        Tensor of shape (N, 3, H, W) with float values in [0, 1], frame order
+        preserved (output index i corresponds to frames[i]).
+    """
+    import numpy as np
+    import torch
+
+    if device is None:
+        device = get_device("auto")
+    if dtype is None:
+        dtype = torch.float32
+
+    # Same H2D-then-convert-on-GPU strategy as tensor_from_frame (see its
+    # comments) -- stack on CPU as raw uint8 BGR HWC (smallest payload), one
+    # single H2D copy for the whole batch, then do cast/normalize/BGR->RGB/
+    # HWC->CHW on the GPU tensor for all N frames at once.
+    stacked = np.stack([np.ascontiguousarray(f) for f in frames], axis=0)
+    cpu_tensor = torch.from_numpy(stacked)
+
+    if device.type == "cuda":
+        # See tensor_from_frame's comments -- same pinned-staging-pool reuse,
+        # same slot-reuse-ordering correctness requirement (get_slot()
+        # blocks on the slot's previous H2D copy before this copy_() may
+        # overwrite it).
+        pool = get_pinned_staging_pool()
+        slot = pool.get_slot(tuple(cpu_tensor.shape), cpu_tensor.dtype)
+        slot.tensor.copy_(cpu_tensor)
+        tensor = slot.tensor.to(device=device, non_blocking=True)
+        pool.record_copy(slot)
+    else:
+        tensor = cpu_tensor.to(device=device)
+
+    tensor = tensor[:, :, :, [2, 1, 0]]  # BGR -> RGB
+    tensor = tensor.permute(0, 3, 1, 2).contiguous()  # NHWC -> NCHW
+    tensor = tensor.to(dtype=dtype).div(255.0)
+    return tensor
+
+
+def frames_from_tensor(tensor: Any, scale: float = 1.0) -> list[Any]:  # list of numpy arrays
+    """Convert a batched PyTorch tensor back to a list of numpy frames.
+
+    Genuinely batched sibling of `frame_from_tensor` above (splits dim 0 into
+    a list instead of squeeze(0)-ing a single-item batch). Same op order and
+    numerical semantics (nan_to_num before scale, truncating uint8 cast) as
+    frame_from_tensor -- see its comments -- applied across the whole batch
+    tensor at once instead of per-frame.
+
+    Args:
+        tensor: Tensor of shape (N, 3, H, W) with values in [0, 1].
+        scale: Output scale factor (output_h = input_h * scale).
+
+    Returns:
+        List of N numpy arrays, each (H_out, W_out, 3) in BGR, uint8, in the
+        same order as the input tensor's batch dimension (output[i]
+        corresponds to tensor[i]).
+    """
+    import torch
+
+    if scale != 1.0:
+        tensor = torch.nn.functional.interpolate(
+            tensor, scale_factor=scale, mode="bilinear", align_corners=False
+        )
+
+    tensor = torch.nan_to_num(tensor, nan=0.0, posinf=1.0, neginf=0.0)
+    tensor = tensor.clamp(0.0, 1.0).mul(255.0).to(torch.uint8)
+    tensor = tensor[:, [2, 1, 0], :, :].permute(0, 2, 3, 1).contiguous()  # N,C,H,W -> N,H,W,C
+
+    arr = tensor.detach().cpu().numpy()
+    return [arr[i] for i in range(arr.shape[0])]
 
 
 def load_model_from_state_dict(

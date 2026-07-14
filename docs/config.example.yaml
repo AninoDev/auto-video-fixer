@@ -197,6 +197,22 @@ stages:
     # after a caught OOM. Set > 0 to always tile at that size (useful on VRAM-constrained GPUs
     # to avoid ever hitting OOM in the first place).
     tile_size: 0
+    # Frames batched into one Real-ESRGAN forward pass (whole-*frame* batching -- N different
+    # frames per call). 1 (default) = one frame at a time, today's behavior; opt-in until
+    # field-tested. Only takes effect for frames small enough to skip tiled inference -- falls
+    # back to one-frame-at-a-time whenever any frame in a chunk would need tiling (see tile_size
+    # above), when tta_mode is enabled, or on the ncnn backend. On a caught CUDA OOM, the batch
+    # is recursively split in half and retried, down to batch=1 (today's per-frame OOM/tiling
+    # retry path, unchanged).
+    batch_size: 1
+    # Tiles (sharing the same padded input shape) batched into one forward pass when a frame's
+    # resolution triggers tiled inference (see tile_size above). 1 (default) = one tile at a
+    # time, today's behavior. This is the batching knob that matters for large frames -- e.g. a
+    # 4K frame at the default tile_size=512 needs a 5x8=40-tile grid, so raising this collapses
+    # many small sequential forward passes into a handful of larger ones. Independent of
+    # batch_size above (different batching axis: N tiles of ONE frame, vs N whole frames) --
+    # same OOM halving-retry behavior as batch_size.
+    tile_batch_size: 1
     # Per-stage AI-fallback override: null = inherit general.ai_fallback above; true/false
     # overrides it for this stage only.
     ai_fallback: null
@@ -205,6 +221,14 @@ stages:
     # Falls through the ai_fallback policy if the ncnn package, a Vulkan device, or the ncnn
     # model files are unavailable.
     backend: torch
+    # CRF for this stage's internal temp encode (the chunked streaming write to a temp .mp4
+    # before the final mux pass), NOT the final output's quality -- that's encoding.crf /
+    # --crf. Default 16 (near-visually-lossless). The mux pass now stream-copies (`-c:v copy`)
+    # this temp file's video track unchanged, so this IS the only encode the AI-processed
+    # frames go through -- previously the temp was written at libx264's own default (CRF 23)
+    # and then RE-encoded by the mux pass at CRF 18, a double lossy generation plus a wasted
+    # full x264 pass. The preset is always "medium" (not configurable here).
+    temp_crf: 16
 
   interpolate:
     enabled: true
@@ -227,6 +251,8 @@ stages:
     # Below this input duration, chunking isn't worth the per-chunk startup/concat overhead --
     # the input runs as a single (serial) chunk regardless of parallel_chunks.
     min_chunk_duration_sec: 5.0
+    # See stages.upscale.temp_crf above -- only used by the AI/RIFE path's internal temp encode.
+    temp_crf: 16
 
   denoise_video:
     enabled: true
@@ -236,7 +262,10 @@ stages:
     # Traditional method: FFmpeg's hqdn3d filter.
     traditional_method: hqdn3d
     tile_size: 0        # see stages.upscale.tile_size above
+    batch_size: 1       # see stages.upscale.batch_size above
+    tile_batch_size: 1  # see stages.upscale.tile_batch_size above
     ai_fallback: null    # see stages.upscale.ai_fallback above
+    temp_crf: 16          # see stages.upscale.temp_crf above
 
   denoise_audio:
     # NOTE: this config block exists in Config.DEFAULTS but there is currently no registered
@@ -253,7 +282,10 @@ stages:
     # (unsharp-based) method.
     strength: medium
     tile_size: 0        # see stages.upscale.tile_size above
+    batch_size: 1       # see stages.upscale.batch_size above
+    tile_batch_size: 1  # see stages.upscale.tile_batch_size above
     ai_fallback: null    # see stages.upscale.ai_fallback above
+    temp_crf: 16          # see stages.upscale.temp_crf above
 
   stabilize:
     enabled: true
@@ -284,6 +316,18 @@ stages:
     # Whether to apply a mild unsharp pass after stabilization when stabilization was actually
     # triggered (compensates for the slight softness stabilization/zoom can introduce).
     sharpen_enabled: true
+    # How much of the clip should end up border-free once zoom_enabled/zoom_threshold's gate
+    # decides zoom applies at all (0.0-1.0) -- does NOT change that gate, only what zoom is used.
+    # 1.0 (default) = optzoom=1, sized to the single worst frame, guaranteed no border on any
+    # frame. 0.0 = no zoom at all (every border stays visible). In between = optzoom=0 plus a
+    # static zoom computed from the zoom_coverage-quantile of per-frame required-zoom estimates
+    # (StabilizeStage._compute_static_zoom_pct) -- trades the "no border, ever" guarantee for a
+    # less aggressive crop with occasional brief borders on the most extreme motion (e.g. a
+    # violent-motion ending). This is an APPROXIMATION of vidstabtransform's own smoothed camera
+    # path (built from the raw TRF local-motion data, with a local moving-average matching
+    # `smoothness`), not an exact read of it -- see AGENTS.md's "Stabilization zoom coverage"
+    # section for the accuracy caveat and verification methodology.
+    zoom_coverage: 1.0
 
   normalize_volume:
     enabled: true
@@ -523,10 +567,11 @@ analysis:
     enabled: true
     # Similarity threshold (0-1) above which two videos are considered duplicates/near-
     # duplicates in find_duplicates()/find_similar().
-    similarity_threshold: 0.95
-    # Perceptual hash algorithm: "perceptual" (average hash / ahash), "dhash" (difference
-    # hash -- more robust to lighting differences), or "combined" (both).
-    hash_type: perceptual
+    similarity_threshold: 0.85
+    # No `hash_type` key: as of R5.2, duplicate detection always uses a single pHash
+    # (DCT-based perceptual hash) algorithm -- see core/analysis.py's
+    # "Perceptual Hashing & Duplicate Detection" section and rust/avf_hashing/ for why
+    # this replaced the old ahash/dhash/combined choice.
 
 # --- Not part of Config.DEFAULTS, but read elsewhere and worth knowing about ---
 #

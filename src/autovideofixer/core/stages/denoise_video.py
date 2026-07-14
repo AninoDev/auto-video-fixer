@@ -129,6 +129,7 @@ class DenoiseVideoStage(BaseStage):
             from autovideofixer.ai.frame_processor import (
                 AsyncVideoWriter,
                 FrameProcessor,
+                StageTimer,
                 StreamingVideoWriter,
             )
             from autovideofixer.ai.torch_utils import is_torch_available
@@ -200,6 +201,8 @@ class DenoiseVideoStage(BaseStage):
             tta_mode=self._stage_config.get("tta_mode", 0),
             device_preference=self.config.get("gpu", "preferred_device", default="auto"),
             tile_size=self._stage_config.get("tile_size", 0),
+            batch_size=self._stage_config.get("batch_size", 1),
+            tile_batch_size=self._stage_config.get("tile_batch_size", 1),
         )
 
         if not upscaler.load_model():
@@ -213,7 +216,6 @@ class DenoiseVideoStage(BaseStage):
 
         probe_info = probe(input_path)
         total_est = probe_info.frame_count or 0
-        use_chunked = total_est > 1000
 
         try:
             import os as _os
@@ -238,83 +240,75 @@ class DenoiseVideoStage(BaseStage):
             )
 
             try:
-                if use_chunked:
-                    chunk_size = 25
-                    # See UpscaleStage._run_single_ai_pass for why: overlaps
-                    # CPU decode/write with GPU inference instead of
-                    # serializing read -> infer -> write per chunk.
-                    writer = AsyncVideoWriter(StreamingVideoWriter(temp_path, fps=fps))
-                    processed = 0
-                    frames_written = 0
+                # All videos (regardless of frame count) go through the
+                # chunked streaming path -- see DeblockStage._execute_ai for
+                # why the old frame-count-only `use_chunked` threshold (and
+                # its full-buffer extract_frames()/frames_to_video() route)
+                # was removed.
+                chunk_size = 25
+                temp_crf = self._stage_config.get("temp_crf", 16)
+                # See UpscaleStage._run_single_ai_pass for why: overlaps
+                # CPU decode/write with GPU inference instead of
+                # serializing read -> infer -> write per chunk.
+                writer = AsyncVideoWriter(
+                    StreamingVideoWriter(temp_path, fps=fps, crf=temp_crf, preset="medium")
+                )
+                processed = 0
+                frames_written = 0
+                timer = StageTimer("denoise_video")
 
-                    def cb(current, total, msg):
-                        self._report_progress(
-                            0.1 + (processed / total_est) * 0.9, msg, progress_callback
-                        )
+                def cb(current, total, msg):
+                    self._report_progress(
+                        0.1 + (processed / total_est) * 0.9, msg, progress_callback
+                    )
 
-                    for chunk in proc.stream_frames_prefetched(
+                chunk_iter = iter(
+                    proc.stream_frames_prefetched(
                         input_path, chunk_size=chunk_size, max_frames=total_est
-                    ):
-                        chunk_denoised = upscaler.upscale_video(chunk, progress_callback=cb)
-                        # Write each chunk's output straight to the ffmpeg pipe
-                        # instead of buffering the whole video's frames in memory.
-                        writer.write(chunk_denoised)
-                        frames_written += len(chunk_denoised)
-                        processed += len(chunk)
+                    )
+                )
+                while True:
+                    t0 = time.time()
+                    try:
+                        chunk = next(chunk_iter)
+                    except StopIteration:
+                        break
+                    timer.record("decode_wait", time.time() - t0)
 
-                        self._report_progress(
-                            0.1 + (processed / total_est) * 0.9,
-                            "Denoising chunk...",
-                            progress_callback,
-                        )
-                    proc.close()
-                    write_ok = writer.close()
+                    chunk_denoised = upscaler.upscale_video(
+                        chunk, progress_callback=cb, timer=timer
+                    )
+                    # Write each chunk's output straight to the ffmpeg pipe
+                    # instead of buffering the whole video's frames in memory.
+                    t0 = time.time()
+                    writer.write(chunk_denoised)
+                    timer.record("write_wait", time.time() - t0)
+                    timer.end_chunk(len(chunk_denoised))
 
-                    if frames_written == 0:
-                        return StageResult(
-                            status=StageStatus.FAILED,
-                            error="No frames produced by denoiser",
-                            duration_sec=time.time() - start,
-                        )
-                    if not write_ok:
-                        return StageResult(
-                            status=StageStatus.FAILED,
-                            error="Failed to write denoised frames to temp file",
-                            duration_sec=time.time() - start,
-                        )
-                else:
-                    frames = proc.extract_frames(input_path)
-                    proc.close()
+                    frames_written += len(chunk_denoised)
+                    processed += len(chunk)
 
-                    if not frames:
-                        return StageResult(
-                            status=StageStatus.FAILED,
-                            error="No frames extracted from input video",
-                            duration_sec=time.time() - start,
-                        )
+                    self._report_progress(
+                        0.1 + (processed / total_est) * 0.9,
+                        "Denoising chunk...",
+                        progress_callback,
+                    )
+                proc.close()
+                write_ok = writer.close()
+                timer.summary()
 
-                    def cb(current, total, msg):
-                        self._report_progress(0.1 + (current / total) * 0.9, msg, progress_callback)
-
-                    denoised = upscaler.upscale_video(frames, progress_callback=cb)
-
-                    if not denoised:
-                        return StageResult(
-                            status=StageStatus.FAILED,
-                            error="No frames produced by denoiser",
-                            duration_sec=time.time() - start,
-                        )
-
-                    proc2 = FrameProcessor()
-                    if not proc2.frames_to_video(denoised, temp_path, fps=fps):
-                        proc2.close()
-                        return StageResult(
-                            status=StageStatus.FAILED,
-                            error="Failed to write denoised frames to temp file",
-                            duration_sec=time.time() - start,
-                        )
-                    proc2.close()
-                    frames_written = len(denoised)
+                if frames_written == 0:
+                    return StageResult(
+                        status=StageStatus.FAILED,
+                        error="No frames produced by denoiser",
+                        duration_sec=time.time() - start,
+                    )
+                if not write_ok:
+                    return StageResult(
+                        status=StageStatus.FAILED,
+                        error="Failed to write denoised frames to temp file",
+                        duration_sec=time.time() - start,
+                    )
 
                 # Mux processed video back with the original audio (if any).
                 # The input may have no audio stream at all - mapping
@@ -328,9 +322,15 @@ class DenoiseVideoStage(BaseStage):
                 except Exception:
                     has_audio = False
 
+                # -c:v copy: the temp file was already encoded once (at
+                # temp_crf/"medium" above) -- re-encoding it again here at a
+                # DIFFERENT crf (this used to be "-crf 18") was a second lossy
+                # generation plus a wasted full x264 pass. Stream-copying the
+                # already-encoded video track makes this mux bit-identical to
+                # the temp file's video stream.
                 mux_args = ["-i", input_path, "-i", temp_path]
                 mux_args += ["-map", "0:a:0", "-map", "1:v:0"] if has_audio else ["-map", "1:v:0"]
-                mux_args += ["-c:v", "libx264", "-crf", "18", "-c:a", "copy", "-y", output_path]
+                mux_args += ["-c:v", "copy", "-c:a", "copy", "-y", output_path]
                 mux_result = run_ffmpeg(mux_args, timeout=600)
 
                 if mux_result.returncode != 0:

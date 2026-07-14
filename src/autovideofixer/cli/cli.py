@@ -289,6 +289,36 @@ def _log_effective_settings(
     "the crop stage itself still needs --enable-stage crop or stages.crop.enabled: true "
     "in config, since auto-crop is opt-in.",
 )
+@click.option(
+    "--zoom-coverage",
+    type=float,
+    default=None,
+    help="Fraction (0.0-1.0) of frames that should end up border-free once the stabilize "
+    "stage's zoom gate decides zoom applies at all (overrides stages.stabilize.zoom_coverage). "
+    "1.0 (default) = vidstabtransform's optzoom=1, guaranteed no border on any frame. 0.0 = no "
+    "zoom (all borders visible). In between trades that guarantee for a less aggressive crop, "
+    "with occasional brief borders on the most extreme motion -- see AGENTS.md's stabilize zoom "
+    "section.",
+)
+@click.option(
+    "--batch-size",
+    type=int,
+    default=None,
+    help="Number of frames batched into one Real-ESRGAN forward pass for the upscale/deblock/"
+    "denoise_video AI stages (overrides stages.{upscale,deblock,denoise_video}.batch_size for "
+    "all three; default 1 = one frame at a time, today's behavior). Only helps frames small "
+    "enough to skip tiled inference -- see --tile-batch-size for large (e.g. 4K) frames, which "
+    "always tile regardless of this setting.",
+)
+@click.option(
+    "--tile-batch-size",
+    type=int,
+    default=None,
+    help="Number of tiles batched into one Real-ESRGAN forward pass when a frame is large "
+    "enough to trigger tiled inference (overrides stages.{upscale,deblock,denoise_video}."
+    "tile_batch_size for all three; default 1 = one tile at a time, today's behavior). This is "
+    "the batching knob that matters at e.g. 4K, where every frame always tiles.",
+)
 @click.pass_context
 def process(
     ctx: click.Context,
@@ -317,6 +347,9 @@ def process(
     scene_mode: bool | None,
     drop_non_content: bool | None,
     crop_limit: int | None,
+    zoom_coverage: float | None,
+    batch_size: int | None,
+    tile_batch_size: int | None,
 ) -> None:
     """Process video files with the specified settings."""
     if list_presets_flag:
@@ -402,6 +435,17 @@ def process(
 
     if crop_limit is not None:
         config.set(crop_limit, "stages", "crop", "limit")
+
+    if zoom_coverage is not None:
+        config.set(zoom_coverage, "stages", "stabilize", "zoom_coverage")
+
+    if batch_size is not None:
+        for _stage_name in ("upscale", "deblock", "denoise_video"):
+            config.set(batch_size, "stages", _stage_name, "batch_size")
+
+    if tile_batch_size is not None:
+        for _stage_name in ("upscale", "deblock", "denoise_video"):
+            config.set(tile_batch_size, "stages", _stage_name, "tile_batch_size")
 
     for stage_name in enable_stages:
         config.set(True, "stages", stage_name, "enabled")
@@ -898,7 +942,7 @@ def analyze(
 @main.command()
 @click.argument("reference")
 @click.argument("directory")
-@click.option("--threshold", type=float, default=0.95, help="Similarity threshold (0-1)")
+@click.option("--threshold", type=float, default=0.85, help="Similarity threshold (0-1)")
 @click.pass_context
 def find_duplicates(ctx: click.Context, reference: str, directory: str, threshold: float) -> None:
     """Find similar/duplicate videos in a directory."""

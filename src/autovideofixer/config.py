@@ -227,6 +227,26 @@ class Config:
                 # (see RealESRGANUpscaler.AUTO_TILE_THRESHOLD_PX) or on a
                 # caught OOM. Set > 0 to always tile at that pixel size.
                 "tile_size": 0,
+                # Frames batched into one forward pass in RealESRGANUpscaler.
+                # upscale_video() (whole-*frame* batching -- N different
+                # frames per call). 1 (default) = today's one-frame-at-a-time
+                # behavior; opt-in until field-tested. Only takes effect for
+                # frames small enough to skip tiling -- see tile_batch_size
+                # below for the batching that matters at e.g. 4K, where every
+                # frame always tiles regardless of this setting.
+                "batch_size": 1,
+                # Tiles (sharing the same padded input shape) batched into one
+                # forward pass inside run_tiled_inference(), when a frame's
+                # resolution triggers tiled inference (see tile_size/
+                # AUTO_TILE_THRESHOLD_PX above). 1 (default) = today's
+                # one-tile-at-a-time behavior. This is the batching knob that
+                # matters for large frames -- a 4K frame at the default
+                # tile_size=512 needs a 5x8=40-tile grid, so raising this
+                # collapses many small sequential forward passes into a
+                # handful of larger ones. Independent of batch_size above
+                # (different batching axis: N tiles of ONE frame, vs N whole
+                # frames) -- opt-in for the same reason.
+                "tile_batch_size": 1,
                 # None = inherit general.ai_fallback; True/False overrides it
                 # for this stage only.
                 "ai_fallback": None,
@@ -234,6 +254,14 @@ class Config:
                 # the ncnn Python package -- portable to AMD/Intel/iGPUs). Falls
                 # through the ai_fallback policy if the backend is unavailable.
                 "backend": "torch",
+                # CRF for the AI stage's internal temp encode (StreamingVideoWriter/
+                # frames_to_video), NOT the final output. Default 16 (near-visually-
+                # lossless) rather than libx264's own default (23) -- the temp file
+                # used to be encoded at CRF 23 and then RE-encoded by the stage's mux
+                # pass at CRF 18, a double lossy generation plus a wasted full x264
+                # pass; the mux pass now stream-copies (`-c:v copy`) instead, so this
+                # is the ONLY encode the AI-processed frames actually go through.
+                "temp_crf": 16,
             },
             "interpolate": {
                 "enabled": True,
@@ -257,13 +285,17 @@ class Config:
                 # Minimum chunk length in seconds -- below this, chunking isn't worth the
                 # per-chunk ffmpeg startup/concat overhead and the input runs as one chunk.
                 "min_chunk_duration_sec": 5.0,
+                "temp_crf": 16,  # see "upscale".temp_crf above; only used by the AI/RIFE path
             },
             "denoise_video": {
                 "enabled": True,
                 "ai_model": "RealESRGAN_x4plus",
                 "traditional_method": "hqdn3d",
                 "tile_size": 0,  # see "upscale".tile_size above
+                "batch_size": 1,  # see "upscale".batch_size above
+                "tile_batch_size": 1,  # see "upscale".tile_batch_size above
                 "ai_fallback": None,  # see "upscale".ai_fallback above
+                "temp_crf": 16,  # see "upscale".temp_crf above
             },
             "denoise_audio": {
                 "enabled": True,
@@ -274,7 +306,10 @@ class Config:
                 "enabled": True,
                 "strength": "medium",  # low, medium, high
                 "tile_size": 0,  # see "upscale".tile_size above
+                "batch_size": 1,  # see "upscale".batch_size above
+                "tile_batch_size": 1,  # see "upscale".tile_batch_size above
                 "ai_fallback": None,  # see "upscale".ai_fallback above
+                "temp_crf": 16,  # see "upscale".temp_crf above
             },
             "stabilize": {
                 "enabled": True,
@@ -287,6 +322,19 @@ class Config:
                 "zoom_threshold": 50.0,  # min movement (px) to trigger zoom
                 "zoom_mode": "black",  # black or keep
                 "sharpen_enabled": True,  # auto sharpen after stabilization
+                # How much of the clip should end up border-free once zoom_enabled's
+                # gate decides zoom applies at all (0.0-1.0). 1.0 (default) = today's
+                # behavior: vidstabtransform's own optzoom=1 ("optimal static zoom"),
+                # sized to the single worst frame so NO frame ever shows a border.
+                # 0.0 = no zoom at all (every border from camera motion stays visible).
+                # In between: a static zoom= percentage is computed from the
+                # zoom_coverage-quantile of per-frame required-zoom estimates (see
+                # StabilizeStage._compute_static_zoom_pct) instead of the max --
+                # trades "guaranteed no border, ever" for "less aggressive crop,
+                # occasional brief borders on the most extreme motion". See AGENTS.md's
+                # stabilize zoom section for the accuracy caveat (approximates the
+                # smoothed camera path from raw per-frame local-motion values).
+                "zoom_coverage": 1.0,
             },
             "normalize_volume": {
                 "enabled": True,
@@ -443,8 +491,11 @@ class Config:
             },
             "duplicate_detection": {
                 "enabled": True,
-                "similarity_threshold": 0.95,
-                "hash_type": "perceptual",  # perceptual (ahash), dhash, combined
+                "similarity_threshold": 0.85,
+                # `hash_type` was removed (R5.2): the old ahash/dhash/combined choice
+                # no longer applies now that compute_video_phash() always uses a
+                # single pHash (DCT-based) algorithm -- see core/analysis.py and
+                # rust/avf_hashing/ for why pHash replaced both.
             },
         },
     }
