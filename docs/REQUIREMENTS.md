@@ -542,6 +542,40 @@ of a literal ahash/dhash port:
 > above, not on the retracted A/B. A valid conclusion about whether transport or compute dominates
 > the real 4K budget requires the corrected, untruncated measurement.
 
+> **2026-07-14 valid post-Phase-1 measurement (the corrected rerun)**: 150-frame synthetic
+> 3840x2160 clip (testsrc2+noise, CRF 40 for real blocking) through `deblock --ai`,
+> `tile_batch_size=1`, RTX 5060 Ti, NO timeout, exit 0, stage completed, output verified.
+> Per-phase budget from the Phase-0 instrumentation: **gpu_forward=592.4s (~100%)**,
+> decode_wait=0.2s, h2d_preprocess=0.5s, d2h_postprocess=1.2s, write_wait=0.0s;
+> avg 0.25 fps (matches real-world 4K deblock observations). Small-res contrast
+> (576x320, same clip recipe): avg 13.87 fps, gpu_forward=10.1s (95%), h2d 4%, d2h 1%.
+> Conclusion: post-Phase-1, deblock is compute-bound at every tested resolution — transport
+> overhead is ~0% at 4K and ~5% at 576x320. The >85% scope gate triggered: `avf_framepipe`
+> lands in lean v1 form only (no NVDEC, no buffer-lease pooling), and its expected speed
+> benefit for deblock is small; its case is architecture robustness (real OS threads, bounded
+> memory, diagnosable ffmpeg errors) and headroom for lighter/faster AI passes.
+>
+> **2026-07-14 final A/B (Python transport vs Rust `avf_framepipe`, same clips/settings/machine,
+> both runs exit 0 + completed)**: 4K deblock — 0.25 fps on both transports (identical, as the
+> ~100% gpu_forward budget predicted). 576x320 deblock — 13.87 fps (Python) → 14.41 fps (Rust),
+> **+3.9%**, gpu_forward share 95% → 98%. Transport is now effectively invisible in the phase
+> budget at all tested resolutions. Output parity proven separately by the bit-exact
+> differential identity test (`tests/unit/test_frame_pipe.py`, integration-marked); bounded
+> memory by the 1200-frame soak test (~6.8MB RSS growth).
+
+> **Status: implemented.** `rust/avf_framepipe/` (lean v1 scope per the gate above -- no NVDEC,
+> no buffer-lease pooling) landed as a `FrameReader`/`FrameWriter` PyO3 crate, and `ai/frame_pipe.py`
+> wires it into `upscale`/`deblock`/`denoise_video`'s chunked stage loops via `get_frame_reader()`/
+> `get_frame_writer()` factories, with a fallback to the pre-existing `ai/frame_processor.py`
+> machinery when the extension isn't built (see AGENTS.md's "Mixed Python/Rust" section for the
+> adapter contract and fallback-parity gaps). Verification: a differential identity test
+> (`tests/unit/test_frame_pipe.py::TestTransportIdentity`) proves the Rust and Python transports
+> are bit-exact-interchangeable under identical passthrough processing and encode settings; a
+> soak test (`TestFramePipeSoak`, 1200 frames) confirms bounded (not full-video) memory growth
+> streaming through the reader/writer pair. `interpolate`'s AI/RIFE path was explicitly left on
+> `frame_processor.py` directly (still buffers frames in a list, not the streaming path) --
+> out of scope per the "Scope carefully" note below, unchanged by this work.
+
 **Target**: `PrefetchIterator` and `AsyncVideoWriter` in `ai/frame_processor.py` (`stream_frames_prefetched`,
 ~line 247), the background-thread decode-prefetch / async-write machinery added to keep the GPU
 fed during AI stage processing (upscale/interpolate/denoise/deblock). Currently Python

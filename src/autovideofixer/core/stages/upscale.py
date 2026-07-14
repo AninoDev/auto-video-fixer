@@ -519,12 +519,8 @@ class UpscaleStage(BaseStage):
             )
 
         try:
-            from autovideofixer.ai.frame_processor import (
-                AsyncVideoWriter,
-                FrameProcessor,
-                StageTimer,
-                StreamingVideoWriter,
-            )
+            from autovideofixer.ai.frame_pipe import get_frame_reader, get_frame_writer
+            from autovideofixer.ai.frame_processor import StageTimer
             from autovideofixer.ai.torch_utils import is_torch_available
             from autovideofixer.ai.wrappers.upscale import RealESRGANUpscaler
         except ImportError:
@@ -617,7 +613,6 @@ class UpscaleStage(BaseStage):
                     "failed to load model", start, _traditional_fallback
                 )
 
-            proc = FrameProcessor()
             # Stream frames in chunks to avoid loading the entire video into
             # memory -- ALL videos go through this path regardless of frame
             # count (see DeblockStage._execute_ai for why the old frame-
@@ -626,6 +621,7 @@ class UpscaleStage(BaseStage):
             fps = self._get_input_fps(input_path)
             probe_info = probe(input_path)
             total_est = int(probe_info.frame_count) if probe_info.frame_count else 0
+            in_width, in_height = probe_info.resolution
 
             # The temp file's extension must NOT be derived from output_path's
             # extension: frames_to_video()/StreamingVideoWriter always mux
@@ -642,16 +638,28 @@ class UpscaleStage(BaseStage):
             try:
                 chunk_size = 25
                 temp_crf = self._stage_config.get("temp_crf", 16)
-                # AsyncVideoWriter hands the ffmpeg pipe write off to a
-                # background thread so it doesn't block the next chunk's
-                # GPU inference; stream_frames_prefetched decodes the next
-                # chunk on a background thread while the current one is
-                # being upscaled. Together these overlap CPU decode/write
+                read_ahead = self._stage_config.get("read_ahead", 2)
+                write_queue_depth = self._stage_config.get("write_queue_depth", 4)
+                # Reader/writer transport (ai/frame_pipe.py): Rust
+                # (avf_framepipe) when available, else a Python fallback
+                # wrapping frame_processor.py's machinery. Either way,
+                # decode/write happen off the main thread so they overlap
                 # with GPU compute instead of serializing all three per
                 # chunk (read -> infer -> write -> read -> ...).
-                writer = AsyncVideoWriter(
-                    StreamingVideoWriter(temp_path, fps=fps, crf=temp_crf, preset="medium")
+                reader = get_frame_reader(
+                    input_path,
+                    in_width,
+                    in_height,
+                    chunk_size=chunk_size,
+                    read_ahead=read_ahead,
                 )
+                # The writer needs the *output* (post-upscale) frame
+                # dimensions, which the Real-ESRGAN forward pass determines
+                # (not always an exact `in_dim * scale_factor` -- tiling/
+                # padding can round slightly) -- so it's constructed lazily,
+                # once the first upscaled chunk's actual shape is known,
+                # rather than precomputed.
+                writer: Any = None
                 total_chunks = 0
                 processed_frames = 0
                 frames_written = 0
@@ -664,27 +672,33 @@ class UpscaleStage(BaseStage):
                         progress_callback,
                     )
 
-                chunk_iter = iter(
-                    proc.stream_frames_prefetched(
-                        input_path, chunk_size=chunk_size, max_frames=total_est
-                    )
-                )
                 while True:
                     t0 = time.time()
-                    try:
-                        chunk = next(chunk_iter)
-                    except StopIteration:
-                        break
+                    chunk = reader.next_batch()
                     timer.record("decode_wait", time.time() - t0)
+                    if chunk is None:
+                        break
 
                     total_chunks += 1
                     chunk_upscaled = upscaler.upscale_video(
                         chunk, progress_callback=cb, timer=timer
                     )
+                    if writer is None and chunk_upscaled:
+                        out_h, out_w = chunk_upscaled[0].shape[:2]
+                        writer = get_frame_writer(
+                            temp_path,
+                            out_w,
+                            out_h,
+                            fps,
+                            crf=temp_crf,
+                            preset="medium",
+                            write_queue=write_queue_depth,
+                        )
                     # Write each chunk's output straight to the ffmpeg pipe
                     # instead of buffering the whole video's frames in memory.
                     t0 = time.time()
-                    writer.write(chunk_upscaled)
+                    if writer is not None:
+                        writer.write_batch(chunk_upscaled)
                     timer.record("write_wait", time.time() - t0)
                     timer.end_chunk(len(chunk_upscaled))
 
@@ -696,8 +710,8 @@ class UpscaleStage(BaseStage):
                         f"Processing chunk {total_chunks}...",
                         progress_callback,
                     )
-                proc.close()
-                write_ok = writer.close()
+                reader.close()
+                write_ok = writer.close() if writer is not None else False
                 timer.summary()
 
                 if frames_written == 0:

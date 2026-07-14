@@ -173,10 +173,21 @@ themselves) — see REQUIREMENTS.md for why.
    sources) scored 0.3438-0.5781 -- a wide margin either side of the 0.85 threshold. See
    `docs/REQUIREMENTS.md` R5.2 for the full algorithm-choice writeup.
 3. **Chunked AI frame I/O overlap** (`PrefetchIterator`/`AsyncVideoWriter`,
-   `ai/frame_processor.py`) — replace GIL-bound Python threading with real OS-thread parallelism
-   for CPU-side frame marshalling, now that GPU inference itself is fast enough (7-92 fps
-   depending on backend) that CPU-side handling is an increasingly real bottleneck. Most
-   architecturally involved of the three; needs its own design pass before implementation.
+   `ai/frame_processor.py`) — **IMPLEMENTED (lean v1 scope).** New crate `rust/avf_framepipe/`
+   (same workspace/build pattern as `avf_scenes`/`avf_hashing` above): `FrameReader`/`FrameWriter`
+   PyO3 classes, each a background OS thread + piped `ffmpeg` subprocess handing frames across a
+   bounded `sync_channel` (no NVDEC, no buffer-lease pooling -- the >85% compute-bound scope gate
+   in `docs/REQUIREMENTS.md` R5.3's 2026-07-14 measurement meant the win here is architecture
+   robustness and headroom for lighter/faster AI passes, not raw throughput). `ai/frame_pipe.py`'s
+   `get_frame_reader()`/`get_frame_writer()` factories wire it into `upscale`/`deblock`/
+   `denoise_video`'s stage loops, falling back to the pre-existing `frame_processor.py` machinery
+   (unchanged) when the extension isn't built -- same lazy-import-with-fallback contract as
+   `avf_scenes`/`avf_hashing`. New config keys `stages.<name>.read_ahead` (default 2) and
+   `stages.<name>.write_queue_depth` (default 4) on the three stages. Verified: a differential
+   identity test proves the Rust and Python transports are bit-exact-interchangeable
+   (`tests/unit/test_frame_pipe.py::TestTransportIdentity`), and a 1200-frame soak test confirms
+   bounded (not full-video) memory growth (`TestFramePipeSoak`). `interpolate`'s AI/RIFE path is
+   unchanged (still buffers frames in a list via `frame_processor.py` directly, not this adapter).
 
 Feature 4 (NCNN backend) is now implemented: `stages.upscale.backend: ncnn` runs Real-ESRGAN
 in-process over Vulkan. Output parity with torch is confirmed on a real frame. Re-verified after

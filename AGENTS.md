@@ -80,6 +80,41 @@ for the algorithm and why it replaced the old ahash/dhash implementation wholesa
 sitting alongside it (no backward-compatibility constraint — see R5.2 in
 `docs/REQUIREMENTS.md`).
 
+A third crate, `rust/avf_framepipe/` (threaded, bounded-channel ffmpeg frame I/O for the AI stage
+loop, `docs/REQUIREMENTS.md` R5.3), followed the same workspace/build pattern (`[tool.uv.workspace]`
+member, `avf-framepipe` dependency + `[tool.uv.sources]` editable-workspace entry, built
+automatically by `uv sync --all-extras`). Unlike `avf_scenes`/`avf_hashing`, which each expose one
+function replacing a hot loop, `avf_framepipe` exposes two classes, `FrameReader` and
+`FrameWriter` (see `rust/avf_framepipe/src/lib.rs`'s module docs for exact signatures): each owns a
+background OS thread plus a piped `ffmpeg` subprocess, handing frames across a bounded
+`std::sync::mpsc::sync_channel` so a Python-side inference loop can pull/push frames without ever
+blocking on the ffmpeg pipe directly. `FrameReader(path, width, height, chunk_size, read_ahead,
+ffmpeg_path).next_batch() -> list[np.ndarray] | None` decodes rawvideo BGR24 frames in
+`chunk_size`-sized batches, buffering at most `read_ahead` batches ahead of the consumer.
+`FrameWriter(path, width, height, fps, codec, crf, preset, write_queue,
+ffmpeg_path).write_batch(list)` mirrors `StreamingVideoWriter`'s ffmpeg argument shape (including
+not setting `-movflags faststart`). Both have `.close()` (writer's returns `bool` success) that are
+idempotent and safe to call from `Drop` as a backstop.
+
+At the Python call site, `ai/frame_pipe.py`'s `get_frame_reader()`/`get_frame_writer()` factories
+follow the identical lazy-import-with-fallback pattern as scene detection/hashing: `try: import
+avf_framepipe` / `except ImportError`, falling back to thin Python wrapper classes
+(`_PythonFrameReader`/`_PythonFrameWriter`) around the *existing* `ai/frame_processor.py` machinery
+(`FrameProcessor.stream_frames_prefetched()` for reading, `AsyncVideoWriter(StreamingVideoWriter(...))`
+for writing) — exposing the identical `next_batch()`/`frames_read()`/`close()` (reader) and
+`write_batch()`/`frames_written()`/`close()` (writer) surface either way, so `upscale`/`deblock`/
+`denoise_video`'s stage loops never branch on backend. `frame_processor.py` itself is **untouched**
+by this — it's still the fallback implementation and still directly usable by anything that doesn't
+need transport-backend selection (e.g. `interpolate`'s AI/RIFE path, which still buffers frames in
+a list rather than streaming — see "Kill the ≤1000-frame full-buffering path" below). Two fallback
+parity gaps worth knowing: `write_queue`/`write_queue_depth` only actually varies the Rust
+backend's channel bound (`AsyncVideoWriter`'s queue depth is a hardcoded constant `frame_processor.py`
+wasn't modified to expose); and the Python fallback's `frames_written()` counts frames as they're
+*enqueued* rather than as they're actually flushed to the ffmpeg pipe (both converge to the same
+final count once `close()` returns). New config keys `stages.<name>.read_ahead` (default `2`) and
+`stages.<name>.write_queue_depth` (default `4`) on `upscale`/`deblock`/`denoise_video` plumb into
+these factories; `chunk_size` (`25`) stays a call-site constant, not a config key.
+
 ## Architecture
 
 ```
@@ -291,7 +326,8 @@ implicit defaults:
   not the streaming path below) but shared the exact same bug.
 
 All AI-capable videos (`upscale`/`deblock`/`denoise_video`) now go through the chunked streaming
-path (`stream_frames_prefetched` + `AsyncVideoWriter(StreamingVideoWriter(...))`, `chunk_size=25`)
+path (`ai/frame_pipe.get_frame_reader()`/`get_frame_writer()`, `chunk_size=25` — see "Mixed
+Python/Rust" above for the Rust-backed `avf_framepipe` transport and its Python fallback)
 regardless of frame count — the old `total_est > 1000` frame-count threshold and its full-buffer
 `extract_frames()` → flat list → `frames_to_video()` route are gone from these three stages'
 `_execute_ai()`/`_run_single_ai_pass()`. That threshold was resolution-blind: a short but
@@ -300,8 +336,7 @@ frame set in RAM (a 33s 4K clip is ~25GB uncompressed), with zero decode/inferen
 Streaming has no measurable downside for short clips either, so there's no longer a reason to keep
 two code paths. `extract_frames()`/`frames_to_video()` themselves are untouched in
 `ai/frame_processor.py` — other callers (`interpolate`'s AI path, `frames_to_temp_video()`) still
-use them, and they remain the eventual Phase-3 fallback machinery for a planned Rust frame-pipe
-rewrite (see `docs/REQUIREMENTS.md` R5.3).
+use them directly (not through `ai/frame_pipe.py`).
 
 ### Pinned staging pool (torch backend, CUDA only)
 
@@ -330,12 +365,14 @@ crash. See `tests/unit/test_torch_utils.py::TestPinnedStagingPoolCudaCorrectness
 stage loop shared by `upscale`/`deblock`/`denoise_video` — instantiated once per stage run
 (`StageTimer("upscale")` etc.) and threaded through as an optional `timer=` kwarg into
 `RealESRGANUpscaler.upscale()`/`upscale_batch()`/`upscale_video()` (`ai/wrappers/upscale.py`).
-Phases tracked: `decode_wait` (time blocked pulling the next chunk out of
-`stream_frames_prefetched`, measured at the stage loop via manual `next()` calls instead of a
-plain `for` loop), `h2d_preprocess`/`d2h_postprocess` (`tensor_from_frame(s)`/`frame_from_tensor(s)`
-call time), `gpu_forward` (every model forward call — bracketed with `torch.cuda.Event` pairs via
+Phases tracked: `decode_wait` (time blocked pulling the next chunk out of the `ai/frame_pipe.py`
+reader's `next_batch()` — Rust `avf_framepipe.FrameReader` or its Python fallback, whichever
+backend is active — measured at the stage loop via manual calls instead of a plain `for` loop),
+`h2d_preprocess`/`d2h_postprocess` (`tensor_from_frame(s)`/`frame_from_tensor(s)` call time),
+`gpu_forward` (every model forward call — bracketed with `torch.cuda.Event` pairs via
 `gpu_forward_timer()` for honest device-side time on CUDA, wall-clock fallback on CPU/MPS),
-`write_wait` (time blocked in `AsyncVideoWriter.write()`). Per-chunk breakdown logs at DEBUG
+`write_wait` (time blocked in the `ai/frame_pipe.py` writer's `write_batch()`). Per-chunk
+breakdown logs at DEBUG
 (`StageTimer.end_chunk()`); an aggregate percentage-of-total breakdown logs at INFO once at stage
 end (`StageTimer.summary()`). Independently, periodic throughput (`frames_done`, `elapsed_sec`,
 `current_fps`) logs at INFO every ~10s or 10 chunks (whichever first) — this exists specifically

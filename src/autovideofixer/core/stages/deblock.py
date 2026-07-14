@@ -139,12 +139,8 @@ class DeblockStage(BaseStage):
         its super-resolution training, so we use scale=1 for pure deblocking.
         """
         try:
-            from autovideofixer.ai.frame_processor import (
-                AsyncVideoWriter,
-                FrameProcessor,
-                StageTimer,
-                StreamingVideoWriter,
-            )
+            from autovideofixer.ai.frame_pipe import get_frame_reader, get_frame_writer
+            from autovideofixer.ai.frame_processor import StageTimer
             from autovideofixer.ai.torch_utils import is_torch_available
             from autovideofixer.ai.wrappers.upscale import RealESRGANUpscaler
         except ImportError:
@@ -229,15 +225,14 @@ class DeblockStage(BaseStage):
         total_est = probe_info.frame_count or 0
 
         try:
-            proc = FrameProcessor()
             fps = self._get_input_fps(input_path)
+            width, height = probe_info.resolution
             # The temp file's extension must NOT be derived from the input's
-            # extension: frames_to_video()/StreamingVideoWriter always mux
-            # with codec="libx264" (H.264), which webm/mkv/etc. containers
-            # can't hold -- so e.g. a .webm input produced a
-            # ".avf_deblock_test.webm" temp target that ffmpeg then failed
-            # to write into. ".mp4" always matches the actual codec being
-            # written, regardless of input container.
+            # extension: the frame writer always muxes with codec="libx264"
+            # (H.264), which webm/mkv/etc. containers can't hold -- so e.g.
+            # a .webm input produced a ".avf_deblock_test.webm" temp target
+            # that ffmpeg then failed to write into. ".mp4" always matches
+            # the actual codec being written, regardless of input container.
             temp_path = os.path.join(
                 os.path.dirname(input_path) or ".",
                 f".avf_deblock_{os.path.splitext(os.path.basename(input_path))[0]}.mp4",
@@ -255,11 +250,29 @@ class DeblockStage(BaseStage):
                 # downside for short clips either.
                 chunk_size = 25
                 temp_crf = self._stage_config.get("temp_crf", 16)
-                # See UpscaleStage._run_single_ai_pass for why: overlaps
-                # CPU decode/write with GPU inference instead of
-                # serializing read -> infer -> write per chunk.
-                writer = AsyncVideoWriter(
-                    StreamingVideoWriter(temp_path, fps=fps, crf=temp_crf, preset="medium")
+                read_ahead = self._stage_config.get("read_ahead", 2)
+                write_queue_depth = self._stage_config.get("write_queue_depth", 4)
+                # Reader/writer transport (ai/frame_pipe.py): Rust
+                # (avf_framepipe) when available, else a Python fallback
+                # wrapping frame_processor.py's machinery -- either way,
+                # decode/write happen on background threads/processes so
+                # they overlap with GPU inference instead of serializing
+                # read -> infer -> write per chunk.
+                reader = get_frame_reader(
+                    input_path,
+                    width,
+                    height,
+                    chunk_size=chunk_size,
+                    read_ahead=read_ahead,
+                )
+                writer = get_frame_writer(
+                    temp_path,
+                    width,
+                    height,
+                    fps,
+                    crf=temp_crf,
+                    preset="medium",
+                    write_queue=write_queue_depth,
                 )
                 processed = 0
                 frames_written = 0
@@ -270,24 +283,18 @@ class DeblockStage(BaseStage):
                         0.1 + (processed / total_est) * 0.9, msg, progress_callback
                     )
 
-                chunk_iter = iter(
-                    proc.stream_frames_prefetched(
-                        input_path, chunk_size=chunk_size, max_frames=total_est
-                    )
-                )
                 while True:
                     t0 = time.time()
-                    try:
-                        chunk = next(chunk_iter)
-                    except StopIteration:
-                        break
+                    chunk = reader.next_batch()
                     timer.record("decode_wait", time.time() - t0)
+                    if chunk is None:
+                        break
 
                     chunk_out = upscaler.upscale_video(chunk, progress_callback=cb, timer=timer)
                     # Write each chunk's output straight to the ffmpeg pipe
                     # instead of buffering the whole video's frames in memory.
                     t0 = time.time()
-                    writer.write(chunk_out)
+                    writer.write_batch(chunk_out)
                     timer.record("write_wait", time.time() - t0)
                     timer.end_chunk(len(chunk_out))
 
@@ -299,7 +306,7 @@ class DeblockStage(BaseStage):
                         "Deblocking chunk...",
                         progress_callback,
                     )
-                proc.close()
+                reader.close()
                 write_ok = writer.close()
                 timer.summary()
 

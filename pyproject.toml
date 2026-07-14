@@ -29,6 +29,7 @@ dependencies = [
     "numpy>=1.24",
     "avf-scenes",
     "avf-hashing",
+    "avf-framepipe",
 ]
 
 [project.optional-dependencies]
@@ -116,8 +117,10 @@ packages = ["src/autovideofixer"]
 members = [
     "rust/avf_scenes",
     "rust/avf_hashing",
+    "rust/avf_framepipe",
 ]
 
 [tool.uv.sources]
 avf-scenes = { workspace = true, editable = true }
 avf-hashing = { workspace = true, editable = true }
+avf-framepipe = { workspace = true, editable = true }

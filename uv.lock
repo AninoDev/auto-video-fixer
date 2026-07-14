@@ -9,6 +9,7 @@ resolution-markers = [
 [manifest]
 members = [
     "auto-video-fixer",
+    "avf-framepipe",
     "avf-hashing",
     "avf-scenes",
 ]
@@ -59,6 +60,7 @@ name = "auto-video-fixer"
 version = "0.3.0"
 source = { editable = "." }
 dependencies = [
+    { name = "avf-framepipe" },
     { name = "avf-hashing" },
     { name = "avf-scenes" },
     { name = "click" },
@@ -98,6 +100,7 @@ ncnn = [
 [package.metadata]
 requires-dist = [
     { name = "auto-video-fixer", extras = ["gui", "ai", "ncnn"], marker = "extra == 'all'" },
+    { name = "avf-framepipe", editable = "rust/avf_framepipe" },
     { name = "avf-hashing", editable = "rust/avf_hashing" },
     { name = "avf-scenes", editable = "rust/avf_scenes" },
     { name = "click", specifier = ">=8.0" },
@@ -117,6 +120,10 @@ requires-dist = [
     { name = "torchvision", marker = "extra == 'ai'", specifier = ">=0.15" },
 ]
 provides-extras = ["gui", "ai", "ncnn", "all", "dev"]
+
+[[package]]
+name = "avf-framepipe"
+source = { editable = "rust/avf_framepipe" }
 
 [[package]]
 name = "avf-hashing"

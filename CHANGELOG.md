@@ -8,6 +8,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Rust-backed AI frame transport (`rust/avf_framepipe/`, docs/REQUIREMENTS.md R5.3)**: a new
+  PyO3/`maturin` extension providing threaded, bounded-channel ffmpeg frame I/O (`FrameReader`/
+  `FrameWriter`, each a background OS thread + piped `ffmpeg` subprocess), following the same
+  `[tool.uv.workspace]`/lazy-import-with-fallback pattern as `avf_scenes` (R5.1) and `avf_hashing`
+  (R5.2) -- see AGENTS.md's "Mixed Python/Rust" section. A new adapter module, `ai/frame_pipe.py`,
+  exposes `get_frame_reader()`/`get_frame_writer()` factories that pick the Rust backend when
+  built, else fall back to thin wrappers around the existing `ai/frame_processor.py` machinery
+  (`stream_frames_prefetched`/`AsyncVideoWriter`/`StreamingVideoWriter`, left unmodified) --
+  exposing an identical `next_batch()`/`frames_read()`/`close()` (reader) and
+  `write_batch()`/`frames_written()`/`close()` (writer) surface either way, so call sites never
+  branch on backend. The `upscale`/`deblock`/`denoise_video` AI stages' chunked streaming loops
+  now go through this adapter (their `StageTimer` phase instrumentation, mux/temp-file handling,
+  and error paths are unchanged -- only the transport underneath `decode_wait`/`write_wait` was
+  swapped). Per docs/REQUIREMENTS.md R5.3's 2026-07-14 measurement (deblock is compute-bound,
+  ~0-5% transport overhead at tested resolutions), this landed as a lean v1 (no NVDEC, no
+  buffer-lease pooling) -- its case is architecture robustness (real OS threads instead of
+  GIL-bound Python threading, bounded memory, diagnosable ffmpeg errors), not a throughput win
+  for existing GPU-bound workloads. New config keys `stages.{upscale,deblock,denoise_video}.
+  read_ahead` (default `2`) and `.write_queue_depth` (default `4`) control the reader/writer's
+  backpressure depth (only the Rust backend's channels actually vary with these -- the Python
+  fallback's writer queue depth is a fixed constant, see `ai/frame_pipe.py`'s docstring).
+  `interpolate`'s AI/RIFE path is unchanged (still uses `frame_processor.py` directly, not this
+  adapter). Verified: a differential identity test proves the Rust and Python transports are
+  bit-exact-interchangeable under identical passthrough processing and encode settings
+  (`tests/unit/test_frame_pipe.py::TestTransportIdentity`), and a 1200-frame soak test confirms
+  bounded (not full-video) memory growth streaming through the reader/writer pair
+  (`TestFramePipeSoak`).
 - **`stages.stabilize.zoom_coverage`** (float, 0.0-1.0, default `1.0`): tunes how aggressively the
   stabilize stage's zoom compensates for stabilization-introduced borders, once
   `zoom_enabled`/`zoom_threshold`'s movement-extent gate has decided zoom applies at all (the gate

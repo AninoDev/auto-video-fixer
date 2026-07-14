@@ -1,0 +1,16 @@
+[build-system]
+requires = ["maturin>=1.14,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "avf_framepipe"
+description = "PyO3/Rust threaded, bounded-channel ffmpeg frame I/O for auto-video-fixer AI stages"
+requires-python = ">=3.14"
+classifiers = [
+    "Programming Language :: Rust",
+    "Programming Language :: Python :: Implementation :: CPython",
+]
+dynamic = ["version"]
+
+[tool.maturin]
+module-name = "avf_framepipe"

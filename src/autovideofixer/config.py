@@ -262,6 +262,16 @@ class Config:
                 # pass; the mux pass now stream-copies (`-c:v copy`) instead, so this
                 # is the ONLY encode the AI-processed frames actually go through.
                 "temp_crf": 16,
+                # Frame-transport backpressure knobs (ai/frame_pipe.py) --
+                # only meaningfully vary the Rust (avf_framepipe) backend's
+                # bounded channels; the pure-Python fallback's writer queue
+                # depth is a fixed constant in frame_processor.py (see
+                # ai/frame_pipe.py's "fallback parity gaps" docstring note).
+                # read_ahead: max decoded chunks buffered ahead of inference.
+                "read_ahead": 2,
+                # write_queue_depth: max encoded chunks buffered ahead of the
+                # ffmpeg encoder pipe.
+                "write_queue_depth": 4,
             },
             "interpolate": {
                 "enabled": True,
@@ -296,6 +306,8 @@ class Config:
                 "tile_batch_size": 1,  # see "upscale".tile_batch_size above
                 "ai_fallback": None,  # see "upscale".ai_fallback above
                 "temp_crf": 16,  # see "upscale".temp_crf above
+                "read_ahead": 2,  # see "upscale".read_ahead above
+                "write_queue_depth": 4,  # see "upscale".write_queue_depth above
             },
             "denoise_audio": {
                 "enabled": True,
@@ -310,6 +322,8 @@ class Config:
                 "tile_batch_size": 1,  # see "upscale".tile_batch_size above
                 "ai_fallback": None,  # see "upscale".ai_fallback above
                 "temp_crf": 16,  # see "upscale".temp_crf above
+                "read_ahead": 2,  # see "upscale".read_ahead above
+                "write_queue_depth": 4,  # see "upscale".write_queue_depth above
             },
             "stabilize": {
                 "enabled": True,

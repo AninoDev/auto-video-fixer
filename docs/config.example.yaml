@@ -229,6 +229,12 @@ stages:
     # and then RE-encoded by the mux pass at CRF 18, a double lossy generation plus a wasted
     # full x264 pass. The preset is always "medium" (not configurable here).
     temp_crf: 16
+    # Frame-transport backpressure knobs (ai/frame_pipe.py, backed by the Rust avf_framepipe
+    # extension when built, else a pure-Python fallback). Only meaningfully vary the Rust
+    # backend's bounded channels -- the Python fallback's writer queue depth is a fixed constant
+    # (see ai/frame_pipe.py's "fallback parity gaps" docstring note).
+    read_ahead: 2         # max decoded chunks buffered ahead of GPU inference
+    write_queue_depth: 4  # max encoded chunks buffered ahead of the ffmpeg encoder pipe
 
   interpolate:
     enabled: true
@@ -266,6 +272,8 @@ stages:
     tile_batch_size: 1  # see stages.upscale.tile_batch_size above
     ai_fallback: null    # see stages.upscale.ai_fallback above
     temp_crf: 16          # see stages.upscale.temp_crf above
+    read_ahead: 2         # see stages.upscale.read_ahead above
+    write_queue_depth: 4  # see stages.upscale.write_queue_depth above
 
   denoise_audio:
     # NOTE: this config block exists in Config.DEFAULTS but there is currently no registered
@@ -286,6 +294,8 @@ stages:
     tile_batch_size: 1  # see stages.upscale.tile_batch_size above
     ai_fallback: null    # see stages.upscale.ai_fallback above
     temp_crf: 16          # see stages.upscale.temp_crf above
+    read_ahead: 2         # see stages.upscale.read_ahead above
+    write_queue_depth: 4  # see stages.upscale.write_queue_depth above
 
   stabilize:
     enabled: true
