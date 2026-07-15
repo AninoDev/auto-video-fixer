@@ -92,6 +92,54 @@ MODEL_REGISTRY: dict[str, dict[str, Any]] = {
         "description": "Real-ESRGAN x4 anime model (lighter, 6 RRDB blocks)",
         "scale": 4,
     },
+    # Compact SRVGG video models (official Real-ESRGAN v0.2.5.0 release).
+    # ~1.2M/~0.6M params vs RRDBNet's ~16.7M: an order of magnitude+ less
+    # GPU compute per frame, which is the whole point -- the AI stages are
+    # measured ~100% gpu_forward-bound (docs/REQUIREMENTS.md R5.3 notes).
+    # Trade-off: somewhat lower restoration quality than the RRDB models;
+    # RRDB stays the default. All sha256 values below verified via
+    # sha256sum of the officially-hosted assets downloaded from these URLs.
+    "realesr-general-x4v3": {
+        "url": "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.5.0/realesr-general-x4v3.pth",
+        "filename": "realesr-general-x4v3.pth",
+        "sha256": "8dc7edb9ac80ccdc30c3a5dca6616509367f05fbc184ad95b731f05bece96292",
+        "size_mb": 5,
+        "description": (
+            "Real-ESRGAN compact general video model (SRVGG, 32 convs) -- "
+            "10-30x faster than the RRDB models at some quality cost"
+        ),
+        "scale": 4,
+        "arch": "srvgg",
+        "num_conv": 32,
+    },
+    "realesr-general-wdn-x4v3": {
+        "url": "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.5.0/realesr-general-wdn-x4v3.pth",
+        "filename": "realesr-general-wdn-x4v3.pth",
+        "sha256": "1641f8c4464b9f097c9fdda5589273713f67cf59f3d909e0bd688f0cee269dca",
+        "size_mb": 5,
+        "description": (
+            "Denoise-strength companion to realesr-general-x4v3 (stronger "
+            "denoising when used alone; official usage blends the two state "
+            "dicts for a tunable denoise_strength -- blending is not "
+            "implemented yet, this checkpoint is usable standalone)"
+        ),
+        "scale": 4,
+        "arch": "srvgg",
+        "num_conv": 32,
+    },
+    "realesr-animevideov3": {
+        "url": "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.5.0/realesr-animevideov3.pth",
+        "filename": "realesr-animevideov3.pth",
+        "sha256": "b8a8376811077954d82ca3fcf476f1ac3da3e8a68a4f4d71363008000a18b75d",
+        "size_mb": 3,
+        "description": (
+            "Real-ESRGAN compact anime video model (SRVGG, 16 convs) -- "
+            "fastest option, tuned for animation content"
+        ),
+        "scale": 4,
+        "arch": "srvgg",
+        "num_conv": 16,
+    },
     # Real weights from the official author's HuggingFace mirror
     # (https://huggingface.co/hzwer/RIFE), verified: the packaged
     # `flownet.pkl` loads into our IFNet with zero missing/unexpected keys.

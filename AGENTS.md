@@ -263,6 +263,37 @@ ncnn models (.param/.bin) have their own registry in `ai/model_cache.py`
 (`NCNN_MODEL_REGISTRY` / `ensure_ncnn_model_available()`), separate from the torch `.pth`
 registry — stage pre-flight model checks must not gate an ncnn run on the torch registry.
 
+### Real-ESRGAN model registry (RRDB vs compact SRVGG)
+
+`ai/model_cache.py`'s `MODEL_REGISTRY` (torch `.pth` models, used by `upscale`/`deblock`/
+`denoise_video` at `backend: torch`) has two architecture families, dispatched in
+`RealESRGANUpscaler.load_model()` (`ai/wrappers/upscale.py`) off each entry's `arch` field
+(default `"rrdb"` when absent, so every pre-existing entry is unaffected):
+
+- **RRDB (`RRDBNet`, default)** — `RealESRGAN_x4plus`, `RealESRGAN_x2plus`,
+  `RealESRGAN_x4plus_anime_6B`. ~16.7M params, the highest-quality restoration, and the default
+  for all three AI-capable stages. `deblock`/`denoise_video` (both run Real-ESRGAN at scale<=2)
+  and `upscale` (for scale<=2 requests) transparently substitute `RealESRGAN_x2plus` whenever the
+  configured model is literally `"RealESRGAN_x4plus"` (a strict `==` string check, e.g.
+  `core/stages/deblock.py`, `core/stages/denoise_video.py`) — this swap is model-name-string-based
+  and does NOT trigger for any other model name, compact or RRDB.
+- **Compact (`SRVGGNetCompact`)** — `realesr-general-x4v3` (`num_conv=32`), `realesr-general-wdn-x4v3`
+  (`num_conv=32`, denoise-strength companion — official usage blends the two checkpoints' state
+  dicts for a tunable `denoise_strength`; that blending is **not implemented**, this checkpoint is
+  only usable standalone here), `realesr-animevideov3` (`num_conv=16`, animation-tuned). ~1.2M/
+  ~0.6M params — an order-of-magnitude-plus less GPU compute per frame than RRDB (the AI stages
+  are measured ~100% `gpu_forward`-bound, see "AI-stage instrumentation" above), at some
+  restoration-quality cost versus RRDB. `arch: "srvgg"` and `num_conv` are registry-only fields
+  (RRDB entries have neither); `RealESRGANUpscaler.load_model()` reads them via the pure helper
+  `resolve_arch()` to pick `SRVGGNetCompact(num_conv=..., upscale=native_scale)` over
+  `RRDBNet(scale=native_scale)`. All three compact checkpoints are the official
+  xinntao/Real-ESRGAN v0.2.5.0 release assets, hash-verified the same way as every other registry
+  entry.
+
+RRDB remains the default for all three stages — set `stages.<name>.ai_model` explicitly to opt
+into a compact model (see `docs/config.example.yaml`'s `ai_model` comment for the full list of
+valid values).
+
 ### Batched inference (torch backend only)
 
 `RealESRGANUpscaler` (`ai/wrappers/upscale.py`, used by `upscale`/`deblock`/`denoise_video` at

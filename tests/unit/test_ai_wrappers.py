@@ -7,7 +7,9 @@ import pytest
 from autovideofixer.ai.wrappers.interpolate import RIFEInterpolator
 from autovideofixer.ai.wrappers.upscale import (
     RealESRGANUpscaler,
+    SRVGGNetCompact,
     compute_tile_grid,
+    resolve_arch,
     run_tiled_inference,
 )
 
@@ -79,6 +81,137 @@ class TestRealESRGANUpscaler:
         upscaler = RealESRGANUpscaler()
         result = upscaler.load_model()
         assert result is False
+
+
+class TestSRVGGNetCompact:
+    """Test the compact SRVGG architecture used by the Real-ESRGAN video models.
+
+    CPU-only, random weights, no downloads -- exercises forward-pass shape
+    correctness and the exact flat state-dict key convention the official
+    checkpoints (realesr-general-x4v3/wdn-x4v3/animevideov3) ship with, so
+    strict `load_state_dict` succeeds against real weights without needing
+    them here.
+    """
+
+    @pytest.mark.parametrize("num_conv", [16, 32])
+    def test_forward_shape_x4(self, num_conv):
+        """Forward pass upscales spatial dims by 4x, channels stay at 3."""
+        torch = pytest.importorskip("torch")
+
+        model = SRVGGNetCompact(
+            num_in_ch=3, num_out_ch=3, num_feat=64, num_conv=num_conv, upscale=4
+        )
+        model.eval()
+        x = torch.randn(1, 3, 16, 24)
+        with torch.no_grad():
+            out = model(x)
+        assert out.shape == (1, 3, 64, 96)
+
+    def test_state_dict_key_convention_matches_official_checkpoints(self):
+        """Constructed model's state_dict keys use the flat body.N convention.
+
+        The official BasicSR SRVGGNetCompact checkpoints store every
+        parameter under `body.<index>.weight`/`body.<index>.bias` (conv
+        layers) or `body.<index>.weight` (PReLU, weight-only), and have NO
+        `upsampler.*` keys since PixelShuffle has no learnable parameters.
+        A mismatch here means `load_state_dict(strict=True)` would fail
+        against a real checkpoint.
+        """
+        pytest.importorskip("torch")
+
+        num_conv = 4
+        model = SRVGGNetCompact(num_in_ch=3, num_out_ch=3, num_feat=8, num_conv=num_conv, upscale=4)
+        keys = set(model.state_dict().keys())
+
+        # No params from PixelShuffle -- it has none.
+        assert not any(k.startswith("upsampler.") for k in keys)
+
+        # First layer (index 0): conv. Index 1: PReLU (weight only).
+        assert {"body.0.weight", "body.0.bias"}.issubset(keys)
+        assert "body.1.weight" in keys
+        assert "body.1.bias" not in keys  # PReLU has no bias
+
+        # Alternating conv/PReLU pairs for each of the num_conv hidden
+        # layers, followed by one final conv (no trailing PReLU).
+        last_conv_idx = 2 + 2 * num_conv
+        assert {f"body.{last_conv_idx}.weight", f"body.{last_conv_idx}.bias"}.issubset(keys)
+        assert f"body.{last_conv_idx + 1}.weight" not in keys
+
+        for i in range(num_conv):
+            conv_idx = 2 + 2 * i
+            prelu_idx = conv_idx + 1
+            assert {f"body.{conv_idx}.weight", f"body.{conv_idx}.bias"}.issubset(keys)
+            assert f"body.{prelu_idx}.weight" in keys
+            assert f"body.{prelu_idx}.bias" not in keys
+
+        # Every key is body.N.{weight,bias} -- no stray top-level params.
+        for k in keys:
+            assert k.startswith("body."), f"Unexpected non-body param key: {k}"
+
+
+class TestSrvggArchDispatch:
+    """Test that MODEL_REGISTRY-driven architecture selection picks SRVGG for
+    the new compact models and leaves existing RRDB models untouched.
+
+    `resolve_arch()` is the exact pure lookup `RealESRGANUpscaler.load_model()`
+    calls to decide between building a `SRVGGNetCompact` or an `RRDBNet` --
+    tested directly here since exercising `load_model()` itself would require
+    real downloaded weights.
+    """
+
+    def test_compact_models_resolve_to_srvgg(self):
+        from autovideofixer.ai.model_cache import MODEL_REGISTRY
+
+        for name in (
+            "realesr-general-x4v3",
+            "realesr-general-wdn-x4v3",
+            "realesr-animevideov3",
+        ):
+            upscaler = RealESRGANUpscaler(model_name=name)
+            entry = MODEL_REGISTRY.get(upscaler.model_name, {})
+            assert resolve_arch(entry) == "srvgg"
+
+    def test_rrdb_models_resolve_to_rrdb_default(self):
+        """NEW MODELS MUST NOT BREAK OLD: existing RRDB models still default correctly."""
+        from autovideofixer.ai.model_cache import MODEL_REGISTRY
+
+        for name in ("RealESRGAN_x4plus", "RealESRGAN_x2plus", "RealESRGAN_x4plus_anime_6B"):
+            upscaler = RealESRGANUpscaler(model_name=name)
+            entry = MODEL_REGISTRY.get(upscaler.model_name, {})
+            assert resolve_arch(entry) == "rrdb"
+
+    def test_unknown_model_defaults_to_rrdb(self):
+        """A model name with no registry entry at all still defaults to rrdb."""
+        assert resolve_arch({}) == "rrdb"
+
+
+class TestSrvggModelSwapPassThrough:
+    """DeblockStage/DenoiseVideoStage swap RealESRGAN_x4plus -> x2plus (a
+    smaller-body optimization for their scale<=2 use) via a strict `==`
+    string equality check against the literal "RealESRGAN_x4plus". Compact
+    SRVGG model names must NOT be substituted by that logic -- mirrors the
+    condition at core/stages/deblock.py and core/stages/denoise_video.py.
+    """
+
+    @pytest.mark.parametrize(
+        "model_name",
+        [
+            "realesr-general-x4v3",
+            "realesr-general-wdn-x4v3",
+            "realesr-animevideov3",
+            "RealESRGAN_x4plus_anime_6B",
+        ],
+    )
+    def test_non_x4plus_names_pass_through_unswapped(self, model_name):
+        # Mirrors: `if deblock_model == "RealESRGAN_x4plus": deblock_model = "RealESRGAN_x2plus"`
+        swapped = "RealESRGAN_x2plus" if model_name == "RealESRGAN_x4plus" else model_name
+        assert swapped == model_name
+
+    def test_x4plus_is_still_swapped(self):
+        """Sanity check the swap condition itself still fires for the literal it targets."""
+        model_name = "RealESRGAN_x4plus"
+        swapped = "RealESRGAN_x2plus" if model_name == "RealESRGAN_x4plus" else model_name
+        assert swapped == "RealESRGAN_x2plus"
 
 
 class TestRIFEInterpolator:

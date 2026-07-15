@@ -41,6 +41,60 @@ class TestModelRegistry:
         assert "RealESRGAN_x4plus" in models
 
 
+class TestCompactSrvggRegistry:
+    """Test the compact SRVGG (Real-ESRGAN v0.2.5.0) model registry entries."""
+
+    COMPACT_MODEL_NAMES = (
+        "realesr-general-x4v3",
+        "realesr-general-wdn-x4v3",
+        "realesr-animevideov3",
+    )
+
+    def test_compact_models_present(self):
+        """All three compact SRVGG models are registered."""
+        for name in self.COMPACT_MODEL_NAMES:
+            assert name in MODEL_REGISTRY, f"Missing registry entry for {name}"
+
+    def test_compact_models_well_formed(self):
+        """Each compact model entry has a valid https URL, sha256, scale, and arch."""
+        for name in self.COMPACT_MODEL_NAMES:
+            meta = MODEL_REGISTRY[name]
+            assert meta["url"].startswith("https://"), f"Non-https URL for {name}"
+            sha256 = meta["sha256"]
+            assert len(sha256) == 64, f"sha256 for {name} is not 64 chars: {sha256!r}"
+            assert sha256 == sha256.lower(), f"sha256 for {name} is not lowercase: {sha256!r}"
+            assert all(c in "0123456789abcdef" for c in sha256), (
+                f"sha256 for {name} is not lowercase hex: {sha256!r}"
+            )
+            assert meta["scale"] == 4, f"Unexpected scale for {name}: {meta['scale']}"
+            assert meta["arch"] == "srvgg", f"Unexpected arch for {name}: {meta['arch']}"
+            assert meta["num_conv"] in (16, 32), (
+                f"Unexpected num_conv for {name}: {meta['num_conv']}"
+            )
+
+    def test_general_x4v3_and_wdn_use_32_convs(self):
+        """The two general-purpose compact models both use num_conv=32."""
+        assert MODEL_REGISTRY["realesr-general-x4v3"]["num_conv"] == 32
+        assert MODEL_REGISTRY["realesr-general-wdn-x4v3"]["num_conv"] == 32
+
+    def test_animevideov3_uses_16_convs(self):
+        """The anime compact model uses the smaller num_conv=16 variant."""
+        assert MODEL_REGISTRY["realesr-animevideov3"]["num_conv"] == 16
+
+    def test_compact_models_listed_as_available(self):
+        """Compact models show up via list_available_models() like any other model."""
+        models = list_available_models()
+        for name in self.COMPACT_MODEL_NAMES:
+            assert name in models
+
+    def test_rrdb_models_unaffected_by_arch_field(self):
+        """Existing RRDB-based models have no 'arch' field and must not have been touched."""
+        for name in ("RealESRGAN_x4plus", "RealESRGAN_x2plus", "RealESRGAN_x4plus_anime_6B"):
+            meta = MODEL_REGISTRY[name]
+            assert "arch" not in meta, f"{name} unexpectedly gained an 'arch' field"
+            assert "num_conv" not in meta, f"{name} unexpectedly gained a 'num_conv' field"
+
+
 class TestModelPath:
     """Test model path resolution."""
 

@@ -178,10 +178,14 @@ pipeline:
 stages:
   upscale:
     enabled: true
-    # Real-ESRGAN checkpoint name from ai/model_cache.py's MODEL_REGISTRY, e.g.
-    # RealESRGAN_x4plus, RealESRGAN_x2plus, RealESRGAN_x4plus_anime_6B. x2plus is
-    # auto-substituted for x4plus whenever a given AI pass only needs <=2x scale (faster; see
-    # CHANGELOG).
+    # Real-ESRGAN checkpoint name from ai/model_cache.py's MODEL_REGISTRY. RRDB models (highest
+    # quality, default): RealESRGAN_x4plus, RealESRGAN_x2plus, RealESRGAN_x4plus_anime_6B.
+    # x2plus is auto-substituted for x4plus whenever a given AI pass only needs <=2x scale
+    # (faster; see CHANGELOG). Compact SRVGG models (10-30x less GPU compute per frame, some
+    # quality cost vs RRDB -- not auto-substituted by the x4plus->x2plus swap above):
+    # realesr-general-x4v3, realesr-general-wdn-x4v3 (denoise-strength companion checkpoint,
+    # blending with realesr-general-x4v3 not implemented -- usable standalone), and
+    # realesr-animevideov3 (animation-tuned, smallest/fastest).
     ai_model: RealESRGAN_x4plus
     # Traditional (non-AI) method identifier; currently only "superres" (FFmpeg lanczos scale)
     # is implemented.

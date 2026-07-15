@@ -562,6 +562,16 @@ of a literal ahash/dhash port:
 > budget at all tested resolutions. Output parity proven separately by the bit-exact
 > differential identity test (`tests/unit/test_frame_pipe.py`, integration-marked); bounded
 > memory by the 1200-frame soak test (~6.8MB RSS growth).
+>
+> **2026-07-14 compact-model follow-up (the change that actually moves 4K throughput)**: since
+> the budget is ~100% gpu_forward, the fix is a lighter model, not a faster runtime — the
+> ncnn-wrapper idea (#24) stays rejected on this hardware (repo's own A/B: ncnn/Vulkan 5.1 fps
+> vs torch/CUDA 7.33 fps at 320x240, OOM at 720p). With the new SRVGG compact models
+> (`ai_model: realesr-general-x4v3`), same 4K/small clips, same discipline (exit 0 + completed):
+> 4K deblock 0.25 → **0.81 fps (3.2x)**; 576x320 deblock 14.4 → **41.7 fps (2.9x)**, where
+> transport (h2d 15%) is now visible — the avf_framepipe work pays off exactly there. Quality
+> vs the RRDB reference output: SSIM 0.973 (4K) / 0.911 (small), healthy signalstats. RRDB
+> remains the default; compact is opt-in per stage via `stages.<name>.ai_model`.
 
 > **Status: implemented.** `rust/avf_framepipe/` (lean v1 scope per the gate above -- no NVDEC,
 > no buffer-lease pooling) landed as a `FrameReader`/`FrameWriter` PyO3 crate, and `ai/frame_pipe.py`

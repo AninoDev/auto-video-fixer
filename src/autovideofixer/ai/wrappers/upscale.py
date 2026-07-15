@@ -437,6 +437,65 @@ class RRDBNet(torch.nn.Module):
         return out
 
 
+def resolve_arch(registry_entry: dict[str, Any]) -> str:
+    """Return the architecture key ("rrdb" or "srvgg") for a MODEL_REGISTRY entry.
+
+    Pure lookup, factored out of `RealESRGANUpscaler.load_model()` so the
+    dispatch condition (which architecture a given model name resolves to)
+    is unit-testable without needing actual model weights on disk. Entries
+    with no explicit "arch" field (every RRDBNet-based model registered
+    before the compact SRVGG models were added) default to "rrdb", so
+    existing model names are unaffected.
+    """
+    return str(registry_entry.get("arch", "rrdb"))
+
+
+class SRVGGNetCompact(torch.nn.Module):
+    """SRVGGNetCompact architecture (Real-ESRGAN compact video models).
+
+    Matches the official BasicSR implementation exactly (param names follow
+    the flat `body.N` ModuleList convention of the released checkpoints, so
+    strict state-dict loading works): a plain conv3x3 + PReLU stack of
+    `num_conv` hidden layers, a final conv to num_out_ch*upscale^2 channels,
+    PixelShuffle(upscale), and a nearest-upsampled residual add of the input.
+
+    ~1.2M params at num_conv=32 (realesr-general-x4v3) vs RRDBNet's ~16.7M --
+    an order-of-magnitude-plus less compute per frame, which is what matters
+    for the AI stages since they are measured ~100% GPU-forward-bound.
+    """
+
+    def __init__(
+        self,
+        num_in_ch: int = 3,
+        num_out_ch: int = 3,
+        num_feat: int = 64,
+        num_conv: int = 32,
+        upscale: int = 4,
+    ):
+        super().__init__()
+        self.upscale = upscale
+
+        self.body = torch.nn.ModuleList()
+        self.body.append(torch.nn.Conv2d(num_in_ch, num_feat, 3, 1, 1))
+        self.body.append(torch.nn.PReLU(num_parameters=num_feat))
+        for _ in range(num_conv):
+            self.body.append(torch.nn.Conv2d(num_feat, num_feat, 3, 1, 1))
+            self.body.append(torch.nn.PReLU(num_parameters=num_feat))
+        self.body.append(torch.nn.Conv2d(num_feat, num_out_ch * upscale * upscale, 3, 1, 1))
+        self.upsampler = torch.nn.PixelShuffle(upscale)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        out = x
+        for layer in self.body:
+            out = layer(out)
+        out = self.upsampler(out)
+        # Residual over the nearest-upsampled input: the network only has to
+        # learn the correction, which is why so few parameters suffice.
+        base = torch.nn.functional.interpolate(x, scale_factor=self.upscale, mode="nearest")
+        result: torch.Tensor = out + base
+        return result
+
+
 class RealESRGANUpscaler:
     """Real-ESRGAN model wrapper for video upscaling.
 
@@ -608,16 +667,32 @@ class RealESRGANUpscaler:
         # they differ.
         from autovideofixer.ai.model_cache import MODEL_REGISTRY
 
-        self._native_scale = MODEL_REGISTRY.get(self.model_name, {}).get("scale", 4)
+        registry_entry = MODEL_REGISTRY.get(self.model_name, {})
+        self._native_scale = registry_entry.get("scale", 4)
 
-        self._model = RRDBNet(
-            num_in_ch=3,
-            num_out_ch=3,
-            num_feat=num_feat,
-            num_block=num_block,
-            num_grow_ch=32,
-            scale=self._native_scale,
-        )
+        arch = resolve_arch(registry_entry)
+        if arch == "srvgg":
+            # Compact video models (realesr-general-x4v3 etc.): plain conv
+            # stack, no pixel-unshuffle -- `scale` is a genuine PixelShuffle
+            # factor here, and num_conv comes from the registry because the
+            # released checkpoints differ (32 for general-x4v3, 16 for
+            # animevideov3).
+            self._model = SRVGGNetCompact(
+                num_in_ch=3,
+                num_out_ch=3,
+                num_feat=num_feat,
+                num_conv=registry_entry.get("num_conv", 32),
+                upscale=int(self._native_scale),
+            )
+        else:
+            self._model = RRDBNet(
+                num_in_ch=3,
+                num_out_ch=3,
+                num_feat=num_feat,
+                num_block=num_block,
+                num_grow_ch=32,
+                scale=int(self._native_scale),
+            )
 
         self._model = load_model_from_state_dict(self._model, model_path, self._device)
 
@@ -642,7 +717,15 @@ class RealESRGANUpscaler:
 
         self._loaded = True
 
-        _get_logger().info(f"Loaded {self.model_name} ({num_block} RRDB blocks) on {self._device}")
+        if arch == "srvgg":
+            _get_logger().info(
+                f"Loaded {self.model_name} (SRVGG compact, "
+                f"{registry_entry.get('num_conv', 32)} convs) on {self._device}"
+            )
+        else:
+            _get_logger().info(
+                f"Loaded {self.model_name} ({num_block} RRDB blocks) on {self._device}"
+            )
         return True
 
     def _needs_tiling(self, height: int, width: int) -> bool:

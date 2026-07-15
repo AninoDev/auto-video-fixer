@@ -8,6 +8,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Compact SRVGG Real-ESRGAN models** (`ai/wrappers/upscale.py`'s new `SRVGGNetCompact`
+  architecture, matching the official BasicSR flat `body.N` ModuleList layout so strict
+  state-dict loading works against the real checkpoints): three new `MODEL_REGISTRY` entries in
+  `ai/model_cache.py` -- `realesr-general-x4v3` and `realesr-general-wdn-x4v3` (`num_conv=32`,
+  the latter a denoise-strength companion checkpoint; the official denoise-strength blending of
+  the two state dicts is not implemented, this checkpoint is usable standalone) and
+  `realesr-animevideov3` (`num_conv=16`, animation-tuned) -- all official xinntao/Real-ESRGAN
+  v0.2.5.0 release assets, hash-verified. `RealESRGANUpscaler.load_model()` dispatches between
+  `SRVGGNetCompact` and the existing `RRDBNet` off each registry entry's new `arch` field (a
+  pure `resolve_arch()` helper; entries without it default to `"rrdb"`, so every existing model
+  is unaffected). ~1.2M/~0.6M params vs RRDB's ~16.7M -- an order-of-magnitude-plus less GPU
+  compute per frame (the AI stages are measured ~100% `gpu_forward`-bound) at some restoration
+  quality cost; RRDB remains the default for `upscale`/`deblock`/`denoise_video`. The existing
+  `RealESRGAN_x4plus` -> `RealESRGAN_x2plus` model-swap optimization in `deblock`/
+  `denoise_video`/`upscale` is a strict string-equality check against the literal
+  `"RealESRGAN_x4plus"`, so it does not fire for (and does not need changes to skip) the new
+  compact model names. Verified (GPU): strict state-dict load of all three official checkpoints,
+  correct x4 output shapes, non-black fp16 output, and the tiled-inference path.
 - **Rust-backed AI frame transport (`rust/avf_framepipe/`, docs/REQUIREMENTS.md R5.3)**: a new
   PyO3/`maturin` extension providing threaded, bounded-channel ffmpeg frame I/O (`FrameReader`/
   `FrameWriter`, each a background OS thread + piped `ffmpeg` subprocess), following the same

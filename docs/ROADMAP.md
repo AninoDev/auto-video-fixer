@@ -30,6 +30,13 @@ draws an explicit VERIFIED / UNVERIFIED line instead of a flat done/not-done che
   `channels_last` memory format (measured ~1.6→11 fps for a 720p→1080p pass on the project's
   target GPU), TTA, FP16 on CUDA. The previous black-output bug (missing `0.2` residual scaling
   in the RRDB block → NaN collapse) is fixed and confirmed producing real output on GPU.
+- **AI upscaling — compact SRVGG models**: `realesr-general-x4v3`/`realesr-general-wdn-x4v3`
+  (`num_conv=32`)/`realesr-animevideov3` (`num_conv=16`), the official xinntao/Real-ESRGAN
+  v0.2.5.0 compact video checkpoints, dispatched alongside RRDBNet off a registry `arch` field
+  (`resolve_arch()` in `ai/wrappers/upscale.py`). ~1.2M/~0.6M params vs RRDBNet's ~16.7M — an
+  order-of-magnitude-plus less GPU compute per frame at some quality cost; RRDB remains the
+  default for `upscale`/`deblock`/`denoise_video`. Verified on GPU: strict state-dict load of
+  all three checkpoints, correct x4 output shapes, non-black fp16 output, tiled inference.
 - **AI frame interpolation — RIFE (IFNet + EMD)**: the previous fps bug (writing interpolated
   output at the *input* fps instead of `input_fps * factor`, which stretched clip duration
   instead of increasing framerate) is fixed.
