@@ -668,6 +668,16 @@ per-run number baked into this codebase.
 - **FFmpeg output paths**: Stages must use an explicit output path. Using `output_path or input_path` on failure produces an empty file.
 - **Stage disabled check**: `should_run()` must check `self.is_enabled()` which reads from `DEFAULTS["stages"][name]["enabled"]`.
 - **`NormalizeVolumeStage`** (name `"normalize_volume"`) and **`NormalizeAudioStage`** (name `"normalize_audio"`) are two separate classes in `normalize_audio.py`.
+- **normalize_audio.py silence-skip**: inputs with no real audio track get a silent stereo track
+  added earlier in the pipeline, so by normalize time there IS an audio stream, just silent (or
+  near-silent with dithering). Two-pass loudnorm's first pass would measure `input_i = -inf` on
+  pure silence and the second pass would blow up (infinite gain) feeding that back in. Both
+  stages read `stages.<name>.silence_threshold_db` (default `-80.0` LUFS, shared implementation
+  `NormalizeAudioStage._silence_skip_result()`/`_resolve_measured_i()`); when measured integrated
+  loudness is `-inf`/`nan`/unparseable or `<=` the threshold, the stage returns
+  `StageStatus.COMPLETED` with `skipped_reason` set and the input copied through unchanged
+  (matching `UpscaleStage`'s "already at target" / `StabilizeStage`'s "no stabilization needed"
+  mid-execute skip convention) instead of failing.
 - **Preset stage enable**: Presets define `enable_stages` which controls which stages run. A stage not listed in a preset's `enable_stages` will not execute, even if it's in the default order.
 - **Every new subprocess spawn must detach stdin**: an ffmpeg subprocess whose stdin is the
   caller's controlling terminal switches that tty to raw mode (to poll for interactive keys) and

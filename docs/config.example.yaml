@@ -496,6 +496,34 @@ stages:
     target_db: -23.0
     # True peak ceiling in dBTP.
     true_peak_db: -2.0
+    # Silence-skip threshold in LUFS. Inputs with no real audio track get a
+    # silent stereo track added earlier in the pipeline, so by the time
+    # normalize_volume/normalize_audio run there IS an audio stream -- just
+    # silent (or near-silent, if the source added dithering noise). Two-pass
+    # loudnorm measures measured_I = -inf on pure digital silence, which would
+    # otherwise blow up the second (apply) pass with infinite gain. When the
+    # measured integrated loudness is -inf/nan/unparseable OR <= this
+    # threshold, the stage is skipped (input passed through unchanged, logged
+    # at INFO) instead of failing. Default -80.0 dBFS sits just above what 2-3
+    # LSBs of 16-bit dither can produce: 20*log10(3/32768) ~= -80.8 dBFS, so
+    # genuine (if extremely quiet) 16-bit-sourced audio stays above the
+    # threshold while dither-only/true silence fall at/below it. See
+    # normalize_audio.py's DEFAULT_SILENCE_THRESHOLD_DB and _silence_skip_result().
+    silence_threshold_db: -80.0
+
+  # normalize_audio is the SAME loudnorm operation as normalize_volume above,
+  # addressed under a separate stage name/config section for backward-
+  # compatible --stage/config addressing (see NormalizeAudioStage's docstring
+  # in normalize_audio.py). Not in the default preset's enable_stages (only
+  # normalize_volume is, to avoid running loudnorm twice) -- opt in via
+  # --stage normalize_audio or by adding it to a preset's enable_stages.
+  normalize_audio:
+    enabled: true
+    target_db: -23.0
+    true_peak_db: -2.0
+    # Same silence-skip semantics as normalize_volume.silence_threshold_db above,
+    # resolved independently from this stage's own config section.
+    silence_threshold_db: -80.0
 
   hdr_to_sdr:
     enabled: false

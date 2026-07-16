@@ -515,6 +515,23 @@ class Config:
                 "enabled": True,
                 "target_db": -23.0,  # EBU R128
                 "true_peak_db": -2.0,
+                # Silence-skip: below this measured integrated loudness (LUFS),
+                # normalize_volume/normalize_audio skip normalization entirely
+                # (pass the input through unchanged) instead of feeding loudnorm's
+                # second pass an unusable -inf/near-inf gain. -80.0 dBFS sits just
+                # above 2-3 LSBs of 16-bit dither noise (20*log10(3/32768) ~=
+                # -80.8 dBFS) -- see normalize_audio.py's DEFAULT_SILENCE_THRESHOLD_DB.
+                "silence_threshold_db": -80.0,
+            },
+            "normalize_audio": {
+                "enabled": True,
+                "target_db": -23.0,  # EBU R128
+                "true_peak_db": -2.0,
+                # See normalize_volume.silence_threshold_db above -- same key,
+                # same default, own config section (normalize_audio and
+                # normalize_volume are two separately-addressable stage names
+                # running the identical loudnorm algorithm).
+                "silence_threshold_db": -80.0,
             },
             "hdr_to_sdr": {
                 "enabled": False,

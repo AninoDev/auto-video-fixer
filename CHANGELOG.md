@@ -8,6 +8,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- **Volume/audio normalization no longer fails on silent or near-silent audio**: inputs with no
+  real audio track get a silent stereo track added earlier in the pipeline, so by the time
+  `normalize_volume`/`normalize_audio` (`core/stages/normalize_audio.py`) run there IS an audio
+  stream -- just silent, or near-silent if the source added dithering noise. Two-pass loudnorm's
+  first pass measured `input_i = -inf` on pure digital silence (or produced other unusable
+  values on near-silence), and the second pass blew up feeding that back in as infinite gain,
+  failing the stage outright. Both stages now parse the measured integrated loudness robustly
+  (`-inf`/`inf`/`nan`/unparseable all collapse to a silence sentinel rather than raising) and, if
+  it's the sentinel or `<=` a new `stages.normalize_volume.silence_threshold_db` /
+  `stages.normalize_audio.silence_threshold_db` config key (default `-80.0` LUFS, chosen to sit
+  just above 2-3 LSBs of 16-bit dither noise: `20*log10(3/32768) ~= -80.8 dBFS`), skip
+  normalization and pass the input through unchanged (logged at INFO, distinguishing perfect
+  silence from near-silence) instead of failing -- matching the mid-execute skip convention
+  `UpscaleStage`'s "already at target resolution" gate and `StabilizeStage`'s "no stabilization
+  needed" path already use (`StageStatus.COMPLETED` with `skipped_reason` set, pipeline
+  continues to later stages). Implemented once in `NormalizeAudioStage` and reused by
+  `NormalizeVolumeStage` (both classes run the identical loudnorm algorithm), so a
+  per-occurrence `pipeline.default_order` `config:` override on either stage section works
+  automatically.
+
 - **Real-world long videos no longer die at 600s ("timeout reached")**: nearly every stage's
   main ffmpeg processing/mux pass hardcoded a fixed wall-clock `timeout=600` (some
   `1800`/`3600`) in `core/stages/*.py` and `core/quality.py` -- wrong-shaped for a whole-video
