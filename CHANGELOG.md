@@ -8,6 +8,53 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **`pipeline.default_order` now actually drives stage order, omission, and repetition**
+  (previously "informational only" -- `Pipeline.optimize_stage_order()` hardcoded the real order
+  and silently ignored this config key entirely, a stale note config.py itself used to document).
+  `Pipeline.resolve_stage_order()` (new; `optimize_stage_order()` becomes a thin backward-compatible
+  wrapper returning a flattened `list[str]` of occurrence labels) reads `pipeline.default_order` and
+  resolves each entry into a run/skip decision independently:
+  - A plain stage name string behaves exactly as before (runs iff the stage is in the
+    requested/auto-determined set).
+  - A mapping `{stage, enabled?, config?}` adds explicit per-occurrence control: `enabled: true`
+    force-runs the occurrence regardless of `stages.<name>.enabled`/preset `enable_stages`/
+    auto-determination (mirroring the existing `--stage`/`explicit_stage_request` bypass
+    mechanism; internal `should_run()` dependency gates still apply); `enabled: false` hard-drops
+    it (the only way to drop a stage that's otherwise requested -- plain omission from the list
+    still gets it appended at the end, for `--stage` compat); `enabled: null`/omitted defers to
+    global gating; `config: {...}` deep-merges per-occurrence overrides onto the cascaded
+    `stages.<name>` dict (`stages.<name>` &larr; `job.stage_overrides[name]` &larr; occurrence
+    `config`) for that occurrence only.
+  - The same stage name may repeat in the list; each occurrence resolves/runs independently and
+    chains off the previous occurrence's output. Repeated occurrences get an occurrence-qualified
+    label (`"deblock"`, `"deblock#2"`, ...) used for `JobResult.stage_results` keys, generated temp
+    filenames, progress, and logging -- the plain name is used everywhere a stage has exactly one
+    occurrence (the common case is unaffected). `pipeline.max_stages` now counts occurrences, not
+    unique stage names.
+  - `BaseStage.__init__` gained an optional `overrides: dict[str, Any] | None` param (deep-merged
+    onto a deep-copied `self._stage_config`, never mutating the shared `Config` data), and
+    `create_stage()`/every built-in stage subclass's `__init__` now threads it through, so
+    `__init__`-cached config fields (e.g. `ai_model`, `tile_size`) see the fully-cascaded value.
+    The deep-merge logic itself was extracted from `Config._deep_update` into a new module-level
+    `autovideofixer.config.deep_merge()`, reused by both.
+  - Malformed `default_order` entries (a mapping missing a string `stage` key, a non-bool/non-null
+    `enabled`, a non-mapping `config`, or an entry that's neither a string nor a mapping) raise
+    `ValueError` at order-resolution time, surfaced by `execute_job()` as a failed `JobResult`
+    rather than an uncaught exception.
+  - **`DEFAULTS["pipeline"]["default_order"]` changed**: `deblock` now runs **before**
+    `stabilize` (previously the reverse, and previously moot since the config value was ignored).
+    Blocking artifacts come from the source video, so deblocking before stabilization's
+    perspective warping keeps the deblock model's input accurate (no warped block edges) and
+    gives the stabilizer cleaner detail to track motion against. New order: `detect, deblock,
+    stabilize, crop, denoise_video, upscale, interpolate, normalize_volume, normalize_audio,
+    speed, hdr, encode` (also fixes `crop` having been entirely absent from `DEFAULTS`'s list,
+    even though the hardcoded order always included it). The historical `default_order` typo
+    (`"denoise"` instead of the registered `"denoise_video"`) is also fixed, now that the list is
+    live rather than ignored.
+  - See `AGENTS.md`'s "Pipeline Behavior" section and `docs/config.example.yaml`'s
+    `pipeline.default_order` comment (full syntax + worked repetition example) for details, and
+    `tests/unit/test_pipeline.py`'s `TestResolveStageOrder`/`TestOccurrenceAwareExecution` for
+    coverage.
 - **Compact SRVGG Real-ESRGAN models** (`ai/wrappers/upscale.py`'s new `SRVGGNetCompact`
   architecture, matching the official BasicSR flat `body.N` ModuleList layout so strict
   state-dict loading works against the real checkpoints): three new `MODEL_REGISTRY` entries in

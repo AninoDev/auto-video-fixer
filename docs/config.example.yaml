@@ -146,15 +146,54 @@ quality:
     keep_aspect_ratio: true
 
 pipeline:
-  # INFORMATIONAL ONLY. Pipeline.optimize_stage_order() hardcodes the actual execution order
-  # and does NOT read this list -- changing it here has no effect. Left in DEFAULTS to
-  # document the intended/actual order (which optimize_stage_order() matches) and because
-  # `stage name mismatch` note: this lists "denoise" but the registered stage name is
-  # "denoise_video" -- another reason this list must not be relied on programmatically.
+  # Drives actual stage order, omission, AND repetition -- Pipeline.resolve_stage_order()
+  # (called by optimize_stage_order()/execute_job()) reads this list; a hardcoded
+  # DEFAULT_STAGE_ORDER fallback in core/pipeline.py only kicks in if this key is
+  # missing/empty. Each entry is either:
+  #
+  #   1. A plain stage name string (as below) -- behaves exactly like before: this
+  #      occurrence runs iff the stage is in the requested/auto-determined stage set
+  #      (job.stages / preset enable_stages / auto_determine_stages()).
+  #
+  #   2. A mapping for explicit per-occurrence control:
+  #        - stage: deblock            # required -- the registered stage name
+  #          enabled: true             # optional tristate:
+  #                                     #   true  = ALWAYS runs, regardless of
+  #                                     #           stages.<name>.enabled, preset
+  #                                     #           enable_stages, or auto-determination
+  #                                     #           membership (should_run()'s own internal
+  #                                     #           dependency/sanity gates still apply).
+  #                                     #   false = NEVER runs -- the only way to hard-drop a
+  #                                     #           stage that's otherwise requested (omitting
+  #                                     #           it from this list entirely does NOT drop
+  #                                     #           it -- see the compat note below).
+  #                                     #   null/omitted (default) = defer to global gating,
+  #                                     #           same as a plain string entry.
+  #          config:                   # optional per-occurrence config overrides, deep-merged
+  #            ai_model: realesr-general-x4v3   # over stages.<name> <- job.stage_overrides[name]
+  #                                             # for THIS occurrence only (see BaseStage.__init__).
+  #
+  #   The same stage name may appear more than once -- each occurrence resolves and runs
+  #   independently, in list order, each chaining off the previous occurrence's output like
+  #   any other stage (occurrence-qualified labels like "deblock#2" are used internally for
+  #   temp filenames/stage_results/logging when a stage repeats -- the plain name is used
+  #   everywhere a stage has just one occurrence, so this is invisible in the common case).
+  #
+  #   Compat note: a stage in the requested/auto-determined set that ISN'T mentioned
+  #   anywhere in this list (as a string or inside a mapping's `stage` key) is still
+  #   appended at the end -- this is what keeps plain --stage usage working when a stage
+  #   isn't in the configured order list. `encode` always stays last regardless.
+  #
+  # DEFAULTS itself stays plain strings (as below) so out-of-box behavior is unaffected by
+  # this feature -- the mapping form is opt-in. Note deblock now runs BEFORE stabilize
+  # (previously the reverse): blocking artifacts come from the source video, so deblocking
+  # before stabilization's perspective warping keeps the deblock model's input accurate and
+  # gives the stabilizer cleaner detail to track motion against.
   default_order:
     - detect
-    - stabilize
     - deblock
+    - stabilize
+    - crop
     - denoise_video
     - upscale
     - interpolate
@@ -164,10 +203,31 @@ pipeline:
     - hdr
     - encode
 
-  # Safety cap on how many stages a single job may run (guards against pathological --stage
-  # repetition, not normal preset/auto-determined pipelines -- must stay >= 11, the length of
-  # a full default run). Exceeding this fails the job outright rather than silently truncating
-  # (which could drop the always-last "encode" stage).
+  # Example (commented out) of the mapping entry form -- forces "deblock" to run a second
+  # time near the end at a different strength, regardless of stages.deblock.enabled:
+  #   default_order:
+  #     - detect
+  #     - deblock
+  #     - stabilize
+  #     - crop
+  #     - denoise_video
+  #     - upscale
+  #     - interpolate
+  #     - normalize_volume
+  #     - normalize_audio
+  #     - speed
+  #     - hdr
+  #     - stage: deblock
+  #       enabled: true
+  #       config:
+  #         strength: low
+  #     - encode
+
+  # Safety cap on how many stage OCCURRENCES a single job may run (guards against
+  # pathological --stage/default_order repetition, not normal preset/auto-determined
+  # pipelines -- must stay >= 12, the length of a full default run). A stage repeated via
+  # default_order counts once per repetition. Exceeding this fails the job outright rather
+  # than silently truncating (which could drop the always-last "encode" stage).
   max_stages: 15
 
   # Whether a stage that FAILS aborts the whole job (false) or is skipped, continuing the

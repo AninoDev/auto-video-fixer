@@ -37,7 +37,8 @@ is looked up by `name` string, not by import order. `core/presets.py` defines na
 (`1080p60`, `4k60`, `size_reduction`, etc.) that set `enable_stages` and per-stage config —
 a stage not in a preset's `enable_stages` won't run even if globally enabled. See AGENTS.md's
 "Stage Development" and "Pipeline Behavior" sections before adding or reordering stages —
-stage order is hardcoded in `Pipeline.optimize_stage_order()`, *not* driven by config.
+stage order, omission, and repetition are driven by `config.pipeline.default_order`, resolved by
+`Pipeline.resolve_stage_order()`.
 
 AI stages (upscale, denoise_video, interpolate) live under `ai/`:
 - `ai/torch_utils.py` — device detection, tensor conversion, TTA, batched inference

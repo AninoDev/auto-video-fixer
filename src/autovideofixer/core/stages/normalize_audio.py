@@ -31,8 +31,8 @@ class NormalizeAudioStage(BaseStage):
     priority = 40
     supports_gpu = False
 
-    def __init__(self, config):
-        super().__init__(config)
+    def __init__(self, config, overrides: dict[str, Any] | None = None):
+        super().__init__(config, overrides)
         self._target_db = self._stage_config.get("target_db", -23.0)
         self._true_peak = self._stage_config.get("true_peak_db", -2.0)
 
@@ -176,8 +176,8 @@ class NormalizeVolumeStage(BaseStage):
     priority = 40
     supports_gpu = False
 
-    def __init__(self, config):
-        super().__init__(config)
+    def __init__(self, config, overrides: dict[str, Any] | None = None):
+        super().__init__(config, overrides)
         self._target_db = self._stage_config.get("target_db", -23.0)
         self._true_peak = self._stage_config.get("true_peak_db", -2.0)
 

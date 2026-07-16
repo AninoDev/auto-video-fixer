@@ -48,14 +48,17 @@ class TestCropStageRegistration:
 
         assert StabilizeStage.priority < CropStage.priority < DeblockStage.priority
 
-    def test_pipeline_order_places_crop_after_stabilize_before_deblock(self, tmp_path):
+    def test_pipeline_order_places_crop_after_stabilize_before_denoise(self, tmp_path):
+        # deblock now runs BEFORE stabilize (see config.py's
+        # pipeline.default_order / CHANGELOG for the rationale) -- crop still
+        # sits right after stabilize.
         from autovideofixer.core.pipeline import Pipeline
 
         pipeline = Pipeline(_config(tmp_path))
         ordered = pipeline.optimize_stage_order(
             ["encode", "deblock", "crop", "detect", "stabilize"]
         )
-        assert ordered == ["detect", "stabilize", "crop", "deblock", "encode"]
+        assert ordered == ["detect", "deblock", "stabilize", "crop", "encode"]
 
     def test_not_enabled_by_default_in_auto_determine(self, tmp_path):
         from autovideofixer.core.pipeline import Job, Pipeline

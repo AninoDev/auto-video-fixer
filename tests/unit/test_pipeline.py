@@ -309,9 +309,9 @@ class TestSkippedTerminalStagePromotion:
         def fake_get_stage(name):
             return stage_registry.get(name)
 
-        def fake_create_stage(name, config):
+        def fake_create_stage(name, config, overrides=None):
             cls = stage_registry.get(name)
-            return cls(config) if cls else None
+            return cls(config, overrides) if cls else None
 
         monkeypatch.setattr("autovideofixer.core.pipeline.get_stage", fake_get_stage)
         monkeypatch.setattr("autovideofixer.core.pipeline.create_stage", fake_create_stage)
@@ -373,8 +373,8 @@ class TestExplicitStageBypassesDisabledFlag:
         def fake_get_stage(name):
             return FakeToggleStage if name == "fake_toggle" else None
 
-        def fake_create_stage(name, config):
-            return FakeToggleStage(config) if name == "fake_toggle" else None
+        def fake_create_stage(name, config, overrides=None):
+            return FakeToggleStage(config, overrides) if name == "fake_toggle" else None
 
         monkeypatch.setattr("autovideofixer.core.pipeline.get_stage", fake_get_stage)
         monkeypatch.setattr("autovideofixer.core.pipeline.create_stage", fake_create_stage)
@@ -416,3 +416,308 @@ class TestExplicitStageBypassesDisabledFlag:
         assert (
             result.stage_results["fake_toggle"].skipped_reason == "Stage disabled in configuration"
         )
+
+
+class TestResolveStageOrder:
+    """pipeline.default_order now actually drives order/omission/repetition
+    (see AGENTS.md's "Pipeline Behavior" -- config.py's DEFAULTS stays plain
+    strings; the mapping-entry forms below are opt-in). These tests exercise
+    Pipeline.resolve_stage_order() directly -- no FFmpeg or stage registry
+    involved, since the ordering logic never touches either."""
+
+    def setup_method(self):
+        self.config = Config(Path(tempfile.mkdtemp()) / "nonexistent.yaml")
+        self.pipeline = Pipeline(self.config)
+
+    def test_deblock_before_stabilize_default(self):
+        """New DEFAULTS order: deblock moves before stabilize."""
+        entries = self.pipeline.resolve_stage_order(["detect", "deblock", "stabilize", "encode"])
+        labels = [e.label for e in entries]
+        assert labels.index("deblock") < labels.index("stabilize")
+
+    def test_encode_stays_last(self):
+        entries = self.pipeline.resolve_stage_order(
+            ["encode", "upscale", "stabilize", "denoise_video"]
+        )
+        assert entries[-1].name == "encode"
+
+    def test_order_from_config_respected(self):
+        """A custom pipeline.default_order is honored, not just the hardcoded fallback."""
+        self.config.set(["upscale", "deblock", "detect", "encode"], "pipeline", "default_order")
+        entries = self.pipeline.resolve_stage_order(["detect", "deblock", "upscale", "encode"])
+        assert [e.name for e in entries] == ["upscale", "deblock", "detect", "encode"]
+
+    def test_stage_not_mentioned_in_order_list_is_appended_but_stays_before_encode(self):
+        """Plain-string compat: a requested stage entirely absent from
+        default_order is appended at the end, but "encode" must remain last."""
+        self.config.set(["detect", "encode"], "pipeline", "default_order")
+        entries = self.pipeline.resolve_stage_order(["detect", "speed", "encode"])
+        labels = [e.label for e in entries]
+        assert labels == ["detect", "speed", "encode"]
+
+    def test_enabled_false_hard_drops_even_when_requested(self):
+        """The ONLY way to hard-drop a stage that's otherwise requested/enabled
+        -- omitting it from default_order entirely still gets it appended
+        (see the compat test above)."""
+        self.config.set(
+            ["detect", {"stage": "deblock", "enabled": False}, "encode"],
+            "pipeline",
+            "default_order",
+        )
+        entries = self.pipeline.resolve_stage_order(["detect", "deblock", "encode"])
+        assert [e.name for e in entries] == ["detect", "encode"]
+
+    def test_enabled_true_forces_run_even_when_not_requested(self):
+        self.config.set(
+            ["detect", {"stage": "deblock", "enabled": True}, "encode"],
+            "pipeline",
+            "default_order",
+        )
+        entries = self.pipeline.resolve_stage_order(["detect", "encode"])  # deblock NOT requested
+        assert [e.name for e in entries] == ["detect", "deblock", "encode"]
+        deblock_entry = next(e for e in entries if e.name == "deblock")
+        assert deblock_entry.forced is True
+
+    def test_enabled_null_defers_to_global_gating(self):
+        self.config.set(
+            ["detect", {"stage": "deblock", "enabled": None}, "encode"],
+            "pipeline",
+            "default_order",
+        )
+        # Not requested -> does not run.
+        entries = self.pipeline.resolve_stage_order(["detect", "encode"])
+        assert [e.name for e in entries] == ["detect", "encode"]
+        # Requested -> runs.
+        entries = self.pipeline.resolve_stage_order(["detect", "deblock", "encode"])
+        assert [e.name for e in entries] == ["detect", "deblock", "encode"]
+
+    def test_repetition_produces_occurrence_qualified_labels(self):
+        self.config.set(
+            ["detect", "deblock", {"stage": "deblock"}, "encode"],
+            "pipeline",
+            "default_order",
+        )
+        entries = self.pipeline.resolve_stage_order(["detect", "deblock", "encode"])
+        assert [e.label for e in entries] == ["detect", "deblock", "deblock#2", "encode"]
+        assert [e.name for e in entries] == ["detect", "deblock", "deblock", "encode"]
+
+    def test_single_occurrence_label_has_no_suffix(self):
+        """The common case (no repeats) uses the plain stage name everywhere,
+        no "#1" churn."""
+        entries = self.pipeline.resolve_stage_order(["detect", "deblock"])
+        labels = [e.label for e in entries]
+        assert "deblock" in labels
+        assert "deblock#1" not in labels
+
+    def test_per_occurrence_config_overrides_carried_on_entry(self):
+        self.config.set(
+            [
+                {"stage": "deblock", "config": {"strength": "low"}},
+                {"stage": "deblock", "config": {"strength": "high"}},
+            ],
+            "pipeline",
+            "default_order",
+        )
+        entries = self.pipeline.resolve_stage_order(["deblock"])
+        assert entries[0].overrides == {"strength": "low"}
+        assert entries[1].overrides == {"strength": "high"}
+        assert entries[0].label == "deblock"
+        assert entries[1].label == "deblock#2"
+
+    def test_malformed_entry_mapping_without_stage_key_errors(self):
+        self.config.set([{"enabled": True}], "pipeline", "default_order")
+        with pytest.raises(ValueError):
+            self.pipeline.resolve_stage_order(["detect"])
+
+    def test_malformed_entry_non_str_non_mapping_errors(self):
+        self.config.set([123], "pipeline", "default_order")
+        with pytest.raises(ValueError):
+            self.pipeline.resolve_stage_order(["detect"])
+
+    def test_malformed_entry_bad_enabled_type_errors(self):
+        self.config.set([{"stage": "deblock", "enabled": "yes"}], "pipeline", "default_order")
+        with pytest.raises(ValueError):
+            self.pipeline.resolve_stage_order(["deblock"])
+
+    def test_malformed_entry_bad_config_type_errors(self):
+        self.config.set(
+            [{"stage": "deblock", "config": "not-a-mapping"}], "pipeline", "default_order"
+        )
+        with pytest.raises(ValueError):
+            self.pipeline.resolve_stage_order(["deblock"])
+
+    def test_optimize_stage_order_still_returns_plain_labels(self):
+        """optimize_stage_order() stays the backward-compatible flattened view."""
+        ordered = self.pipeline.optimize_stage_order(
+            ["encode", "upscale", "stabilize", "denoise_video"]
+        )
+        assert isinstance(ordered, list)
+        assert all(isinstance(s, str) for s in ordered)
+        assert ordered[-1] == "encode"
+
+
+class TestOccurrenceAwareExecution:
+    """Full execute_job() runs exercising per-occurrence semantics: forced
+    enabled/disabled bypassing stages.<name>.enabled, repetition with
+    occurrence-unique temp filenames, and per-occurrence config overrides
+    reaching the stage instance/kwargs. Uses fake in-process stages (no
+    FFmpeg needed), following the pattern of TestExplicitStageBypassesDisabledFlag
+    above."""
+
+    def setup_method(self):
+        self.config = Config(Path(tempfile.mkdtemp()) / "nonexistent.yaml")
+        self.pipeline = Pipeline(self.config)
+
+    def _register_fakes(self, monkeypatch):
+        from autovideofixer.core.stages.base import BaseStage
+
+        calls: list[dict] = []
+
+        class RecordingStage(BaseStage):
+            name = "fake_record"
+            display_name = "Fake Record"
+            description = "test-only stage recording its own effective config per call"
+            category = "test"
+            priority = 10
+            produces_output = True
+
+            def __init__(self, config, overrides=None):
+                super().__init__(config, overrides)
+                self._marker = self._stage_config.get("marker", "default")
+
+            def should_run(self, input_info):
+                return True, None
+
+            def execute(self, input_path, output_path=None, progress_callback=None, **kwargs):
+                calls.append(
+                    {
+                        "marker": self._marker,
+                        "kwargs": dict(kwargs),
+                        "output_path": output_path,
+                    }
+                )
+                with open(output_path, "wb") as f:
+                    f.write(self._marker.encode())
+                return StageResult(status=StageStatus.COMPLETED, output_path=output_path)
+
+        class TerminalStage(BaseStage):
+            name = "fake_final"
+            display_name = "Fake Final"
+            description = "test-only terminal stage"
+            category = "test"
+            priority = 90
+            produces_output = True
+
+            def should_run(self, input_info):
+                return True, None
+
+            def execute(self, input_path, output_path=None, progress_callback=None, **kwargs):
+                with open(output_path, "wb") as f:
+                    f.write(b"final")
+                return StageResult(status=StageStatus.COMPLETED, output_path=output_path)
+
+        registry = {"fake_record": RecordingStage, "fake_final": TerminalStage}
+
+        def fake_get_stage(name):
+            return registry.get(name)
+
+        def fake_create_stage(name, config, overrides=None):
+            cls = registry.get(name)
+            return cls(config, overrides) if cls else None
+
+        monkeypatch.setattr("autovideofixer.core.pipeline.get_stage", fake_get_stage)
+        monkeypatch.setattr("autovideofixer.core.pipeline.create_stage", fake_create_stage)
+        monkeypatch.setattr(
+            "autovideofixer.core.pipeline.get_video_info",
+            lambda path: {"resolution": (320, 240), "framerate": 30.0, "duration": 1.0},
+        )
+        return calls
+
+    def test_repetition_runs_twice_with_occurrence_unique_temp_names(self, tmp_path, monkeypatch):
+        calls = self._register_fakes(monkeypatch)
+        self.config.set(["fake_record", "fake_record", "fake_final"], "pipeline", "default_order")
+
+        input_file = tmp_path / "in.mp4"
+        input_file.write_bytes(b"fake input")
+        job = self.pipeline.add_job(str(input_file))
+        job.stages = ["fake_record", "fake_final"]
+
+        result = self.pipeline.execute_job(job)
+
+        assert result.success is True
+        assert len(calls) == 2
+        assert "fake_record" in result.stage_results
+        assert "fake_record#2" in result.stage_results
+        # The second occurrence's temp output must be a distinct path from
+        # the first's (occurrence-qualified temp filename).
+        first_out = calls[0]["output_path"]
+        second_out = calls[1]["output_path"]
+        assert first_out != second_out
+        assert "fake_record#2" in os.path.basename(second_out)
+
+    def test_per_occurrence_config_merges_over_stages_and_job_overrides(
+        self, tmp_path, monkeypatch
+    ):
+        calls = self._register_fakes(monkeypatch)
+        self.config.set({"marker": "base"}, "stages", "fake_record")
+        self.config.set(
+            [
+                {"stage": "fake_record", "config": {"marker": "occurrence-1"}},
+                {"stage": "fake_record", "config": {"marker": "occurrence-2"}},
+                "fake_final",
+            ],
+            "pipeline",
+            "default_order",
+        )
+
+        input_file = tmp_path / "in.mp4"
+        input_file.write_bytes(b"fake input")
+        job = self.pipeline.add_job(str(input_file))
+        job.stages = ["fake_record", "fake_final"]
+        # job.stage_overrides should be superseded by each occurrence's own config.
+        job.stage_overrides["fake_record"] = {"marker": "job-level"}
+
+        result = self.pipeline.execute_job(job)
+
+        assert result.success is True
+        assert [c["marker"] for c in calls] == ["occurrence-1", "occurrence-2"]
+
+    def test_enabled_true_bypasses_stages_enabled_false_for_that_occurrence(
+        self, tmp_path, monkeypatch
+    ):
+        calls = self._register_fakes(monkeypatch)
+        self.config.set(False, "stages", "fake_record", "enabled")
+        self.config.set(
+            [{"stage": "fake_record", "enabled": True}, "fake_final"],
+            "pipeline",
+            "default_order",
+        )
+
+        input_file = tmp_path / "in.mp4"
+        input_file.write_bytes(b"fake input")
+        job = self.pipeline.add_job(str(input_file))
+        # fake_record deliberately NOT in job.stages -- only reachable via
+        # default_order's forced enabled: true.
+        job.stages = ["fake_final"]
+
+        result = self.pipeline.execute_job(job)
+
+        assert result.success is True
+        assert len(calls) == 1
+        assert "fake_record" not in result.skipped
+        assert result.stage_results["fake_record"].status == StageStatus.COMPLETED
+
+    def test_max_stages_counts_occurrences(self, tmp_path, monkeypatch):
+        self._register_fakes(monkeypatch)
+        self.config.set(2, "pipeline", "max_stages")
+        self.config.set(["fake_record", "fake_record", "fake_final"], "pipeline", "default_order")
+
+        input_file = tmp_path / "in.mp4"
+        input_file.write_bytes(b"fake input")
+        job = self.pipeline.add_job(str(input_file))
+        job.stages = ["fake_record", "fake_final"]
+
+        result = self.pipeline.execute_job(job)
+
+        assert result.success is False
+        assert any("max_stages" in e for e in result.errors)

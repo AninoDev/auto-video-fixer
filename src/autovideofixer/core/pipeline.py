@@ -7,6 +7,7 @@ intelligent stage selection based on input/output requirements.
 
 from __future__ import annotations
 
+import copy
 import logging
 import os
 import shutil
@@ -14,7 +15,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Callable
 
-from autovideofixer.config import Config, redact_secrets
+from autovideofixer.config import Config, deep_merge, redact_secrets
 from autovideofixer.core.ffmpeg_utils import (
     generate_temp_path,
     get_video_info,
@@ -25,6 +26,56 @@ from autovideofixer.core.stages.base import (
     create_stage,
     get_stage,
 )
+
+# Fallback when config `pipeline.default_order` is missing/empty -- mirrors
+# Config.DEFAULTS["pipeline"]["default_order"] exactly (see config.py for the
+# deblock-before-stabilize rationale). Kept as a plain list[str] since
+# DEFAULTS itself never uses mapping entries.
+DEFAULT_STAGE_ORDER: list[str] = [
+    "detect",
+    "deblock",
+    "stabilize",
+    "crop",
+    "denoise_video",
+    "upscale",
+    "interpolate",
+    "normalize_volume",
+    "normalize_audio",
+    "speed",
+    "hdr",
+    "encode",
+]
+
+
+@dataclass
+class StageOrderEntry:
+    """One resolved, runnable occurrence from ``pipeline.default_order``.
+
+    label: unique key for this occurrence within the job -- the plain stage
+        name for the (common-case) single occurrence, or ``"<name>#2"``,
+        ``"<name>#3"``, ... for a stage repeated via ``default_order``. Used
+        everywhere uniqueness matters: ``JobResult.stage_results``,
+        generated temp filenames, progress/logging, ``job.current_stage``.
+    name: the actual registered stage name (e.g. ``"deblock"`` for both
+        ``"deblock"`` and ``"deblock#2"``) -- what's passed to
+        ``get_stage()``/``create_stage()``.
+    forced: tristate mirroring the order entry's ``enabled:`` field. ``True``
+        forces this occurrence to run regardless of ``stages.<name>.enabled``,
+        preset ``enable_stages``, or auto-determination membership (mirrors
+        the existing ``explicit_stage_request``/``_force_enabled``
+        mechanism -- internal ``should_run()`` sanity/dependency gates still
+        apply). ``False`` means this occurrence never runs. ``None`` defers
+        to whether ``name`` is in the job's requested/auto-determined stage
+        set, exactly like a plain string entry always has.
+    overrides: per-occurrence config overrides (an order entry's ``config:``
+        mapping), deep-merged over ``stages.<name>`` <- ``job.stage_overrides[name]``
+        for this occurrence only.
+    """
+
+    label: str
+    name: str
+    forced: bool | None = None
+    overrides: dict[str, Any] = field(default_factory=dict)
 
 
 class PipelineStatus(Enum):
@@ -275,50 +326,172 @@ class Pipeline:
             if cfg_key in encoding_cfg and stage_kwarg not in encode_overrides:
                 encode_overrides[stage_kwarg] = encoding_cfg[cfg_key]
 
-    def optimize_stage_order(self, stages: list[str]) -> list[str]:
-        """Reorder stages for optimal quality and performance.
+    def _resolve_order_entries(self) -> list[tuple[str, bool | None, dict[str, Any]]]:
+        """Parse ``pipeline.default_order`` into ``(name, forced, overrides)`` tuples.
 
-        Rules:
+        Falls back to ``DEFAULT_STAGE_ORDER`` (plain names, no forcing/overrides)
+        when the config key is missing or empty. Each entry is either a plain
+        stage name string, or a mapping ``{stage: str, enabled?: bool|null,
+        config?: dict}``.
+
+        Raises:
+            ValueError: a mapping entry has no (or a non-string) ``stage`` key,
+                an ``enabled`` value that isn't true/false/null, a non-mapping
+                ``config`` value, or an entry that's neither a string nor a
+                mapping. Malformed entries are a hard configuration error
+                (caught at order-resolution time, not silently skipped) since
+                they indicate a typo'd/invalid config rather than an
+                unregistered-but-otherwise-valid stage name (see the
+                "Unknown stage" warning-and-skip path in ``execute_job``,
+                which is a different, non-fatal case).
+        """
+        raw = self.config.get("pipeline", "default_order", default=None)
+        if not raw:
+            raw = DEFAULT_STAGE_ORDER
+
+        parsed: list[tuple[str, bool | None, dict[str, Any]]] = []
+        for entry in raw:
+            if isinstance(entry, str):
+                parsed.append((entry, None, {}))
+                continue
+            if isinstance(entry, dict):
+                name = entry.get("stage")
+                if not isinstance(name, str) or not name:
+                    raise ValueError(
+                        "Malformed pipeline.default_order entry: mapping is missing a "
+                        f"string 'stage' key: {entry!r}"
+                    )
+                forced = entry.get("enabled", None)
+                if forced is not None and not isinstance(forced, bool):
+                    raise ValueError(
+                        f"Malformed pipeline.default_order entry for stage {name!r}: "
+                        f"'enabled' must be true, false, or null/omitted -- got {forced!r}"
+                    )
+                overrides = entry.get("config", {}) or {}
+                if not isinstance(overrides, dict):
+                    raise ValueError(
+                        f"Malformed pipeline.default_order entry for stage {name!r}: "
+                        f"'config' must be a mapping -- got {type(overrides).__name__}"
+                    )
+                parsed.append((name, forced, overrides))
+                continue
+            raise ValueError(
+                "Malformed pipeline.default_order entry: expected a string or a "
+                f"mapping with a 'stage' key -- got {type(entry).__name__}: {entry!r}"
+            )
+        return parsed
+
+    def resolve_stage_order(self, requested: list[str]) -> list[StageOrderEntry]:
+        """Resolve ``pipeline.default_order`` into an ordered list of occurrences.
+
+        ``requested`` is the job's requested/auto-determined stage name set
+        (``job.stages`` after ``auto_determine_stages()``/explicit ``--stage``).
+        Each ``default_order`` entry independently decides whether it runs:
+
+        - Plain string / mapping with ``enabled: null`` (or omitted): runs iff
+          its stage name is in ``requested`` -- exactly today's gating.
+        - ``enabled: true``: always runs, regardless of ``requested``
+          membership, ``stages.<name>.enabled``, or preset ``enable_stages``
+          (``should_run()``'s own internal dependency/sanity gates still
+          apply -- this only bypasses the config ``enabled`` flag, mirroring
+          the existing ``explicit_stage_request``/``_force_enabled``
+          mechanism for ``--stage``).
+        - ``enabled: false``: never runs (the only way to hard-drop a stage
+          that's otherwise in ``requested`` -- omitting it from
+          ``default_order`` entirely does NOT drop it, see below).
+
+        A stage name repeated in ``default_order`` (and passing its own gate)
+        produces multiple occurrences, each independently resolved and each
+        chaining off the previous occurrence's output like any other stage.
+
+        Stages in ``requested`` but not mentioned anywhere in
+        ``default_order`` (as a plain string OR inside a mapping's ``stage``
+        key, regardless of that mapping's ``enabled`` value) are appended at
+        the end, preserving their relative order in ``requested`` -- this is
+        what keeps plain ``--stage`` usage working when a stage isn't in the
+        configured order list. ``encode`` is always forced back to the last
+        position afterward (existing invariant), in case a remaining-append
+        would otherwise have landed something after it.
+
+        Raises:
+            ValueError: propagated from ``_resolve_order_entries()`` on a
+                malformed ``default_order`` entry.
+        """
+        entries = self._resolve_order_entries()
+
+        mentioned: set[str] = set()
+        occurrence_counts: dict[str, int] = {}
+        resolved: list[StageOrderEntry] = []
+
+        def _add_occurrence(name: str, forced: bool | None, overrides: dict[str, Any]) -> None:
+            occurrence_counts[name] = occurrence_counts.get(name, 0) + 1
+            idx = occurrence_counts[name]
+            label = name if idx == 1 else f"{name}#{idx}"
+            resolved.append(
+                StageOrderEntry(label=label, name=name, forced=forced, overrides=overrides)
+            )
+
+        for name, forced, overrides in entries:
+            mentioned.add(name)
+            if forced is True:
+                will_run = True
+            elif forced is False:
+                will_run = False
+            else:
+                will_run = name in requested
+            if will_run:
+                _add_occurrence(name, forced, overrides)
+
+        # Plain-string compat: a requested stage never mentioned in
+        # default_order (as a string or inside a mapping's `stage` key) is
+        # appended at the end -- a stage that IS mentioned (even with
+        # enabled: false) is never re-appended here; enabled: false is the
+        # only way to hard-drop it (see AGENTS.md's Pipeline Behavior note).
+        for name in requested:
+            if name not in mentioned:
+                _add_occurrence(name, None, {})
+
+        # Invariant: "encode" must remain last, even if the remaining-stage
+        # append above landed something after it (only possible when a
+        # requested stage outside default_order sorts after "encode" in
+        # `requested`).
+        encode_positions = [i for i, e in enumerate(resolved) if e.name == "encode"]
+        if encode_positions and encode_positions[-1] != len(resolved) - 1:
+            idx = encode_positions[-1]
+            resolved.append(resolved.pop(idx))
+
+        return resolved
+
+    def optimize_stage_order(self, stages: list[str]) -> list[str]:
+        """Reorder ``stages`` per ``pipeline.default_order`` (config-driven).
+
+        Backward-compatible flattened view: returns occurrence labels in
+        execution order (e.g. plain ``"deblock"``, or ``"deblock"``/
+        ``"deblock#2"`` if ``default_order`` repeats it and both occurrences'
+        gates pass) -- see ``resolve_stage_order()`` for the full per-occurrence
+        records (forced tristate, per-occurrence config overrides), which is
+        what ``execute_job()`` actually uses.
+
+        Rules (informational -- ``pipeline.default_order``, which
+        ``resolve_stage_order()`` reads, is the actual source of truth):
         1. Analysis/detection first
-        2. Stabilization before enhancement (reduce noise from motion)
+        2. Deblocking before stabilization (compression artifacts come from
+           the source video; deblocking a not-yet-warped frame keeps the
+           deblock model's input accurate, and gives the stabilizer cleaner
+           detail to track)
         3. Auto-crop right after stabilization: stabilize's zoom-out correction
            can itself add a black border, so cropping after it removes both
            the original letterboxing/pillarboxing AND any residual
            stabilization border in a single pass -- and running it before
-           deblock/denoise/upscale/interpolate/encode means none of those
+           denoise/upscale/interpolate/encode means none of those
            (especially the AI-capable ones) waste compute on pixels that are
            about to be cropped away.
         4. Denoising before upscaling (don't upscale noise)
-        5. Deblocking before denoising (remove compression artifacts first)
-        6. Upscaling before interpolation (higher res frames interpolate better)
-        7. Normalization near the end
-        8. Encoding last
+        5. Upscaling before interpolation (higher res frames interpolate better)
+        6. Normalization near the end
+        7. Encoding last
         """
-        # Default optimal order
-        default_order = [
-            "detect",
-            "stabilize",
-            "crop",
-            "deblock",
-            "denoise_video",
-            "upscale",
-            "interpolate",
-            "normalize_volume",
-            "normalize_audio",
-            "speed",
-            "hdr",
-            "encode",
-        ]
-
-        # Filter to only requested stages, preserving order
-        ordered = [s for s in default_order if s in stages]
-
-        # Add any remaining stages not in default_order
-        for s in stages:
-            if s not in ordered:
-                ordered.append(s)
-
-        return ordered
+        return [entry.label for entry in self.resolve_stage_order(stages)]
 
     def execute_job(
         self,
@@ -347,28 +520,48 @@ class Pipeline:
         if not job.stages:
             job.stages = self.auto_determine_stages(job)
 
-        # Optimize order, then drop anything that isn't a registered stage up front so
-        # progress accounting and cleanup only ever deal with stages that actually run.
-        requested_names = self.optimize_stage_order(job.stages)
-        stage_names: list[str] = []
+        # Resolve pipeline.default_order into occurrence records (order,
+        # omission, repetition, per-occurrence enabled/config overrides --
+        # see resolve_stage_order()), then drop anything that isn't a
+        # registered stage up front so progress accounting and cleanup only
+        # ever deal with stages that actually run.
+        try:
+            requested_entries = self.resolve_stage_order(job.stages)
+        except ValueError as e:
+            msg = f"Invalid pipeline.default_order: {e}"
+            self.logger.error(msg)
+            job_result = JobResult(
+                input_path=job.input_path,
+                output_path=None,
+                errors=[msg],
+                success=False,
+            )
+            job.status = PipelineStatus.FAILED
+            job.result = job_result
+            job.progress = 1.0
+            return job_result
+
+        stage_entries: list[StageOrderEntry] = []
         skipped: list[str] = []
-        for name in requested_names:
-            if get_stage(name) is None:
-                self.logger.warning(f"Unknown stage: {name}")
-                skipped.append(name)
+        for entry in requested_entries:
+            if get_stage(entry.name) is None:
+                self.logger.warning(f"Unknown stage: {entry.name}")
+                skipped.append(entry.label)
             else:
-                stage_names.append(name)
+                stage_entries.append(entry)
 
         max_stages = self.config.get("pipeline", "max_stages", default=None)
-        if max_stages is not None and len(stage_names) > max_stages:
+        if max_stages is not None and len(stage_entries) > max_stages:
             # Not truncated: the always-last "encode" stage must not be dropped, and
-            # naive slicing would drop it whenever a full default pipeline (11 stages)
+            # naive slicing would drop it whenever a full default pipeline (12 stages)
             # exceeds the default max_stages=10. Surface it as an explicit failure
             # instead of silently either truncating output-producing stages or
-            # ignoring the configured cap outright.
+            # ignoring the configured cap outright. Counts occurrences, so a
+            # default_order-repeated stage counts once per repetition.
+            stage_labels = [e.label for e in stage_entries]
             msg = (
-                f"Requested {len(stage_names)} stages exceeds pipeline.max_stages="
-                f"{max_stages}: {stage_names}"
+                f"Requested {len(stage_entries)} stage occurrences exceeds "
+                f"pipeline.max_stages={max_stages}: {stage_labels}"
             )
             self.logger.error(msg)
             job_result = JobResult(
@@ -382,14 +575,19 @@ class Pipeline:
             job.progress = 1.0
             return job_result
 
+        stage_names: list[str] = [e.label for e in stage_entries]
         self.logger.info(f"Processing {os.path.basename(job.input_path)}: stages={stage_names}")
         if self.logger.isEnabledFor(logging.DEBUG):  # avoid building the dump otherwise
-            for stage_name in stage_names:
-                stage_cfg = self.config.get("stages", stage_name, default={})
-                overrides = job.stage_overrides.get(stage_name, {})
-                effective = {**stage_cfg, **overrides} if overrides else dict(stage_cfg)
+            for entry in stage_entries:
+                stage_cfg = self.config.get("stages", entry.name, default={})
+                job_overrides = job.stage_overrides.get(entry.name, {})
+                effective = copy.deepcopy(stage_cfg)
+                if job_overrides:
+                    deep_merge(effective, job_overrides)
+                if entry.overrides:
+                    deep_merge(effective, entry.overrides)
                 self.logger.debug(
-                    "Stage '%s' effective config: %s", stage_name, redact_secrets(effective)
+                    "Stage '%s' effective config: %s", entry.label, redact_secrets(effective)
                 )
 
         input_info = get_video_info(job.input_path)
@@ -416,8 +614,10 @@ class Pipeline:
         # on the stage list/behavior below when scenes.enabled is False (the
         # default) -- this block is a strict no-op in that case.
         scene_mode_temp_path: str | None = None
+        _run_stabilize = any(e.name == "stabilize" for e in stage_entries)
+        _run_interpolate = any(e.name == "interpolate" for e in stage_entries)
         if self.config.get("scenes", "enabled", default=False) and (
-            "stabilize" in stage_names or "interpolate" in stage_names
+            _run_stabilize or _run_interpolate
         ):
             try:
                 from autovideofixer.core.scenes import run_scene_pipeline
@@ -426,8 +626,8 @@ class Pipeline:
                 scene_result = run_scene_pipeline(
                     job.input_path,
                     self.config,
-                    run_stabilize="stabilize" in stage_names,
-                    run_interpolate="interpolate" in stage_names,
+                    run_stabilize=_run_stabilize,
+                    run_interpolate=_run_interpolate,
                     target_fps=quality_target.get("target_framerate"),
                 )
             except Exception:
@@ -459,7 +659,10 @@ class Pipeline:
                     )
                 current_path = scene_result.output_path
                 scene_mode_temp_path = scene_result.output_path
-                stage_names = [s for s in stage_names if s not in ("stabilize", "interpolate")]
+                stage_entries = [
+                    e for e in stage_entries if e.name not in ("stabilize", "interpolate")
+                ]
+                stage_names = [e.label for e in stage_entries]
                 # Stages after this point (e.g. upscale's should_run) read
                 # input_info for resolution/framerate/duration -- reprobe the
                 # reassembled file so they see its actual (possibly
@@ -517,17 +720,31 @@ class Pipeline:
 
         try:
             try:
-                for i, stage_name in enumerate(stage_names):
+                for i, entry in enumerate(stage_entries):
+                    stage_name = entry.label
                     if self._cancel_requested:
                         job.status = PipelineStatus.CANCELLED
                         break
 
-                    stage = create_stage(stage_name, self.config)
+                    # Per-occurrence config cascade: stages.<name> (baked into
+                    # create_stage()'s cascaded lookup) <- job.stage_overrides[name]
+                    # <- this occurrence's own `config:` overrides (highest
+                    # precedence) -- merged once and threaded into BOTH the
+                    # stage instance's _stage_config (so __init__-cached fields
+                    # like ai_model/tile_size see it) and execute()'s **kwargs
+                    # (so explicit execute() params like deblock's `strength`
+                    # see it too).
+                    job_overrides = job.stage_overrides.get(entry.name, {})
+                    effective_overrides: dict[str, Any] = dict(job_overrides)
+                    if entry.overrides:
+                        deep_merge(effective_overrides, entry.overrides)
+
+                    stage = create_stage(entry.name, self.config, overrides=effective_overrides)
                     if stage is None:
                         # Already filtered above; defensive only.
                         skipped.append(stage_name)
                         continue
-                    if explicit_stage_request:
+                    if explicit_stage_request or entry.forced is True:
                         stage._force_enabled = True
 
                     # Check if stage should run
@@ -541,11 +758,8 @@ class Pipeline:
                         )
                         continue
 
-                    # Apply per-stage overrides
-                    overrides = job.stage_overrides.get(stage_name, {})
-
                     # Determine output path for this stage
-                    is_last = i == len(stage_names) - 1
+                    is_last = i == len(stage_entries) - 1
                     if is_last:
                         stage_output = job.output_path
                     else:
@@ -561,7 +775,7 @@ class Pipeline:
                     self.logger.info(f"Running stage: {stage_name}")
 
                     # Execute stage with progress
-                    def progress_cb(prog, msg, _i=i, _n=len(stage_names)):
+                    def progress_cb(prog, msg, _i=i, _n=len(stage_entries)):
                         job.progress = (_i + prog) / _n
                         if progress_callback:
                             progress_callback(job, job.progress, msg)
@@ -572,7 +786,7 @@ class Pipeline:
                             stage_output,
                             progress_callback=progress_cb,
                             input_info=input_info,
-                            **overrides,
+                            **effective_overrides,
                         )
                     except Exception as e:
                         self.logger.exception(f"Stage {stage_name} raised an unexpected exception")
@@ -625,7 +839,7 @@ class Pipeline:
                 final_output_path = current_path
             elif stage_names:
                 final_result = stage_results.get(stage_names[-1])
-                final_stage = create_stage(stage_names[-1], self.config)
+                final_stage = create_stage(stage_entries[-1].name, self.config)
                 if final_result is not None and final_result.output_path:
                     final_output_path = final_result.output_path
                 elif final_result is not None and (

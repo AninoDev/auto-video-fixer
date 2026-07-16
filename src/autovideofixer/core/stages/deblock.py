@@ -24,8 +24,8 @@ class DeblockStage(BaseStage):
     priority = 15
     supports_gpu = True
 
-    def __init__(self, config):
-        super().__init__(config)
+    def __init__(self, config, overrides: dict[str, Any] | None = None):
+        super().__init__(config, overrides)
         self._strength = self._stage_config.get("strength", "medium")
         self._ai_model = self._stage_config.get("ai_model", "RealESRGAN_x4plus")
 

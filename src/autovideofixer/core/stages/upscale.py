@@ -35,8 +35,8 @@ class UpscaleStage(BaseStage):
     # -> 1080x1920 is 2.0x).
     _SKIP_SCALE_THRESHOLD = 1.05
 
-    def __init__(self, config):
-        super().__init__(config)
+    def __init__(self, config, overrides: dict[str, Any] | None = None):
+        super().__init__(config, overrides)
         self._ai_model = self._stage_config.get("ai_model", "RealESRGAN_x4plus")
         self._tt_mode = self._stage_config.get("tta_mode", 0)
         self._scale_factor = self._stage_config.get("scale_factor", 4)

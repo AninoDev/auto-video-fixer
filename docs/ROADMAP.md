@@ -16,7 +16,8 @@ draws an explicit VERIFIED / UNVERIFIED line instead of a flat done/not-done che
 ### Implemented and verified working
 
 - **Core pipeline architecture** — stage registry, `Pipeline.execute_job()`/`execute_all()`,
-  hardcoded stage ordering (`optimize_stage_order()`), per-job temp file lifecycle (`.mkv`
+  config-driven stage ordering/omission/repetition (`pipeline.default_order`, resolved by
+  `Pipeline.resolve_stage_order()`), per-job temp file lifecycle (`.mkv`
   intermediates, unconditional cleanup, orphan-temp promotion to output), quality gate
   (SSIM/PSNR via FFmpeg with `measurement_failed` reported instead of a fake 0.0 score).
 - **Traditional (FFmpeg-only) processing end-to-end**: stabilize (vidstab, raw-pipe

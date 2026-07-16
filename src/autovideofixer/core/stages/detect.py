@@ -30,8 +30,8 @@ class DetectStage(BaseStage):
     produces_output = False
     can_parallelize = False
 
-    def __init__(self, config):
-        super().__init__(config)
+    def __init__(self, config, overrides: dict[str, Any] | None = None):
+        super().__init__(config, overrides)
 
     def should_run(self, input_info: dict[str, Any]) -> tuple[bool, str | None]:
         return True, None

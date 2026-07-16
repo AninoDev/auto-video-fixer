@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
+import copy
 import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Callable
 
-from autovideofixer.config import Config
+from autovideofixer.config import Config, deep_merge
 
 
 class StageStatus(Enum):
@@ -59,9 +60,27 @@ class BaseStage(ABC):
     can_parallelize: bool = False
     needs_intermediate: bool = False  # Must run on intermediate file, not source
 
-    def __init__(self, config: Config):
+    def __init__(self, config: Config, overrides: dict[str, Any] | None = None):
+        """Create a stage instance.
+
+        Args:
+            config: The job's Config.
+            overrides: Optional per-occurrence config overrides (see
+                ``Pipeline.resolve_stage_order`` / ``pipeline.default_order``
+                entries' ``config:`` key), deep-merged onto the cascaded
+                ``stages.<name>`` dict for THIS instance only -- never
+                mutates ``config``'s own data. When given, `self._stage_config`
+                is a deep copy of the cascaded config with `overrides` merged
+                on top (occurrence overrides win); when omitted, it's the
+                same live-shared dict Config.get() returns, matching prior
+                behavior exactly (no copy, no perf/behavior change).
+        """
         self.config = config
-        self._stage_config = config.get("stages", self.name, default={})
+        stage_config = config.get("stages", self.name, default={})
+        if overrides:
+            stage_config = copy.deepcopy(stage_config)
+            deep_merge(stage_config, overrides)
+        self._stage_config = stage_config
         self._logger = None
         # Set by Pipeline.execute_job() on stage instances belonging to a job whose
         # stage list was explicitly requested (e.g. CLI --stage), as opposed to
@@ -230,9 +249,17 @@ def list_stages() -> dict[str, type[BaseStage]]:
     return dict(_STAGE_REGISTRY)
 
 
-def create_stage(name: str, config: Config) -> BaseStage | None:
-    """Instantiate a registered stage."""
+def create_stage(
+    name: str, config: Config, overrides: dict[str, Any] | None = None
+) -> BaseStage | None:
+    """Instantiate a registered stage.
+
+    ``overrides``, when given, is deep-merged onto the stage's cascaded
+    ``stages.<name>`` config for this instance only (see
+    ``BaseStage.__init__``) -- used for per-occurrence config from a
+    ``pipeline.default_order`` mapping entry's ``config:`` key.
+    """
     cls = get_stage(name)
     if cls is None:
         return None
-    return cls(config)
+    return cls(config, overrides)

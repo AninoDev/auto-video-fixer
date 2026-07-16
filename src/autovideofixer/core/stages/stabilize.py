@@ -26,8 +26,8 @@ class StabilizeStage(BaseStage):
     priority = 10
     supports_hardware_encoding = False
 
-    def __init__(self, config):
-        super().__init__(config)
+    def __init__(self, config, overrides: dict[str, Any] | None = None):
+        super().__init__(config, overrides)
         self._threshold = self._stage_config.get("threshold", 2.0)
         self._smoothness = self._stage_config.get("smoothness", 40)
         self._maxshift = self._stage_config.get("maxshift", 20)

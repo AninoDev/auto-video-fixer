@@ -24,8 +24,8 @@ class InterpolateStage(BaseStage):
     priority = 35
     supports_gpu = True
 
-    def __init__(self, config):
-        super().__init__(config)
+    def __init__(self, config, overrides: dict[str, Any] | None = None):
+        super().__init__(config, overrides)
         self._ai_model = self._stage_config.get("ai_model", "rife_v4.6")
 
     def should_run(self, input_info: dict[str, Any]) -> tuple[bool, str | None]:

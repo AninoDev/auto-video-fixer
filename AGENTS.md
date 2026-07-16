@@ -156,15 +156,62 @@ FFmpeg must be in PATH. Verify with `avf gpu-info`.
 
 ## Pipeline Behavior
 
-- **Stage ordering is hardcoded** in `Pipeline.optimize_stage_order()` (`core/pipeline.py`). Changing `DEFAULTS["pipeline"]["default_order"]` in config has **no effect**. Order:
-  `detect, stabilize, crop, deblock, denoise_video, upscale, interpolate, normalize_volume,
-  normalize_audio, speed, hdr, encode`. `crop` sits right after `stabilize` and before every
-  other enhancement stage: stabilize's zoom-out correction can itself add a black border, so
-  cropping after it removes both the original letterboxing/pillarboxing AND any residual
-  stabilization border in one pass; running it before deblock/denoise/upscale/interpolate/encode
-  means none of those (especially the AI-capable ones) spend compute on pixels about to be
-  cropped away.
-- **Stage name mismatch**: config `default_order` lists `"denoise"` but the registered name is `"denoise_video"`. Ignoring `default_order` avoids the bug.
+- **Stage ordering, omission, and repetition are driven by config**:
+  `Pipeline.resolve_stage_order()` (`core/pipeline.py`, called by both `optimize_stage_order()`
+  and `execute_job()`) reads `config.get("pipeline", "default_order")` and resolves it into an
+  ordered list of `StageOrderEntry` occurrences. The old hardcoded-and-ignored-config behavior is
+  gone -- `DEFAULTS["pipeline"]["default_order"]` (and a matching `DEFAULT_STAGE_ORDER` constant
+  in `core/pipeline.py`, used only as a fallback when the config key is missing/empty) now
+  **is** the actual execution order. Default order:
+  `detect, deblock, stabilize, crop, denoise_video, upscale, interpolate, normalize_volume,
+  normalize_audio, speed, hdr, encode`. Two changes from the previous hardcoded order:
+  - `deblock` now runs **before** `stabilize` (previously the reverse): blocking artifacts come
+    from the source video, so deblocking before stabilization's perspective warping keeps the
+    deblock model's input accurate (no warped block edges), and gives the stabilizer cleaner
+    detail to track motion against.
+  - `crop` sits right after `stabilize` and before every other enhancement stage: stabilize's
+    zoom-out correction can itself add a black border, so cropping after it removes both the
+    original letterboxing/pillarboxing AND any residual stabilization border in one pass; running
+    it before denoise/upscale/interpolate/encode means none of those (especially the AI-capable
+    ones) spend compute on pixels about to be cropped away.
+
+  Each `default_order` entry is either a plain stage name string (behaves exactly as before:
+  this occurrence runs iff the stage is in the requested/auto-determined stage set) or a mapping
+  `{stage, enabled?, config?}` for explicit per-occurrence control:
+  - `enabled: true` forces the occurrence to run regardless of `stages.<name>.enabled`, preset
+    `enable_stages`, or auto-determination membership (`should_run()`'s own internal
+    dependency/sanity gates still apply -- this only bypasses the config `enabled` flag, mirroring
+    the existing `explicit_stage_request`/`_force_enabled` mechanism `--stage` already uses).
+  - `enabled: false` means this occurrence **never** runs -- this is the **only** way to
+    hard-drop a stage that's otherwise in the requested set. Omitting a stage from
+    `default_order` entirely does **not** drop it: for plain-`--stage` compatibility, any
+    requested stage never mentioned anywhere in `default_order` (as a string or inside a
+    mapping's `stage` key) is still appended at the end. `encode` always stays last regardless.
+  - `enabled: null`/omitted defers to global gating, identical to a plain string entry.
+  - `config: {...}` deep-merges onto the cascaded `stages.<name>` dict for **that occurrence
+    only** (order: `stages.<name>` &larr; `job.stage_overrides[name]` &larr; this occurrence's
+    `config`), via `BaseStage.__init__`'s optional `overrides` param -- see `core/stages/base.py`.
+
+  The same stage name may appear more than once in `default_order`; each occurrence resolves
+  and runs independently (in list order), chaining off the previous occurrence's output like any
+  other stage. A repeated stage's second+ occurrence is temp-filed/logged/keyed in
+  `JobResult.stage_results` under an occurrence-qualified label (`"deblock"`, `"deblock#2"`, ...)
+  -- the plain stage name is used everywhere a stage has just one occurrence (the common case),
+  so this is invisible unless `default_order` actually repeats a name. `pipeline.max_stages`
+  counts occurrences, not unique stage names. Malformed `default_order` entries (a mapping
+  without a string `stage` key, a non-bool/non-null `enabled`, a non-mapping `config`, or an
+  entry that's neither a string nor a mapping) raise `ValueError` at order-resolution time,
+  surfaced by `execute_job()` as a failed `JobResult` (not an uncaught exception). See
+  `docs/config.example.yaml`'s `pipeline.default_order` comment for the full syntax and a worked
+  example, and `tests/unit/test_pipeline.py`'s `TestResolveStageOrder`/
+  `TestOccurrenceAwareExecution` for behavioral coverage.
+- **Stage name mismatch (historical, fixed)**: `default_order` used to list `"denoise"` while the
+  registered stage name is `"denoise_video"` -- back when the config list was ignored entirely,
+  this typo was harmless. Now that `default_order` is live, `DEFAULTS` was audited and uses the
+  correct `"denoise_video"` name; a raw `"denoise"` entry in a *user* config would simply never
+  match any requested stage (silently a no-op, not an error, since unmatched plain-string entries
+  aren't validated against the stage registry until `execute_job()`'s "Unknown stage" warn+skip
+  pass -- which only fires for entries that actually resolve to a running occurrence).
 - `remux` is **not** in the default pipeline. It is only added by `auto_determine_stages()` when the input is MKV.
 - `detect` stage has `priority=1` (runs first) and `produces_output=False`.
 - Default: `skip_stage_on_error: true` — pipeline continues on failure using the original input.

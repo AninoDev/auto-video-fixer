@@ -22,8 +22,8 @@ class EncodeStage(BaseStage):
     priority = 90
     supports_hardware_encoding = True
 
-    def __init__(self, config):
-        super().__init__(config)
+    def __init__(self, config, overrides: dict[str, Any] | None = None):
+        super().__init__(config, overrides)
 
     def should_run(self, input_info: dict[str, Any]) -> tuple[bool, str | None]:
         # Encode is always the final stage

@@ -142,6 +142,36 @@ class _Missing:
 _MISSING = _Missing()
 
 
+def deep_merge(base: dict, override: dict, _path: str = "") -> None:
+    """Recursively merge `override` onto `base`, in place.
+
+    Shared by ``Config._merge()`` (user config.yaml onto DEFAULTS) and
+    ``BaseStage.__init__``'s per-occurrence ``overrides`` param
+    (``pipeline.default_order`` entries' ``config:`` key onto the cascaded
+    ``stages.<name>`` dict) -- same merge semantics both places: a mapping
+    recurses, a scalar overwrites, and a scalar is refused if it would
+    clobber a dict-valued default (logged and skipped, not raised) since
+    callers unconditionally treat those keys as mappings.
+    """
+    from autovideofixer.logger import get_logger
+
+    for k, v in override.items():
+        key_path = f"{_path}.{k}" if _path else k
+        if isinstance(v, dict) and isinstance(base.get(k), dict):
+            deep_merge(base[k], v, key_path)
+        elif k in base and isinstance(base[k], dict) and not isinstance(v, dict):
+            # Refuse to clobber a default mapping (e.g. stages.upscale, quality.quality_target)
+            # with a scalar override -- consumers unconditionally call .get()/.items() on
+            # these and would crash with an unhandled AttributeError otherwise.
+            get_logger("autovideofixer.config").warning(
+                "Ignoring invalid config override for '%s': expected a mapping, got %s",
+                key_path,
+                type(v).__name__,
+            )
+        else:
+            base[k] = v
+
+
 class Config:
     """Central configuration manager. Loads from disk and provides defaults."""
 
@@ -195,12 +225,32 @@ class Config:
             },
         },
         "pipeline": {
-            # Informational only -- Pipeline.optimize_stage_order() is the actual
-            # source of truth for execution order and does not read this list.
+            # Drives actual execution order/omission/repetition --
+            # Pipeline.resolve_stage_order() (called by optimize_stage_order()/
+            # execute_job()) reads this list; the hardcoded DEFAULT_STAGE_ORDER
+            # fallback in core/pipeline.py only kicks in if this key is
+            # missing/empty. Entries are either a plain stage name (string --
+            # behaves exactly as before: runs iff the stage is in the
+            # requested/auto-determined set) or a mapping
+            # ``{stage, enabled, config}`` for explicit per-occurrence control
+            # (force-run/force-skip regardless of global gating, and/or
+            # per-occurrence config overrides) and repetition (the same stage
+            # name can appear more than once; each occurrence resolves and
+            # runs independently). See docs/config.example.yaml for the full
+            # mapping-entry syntax and AGENTS.md's "Pipeline Behavior" section
+            # for semantics. DEFAULTS itself stays plain strings so
+            # out-of-box behavior is unaffected by this feature.
+            #
+            # deblock now runs BEFORE stabilize (previously the reverse):
+            # blocking artifacts come from the source video, so deblocking
+            # before stabilization's perspective warping keeps the deblock
+            # model's input accurate (no warped block edges) and gives the
+            # stabilizer cleaner detail to track motion against.
             "default_order": [
                 "detect",
-                "stabilize",
                 "deblock",
+                "stabilize",
+                "crop",
                 "denoise_video",
                 "upscale",
                 "interpolate",
@@ -210,9 +260,11 @@ class Config:
                 "hdr",
                 "encode",
             ],
-            # Must stay >= len(default_order) above (11) since a full default run
+            # Must stay >= len(default_order) above (12) since a full default run
             # legitimately uses every stage; this only guards against pathological
-            # --stage repetition, not normal preset/auto-determined pipelines.
+            # --stage/default_order repetition, not normal preset/auto-determined
+            # pipelines. Counts resolved OCCURRENCES, not unique stage names -- a
+            # stage repeated via default_order counts once per repetition.
             "max_stages": 15,
             "skip_stage_on_error": True,
         },
@@ -568,23 +620,14 @@ class Config:
 
     @staticmethod
     def _deep_update(base: dict, override: dict, _path: str = "") -> None:
-        from autovideofixer.logger import get_logger
+        """Recursively merge `override` onto `base`, in place.
 
-        for k, v in override.items():
-            key_path = f"{_path}.{k}" if _path else k
-            if isinstance(v, dict) and isinstance(base.get(k), dict):
-                Config._deep_update(base[k], v, key_path)
-            elif k in base and isinstance(base[k], dict) and not isinstance(v, dict):
-                # Refuse to clobber a default mapping (e.g. stages.upscale, quality.quality_target)
-                # with a scalar override -- consumers unconditionally call .get()/.items() on
-                # these and would crash with an unhandled AttributeError otherwise.
-                get_logger("autovideofixer.config").warning(
-                    "Ignoring invalid config override for '%s': expected a mapping, got %s",
-                    key_path,
-                    type(v).__name__,
-                )
-            else:
-                base[k] = v
+        Thin backward-compatible wrapper -- the actual merge logic is the
+        module-level `deep_merge()`, reused by BaseStage.__init__ for
+        per-occurrence stage config overrides (see pipeline.default_order's
+        `config:` key).
+        """
+        deep_merge(base, override, _path)
 
     def get(self, *keys: str, default: Any = None) -> Any:
         node = self._data

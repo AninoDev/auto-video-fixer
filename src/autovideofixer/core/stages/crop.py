@@ -60,8 +60,8 @@ class CropStage(BaseStage):
     priority = 12
     supports_gpu = False
 
-    def __init__(self, config):
-        super().__init__(config)
+    def __init__(self, config, overrides: dict[str, Any] | None = None):
+        super().__init__(config, overrides)
         self._limit = self._stage_config.get("limit", 24)
         self._round = self._stage_config.get("round", 2)
         self._min_crop_px = self._stage_config.get("min_crop_px", 8)
