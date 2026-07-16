@@ -185,7 +185,9 @@ def probe(filepath: str, config: Config | None = None) -> ProbeResult:
         "--",
         filepath,
     ]
-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+    result = subprocess.run(
+        cmd, capture_output=True, text=True, timeout=120, stdin=subprocess.DEVNULL
+    )
     if result.returncode != 0:
         raise RuntimeError(f"ffprobe failed for {filepath}: {result.stderr}")
 
@@ -288,9 +290,11 @@ def _safe_int(val: Any) -> int:
 def detect_hardware_acceleration() -> list[str]:
     """Detect available FFmpeg hardware acceleration methods."""
     ffmpeg = get_ffmpeg_path()
-    cmd = [ffmpeg, "-hwaccels"]
+    cmd = [ffmpeg, "-nostdin", "-hwaccels"]
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+        result = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=10, stdin=subprocess.DEVNULL
+        )
         hwaccels = []
         for line in result.stdout.strip().split("\n")[1:]:
             line = line.strip()
@@ -360,7 +364,17 @@ def run_ffmpeg(
     logger = get_logger("autovideofixer.ffmpeg")
 
     ffmpeg = get_ffmpeg_path()
-    cmd = [ffmpeg, "-hide_banner"] + args
+    # -nostdin: every ffmpeg invocation in this codebase is non-interactive
+    # (no caller ever intends to feed it keyboard commands like 'q'). Without
+    # it, ffmpeg switches its controlling terminal's tty to raw mode to poll
+    # for those keys and -- if killed/crashed/backgrounded before it exits
+    # cleanly -- never restores it, leaving the user's shell with no echo
+    # and a stray newline per command. stdin=DEVNULL below is belt-and-
+    # suspenders: even if a future ffmpeg build ever changed -nostdin's
+    # behavior, a subprocess with no access to the real tty on stdin can't
+    # raw-mode it either way. See AGENTS.md's "every new subprocess spawn
+    # must detach stdin" gotcha.
+    cmd = [ffmpeg, "-hide_banner", "-nostdin"] + args
 
     # Always logged at DEBUG (not gated on failure) so `--log-file` with
     # `--file-log-level DEBUG` captures every command run in a job, including
@@ -371,6 +385,7 @@ def run_ffmpeg(
 
     proc = subprocess.Popen(
         cmd,
+        stdin=subprocess.DEVNULL,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.PIPE if capture_stderr else subprocess.DEVNULL,
         text=True,

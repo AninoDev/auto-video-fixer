@@ -632,6 +632,7 @@ def _fetch_to(url: str, dest: str, chunk_size: int = 8192) -> None:
         capture_output=True,
         text=True,
         timeout=300,
+        stdin=subprocess.DEVNULL,
     )
     if result.returncode != 0:
         errors.append(f"curl: {result.stderr}")

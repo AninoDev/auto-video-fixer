@@ -360,7 +360,7 @@ impl FrameReader {
 
         let mut child = Command::new(&ffmpeg_path)
             .args([
-                "-v", "error", "-i", &path, "-f", "rawvideo", "-pix_fmt", "bgr24", "-",
+                "-v", "error", "-nostdin", "-i", &path, "-f", "rawvideo", "-pix_fmt", "bgr24", "-",
             ])
             .stdin(Stdio::null())
             .stdout(Stdio::piped())

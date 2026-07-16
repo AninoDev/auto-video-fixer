@@ -2,6 +2,7 @@
 
 import os
 import subprocess
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -15,6 +16,7 @@ from autovideofixer.core.ffmpeg_utils import (
     get_ffprobe_path,
     probe,
     resolve_hwaccel,
+    run_ffmpeg,
 )
 
 
@@ -206,6 +208,59 @@ class TestHardwareAcceleration:
         """Test disabling hardware acceleration."""
         result = resolve_hwaccel("none")
         assert result == "none"
+
+
+class TestStdinDetachment:
+    """No ffmpeg/ffprobe spawn in this module may inherit the caller's tty
+    on stdin -- ffmpeg raw-modes a controlling terminal to poll for
+    interactive keys and doesn't restore it if killed/backgrounded/crashed.
+    Every spawn site here must pass ``-nostdin`` (ffmpeg only -- ffprobe has
+    no such flag) AND ``stdin=subprocess.DEVNULL`` (belt-and-suspenders, and
+    the only lever available to ffprobe).
+    """
+
+    def test_run_ffmpeg_central_runner_detaches_stdin(self):
+        """`run_ffmpeg()` is the central choke point nearly every ffmpeg-
+        spawning stage routes through -- fixing it here covers all of them.
+        """
+        with patch("autovideofixer.core.ffmpeg_utils.subprocess.Popen") as mock_popen:
+            mock_proc = MagicMock()
+            mock_proc.wait.return_value = None
+            mock_proc.returncode = 0
+            mock_proc.stderr = iter([])
+            mock_popen.return_value = mock_proc
+
+            run_ffmpeg(["-i", "in.mp4", "out.mp4"], capture_stderr=False)
+
+            assert mock_popen.called
+            args, kwargs = mock_popen.call_args
+            cmd = args[0]
+            assert "-nostdin" in cmd
+            # -nostdin must appear before any -i/output args, matching the
+            # spec's "early, before -i" placement.
+            assert cmd.index("-nostdin") < cmd.index("-i")
+            assert kwargs["stdin"] == subprocess.DEVNULL
+
+    def test_probe_detaches_stdin_no_nostdin_flag(self):
+        """ffprobe has no -nostdin flag -- only stdin=DEVNULL applies."""
+        with patch("autovideofixer.core.ffmpeg_utils.subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=0, stdout='{"format": {}, "streams": []}')
+            probe("in.mp4")
+
+            args, kwargs = mock_run.call_args
+            cmd = args[0]
+            assert "-nostdin" not in cmd
+            assert kwargs["stdin"] == subprocess.DEVNULL
+
+    def test_detect_hardware_acceleration_detaches_stdin(self):
+        with patch("autovideofixer.core.ffmpeg_utils.subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=0, stdout="Hardware acceleration:\ncuda\n")
+            detect_hardware_acceleration()
+
+            args, kwargs = mock_run.call_args
+            cmd = args[0]
+            assert "-nostdin" in cmd
+            assert kwargs["stdin"] == subprocess.DEVNULL
 
 
 class TestPathGeneration:

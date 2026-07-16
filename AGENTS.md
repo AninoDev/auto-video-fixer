@@ -608,6 +608,35 @@ place (never reassigning it — `self.pipeline` holds the same object by referen
 - **Stage disabled check**: `should_run()` must check `self.is_enabled()` which reads from `DEFAULTS["stages"][name]["enabled"]`.
 - **`NormalizeVolumeStage`** (name `"normalize_volume"`) and **`NormalizeAudioStage`** (name `"normalize_audio"`) are two separate classes in `normalize_audio.py`.
 - **Preset stage enable**: Presets define `enable_stages` which controls which stages run. A stage not listed in a preset's `enable_stages` will not execute, even if it's in the default order.
+- **Every new subprocess spawn must detach stdin**: an ffmpeg subprocess whose stdin is the
+  caller's controlling terminal switches that tty to raw mode (to poll for interactive keys) and
+  does **not** restore it if killed/crashed/backgrounded -- the classic symptom is a shell with no
+  keystroke echo and a stray blank line per command after an interrupted `avf process` run. Any
+  new ffmpeg spawn must pass `-nostdin` (early in the arg list, before `-i`) **and**
+  `stdin=subprocess.DEVNULL` on the `Popen`/`run()` call (Rust: `.stdin(Stdio::null())` on
+  `Command`) -- both, belt and suspenders. ffprobe has no `-nostdin` flag, so `stdin=DEVNULL`/
+  `Stdio::null()` alone is the fix there. **Exception**: a process whose stdin is deliberately a
+  pipe (frame-feeding writers like `StreamingVideoWriter`, `ai/frame_processor.py`'s two Popen
+  writers, `avf_framepipe`'s `FrameWriter`, `stabilize.py`'s transform process reading
+  decode_proc's stdout) already can't capture a tty and does not need `-nostdin` added -- don't
+  touch those. `core/ffmpeg_utils.py`'s `run_ffmpeg()` is the central choke point most stages
+  route through; a spawn that bypasses it (a direct `subprocess.run`/`Popen`/`Command::new`) needs
+  the fix applied at its own call site. See CHANGELOG.md's "ffmpeg/ffprobe subprocess spawns could
+  leave the user's terminal stuck in raw mode" entry for the full audit and fix list.
+- **Console output of external data must go through `sanitize_console_text()`**: filenames from a
+  directory scan, ffmpeg stderr excerpts, exception text, and VLM output can all contain raw
+  control/escape bytes (C0 controls, DEL, the C1 range, ESC) that -- if echoed straight to a
+  terminal -- can trigger the same kind of tty-mode corruption `-nostdin` fixes for ffmpeg itself
+  (defense in depth, not the primary fix). `config.sanitize_console_text()` (next to
+  `redact_secrets()`) strips/replaces those bytes with U+FFFD while leaving every other Unicode
+  codepoint (CJK, RTL, combining marks, emoji) untouched -- never normalize or strip non-ASCII
+  text here. The logging pipeline's console handler already sanitizes everything that goes through
+  `logger.py` (`_SanitizingConsoleFormatter`, console-only -- file/log-file handlers keep raw
+  text). Anything printed via a *direct* `console.print()`/`click.echo()` call that interpolates
+  external data (not routed through the logger) needs its own call to
+  `sanitize_console_text()`/`cli.py`'s `_safe()` wrapper at the interpolation site -- see `cli.py`
+  for the pattern; do not sanitize the whole f-string blindly if it also contains deliberate Rich
+  markup (`[red]...[/red]`) the code itself emits.
 
 ## Known bugs / pitfalls to avoid
 

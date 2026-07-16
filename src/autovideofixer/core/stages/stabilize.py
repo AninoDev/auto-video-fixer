@@ -117,6 +117,7 @@ class StabilizeStage(BaseStage):
                     "csv=p=0",
                     input_path,
                 ],
+                stdin=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
                 stdout=subprocess.PIPE,
                 text=True,
@@ -163,6 +164,7 @@ class StabilizeStage(BaseStage):
                     "csv=p=0",
                     input_path,
                 ],
+                stdin=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
                 stdout=subprocess.PIPE,
                 text=True,
@@ -720,6 +722,7 @@ class StabilizeStage(BaseStage):
                 [
                     ffmpeg_bin,
                     "-hide_banner",
+                    "-nostdin",
                     "-i",
                     input_path,
                     "-vf",
@@ -734,6 +737,13 @@ class StabilizeStage(BaseStage):
                     "10M",
                     "-",
                 ],
+                # No stdin data is ever piped into decode_proc (only its
+                # stdout feeds transform_proc) -- without stdin=DEVNULL it
+                # would otherwise inherit the parent's stdin, i.e. the
+                # user's controlling terminal if run interactively, letting
+                # ffmpeg switch it to raw mode. -nostdin above is the
+                # primary fix; DEVNULL is belt-and-suspenders.
+                stdin=sp.DEVNULL,
                 stdout=sp.PIPE,
                 stderr=sp.PIPE,
             )

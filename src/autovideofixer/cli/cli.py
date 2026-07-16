@@ -26,6 +26,7 @@ from autovideofixer.config import (
     get_log_dir,
     prune_old_logs,
     redact_secrets,
+    sanitize_console_text,
 )
 from autovideofixer.core.analysis import is_video_file, scan_directory
 from autovideofixer.core.pipeline import Pipeline
@@ -36,6 +37,22 @@ if TYPE_CHECKING:
     from autovideofixer.core.analysis import VideoAnalysis
 
 console = Console()
+
+
+def _safe(value: object) -> str:
+    """Sanitize external data (filenames, exception text, subprocess stderr
+    excerpts) before it's interpolated into a console.print() f-string.
+
+    console.print() is Rich's own I/O path, not the logging pipeline that
+    logger.py's _SanitizingConsoleFormatter covers -- direct console.print()
+    calls in this module that embed user-supplied/filesystem/exception data
+    need their own sanitization at the interpolation site. Deliberate Rich
+    markup ("[red]...[/red]") the code itself writes is untouched since it's
+    always plain ASCII brackets/letters written directly in the f-string,
+    never passed through this helper.
+    """
+    return sanitize_console_text(value)
+
 
 # Max automatic per-run log files retained under get_log_dir() (see
 # config.prune_old_logs()). Oldest-by-mtime files beyond this count are
@@ -331,7 +348,7 @@ def main(
         else:
             ctx.obj["config"] = Config()
     except FileNotFoundError as e:
-        console.print(f"[red]{e}[/red]")
+        console.print(f"[red]{_safe(e)}[/red]")
         sys.exit(1)
 
     ctx.obj["config_path_source"] = config_path
@@ -767,7 +784,7 @@ def process(
         elif is_video_file(path):
             input_files.append(path)
         else:
-            console.print(f"[yellow]Skipping non-video file: {path}[/yellow]")
+            console.print(f"[yellow]Skipping non-video file: {_safe(path)}[/yellow]")
 
     if not input_files:
         console.print("[red]No video files found.[/red]")
@@ -784,7 +801,7 @@ def process(
     if dry_run:
         console.print("\n[bold]DRY RUN - No files will be processed:[/bold]")
         for f in input_files:
-            console.print(f"  - {f}")
+            console.print(f"  - {_safe(f)}")
         return
 
     # Create pipeline and process
@@ -853,7 +870,7 @@ def _print_analysis_result(analysis: "VideoAnalysis", *, full_output: bool) -> N
     table.add_column("Property")
     table.add_column("Value")
 
-    table.add_row("Filename", analysis.filename)
+    table.add_row("Filename", _safe(analysis.filename))
     table.add_row("Duration", f"{analysis.duration:.1f}s")
     table.add_row("Resolution", f"{analysis.resolution[0]}x{analysis.resolution[1]}")
     table.add_row("Framerate", f"{analysis.framerate:.1f} fps")
@@ -870,21 +887,21 @@ def _print_analysis_result(analysis: "VideoAnalysis", *, full_output: bool) -> N
             summary = (
                 summary[:_VLM_SUMMARY_PREVIEW_LEN].rstrip() + " [...] (use --full for full text)"
             )
-        table.add_row("VLM Summary", summary)
+        table.add_row("VLM Summary", _safe(summary))
     if analysis.vlm_tags:
-        table.add_row("Tags", ", ".join(analysis.vlm_tags))
+        table.add_row("Tags", _safe(", ".join(analysis.vlm_tags)))
     if analysis.vlm_objects:
-        table.add_row("Objects", ", ".join(analysis.vlm_objects))
+        table.add_row("Objects", _safe(", ".join(analysis.vlm_objects)))
     if analysis.content_rating:
-        table.add_row("Content Rating", analysis.content_rating)
+        table.add_row("Content Rating", _safe(analysis.content_rating))
 
     console.print(table)
 
     if full_output and analysis.vlm_summary:
         console.print(
             Panel(
-                analysis.vlm_summary,
-                title=f"Full VLM Summary: {analysis.filename}",
+                _safe(analysis.vlm_summary),
+                title=f"Full VLM Summary: {_safe(analysis.filename)}",
                 expand=True,
             )
         )
@@ -892,7 +909,7 @@ def _print_analysis_result(analysis: "VideoAnalysis", *, full_output: bool) -> N
     if analysis.scenes:
         console.print(f"\n[bold]Detected {analysis.total_scenes} Scene(s):[/bold]")
         for scene in analysis.scenes[:30]:
-            desc = f" - {scene.description}" if scene.description else ""
+            desc = f" - {_safe(scene.description)}" if scene.description else ""
             # Boundary confidence (the frame-differencing diff_score that ended
             # this scene) only in --full -- keeps the default view uncluttered;
             # see _scene_boundaries_str()'s docstring for what it means and the
@@ -1123,7 +1140,7 @@ def analyze(
         elif is_video_file(path):
             input_files.append(path)
         else:
-            console.print(f"[yellow]Skipping non-video file: {path}[/yellow]")
+            console.print(f"[yellow]Skipping non-video file: {_safe(path)}[/yellow]")
 
     if not input_files:
         console.print("[red]No video files found.[/red]")
@@ -1136,9 +1153,11 @@ def analyze(
 
     for idx, filepath in enumerate(input_files, start=1):
         if len(input_files) > 1:
-            console.print(f"\n[bold]== [{idx}/{len(input_files)}] Analyzing: {filepath} ==[/bold]")
+            console.print(
+                f"\n[bold]== [{idx}/{len(input_files)}] Analyzing: {_safe(filepath)} ==[/bold]"
+            )
         else:
-            console.print(f"Analyzing: {filepath}")
+            console.print(f"Analyzing: {_safe(filepath)}")
 
         # A live-updating status line on a real terminal; on a non-TTY (e.g.
         # captured output, CI, a pipe) Rich prints status updates as plain
@@ -1184,7 +1203,9 @@ def analyze(
                     analysis.total_scenes = len(analysis.scenes)
         except Exception:
             logger.error("Analysis failed for %r", filepath, exc_info=True)
-            console.print(f"[red]Analysis failed for {filepath} -- see log for details.[/red]")
+            console.print(
+                f"[red]Analysis failed for {_safe(filepath)} -- see log for details.[/red]"
+            )
             failed_files.append(filepath)
             continue
 
@@ -1218,13 +1239,14 @@ def analyze(
                 )
                 if clips:
                     console.print(
-                        f"\n[green]Extracted {len(clips)} clip(s) to: {file_clip_output}[/green]"
+                        f"\n[green]Extracted {len(clips)} clip(s) to: "
+                        f"{_safe(file_clip_output)}[/green]"
                     )
                     for clip in clips:
                         console.print(
                             f"  Clip {clip.scene_index}: "
                             f"{clip.start_time:.1f}s-{clip.end_time:.1f}s -> "
-                            f"{os.path.basename(clip.output_path)}"
+                            f"{_safe(os.path.basename(clip.output_path))}"
                         )
                 else:
                     console.print("\n[yellow]No clips could be extracted.[/yellow]")
@@ -1253,14 +1275,14 @@ def find_duplicates(ctx: click.Context, reference: str, directory: str, threshol
     analyzer = VideoAnalyzer(config)
 
     candidates = scan_directory(directory)
-    console.print(f"Comparing {reference} against {len(candidates)} candidate(s)...")
+    console.print(f"Comparing {_safe(reference)} against {len(candidates)} candidate(s)...")
 
     results = analyzer.find_similar(reference, candidates, threshold)
 
     if results:
         console.print(f"\nFound {len(results)} similar video(s):")
         for path, sim in results:
-            console.print(f"  [{sim * 100:.1f}%] {path}")
+            console.print(f"  [{sim * 100:.1f}%] {_safe(path)}")
     else:
         console.print("No similar videos found.")
 
@@ -1449,7 +1471,7 @@ def _list_presets() -> None:
 def _on_job_complete(job, result) -> None:
     """Callback when a job completes."""
     status_icon = "[green]OK[/green]" if result.success else "[red]FAIL[/red]"
-    console.print(f"  {status_icon} {os.path.basename(job.input_path)}")
+    console.print(f"  {status_icon} {_safe(os.path.basename(job.input_path))}")
 
 
 def _print_summary(results) -> None:
@@ -1467,4 +1489,4 @@ def _print_summary(results) -> None:
         console.print("\n[red]Failed jobs:[/red]")
         for r in results:
             if not r.success:
-                console.print(f"  - {r.input_path}: {'; '.join(r.errors)}")
+                console.print(f"  - {_safe(r.input_path)}: {_safe('; '.join(r.errors))}")

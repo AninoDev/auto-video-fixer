@@ -195,6 +195,84 @@ class TestRedactSecrets:
         assert redact_secrets(data) == data
 
 
+class TestSanitizeConsoleText:
+    """sanitize_console_text() must neutralize control/escape bytes a
+    filename or ffmpeg stderr excerpt could use to corrupt a terminal's tty
+    mode, while never touching legitimate printable Unicode.
+    """
+
+    def test_strips_esc_sequence(self):
+        from autovideofixer.config import sanitize_console_text
+
+        # OSC "set title" sequence terminated by BEL -- a classic
+        # terminal-corrupting payload smuggled via a crafted filename.
+        raw = "evil\x1b]0;pwned\x07name.mp4"
+        out = sanitize_console_text(raw)
+        assert "\x1b" not in out
+        assert "\x07" not in out
+        assert "evil" in out and "name.mp4" in out
+
+    def test_strips_c1_range(self):
+        from autovideofixer.config import sanitize_console_text
+
+        raw = "c1\x9b31mtest"
+        out = sanitize_console_text(raw)
+        assert "\x9b" not in out
+        assert "c1" in out and "test" in out
+
+    def test_strips_del(self):
+        from autovideofixer.config import sanitize_console_text
+
+        out = sanitize_console_text("a\x7fb")
+        assert "\x7f" not in out
+
+    def test_keeps_tab_and_newline(self):
+        from autovideofixer.config import sanitize_console_text
+
+        raw = "line1\tcolumn\nline2"
+        assert sanitize_console_text(raw) == raw
+
+    def test_preserves_cjk_rtl_emoji_and_combining_marks(self):
+        from autovideofixer.config import sanitize_console_text
+
+        raw = "中文测试 \U0001f600 اختبار é"
+        assert sanitize_console_text(raw) == raw
+
+    def test_does_not_normalize_unicode(self):
+        from autovideofixer.config import sanitize_console_text
+
+        # Combining acute accent (U+0301) kept as a separate codepoint, not
+        # collapsed/NFC-normalized into a precomposed form.
+        raw = "café"
+        out = sanitize_console_text(raw)
+        assert out == raw
+        assert len(out) == len(raw) == 5
+
+    def test_none_is_safe(self):
+        from autovideofixer.config import sanitize_console_text
+
+        assert sanitize_console_text(None) == ""
+
+    def test_empty_string_is_safe(self):
+        from autovideofixer.config import sanitize_console_text
+
+        assert sanitize_console_text("") == ""
+
+    def test_accepts_non_str_via_str_conversion(self):
+        from autovideofixer.config import sanitize_console_text
+
+        assert sanitize_console_text(42) == "42"
+
+    def test_every_c0_except_tab_newline_is_replaced(self):
+        from autovideofixer.config import sanitize_console_text
+
+        for code in range(0x00, 0x20):
+            if code in (0x09, 0x0A):
+                continue
+            out = sanitize_console_text(f"x{chr(code)}y")
+            assert chr(code) not in out, f"C0 byte 0x{code:02x} leaked through"
+
+
 class TestDiffFromDefaults:
     def test_no_changes_yields_empty_diff(self):
         from autovideofixer.config import diff_from_defaults

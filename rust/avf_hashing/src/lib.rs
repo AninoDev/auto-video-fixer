@@ -86,6 +86,8 @@ fn probe_total_frames(ffprobe_path: &str, filepath: &str) -> u64 {
             "--",
             filepath,
         ])
+        // ffprobe has no -nostdin flag; detaching stdin is the only lever.
+        .stdin(Stdio::null())
         .output()
     else {
         return 0;
@@ -149,8 +151,8 @@ fn sample_frames(
 
     let mut child = match Command::new(ffmpeg_path)
         .args([
-            "-v", "error", "-i", filepath, "-vf", &vf, "-vsync", "vfr", "-f", "rawvideo",
-            "-pix_fmt", "gray", "-",
+            "-v", "error", "-nostdin", "-i", filepath, "-vf", &vf, "-vsync", "vfr", "-f",
+            "rawvideo", "-pix_fmt", "gray", "-",
         ])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())

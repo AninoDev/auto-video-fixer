@@ -8,6 +8,8 @@ from typing import Optional
 from rich.console import Console
 from rich.logging import RichHandler
 
+from autovideofixer.config import sanitize_console_text
+
 # All module loggers are named "autovideofixer.<module>" (see get_logger() call
 # sites). Handlers are attached ONLY here, once, so setup_logging()'s console/file
 # configuration is the single source of truth -- see setup_logging()'s docstring
@@ -35,6 +37,27 @@ def get_logger(name: str, level: Optional[int] = None) -> logging.Logger:
 
 
 _PLAIN_FILE_FORMAT = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+
+
+class _SanitizingConsoleFormatter(logging.Formatter):
+    """Console-only formatter that neutralizes raw control/escape bytes.
+
+    Attached ONLY to the console handler (RichHandler) -- file handlers keep
+    the raw, unsanitized text, since a log file isn't a tty and the original
+    bytes may matter for debugging. This runs *after* the normal
+    ``%``-style message formatting (so ``%(message)s`` interpolation and any
+    exception traceback text are both covered) but *before* RichHandler's
+    own markup rendering -- Rich's ``[style]...[/style]`` bbcode-like markup
+    tags are plain ASCII brackets/letters, not raw ANSI/C1 bytes, so
+    sanitizing here can't damage deliberate Rich markup the code itself
+    emits (e.g. via ``console.print(f"[red]...[/red]")`` or ``click.style``);
+    it only strips control bytes that arrived embedded in the *data*
+    (filenames, ffmpeg stderr excerpts, exception text) being logged.
+    """
+
+    def format(self, record: logging.LogRecord) -> str:
+        formatted = super().format(record)
+        return sanitize_console_text(formatted)
 
 
 def setup_logging(
@@ -81,7 +104,7 @@ def setup_logging(
         markup=True,
         rich_tracebacks=True,
     )
-    console_handler.setFormatter(logging.Formatter("%(message)s"))
+    console_handler.setFormatter(_SanitizingConsoleFormatter("%(message)s"))
     console_handler.setLevel(numeric_level)
     root.addHandler(console_handler)
 

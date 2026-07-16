@@ -88,6 +88,32 @@ class TestGetVideoFramerate:
         assert fps == 30.0
 
 
+class TestFfprobeSpawnsDetachStdin:
+    """Neither ffprobe helper may leave stdin attached to the caller's tty.
+
+    ffprobe has no -nostdin flag (unlike ffmpeg), so stdin=DEVNULL is the
+    only lever available here.
+    """
+
+    def test_get_video_dimensions_detaches_stdin(self, tmp_path):
+        stage = _make_stage(tmp_path)
+        with patch.object(
+            subprocess, "run", return_value=_fake_ffprobe_result("1920,1080\n")
+        ) as mock_run:
+            stage._get_video_dimensions("dummy.mp4")
+        _, kwargs = mock_run.call_args
+        assert kwargs.get("stdin") == subprocess.DEVNULL
+
+    def test_get_video_framerate_detaches_stdin(self, tmp_path):
+        stage = _make_stage(tmp_path)
+        with patch.object(
+            subprocess, "run", return_value=_fake_ffprobe_result("30/1,30/1\n")
+        ) as mock_run:
+            stage._get_video_framerate("dummy.mp4")
+        _, kwargs = mock_run.call_args
+        assert kwargs.get("stdin") == subprocess.DEVNULL
+
+
 class TestMovementExtent:
     """Movement extent is a pure signal for gating zoom, not a zoom amount."""
 

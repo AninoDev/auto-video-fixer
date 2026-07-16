@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import re
 import sys
 from pathlib import Path
 from typing import Any
@@ -112,6 +113,45 @@ def redact_secrets(data: Any) -> Any:
     if isinstance(data, list):
         return [redact_secrets(v) for v in data]
     return data
+
+
+# C0 controls except \t (0x09) and \n (0x0A), DEL (0x7F), and the C1
+# range (0x80-0x9F). ESC (0x1B) is already inside C0 but is the specific
+# byte that kicks off terminal escape sequences (cursor moves, mode
+# switches, OSC title-setting, etc.) a raw filename/stderr excerpt could
+# smuggle into console output -- called out here for clarity, not handled
+# separately.
+_UNSAFE_CHARS_RE = re.compile("[\x00-\x08\x0b-\x1f\x7f-\x9f]")
+
+
+def sanitize_console_text(s: Any) -> str:
+    """Neutralize control bytes that could corrupt a terminal's tty mode.
+
+    Strips/replaces C0 control characters (except \\t and \\n, which are
+    harmless and often meaningful in log output), DEL (U+007F), the C1
+    control range (U+0080-U+009F), and ESC (U+001B, already covered by the
+    C0 range) -- the bytes a malicious or merely exotic filename could use to
+    trigger a terminal escape sequence (e.g. switching the tty to raw mode
+    without restoring it, as ffmpeg itself is known to do when its stdin is
+    the controlling terminal -- see AGENTS.md's "every new subprocess spawn
+    must detach stdin" gotcha for the primary fix this is defense-in-depth
+    for).
+
+    Each offending character is replaced with U+FFFD (the standard Unicode
+    replacement character) -- chosen over caret notation (``^[``) so the
+    output length change is visually obvious without trying to look like a
+    "real" representation of the stripped byte. All other Unicode -- CJK,
+    RTL scripts, combining marks, emoji -- is passed through untouched; this
+    must NOT normalize or strip any non-ASCII text, only the specific
+    control/format byte ranges above.
+
+    Accepts non-str input via ``str()`` for convenience at call sites that
+    interpolate exceptions/paths of unknown type; ``None`` becomes ``""``.
+    """
+    if s is None:
+        return ""
+    text = s if isinstance(s, str) else str(s)
+    return _UNSAFE_CHARS_RE.sub("�", text)
 
 
 def diff_from_defaults(data: dict[str, Any], defaults: dict[str, Any]) -> dict[str, Any]:

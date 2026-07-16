@@ -57,6 +57,9 @@ fn probe_fps_and_frames(ffprobe_path: &str, filepath: &str) -> Option<(f64, u64)
             "--",
             filepath,
         ])
+        // ffprobe has no -nostdin flag; detaching stdin is the only lever
+        // here (see the ffmpeg spawn below for the primary fix + rationale).
+        .stdin(Stdio::null())
         .output()
         .ok()?;
 
@@ -134,6 +137,12 @@ fn run_detection(
         .args([
             "-v",
             "error",
+            // Non-interactive: this ffmpeg is never fed keyboard commands.
+            // Without it, ffmpeg raw-modes its controlling tty (if any) to
+            // poll stdin for interactive keys and won't restore it if
+            // killed/crashed -- stdin(Stdio::null()) below is
+            // belt-and-suspenders for the same reason.
+            "-nostdin",
             "-i",
             filepath,
             "-vf",

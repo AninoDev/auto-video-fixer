@@ -7,6 +7,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **ffmpeg/ffprobe subprocess spawns could leave the user's terminal stuck in raw mode**: no
+  spawn site in this codebase passed `-nostdin` (ffmpeg) or detached stdin, so whenever a spawned
+  ffmpeg's stdin happened to be the controlling terminal, ffmpeg would switch that tty to raw mode
+  to poll for interactive keyboard commands (`q` to quit, etc.) -- and, if the process was
+  killed/crashed/backgrounded before exiting cleanly (an interrupted `avf process` being the
+  common case), never restore it. Symptom: after such a run, the shell shows no keystroke echo and
+  an extra blank line per command until the user manually runs `reset`/`stty sane`. Root-caused via
+  `grep -rn "subprocess.run\|subprocess.Popen" src/` plus `Command::new` in the Rust crates -- no
+  call site anywhere passed `-nostdin` or `stdin=DEVNULL`/`Stdio::null()`.
+  - **Central fix**: `core/ffmpeg_utils.py`'s `run_ffmpeg()` -- the shared runner nearly every
+    stage's ffmpeg pass routes through -- now always prepends `-nostdin` to the built command and
+    passes `stdin=subprocess.DEVNULL` to `Popen()`, fixing every stage in one place. `probe()`
+    (ffprobe) and `detect_hardware_acceleration()` (ffmpeg `-hwaccels`), the two other central
+    helpers in the same module, got the same treatment (`-nostdin` where applicable -- ffprobe has
+    no such flag, so it's `stdin=DEVNULL` only there).
+  - **Per-site fixes** for the spawns that don't route through the central helpers:
+    `stages/stabilize.py`'s two direct `ffprobe` calls (`_get_video_dimensions`/
+    `_get_video_framerate`) and its manual decode→transform raw-pipe `ffmpeg` (the decode side --
+    the transform side already reads its video from a pipe, which already prevents tty capture, so
+    it's intentionally left alone); `ai/model_cache.py`'s `curl` fallback download.
+  - **Rust**: `rust/avf_scenes/src/lib.rs`'s ffprobe/ffmpeg spawns and `rust/avf_framepipe/src/lib.rs`'s
+    `FrameReader` decode ffmpeg gained `-nostdin` (the ffmpeg one already had `Stdio::null()` set;
+    the ffprobe one gained it). `rust/avf_hashing/src/lib.rs`'s ffprobe/ffmpeg spawns (found by the
+    same grep audit, not originally called out for this fix but in scope for "no spawn site")
+    got the identical treatment. `FrameWriter`'s ffmpeg (piped stdin, by design) is untouched, same
+    as `stabilize.py`'s transform process and `ai/frame_processor.py`'s `StreamingVideoWriter`/
+    `frames_to_video()` writer pipes -- a deliberately piped stdin already can't capture a tty.
+  - **Defense in depth**: new `sanitize_console_text()` (`config.py`, alongside `redact_secrets()`)
+    strips/replaces C0 controls (except `\t`/`\n`), DEL, the C1 range, and ESC with U+FFFD, without
+    touching any other Unicode (CJK/RTL/combining marks/emoji preserved, no normalization) --
+    covers the secondary vector where a crafted filename's raw escape bytes get echoed into console
+    output. Wired into `logger.py` as `_SanitizingConsoleFormatter`, attached to the console
+    (Rich) handler only -- file/log-file handlers keep raw text for debugging. `cli.py`'s direct
+    `console.print()` calls that interpolate external data (filenames, exception text, VLM
+    summaries/tags) now route that data through the same helper (`_safe()`) at the interpolation
+    site, since Rich's own `[style]` markup tags need to keep working and can't go through a
+    blanket formatter the way the logging path does.
+
 ### Added
 - **CSS-like config cascade for `avf process`, plus `--set KEY=VALUE`**: config now resolves as
   an ordered stack of layers -- `Config.DEFAULTS` < the user `config.yaml` (or an explicit
