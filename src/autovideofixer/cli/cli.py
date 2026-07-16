@@ -9,9 +9,11 @@ import logging
 import os
 import sys
 from datetime import datetime
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import click
+import yaml
 from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
@@ -19,6 +21,7 @@ from rich.table import Table
 from autovideofixer import __version__
 from autovideofixer.config import (
     Config,
+    _looks_like_secret_key,
     diff_from_defaults,
     get_log_dir,
     prune_old_logs,
@@ -26,7 +29,7 @@ from autovideofixer.config import (
 )
 from autovideofixer.core.analysis import is_video_file, scan_directory
 from autovideofixer.core.pipeline import Pipeline
-from autovideofixer.core.presets import get_preset, list_presets
+from autovideofixer.core.presets import get_preset, list_presets, load_preset
 from autovideofixer.logger import get_logger, setup_logging
 
 if TYPE_CHECKING:
@@ -38,6 +41,206 @@ console = Console()
 # config.prune_old_logs()). Oldest-by-mtime files beyond this count are
 # deleted at startup, before the current run's log file is created.
 MAX_RETAINED_LOGS = 50
+
+
+# ─── Config cascade: --preset/--config layering + --set + CLI-flags layer ──
+#
+# See AGENTS.md's "Config cascade" section for the full model. In short:
+#   1. DEFAULTS
+#   2. the user config.yaml (or an explicit top-level --config/AVF_CONFIG path)
+#   3. each `process --preset`/`process --config PATH` layer, in the order the
+#      flags appear on the command line, interleaved
+#   4. every non-config/non-preset CLI option (including --set), folded into
+#      ONE final layer applied last, later-flag-beats-earlier-flag on conflict
+#
+# Click parses each `multiple=True` option into its own tuple, preserving
+# that option's *own* order but losing cross-option interleaving. The scan
+# below recovers the true left-to-right order from sys.argv; if sys.argv
+# doesn't actually correspond to this invocation (e.g. a programmatic
+# CliRunner.invoke() call in a test, whose sys.argv is the test runner's
+# own), we can't trust it and fall back to a fixed, documented order instead.
+
+# Flags (after the `process` subcommand token) that take a value, either as
+# a following token or `--flag=value`. Includes both the repeatable
+# cascade-layer flags (--preset/--config/--set/--enable-stage/--disable-stage)
+# and every other value-taking option that maps to a config key, so their
+# relative argv position can be recovered too (see _position() below).
+_VALUE_FLAGS = {
+    "--preset",
+    "-p",
+    "--config",
+    "--set",
+    "--enable-stage",
+    "--disable-stage",
+    "--output",
+    "-o",
+    "--threads",
+    "--fps",
+    "--resolution",
+    "--codec",
+    "--audio-codec",
+    "--crf",
+    "--encoder-preset",
+    "--hwaccel",
+    "--gpu-device",
+    "--crop-limit",
+    "--zoom-coverage",
+    "--batch-size",
+    "--tile-batch-size",
+}
+
+# Boolean/flag-value options that map to a config key -- recorded with a
+# None value (the flag's mere presence is the signal).
+_BOOL_FLAGS = {
+    "--ai",
+    "--no-ai",
+    "--overwrite",
+    "--no-overwrite",
+    "--ai-fallback",
+    "--no-ai-fallback",
+    "--scene-mode",
+    "--no-scene-mode",
+    "--drop-non-content",
+    "--no-drop-non-content",
+}
+
+
+def _scan_process_argv() -> list[tuple[str, str | None, int]]:
+    """Walk sys.argv from the `process` subcommand token onward.
+
+    Returns an ordered list of (flag, value, argv_index) for every
+    recognized config-affecting flag occurrence (see _VALUE_FLAGS/
+    _BOOL_FLAGS). Returns [] if "process" isn't found in sys.argv at all --
+    callers must treat that (or a value mismatch against what Click actually
+    parsed) as "argv unavailable" and fall back to a fixed order.
+    """
+    argv = sys.argv
+    try:
+        start = argv.index("process") + 1
+    except ValueError:
+        return []
+
+    out: list[tuple[str, str | None, int]] = []
+    i = start
+    n = len(argv)
+    while i < n:
+        tok = argv[i]
+        matched = False
+        for flag in _VALUE_FLAGS:
+            if tok == flag:
+                val = argv[i + 1] if i + 1 < n else None
+                out.append((flag, val, i))
+                i += 1
+                matched = True
+                break
+            if tok.startswith(flag + "="):
+                out.append((flag, tok[len(flag) + 1 :], i))
+                matched = True
+                break
+        if matched:
+            i += 1
+            continue
+        if tok in _BOOL_FLAGS:
+            out.append((tok, None, i))
+        i += 1
+    return out
+
+
+def _repeatable_matches(
+    occurrences: list[tuple[str, str | None, int]], flag_names: set[str], expected: tuple[str, ...]
+) -> bool:
+    """True iff the argv-scanned values for `flag_names` exactly match `expected`."""
+    scanned = [val for flag, val, _idx in occurrences if flag in flag_names]
+    return scanned == list(expected)
+
+
+def _is_preset_path(value: str) -> bool:
+    """Disambiguate a --preset value: a filesystem path, or a registered name?"""
+    return (
+        os.sep in value
+        or (os.altsep is not None and os.altsep in value)
+        or value.endswith((".yaml", ".yml"))
+        or os.path.exists(value)
+    )
+
+
+def _resolve_preset_layer(value: str) -> dict[str, Any]:
+    """Resolve one --preset value (name or path) to a config-layer dict."""
+    if _is_preset_path(value):
+        p = load_preset(value)
+        if p is None:
+            console.print(f"[red]Failed to load preset file: {value}[/red]")
+            sys.exit(1)
+        return p.to_config()
+    p = get_preset(value)
+    if p is None:
+        console.print(f"[red]Unknown preset: {value}[/red]")
+        console.print(f"Available: {', '.join(list_presets())}")
+        sys.exit(1)
+    return p.to_config()
+
+
+def _resolve_config_layer(path: str) -> dict[str, Any]:
+    """Resolve one --config PATH value to a config-layer dict.
+
+    Unlike the default config path, an explicitly-given --config layer is a
+    hard error if missing or malformed -- same "no silent no-op" policy as
+    the top-level --config/AVF_CONFIG flag.
+    """
+    p = Path(path)
+    if not p.exists():
+        console.print(f"[red]Config layer file not found: {path}[/red]")
+        sys.exit(1)
+    try:
+        with open(p) as f:
+            data = yaml.safe_load(f) or {}
+    except yaml.YAMLError as e:
+        console.print(f"[red]Invalid YAML in config layer {path}: {e}[/red]")
+        sys.exit(1)
+    if not isinstance(data, dict):
+        console.print(f"[red]Config layer file must contain a YAML mapping: {path}[/red]")
+        sys.exit(1)
+    return data
+
+
+def _parse_set_option(raw: str) -> tuple[list[str], Any]:
+    """Parse one --set KEY=VALUE into (dot-notation key path, parsed value).
+
+    VALUE is parsed as a YAML scalar, so `true`/`16`/`null`/quoted strings/
+    inline lists (`[a,b]`) all work. Rejects secret-looking keys (api_key/
+    token/password/etc.) -- those are config-file-only, to keep secrets out
+    of shell history (see AGENTS.md).
+    """
+    if "=" not in raw:
+        raise click.BadParameter(f"--set value must be KEY=VALUE, got {raw!r}")
+    key, _, value_str = raw.partition("=")
+    key = key.strip()
+    if not key:
+        raise click.BadParameter(f"--set KEY=VALUE: empty key in {raw!r}")
+    key_path = key.split(".")
+    if any(_looks_like_secret_key(part) for part in key_path):
+        raise click.BadParameter(
+            f"--set {key}=...: secret-looking keys (api_key/token/password/etc.) are "
+            "config-file-only and must not be passed on the command line (shell history "
+            "risk) -- set this in your config.yaml instead"
+        )
+    try:
+        value = yaml.safe_load(value_str)
+    except yaml.YAMLError as e:
+        raise click.BadParameter(f"--set {key}=...: invalid YAML value: {e}") from e
+    return key_path, value
+
+
+def _set_nested(d: dict[str, Any], key_path: list[str], value: Any) -> None:
+    """Assign `value` at `key_path` in `d`, creating intermediate dicts as needed."""
+    node = d
+    for k in key_path[:-1]:
+        nxt = node.get(k)
+        if not isinstance(nxt, dict):
+            nxt = {}
+            node[k] = nxt
+        node = nxt
+    node[key_path[-1]] = value
 
 
 @click.group()
@@ -161,7 +364,37 @@ def _log_effective_settings(
 
 @main.command()
 @click.argument("paths", nargs=-1, required=True)
-@click.option("--preset", "-p", default=None, help="Processing preset name")
+@click.option(
+    "--preset",
+    "-p",
+    "presets",
+    multiple=True,
+    help="Processing preset name, or a path to a preset YAML file (detected by a path "
+    "separator, a .yaml/.yml extension, or the file existing on disk). Repeatable -- each "
+    "one is applied as its own cascade layer, interleaved with --config in the order they "
+    "appear on the command line (see AGENTS.md's 'Config cascade' section).",
+)
+@click.option(
+    "--config",
+    "config_layers",
+    type=click.Path(),
+    multiple=True,
+    help="Additional config file to merge on top of the base config (DEFAULTS + the user "
+    "config.yaml / top-level --config), as its own cascade layer. Repeatable -- interleaved "
+    "with --preset in command-line order. Must already exist (hard error if not). Not the "
+    "same as the top-level `avf --config PATH process ...` flag, which selects which file "
+    "IS the base config; this one adds a layer on top.",
+)
+@click.option(
+    "--set",
+    "set_overrides",
+    multiple=True,
+    help="Set a config key directly: KEY=VALUE using dot-notation for nested keys (e.g. "
+    "stages.upscale.ai_model=RealESRGAN_x2plus). VALUE is parsed as a YAML scalar, so "
+    "true/16/null/quoted strings/inline lists ([a,b]) all work. Repeatable. Applied as part "
+    "of the final CLI-flags layer (always last). Secret-looking keys (api_key/token/"
+    "password/etc.) are rejected -- set those in config.yaml instead.",
+)
 @click.option("--output", "-o", default=None, help="Output directory")
 @click.option(
     "--output-name",
@@ -323,7 +556,9 @@ def _log_effective_settings(
 def process(
     ctx: click.Context,
     paths: tuple[str, ...],
-    preset: str | None,
+    presets: tuple[str, ...],
+    config_layers: tuple[str, ...],
+    set_overrides: tuple[str, ...],
     output: str | None,
     output_name: str | None,
     recursive: bool,
@@ -357,105 +592,171 @@ def process(
         return
 
     logger = get_logger("autovideofixer.cli")
-    logger.info("Preset: %s", preset or "(none -- auto-determined per-file)")
+    logger.info(
+        "Preset(s): %s", ", ".join(presets) if presets else "(none -- auto-determined per-file)"
+    )
 
-    config = ctx.obj["config"]
-    if threads:
-        config.set(threads, "general", "max_concurrent_jobs")
+    # Work on a deep copy so preset/--config/--set/CLI-flag layers never
+    # mutate (or get persisted from) the shared Config object main() built.
+    config = copy.deepcopy(ctx.obj["config"])
 
-    # Apply preset if specified
-    if preset:
-        p = get_preset(preset)
-        if p is None:
-            console.print(f"[red]Unknown preset: {preset}[/red]")
-            console.print(f"Available: {', '.join(list_presets())}")
-            sys.exit(1)
-        config_data = p.to_config()
-        # Work on a deep copy to avoid persisting preset values to disk
-        config = copy.deepcopy(config)
-        _merge_config(config, config_data)
+    # --- Step 3: interleaved --preset/--config layers, in command-line order ---
+    occurrences = _scan_process_argv()
+    argv_usable = (
+        _repeatable_matches(occurrences, {"--preset", "-p"}, presets)
+        and _repeatable_matches(occurrences, {"--config"}, config_layers)
+        and _repeatable_matches(occurrences, {"--set"}, set_overrides)
+        and _repeatable_matches(occurrences, {"--enable-stage"}, enable_stages)
+        and _repeatable_matches(occurrences, {"--disable-stage"}, disable_stages)
+    )
+    if argv_usable and occurrences:
+        layer_seq = [
+            (("preset" if flag in ("--preset", "-p") else "config"), val)
+            for flag, val, _idx in occurrences
+            if flag in ("--preset", "-p", "--config") and val is not None
+        ]
+    else:
+        # Click's own order: each option's internal order is preserved, but
+        # cross-option interleaving is lost -- all --preset values, then all
+        # --config values.
+        layer_seq = [("preset", v) for v in presets] + [("config", v) for v in config_layers]
 
-    # Resolve output directory
-    if output:
-        config.set(output, "general", "output_dir")
+    for kind, value in layer_seq:
+        if kind == "preset":
+            config.apply_layer(_resolve_preset_layer(value), f"preset:{value}")
+        else:
+            config.apply_layer(_resolve_config_layer(value), f"config:{value}")
 
-    # Resolve AI override
+    # --- Step 4: every non-config/non-preset CLI option, folded into ONE
+    # final layer applied last (later-flag-beats-earlier-flag on conflict) ---
+    # Each entry: (flag token(s) to look for in argv, key_path, value).
+    cli_candidates: list[tuple[tuple[str, ...], list[str], Any]] = []
+    if threads is not None:
+        cli_candidates.append((("--threads",), ["general", "max_concurrent_jobs"], threads))
+    if output is not None:
+        cli_candidates.append((("--output", "-o"), ["general", "output_dir"], output))
     if use_ai is not None:
-        config.set(use_ai, "general", "use_ai")
-
+        cli_candidates.append((("--ai", "--no-ai"), ["general", "use_ai"], use_ai))
     if overwrite is not None:
-        config.set(overwrite, "general", "overwrite")
-
+        cli_candidates.append(
+            (("--overwrite", "--no-overwrite"), ["general", "overwrite"], overwrite)
+        )
     if ai_fallback is not None:
-        config.set(ai_fallback, "general", "ai_fallback")
-
+        cli_candidates.append(
+            (("--ai-fallback", "--no-ai-fallback"), ["general", "ai_fallback"], ai_fallback)
+        )
     if fps is not None:
-        config.set(fps, "quality", "quality_target", "target_framerate")
-
+        cli_candidates.append((("--fps",), ["quality", "quality_target", "target_framerate"], fps))
     if resolution is not None:
         try:
             w_str, h_str = resolution.lower().split("x")
-            config.set([int(w_str), int(h_str)], "quality", "quality_target", "target_resolution")
+            resolved = [int(w_str), int(h_str)]
         except ValueError:
             console.print(
                 f"[red]Invalid --resolution {resolution!r}: expected WIDTHxHEIGHT[/red] "
                 "(e.g. 3840x2160)"
             )
             sys.exit(1)
-
+        cli_candidates.append(
+            (("--resolution",), ["quality", "quality_target", "target_resolution"], resolved)
+        )
     # Encoder settings feed the same "encoding" config key that
     # Preset.to_config() writes, which Pipeline.execute_job() merges into
-    # job.stage_overrides["encode"] -- explicit flags here are applied after
-    # the preset merge above, so they take priority over the preset's values.
-    encoding_overrides = {}
+    # job.stage_overrides["encode"] -- each is its own leaf entry so deep_merge
+    # folds it onto "encoding" without clobbering sibling keys.
     if codec is not None:
-        encoding_overrides["video_codec"] = codec
+        cli_candidates.append((("--codec",), ["encoding", "video_codec"], codec))
     if audio_codec is not None:
-        encoding_overrides["audio_codec"] = audio_codec
+        cli_candidates.append((("--audio-codec",), ["encoding", "audio_codec"], audio_codec))
     if crf is not None:
-        encoding_overrides["crf"] = crf
+        cli_candidates.append((("--crf",), ["encoding", "crf"], crf))
     if encoder_preset is not None:
-        encoding_overrides["preset"] = encoder_preset
-    if encoding_overrides:
-        merged = dict(config.get("encoding", default={}) or {})
-        merged.update(encoding_overrides)
-        config.set(merged, "encoding")
-
+        cli_candidates.append((("--encoder-preset",), ["encoding", "preset"], encoder_preset))
     if hwaccel is not None:
-        config.set(hwaccel, "ffmpeg", "hwaccel")
-
+        cli_candidates.append((("--hwaccel",), ["ffmpeg", "hwaccel"], hwaccel))
     if gpu_device is not None:
-        config.set(gpu_device, "gpu", "preferred_device")
-
+        cli_candidates.append((("--gpu-device",), ["gpu", "preferred_device"], gpu_device))
     if scene_mode is not None:
-        config.set(scene_mode, "scenes", "enabled")
-
+        cli_candidates.append(
+            (("--scene-mode", "--no-scene-mode"), ["scenes", "enabled"], scene_mode)
+        )
     if drop_non_content is not None:
-        config.set(drop_non_content, "scenes", "drop_non_content")
-
+        cli_candidates.append(
+            (
+                ("--drop-non-content", "--no-drop-non-content"),
+                ["scenes", "drop_non_content"],
+                drop_non_content,
+            )
+        )
     if crop_limit is not None:
-        config.set(crop_limit, "stages", "crop", "limit")
-
+        cli_candidates.append((("--crop-limit",), ["stages", "crop", "limit"], crop_limit))
     if zoom_coverage is not None:
-        config.set(zoom_coverage, "stages", "stabilize", "zoom_coverage")
-
+        cli_candidates.append(
+            (("--zoom-coverage",), ["stages", "stabilize", "zoom_coverage"], zoom_coverage)
+        )
     if batch_size is not None:
         for _stage_name in ("upscale", "deblock", "denoise_video"):
-            config.set(batch_size, "stages", _stage_name, "batch_size")
-
+            cli_candidates.append(
+                (("--batch-size",), ["stages", _stage_name, "batch_size"], batch_size)
+            )
     if tile_batch_size is not None:
         for _stage_name in ("upscale", "deblock", "denoise_video"):
-            config.set(tile_batch_size, "stages", _stage_name, "tile_batch_size")
-
+            cli_candidates.append(
+                (
+                    ("--tile-batch-size",),
+                    ["stages", _stage_name, "tile_batch_size"],
+                    tile_batch_size,
+                )
+            )
     for stage_name in enable_stages:
-        config.set(True, "stages", stage_name, "enabled")
+        cli_candidates.append((("--enable-stage",), ["stages", stage_name, "enabled"], True))
     for stage_name in disable_stages:
-        config.set(False, "stages", stage_name, "enabled")
+        cli_candidates.append((("--disable-stage",), ["stages", stage_name, "enabled"], False))
+    for raw in set_overrides:
+        key_path, value = _parse_set_option(raw)
+        cli_candidates.append((("--set",), key_path, value))
 
-    # Re-log the effective settings now that the preset (if any) and every
-    # CLI override above have been merged in -- the group-level log in
-    # main() only reflects the config as loaded from disk, before any of
-    # this command's own overrides.
+    # Order these entries. When the argv scan above is trustworthy, sort by
+    # each entry's actual command-line position -- repeatable flags
+    # (--enable-stage/--disable-stage/--set) are matched to their own
+    # occurrences in order, so e.g. two --set flags on the same key resolve
+    # later-wins correctly; otherwise fall back to the fixed declaration
+    # order above (each option's own internal repeat order is still
+    # preserved, just not interleaved with other flags).
+    if argv_usable:
+        _repeat_iters = {
+            "--enable-stage": iter([idx for f, _v, idx in occurrences if f == "--enable-stage"]),
+            "--disable-stage": iter([idx for f, _v, idx in occurrences if f == "--disable-stage"]),
+            "--set": iter([idx for f, _v, idx in occurrences if f == "--set"]),
+        }
+
+        def _position(flag_names: tuple[str, ...], fallback_idx: int) -> int:
+            if len(flag_names) == 1 and flag_names[0] in _repeat_iters:
+                return next(_repeat_iters[flag_names[0]], fallback_idx)
+            for flag, _v, idx in occurrences:
+                if flag in flag_names:
+                    return idx
+            return fallback_idx
+
+        positioned = [
+            (_position(flags, 10_000 + i), key_path, value)
+            for i, (flags, key_path, value) in enumerate(cli_candidates)
+        ]
+        positioned.sort(key=lambda t: t[0])
+        ordered_entries = [(key_path, value) for _pos, key_path, value in positioned]
+    else:
+        ordered_entries = [(key_path, value) for _flags, key_path, value in cli_candidates]
+
+    final_layer: dict[str, Any] = {}
+    for key_path, value in ordered_entries:
+        _set_nested(final_layer, key_path, value)
+    if final_layer:
+        config.apply_layer(final_layer, "cli-flags")
+
+    # Re-log the effective settings now that every preset/config/set/CLI
+    # layer above has been folded in -- the group-level log in main() only
+    # reflects the config as loaded from disk, before any of this command's
+    # own layers.
     _log_effective_settings(logger, config, ctx.obj.get("config_path_source"))
 
     # Collect input files
@@ -1143,30 +1444,6 @@ def _list_presets() -> None:
         table.add_row(name, preset.display_name, preset.description)
 
     console.print(table)
-
-
-def _merge_config(config: Config, data: dict) -> None:
-    """Recursively merge data into config."""
-    for key, value in data.items():
-        if isinstance(value, dict):
-            current = config.get(key, default={})
-            if isinstance(current, dict):
-                # Recursively merge nested dicts
-                _merge_config_helper(current, value)
-                config.set(current, key)
-            else:
-                config.set(value, key)
-        else:
-            config.set(value, key)
-
-
-def _merge_config_helper(target: dict, source: dict) -> None:
-    """Recursively merge source dict into target dict."""
-    for key, value in source.items():
-        if isinstance(value, dict) and key in target and isinstance(target[key], dict):
-            _merge_config_helper(target[key], value)
-        else:
-            target[key] = value
 
 
 def _on_job_complete(job, result) -> None:

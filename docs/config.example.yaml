@@ -14,8 +14,27 @@
 #
 # You do not need to list every key: Config merges whatever you provide recursively on top of
 # Config.DEFAULTS, so an empty/partial file is valid and any key you omit keeps its default.
-# A preset (-p/--preset) further overrides on top of this at run time, without persisting to
-# disk (see AGENTS.md's "Configuration" section).
+#
+# `avf process` cascades several further layers on top of this file at run time, none of which
+# persist to disk:
+#   1. Config.DEFAULTS
+#   2. this file (or whatever --config/AVF_CONFIG points at instead)
+#   3. each `process --preset NAME_OR_PATH` / `process --config PATH`, applied in the order the
+#      flags appear on the command line, interleaved (`--preset A --config B --preset C` applies
+#      A, then B, then C)
+#   4. every other config-affecting CLI flag (--fps, --crf, --enable-stage, --set KEY=VALUE, etc.),
+#      folded into ONE final layer applied LAST -- this always wins over any --preset/--config
+#      layer, even if typed earlier on the command line
+# A layer only clobbers the keys it actually specifies (recursive deep-merge) -- EXCEPT list-
+# valued keys (e.g. pipeline.default_order below, or a preset's enable_stages), which a later
+# layer REPLACES WHOLESALE, never merges element-by-element. See AGENTS.md's "Config cascade"
+# section for the full model, including how --preset disambiguates a name vs. a file path, --set's
+# YAML-scalar value parsing, and the argv-order-recovery mechanics/fallback.
+#
+# Examples:
+#   avf process in.mp4 --preset 1080p60 --set stages.upscale.ai_model=RealESRGAN_x2plus
+#   avf process in.mp4 --config extra.yaml --preset size_reduction   # preset applied AFTER extra.yaml
+#   avf process in.mp4 --preset size_reduction --config extra.yaml   # extra.yaml applied AFTER preset
 #
 # Standing rule (see AGENTS.md): any change to a config key here MUST be reflected in
 # Config.DEFAULTS in config.py, and vice versa -- keep this file and the code in sync.

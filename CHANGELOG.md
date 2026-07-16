@@ -8,6 +8,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **CSS-like config cascade for `avf process`, plus `--set KEY=VALUE`**: config now resolves as
+  an ordered stack of layers -- `Config.DEFAULTS` < the user `config.yaml` (or an explicit
+  top-level `--config`/`AVF_CONFIG` path, unchanged) < each `process --preset NAME_OR_PATH` /
+  `process --config PATH` layer, applied in the order those flags actually appear on the command
+  line (interleaved -- `--preset A --config B --preset C` applies A, then B, then C, not "both
+  presets then the config") < one final layer folding in every other config-affecting CLI flag
+  (including the new `--set`), always applied LAST regardless of where it was typed, with a
+  later-typed flag beating an earlier-typed one on conflict. Each layer deep-merges onto the
+  previous one (only clobbers the keys it specifies); list-valued keys (e.g.
+  `pipeline.default_order`, a preset's `enable_stages`) are replaced wholesale by the last layer
+  that sets them, never merged element-wise.
+  - `Config` gained `apply_layer(layer, source_label)` (module-level `deep_merge()` under the
+    hood, same merge semantics `_deep_update`/the `pipeline.default_order` occurrence-`config`
+    override already used) and a `sources` property recording every layer's label in order, for
+    DEBUG-level tracing of which layer set a given effective value. `cli.py`'s
+    `_log_effective_settings()`/preset-merge call sites and `gui/main_window.py`'s
+    `_on_preset_changed()` now go through this instead of the old bespoke `_merge_config()`
+    helper duplicated in both files (removed).
+  - `process --preset` and `process --config` are both now repeatable (`multiple=True`). `--preset`
+    accepts either a registered name or a path to a preset file (JSON, via the existing
+    `load_preset()`) -- disambiguated by a path separator, a `.yaml`/`.yml` extension, or the path
+    existing on disk. The new per-command `process --config PATH` is distinct from the existing
+    top-level `avf --config PATH process ...` flag: the top-level flag still selects *which file*
+    fills the base "user config.yaml" slot (unchanged); the new one adds an *additional* layer on
+    top of that.
+  - `--set KEY=VALUE` (repeatable): dot-notation key, value parsed as a YAML scalar (`true`/`16`/
+    `null`/quoted strings/inline lists all work). Malformed input (no `=`, empty key) is a
+    `click.BadParameter` error. Secret-looking keys (`api_key`/`token`/`password`/etc., matching
+    the same check `redact_secrets()` uses) are rejected -- config-file-only, to keep secrets out
+    of shell history.
+  - Cross-option command-line ordering (which Click itself loses -- it parses each `multiple=True`
+    option into its own tuple) is recovered via a `sys.argv` scan (`_scan_process_argv()` in
+    `cli.py`); if `sys.argv` doesn't actually correspond to the invocation being processed (e.g. a
+    programmatic `CliRunner.invoke()` call in a test) the scan is discarded and a fixed, documented
+    fallback order is used instead (all `--preset` values then all `--config` values for step 3;
+    declared-option order for step 4).
+  - See AGENTS.md's new "Config cascade" section and `docs/config.example.yaml`'s header for the
+    full model plus worked CLI examples.
 - **`pipeline.default_order` now actually drives stage order, omission, and repetition**
   (previously "informational only" -- `Pipeline.optimize_stage_order()` hardcoded the real order
   and silently ignored this config key entirely, a stale note config.py itself used to document).

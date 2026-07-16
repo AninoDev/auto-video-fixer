@@ -58,8 +58,13 @@ detection (ahash/dhash + Hamming distance) — this is what backs `avf analyze` 
 
 Config is a single `Config` object (`config.py`) merging `DEFAULTS` with a YAML file at
 `~/.config/auto-video-fixer/config.yaml` (platform-specific path via `get_config_dir()`), read
-once at construction; presets merge recursively on top without clobbering user overrides not
-present in the preset.
+once at construction. `avf process` then folds an ordered stack of further cascade layers on top
+via `Config.apply_layer()` -- each `--preset`/`--config PATH` in the order they appear on the
+command line (interleaved), then one final layer for every other config-affecting CLI flag
+(including `--set KEY=VALUE`), always applied last regardless of where it was typed. Layers deep-
+merge (a layer only clobbers the keys it specifies; list-valued keys are replaced wholesale, not
+merged element-wise) -- see AGENTS.md's "Config cascade" section for the full precedence order and
+argv-order-recovery mechanics.
 
 ## Repo hygiene note
 

@@ -2,6 +2,7 @@
 
 import os
 import re
+import sys
 from unittest.mock import patch
 
 import pytest
@@ -558,3 +559,256 @@ class TestConfigFlag:
         assert str(flag_config).replace(" ", "") in plain
         assert str(env_config).replace(" ", "") not in plain
         assert "max_concurrent_jobs':11" in plain
+
+
+class TestConfigCascadeCli:
+    """Tests for `process --config`/`--preset`/`--set` cascade layering
+    (spec: DEFAULTS < user config.yaml < interleaved --config/--preset layers
+    in argv order < the final CLI-flags layer, always last)."""
+
+    def setup_method(self):
+        self.runner = CliRunner()
+
+    @staticmethod
+    def _video(tmp_path, name="test.mp4"):
+        f = tmp_path / name
+        f.write_text("fake video")
+        return f
+
+    def test_process_config_layer_applies_on_top_of_base(self, tmp_path):
+        """process --config PATH merges that file's values as a layer."""
+        layer = tmp_path / "layer.yaml"
+        layer.write_text("general:\n  max_concurrent_jobs: 42\n")
+        test_file = self._video(tmp_path)
+
+        result = self.runner.invoke(
+            main, ["process", str(test_file), "--config", str(layer), "--dry-run"]
+        )
+
+        assert result.exit_code == 0
+        assert "max_concurrent_jobs':42" in _plain(result.output)
+
+    def test_process_config_layer_missing_file_errors(self, tmp_path):
+        missing = tmp_path / "nope.yaml"
+        test_file = self._video(tmp_path)
+
+        result = self.runner.invoke(
+            main, ["process", str(test_file), "--config", str(missing), "--dry-run"]
+        )
+
+        assert result.exit_code != 0
+        assert "not found" in result.output.lower()
+
+    def test_preset_by_name(self, tmp_path):
+        test_file = self._video(tmp_path)
+        result = self.runner.invoke(
+            main, ["process", str(test_file), "--preset", "size_reduction", "--dry-run"]
+        )
+        assert result.exit_code == 0
+        # size_reduction sets encoding.crf=28.
+        assert "crf':28" in _plain(result.output)
+
+    def test_preset_by_path(self, tmp_path):
+        from autovideofixer.core.presets import Preset, save_preset
+
+        preset = Preset(
+            name="custom_from_path",
+            display_name="Custom",
+            video_codec="libx264",
+            audio_codec="aac",
+            crf=7,
+        )
+        preset_path = save_preset(preset, str(tmp_path / "custom_preset.json"))
+        test_file = self._video(tmp_path)
+
+        result = self.runner.invoke(
+            main, ["process", str(test_file), "--preset", preset_path, "--dry-run"]
+        )
+
+        assert result.exit_code == 0
+        assert "crf':7" in _plain(result.output)
+
+    def test_preset_by_path_missing_file_errors(self, tmp_path):
+        test_file = self._video(tmp_path)
+        missing_preset = str(tmp_path / "does_not_exist.json")
+
+        result = self.runner.invoke(
+            main, ["process", str(test_file), "--preset", missing_preset, "--dry-run"]
+        )
+
+        assert result.exit_code != 0
+
+    def test_preset_setting_arbitrary_keys_not_just_stages(self, tmp_path):
+        """A --config layer (standing in for 'a preset may set any key') can
+        set a top-level key that isn't under stages/encoding/quality."""
+        layer = tmp_path / "layer.yaml"
+        layer.write_text("gpu:\n  vulkan_device: 3\n")
+        test_file = self._video(tmp_path)
+
+        result = self.runner.invoke(
+            main, ["process", str(test_file), "--config", str(layer), "--dry-run"]
+        )
+
+        assert result.exit_code == 0
+        assert "vulkan_device':3" in _plain(result.output)
+
+    def test_interleaved_preset_config_order_from_argv(self, tmp_path, monkeypatch):
+        """--config X --preset Y and --preset Y --config X must produce
+        different results when both set the same key -- true command-line
+        order wins, not Click's own per-option grouping."""
+        layer = tmp_path / "layer.yaml"
+        layer.write_text("encoding:\n  crf: 5\n")
+        test_file = self._video(tmp_path)
+
+        args_config_then_preset = [
+            "process",
+            str(test_file),
+            "--config",
+            str(layer),
+            "--preset",
+            "size_reduction",
+            "--dry-run",
+        ]
+        monkeypatch.setattr(sys, "argv", ["avf", *args_config_then_preset])
+        result1 = self.runner.invoke(main, args_config_then_preset)
+        assert result1.exit_code == 0
+        # preset (crf=28) applied AFTER the config layer (crf=5) -> preset wins.
+        assert "crf':28" in _plain(result1.output)
+
+        args_preset_then_config = [
+            "process",
+            str(test_file),
+            "--preset",
+            "size_reduction",
+            "--config",
+            str(layer),
+            "--dry-run",
+        ]
+        monkeypatch.setattr(sys, "argv", ["avf", *args_preset_then_config])
+        result2 = self.runner.invoke(main, args_preset_then_config)
+        assert result2.exit_code == 0
+        # config layer (crf=5) applied AFTER the preset (crf=28) -> config wins.
+        assert "crf':5" in _plain(result2.output)
+
+    def test_cli_flags_always_last_even_when_typed_before_preset(self, tmp_path):
+        test_file = self._video(tmp_path)
+        result = self.runner.invoke(
+            main,
+            ["process", str(test_file), "--crf", "99", "--preset", "size_reduction", "--dry-run"],
+        )
+        assert result.exit_code == 0
+        # --crf was typed BEFORE --preset, but the CLI-flags layer always
+        # applies last, so it beats the preset's own crf=28.
+        assert "crf':99" in _plain(result.output)
+
+    def test_later_cli_flag_beats_earlier_conflicting_one(self, tmp_path, monkeypatch):
+        test_file = self._video(tmp_path)
+
+        args_crf_then_set = [
+            "process",
+            str(test_file),
+            "--crf",
+            "10",
+            "--set",
+            "encoding.crf=20",
+            "--dry-run",
+        ]
+        monkeypatch.setattr(sys, "argv", ["avf", *args_crf_then_set])
+        result1 = self.runner.invoke(main, args_crf_then_set)
+        assert result1.exit_code == 0
+        assert "crf':20" in _plain(result1.output)
+
+        args_set_then_crf = [
+            "process",
+            str(test_file),
+            "--set",
+            "encoding.crf=20",
+            "--crf",
+            "10",
+            "--dry-run",
+        ]
+        monkeypatch.setattr(sys, "argv", ["avf", *args_set_then_crf])
+        result2 = self.runner.invoke(main, args_set_then_crf)
+        assert result2.exit_code == 0
+        assert "crf':10" in _plain(result2.output)
+
+    def test_set_scalar_parsing(self, tmp_path):
+        test_file = self._video(tmp_path)
+        result = self.runner.invoke(
+            main,
+            [
+                "process",
+                str(test_file),
+                "--set",
+                "general.max_concurrent_jobs=7",
+                "--set",
+                "general.overwrite=true",
+                "--set",
+                "stages.crop.analyze_duration_sec=null",
+                "--set",
+                "quality.quality_target.target_resolution=[1920,1080]",
+                "--dry-run",
+            ],
+        )
+        assert result.exit_code == 0
+        plain = _plain(result.output)
+        assert "max_concurrent_jobs':7" in plain
+        assert "overwrite':True" in plain
+        assert "analyze_duration_sec':None" in plain
+        assert "target_resolution':[1920,1080]" in plain
+
+    def test_set_nested_key_creation(self, tmp_path):
+        test_file = self._video(tmp_path)
+        result = self.runner.invoke(
+            main,
+            ["process", str(test_file), "--set", "custom.new.key=5", "--dry-run"],
+        )
+        assert result.exit_code == 0
+        assert "custom" in _plain(result.output)
+        assert "'key':5" in _plain(result.output)
+
+    def test_set_secret_key_rejected(self, tmp_path):
+        test_file = self._video(tmp_path)
+        result = self.runner.invoke(
+            main,
+            [
+                "process",
+                str(test_file),
+                "--set",
+                "analysis.vlm.api_key=sk-supersecret",
+                "--dry-run",
+            ],
+        )
+        assert result.exit_code != 0
+        assert "config-file-only" in result.output
+        assert "sk-supersecret" not in result.output
+
+    def test_set_malformed_no_equals_errors(self, tmp_path):
+        test_file = self._video(tmp_path)
+        result = self.runner.invoke(
+            main, ["process", str(test_file), "--set", "noequalshere", "--dry-run"]
+        )
+        assert result.exit_code != 0
+
+    def test_set_malformed_empty_key_errors(self, tmp_path):
+        test_file = self._video(tmp_path)
+        result = self.runner.invoke(
+            main, ["process", str(test_file), "--set", "=value", "--dry-run"]
+        )
+        assert result.exit_code != 0
+
+    def test_wholesale_list_replacement_via_set(self, tmp_path):
+        """A --set on a list-valued key replaces the whole list, not element-wise."""
+        test_file = self._video(tmp_path)
+        result = self.runner.invoke(
+            main,
+            [
+                "process",
+                str(test_file),
+                "--set",
+                "pipeline.default_order=[detect,encode]",
+                "--dry-run",
+            ],
+        )
+        assert result.exit_code == 0
+        assert "default_order':['detect','encode']" in _plain(result.output)

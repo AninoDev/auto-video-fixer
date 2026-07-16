@@ -596,6 +596,14 @@ class Config:
             raise FileNotFoundError(f"Config file not found: {self._path}")
         self._data = self._merge()
         self._save_pending = False
+        # Ordered record of every layer folded into `self._data` so far, for
+        # DEBUG logging / diagnostics -- see `apply_layer()`. The base two
+        # layers (DEFAULTS, and the user config.yaml if it was found on disk)
+        # are recorded here; every subsequent cascade layer (--preset,
+        # --config, --set, other CLI flags) is appended via apply_layer().
+        self._sources: list[str] = ["defaults"]
+        if self._path.exists():
+            self._sources.append(f"user-config:{self._path}")
 
     def _merge(self) -> dict[str, Any]:
         merged = self._deep_copy(self.DEFAULTS)
@@ -628,6 +636,38 @@ class Config:
         `config:` key).
         """
         deep_merge(base, override, _path)
+
+    def apply_layer(self, layer: dict[str, Any], source_label: str) -> None:
+        """Deep-merge an additional cascade layer onto the current config data.
+
+        Used by CLI/GUI callers to fold in each `--preset`/`--config PATH` layer
+        (in the order they should apply -- see AGENTS.md's "Config cascade"
+        section) and the final CLI-flags layer, on top of the DEFAULTS + user
+        config.yaml base already loaded by `__init__`. A layer only clobbers the
+        keys it actually specifies (`deep_merge()` semantics) -- list-valued
+        keys (e.g. `pipeline.default_order`) are replaced wholesale, not
+        element-wise merged.
+
+        `source_label` is a short human-readable tag for this layer (e.g.
+        `"preset:1080p60"`, `"config:/path/to/extra.yaml"`, `"cli-flags"`) --
+        recorded in `self.sources` and logged at DEBUG (redacted) so a run's
+        effective config can be traced back to the layer that set each value.
+        """
+        from autovideofixer.logger import get_logger
+
+        deep_merge(self._data, layer)
+        self._sources.append(source_label)
+        get_logger("autovideofixer.config").debug(
+            "Applied config layer %r (stack so far: %s): %s",
+            source_label,
+            self._sources,
+            redact_secrets(layer),
+        )
+
+    @property
+    def sources(self) -> list[str]:
+        """Ordered labels of every layer folded into this Config so far."""
+        return list(self._sources)
 
     def get(self, *keys: str, default: Any = None) -> Any:
         node = self._data

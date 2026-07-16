@@ -208,3 +208,86 @@ class TestDiffFromDefaults:
         data["general"] = {**data["general"], "max_concurrent_jobs": 8}
         diff = diff_from_defaults(data, Config.DEFAULTS)
         assert diff == {"general": {"max_concurrent_jobs": 8}}
+
+
+class TestConfigCascadeLayers:
+    """Tests for Config.apply_layer() / the cascade-layer mechanism (spec:
+    DEFAULTS < user config.yaml < explicit --config/--preset layers, in
+    argv order < the final CLI-flags layer)."""
+
+    def test_apply_layer_folds_onto_existing_data(self, tmp_path):
+        config = Config(tmp_path / "nonexistent.yaml")
+        config.apply_layer({"general": {"max_concurrent_jobs": 5}}, "layer1")
+        assert config.get("general", "max_concurrent_jobs") == 5
+        # Sibling keys under "general" are untouched (deep-merge, not replace).
+        assert config.get("general", "output_container") == "mp4"
+
+    def test_layer_fold_order_defaults_lt_user_lt_layer1_lt_layer2(self, tmp_path):
+        config_path = tmp_path / "config.yaml"
+        with open(config_path, "w") as f:
+            yaml.dump({"general": {"max_concurrent_jobs": 2}}, f)
+
+        config = Config(config_path)
+        assert config.get("general", "max_concurrent_jobs") == 2  # user yaml beat DEFAULTS (1)
+
+        config.apply_layer({"general": {"max_concurrent_jobs": 3}}, "layer1")
+        assert config.get("general", "max_concurrent_jobs") == 3  # layer1 beat user yaml
+
+        config.apply_layer({"general": {"max_concurrent_jobs": 4}}, "layer2")
+        assert config.get("general", "max_concurrent_jobs") == 4  # layer2 beat layer1
+
+    def test_layer_only_clobbers_keys_it_specifies(self, tmp_path):
+        config = Config(tmp_path / "nonexistent.yaml")
+        config.apply_layer({"stages": {"upscale": {"scale_factor": 8}}}, "layer1")
+        assert config.get("stages", "upscale", "scale_factor") == 8
+        # Untouched sibling key under stages.upscale survives.
+        assert config.get("stages", "upscale", "ai_model") == "RealESRGAN_x4plus"
+
+    def test_wholesale_list_replacement(self, tmp_path):
+        """A later layer's list-valued key fully replaces the earlier one's --
+        no element-wise merging."""
+        config = Config(tmp_path / "nonexistent.yaml")
+        config.apply_layer({"pipeline": {"default_order": ["detect", "encode"]}}, "layer1")
+        assert config.get("pipeline", "default_order") == ["detect", "encode"]
+
+        config.apply_layer({"pipeline": {"default_order": ["encode"]}}, "layer2")
+        assert config.get("pipeline", "default_order") == ["encode"]
+
+    def test_sources_records_each_layer_label(self, tmp_path):
+        config_path = tmp_path / "config.yaml"
+        with open(config_path, "w") as f:
+            yaml.dump({"general": {"max_concurrent_jobs": 2}}, f)
+
+        config = Config(config_path)
+        assert config.sources == ["defaults", f"user-config:{config_path}"]
+
+        config.apply_layer({}, "preset:1080p60")
+        config.apply_layer({}, "config:/tmp/extra.yaml")
+        assert config.sources == [
+            "defaults",
+            f"user-config:{config_path}",
+            "preset:1080p60",
+            "config:/tmp/extra.yaml",
+        ]
+
+    def test_sources_omits_user_config_when_absent(self, tmp_path):
+        config = Config(tmp_path / "nonexistent.yaml")
+        assert config.sources == ["defaults"]
+
+    def test_apply_layer_can_set_arbitrary_top_level_keys(self, tmp_path):
+        """A layer (e.g. a preset) may set ANY config key, not just stage keys."""
+        config = Config(tmp_path / "nonexistent.yaml")
+        config.apply_layer({"encoding": {"video_codec": "libx265"}}, "layer1")
+        assert config.get("encoding", "video_codec") == "libx265"
+
+    def test_apply_layer_logs_at_debug_with_secrets_redacted(self, tmp_path, caplog):
+        import logging
+
+        config = Config(tmp_path / "nonexistent.yaml")
+        with caplog.at_level(logging.DEBUG, logger="autovideofixer.config"):
+            config.apply_layer(
+                {"analysis": {"vlm": {"api_key": "sk-supersecret"}}}, "config:/tmp/extra.yaml"
+            )
+        joined = "\n".join(r.getMessage() for r in caplog.records)
+        assert "sk-supersecret" not in joined
+        assert "***" in joined

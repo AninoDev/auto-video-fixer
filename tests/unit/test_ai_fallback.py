@@ -297,23 +297,30 @@ class TestAiFallbackCli:
 
     def test_flag_beats_config_default(self, tmp_path, monkeypatch):
         """--no-ai-fallback must override general.ai_fallback even when the
-        loaded config file has it enabled."""
+        loaded config file has it enabled.
+
+        CLI flags are folded into a "cli-flags" cascade layer via
+        Config.apply_layer() (not per-key Config.set() calls -- see
+        AGENTS.md's "Config cascade" section), so this spies on apply_layer
+        and inspects the effective config after every layer has been applied,
+        rather than a single .set() call for this specific key.
+        """
         config_path = tmp_path / "config.yaml"
         config_path.write_text("general:\n  ai_fallback: true\n")
         monkeypatch.setenv("AVF_CONFIG", str(config_path))
 
         captured = {}
-        real_config_set = Config.set
+        real_apply_layer = Config.apply_layer
 
-        def spy_set(self, value, *keys):
-            if keys == ("general", "ai_fallback"):
-                captured["value"] = value
-            return real_config_set(self, value, *keys)
+        def spy_apply_layer(self, layer, source_label):
+            real_apply_layer(self, layer, source_label)
+            if source_label == "cli-flags":
+                captured["value"] = self.get("general", "ai_fallback")
 
         test_file = tmp_path / "test.mp4"
         test_file.write_text("fake video")
 
-        with patch.object(Config, "set", spy_set):
+        with patch.object(Config, "apply_layer", spy_apply_layer):
             result = self.runner.invoke(
                 main, ["process", str(test_file), "--no-ai-fallback", "--dry-run"]
             )

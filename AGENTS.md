@@ -527,9 +527,77 @@ is already 2x and a genuine sub-2x need this close to target isn't worth a full 
   explicitly-given path (flag or env var) is a **hard error** if it doesn't exist — no silent
   no-op.
 - Config is read-once at `Config()` construction; `config.set()` marks dirty and `config.save()` writes YAML.
-- Preset merging is recursive — preset values override config, but config values not in preset are preserved.
 - A full, commented example covering every `Config.DEFAULTS` key lives at
   `docs/config.example.yaml`.
+
+### Config cascade
+
+`avf process` builds its effective config as an ordered stack of layers, each deep-merged
+(`config.py`'s module-level `deep_merge()`, exposed as `Config.apply_layer(layer, source_label)`)
+onto the previous one — a layer only clobbers the keys it actually specifies; keys it doesn't
+mention keep whatever the earlier layers set. **List-valued keys are the one exception**: a list
+(e.g. `pipeline.default_order`, a preset's `enable_stages`) is replaced **wholesale** by the last
+layer that sets it, never merged element-by-element.
+
+1. **`Config.DEFAULTS`** (`config.py`).
+2. **The user config file** — `~/.config/auto-video-fixer/config.yaml` by default, or whatever
+   the top-level `avf --config PATH` flag / `AVF_CONFIG` env var points at instead (unchanged from
+   before this feature: this step decides *which file* fills the "user config" slot, not an
+   additional layer on top of it). Unlike the default path (silently falls back to
+   `Config.DEFAULTS` if missing), an explicitly-given path (flag or env var) is a **hard error** if
+   it doesn't exist — no silent no-op. Precedence: `--config` flag > `AVF_CONFIG` env var > default
+   platform path.
+3. **Each `process --preset NAME_OR_PATH` / `process --config PATH` layer**, applied in the order
+   the flags actually appear on the command line, interleaved (`--preset A --config B --preset C`
+   applies A, then B, then C — not "both presets, then the config", which is what Click's own
+   per-option parsing would otherwise give you). Both flags are repeatable. This `process --config
+   PATH` is a *different* flag from the top-level one in step 2 — it adds a layer on top of
+   whatever step 2 already loaded, rather than choosing which file step 2 itself uses; it's a hard
+   error if the path doesn't exist or isn't a YAML mapping. `--preset` accepts either a registered
+   preset name (`get_preset()`) or a path to a preset file (`load_preset()`, JSON — see
+   `save_preset()`/`load_preset()` in `presets.py`); disambiguated by: contains a path separator,
+   ends in `.yaml`/`.yml`, or the path exists on disk — otherwise treated as a name, and an unknown
+   name is an error.
+4. **Every other CLI option that maps to a config key** (`--threads`, `--ai`/`--no-ai`,
+   `--fps`, `--resolution`, `--codec`/`--audio-codec`/`--crf`/`--encoder-preset`, `--hwaccel`,
+   `--gpu-device`, `--scene-mode`, `--drop-non-content`, `--crop-limit`, `--zoom-coverage`,
+   `--batch-size`/`--tile-batch-size`, `--enable-stage`/`--disable-stage`, and `--set
+   KEY=VALUE`), folded into **one** final layer applied **last** — this layer always wins over
+   every `--preset`/`--config` layer, *even if the CLI flag was typed before them on the command
+   line* (e.g. `avf process in.mp4 --crf 99 --preset size_reduction` still ends up with `crf: 99`,
+   not the preset's `crf: 28`). Within this final layer, when two different flags target the same
+   key (e.g. `--crf` and `--set encoding.crf=...`), the one that appears **later on the command
+   line** wins — recovered the same way as step 3's interleaving, via a `sys.argv` scan
+   (`cli.py`'s `_scan_process_argv()`/`_repeatable_matches()`). Purely operational flags that don't
+   map to a config key (`--output-name`, `--recursive`, `--dry-run`, `--list-presets`, `--stage`)
+   are unaffected by this layering — they're consumed directly by `process()` as before.
+   - **`--set KEY=VALUE`** (repeatable): `KEY` is dot-notation (e.g.
+     `stages.upscale.ai_model=RealESRGAN_x2plus`), creating intermediate mappings as needed.
+     `VALUE` is parsed as a YAML scalar (`yaml.safe_load`), so `true`/`16`/`null`/quoted strings/
+     inline lists (`[a,b]`) all work. Malformed input (no `=`, or an empty key) is a
+     `click.BadParameter` error. **Security**: a key containing `api_key`/`apikey`/`token`/
+     `password`/`secret` (case-insensitive — the same `_looks_like_secret_key()` check
+     `redact_secrets()` uses) is rejected with an error telling the user to put it in `config.yaml`
+     instead — keeps secrets out of shell history.
+
+Both the group-level `sys.argv` scan (step 3/4's ordering recovery) require `sys.argv` to actually
+reflect the invocation being processed — true for a real CLI invocation, but **not** true for a
+programmatic `CliRunner.invoke(main, [...])` call in a test, whose `sys.argv` is the test runner's
+own. When the scan can't find `"process"` in `sys.argv`, or what it *did* find doesn't exactly
+match what Click parsed (count and values), the whole scan is discarded and a fixed fallback order
+is used instead: step 3 falls back to "all `--preset` values, then all `--config` values" (Click's
+own per-option order, cross-option interleaving lost); step 4 falls back to a fixed declaration
+order matching the option list above. Tests exercising true argv-order behavior must
+`monkeypatch.setattr(sys, "argv", ["avf", "process", ...])` with the exact args passed to
+`CliRunner.invoke()` — see `tests/unit/test_cli.py::TestConfigCascadeCli` for the pattern.
+
+`Config.apply_layer(layer, source_label)` records `source_label` in `config.sources` (e.g.
+`"defaults"`, `"user-config:/path"`, `"preset:1080p60"`, `"config:/path/extra.yaml"`,
+`"cli-flags"`) and logs the layer stack plus the layer's own (redacted) contents at DEBUG on every
+call — useful for tracing which layer set a given effective value. The GUI (`gui/main_window.py`'s
+`_on_preset_changed()`) uses the identical `config.apply_layer(preset.to_config(),
+f"preset:{name}")` call when a preset is selected from the dropdown, mutating `self.config` in
+place (never reassigning it — `self.pipeline` holds the same object by reference).
 
 ## Gotchas
 
@@ -759,7 +827,17 @@ Global (before the subcommand):
   must already exist (hard error if not)
 
 `avf process`:
-- `--preset, -p NAME`: Apply preset (e.g., `1080p60`, `4k60`, `size_reduction`)
+- `--preset, -p NAME_OR_PATH`: Apply a preset by registered name or a path to a preset file
+  (can repeat — see "Config cascade" above for the interleaved `--preset`/`--config` layer order
+  and name-vs-path disambiguation)
+- `--config PATH`: Merge an additional config file on top of the base config as its own layer
+  (can repeat, interleaved with `--preset` in command-line order — see "Config cascade" above;
+  NOT the same as the top-level `avf --config PATH process ...` flag, which selects the base
+  config file itself)
+- `--set KEY=VALUE`: Set a config key directly via dot-notation (e.g.
+  `stages.upscale.ai_model=RealESRGAN_x2plus`), value parsed as a YAML scalar (can repeat; see
+  "Config cascade" above — always applied as part of the final CLI-flags layer, secret-looking
+  keys rejected)
 - `--output, -o DIR`: Output directory
 - `--output-name NAME`: Explicit output filename (only valid with exactly one input file)
 - `--recursive, -r`: Scan directories recursively

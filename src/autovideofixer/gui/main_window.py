@@ -33,29 +33,6 @@ from autovideofixer.core.pipeline import Job, JobResult, Pipeline
 from autovideofixer.core.presets import get_preset, list_presets
 
 
-def _merge_config(config: Config, data: dict) -> None:
-    """Recursively merge data into config in place (mirrors cli.py's merge)."""
-    for key, value in data.items():
-        if isinstance(value, dict):
-            current = config.get(key, default={})
-            if isinstance(current, dict):
-                _merge_config_helper(current, value)
-                config.set(current, key)
-            else:
-                config.set(value, key)
-        else:
-            config.set(value, key)
-
-
-def _merge_config_helper(target: dict, source: dict) -> None:
-    """Recursively merge source dict into target dict."""
-    for key, value in source.items():
-        if isinstance(value, dict) and key in target and isinstance(target[key], dict):
-            _merge_config_helper(target[key], value)
-        else:
-            target[key] = value
-
-
 class ProcessingThread(QThread):
     """Background thread for pipeline execution."""
 
@@ -315,11 +292,13 @@ class MainWindow(QMainWindow):
         """Apply preset configuration (in memory only, not persisted)."""
         preset = get_preset(preset_name)
         if preset:
-            config_data = preset.to_config()
             # Mutate self.config in place (do NOT reassign it) - self.pipeline
             # holds a reference to this same Config object, so replacing
-            # self.config here would silently desync the two.
-            _merge_config(self.config, config_data)
+            # self.config here would silently desync the two. apply_layer()
+            # deep-merges the preset dict onto the current config data --
+            # same cascade layer mechanism `avf process --preset` uses (see
+            # AGENTS.md's "Config cascade" section).
+            self.config.apply_layer(preset.to_config(), f"preset:{preset_name}")
 
     def _on_browse_output(self) -> None:
         """Browse for output directory."""
