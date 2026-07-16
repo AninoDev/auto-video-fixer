@@ -8,6 +8,7 @@ import tempfile
 import time
 from typing import Any
 
+from autovideofixer.config import resolve_timeout
 from autovideofixer.core.ffmpeg_utils import run_ffmpeg
 from autovideofixer.core.stages.base import BaseStage, StageResult, StageStatus
 
@@ -44,7 +45,22 @@ class StabilizeStage(BaseStage):
         self._sharpen_enabled = self._stage_config.get("sharpen_enabled", True)
         self._optalgo = self._stage_config.get("optalgo", "gauss")
         self._shakiness = self._stage_config.get("shakiness", 10)
-        self._pipe_timeout = self._stage_config.get("pipe_timeout", 1800)
+        # pipe_timeout guards the decode/transform pipe's whole-video wait
+        # (see execute()'s decode_proc/transform_proc.wait() calls below) --
+        # it's a stage-specific override of the same resolved timeout the
+        # rest of this stage's main passes use, not an independent fixed
+        # default: explicit stages.stabilize.pipe_timeout wins when set
+        # (still going through resolve_timeout()'s null/0-means-unlimited
+        # semantics), otherwise it falls back to stage_timeout() (stage ->
+        # global -> None/unlimited), matching every other main-pass timeout
+        # in this codebase instead of a bespoke hardcoded 1800.
+        pipe_timeout_override = self._stage_config.get("pipe_timeout", None)
+        if pipe_timeout_override is not None:
+            self._pipe_timeout = resolve_timeout(
+                pipe_timeout_override, "stages.stabilize.pipe_timeout"
+            )
+        else:
+            self._pipe_timeout = self.stage_timeout()
 
         self.logger.debug(
             f"StabilizeStage initialized: smoothness={self._smoothness}, "
@@ -553,7 +569,7 @@ class StabilizeStage(BaseStage):
                 "null",
                 "-",
             ]
-            det_result = run_ffmpeg(detection_args, timeout=300)
+            det_result = run_ffmpeg(detection_args, timeout=self.stage_timeout())
 
             if det_result.returncode != 0:
                 return StageResult(
@@ -600,7 +616,12 @@ class StabilizeStage(BaseStage):
                 self._report_progress(
                     1.0, f"No stabilization needed (avg: {avg_value:.3f})", progress_callback
                 )
-                # Skip stabilization, just copy the input
+                # Skip stabilization, just copy the input. This is effectively
+                # the stage's alternate "main pass" output when no
+                # stabilization is needed (a whole-video stream copy, not a
+                # bounded probe/sample), so it uses the same resolved timeout
+                # as the real transform pass below rather than a small fixed
+                # value.
                 run_ffmpeg(
                     [
                         "-hide_banner",
@@ -611,7 +632,7 @@ class StabilizeStage(BaseStage):
                         "-y",
                         output_path,
                     ],
-                    timeout=120,
+                    timeout=self.stage_timeout(),
                 )
                 return StageResult(
                     status=StageStatus.COMPLETED,

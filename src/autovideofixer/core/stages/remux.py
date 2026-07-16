@@ -75,7 +75,7 @@ class RemuxStage(BaseStage):
             def cb(p, m):
                 self._report_progress(0.5 + p * 0.5, m, progress_callback)
 
-            result = run_ffmpeg(args, progress_callback=cb, timeout=300)
+            result = run_ffmpeg(args, progress_callback=cb, timeout=self.stage_timeout())
 
             if result.returncode != 0:
                 if in_place and os.path.exists(dest):

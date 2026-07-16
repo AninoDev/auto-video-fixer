@@ -599,6 +599,67 @@ call — useful for tracing which layer set a given effective value. The GUI (`g
 f"preset:{name}")` call when a preset is selected from the dropdown, mutating `self.config` in
 place (never reassigning it — `self.pipeline` holds the same object by reference).
 
+## Stage/quality ffmpeg timeouts
+
+Most `run_ffmpeg()` calls that used to hardcode `timeout=600`/`1800`/`3600` (a whole-video
+pass's wall-clock cap) now resolve a configurable, null-means-unlimited timeout instead —
+real-world long inputs legitimately exceed any fixed cap on a whole-video pass; a genuine hang
+should surface as an external job runner/OS-level inactivity timeout, not an arbitrary
+per-run number baked into this codebase.
+
+- **`pipeline.stage_timeout`** (`config.py` DEFAULTS): the global default timeout (seconds) for
+  a stage's MAIN ffmpeg processing/mux pass(es). `null` (default) = unlimited.
+- **`stages.<name>.timeout`**: per-stage override, absent by default (falls back to
+  `pipeline.stage_timeout`).
+- **Resolution**: `BaseStage.stage_timeout()` (`core/stages/base.py`) resolves
+  `stages.<name>.timeout` → `pipeline.stage_timeout` → `None`, via the shared
+  `resolve_timeout(value, key)` helper in `config.py`. Semantics at every level: `null`/absent
+  or `0` → `None` (unlimited); a positive number → seconds; negative/non-numeric → `ValueError`
+  raised *at the point the stage resolves its timeout* ("at use time"), not eagerly at
+  config-load time. Stages pass the result straight to `run_ffmpeg(..., timeout=...)`, which
+  accepts `None` (`subprocess.Popen.wait(timeout=None)` blocks indefinitely — no special-cased
+  branch needed in `run_ffmpeg()` itself).
+- **Per-occurrence override**: no new machinery — a `pipeline.default_order` mapping entry's
+  existing `config: {timeout: 1200}` deep-merges onto `stages.<name>` for that occurrence only
+  (via `BaseStage.__init__`'s `overrides` param, same mechanism every other per-occurrence
+  config key already uses), and `stage_timeout()` reads it from `self._stage_config` like any
+  other key. See `docs/config.example.yaml`'s `pipeline.default_order` section for a worked
+  example.
+- **`quality.timeout`**: `core/quality.py`'s `estimate_quality_vmaf()`/`estimate_ssim_psnr()`
+  (the whole-video VMAF/SSIM comparison pass behind `Pipeline.execute_job()`'s post-job quality
+  gate) aren't stages, so they get their own config key with identical null-unlimited
+  semantics, resolved via the same `resolve_timeout()` helper and passed as an explicit
+  `timeout=` param (these are plain functions with no `Config` access of their own —
+  `Pipeline.execute_job()` resolves `quality.timeout` and passes it through).
+- **Scene mode** (`core/scenes.py`): the per-scene split/concat/mux helpers (whole-video-scale
+  work, previously fixed at 300/600/1800s) take a `timeout` param; `run_scene_mode()` resolves
+  `pipeline.stage_timeout` once and threads it through. Per-scene stabilize/interpolate already
+  go through the stage classes and honor `stages.<name>.timeout` like any other run.
+- **CLI**: nothing new — `avf process ... --set pipeline.stage_timeout=1200` (or
+  `--set stages.upscale.timeout=1200`, `--set quality.timeout=900`) already works via the
+  existing `--set KEY=VALUE` cascade layer (see "Config cascade" above).
+- **Deliberately KEPT at small fixed timeouts** (not wired to the above — a hang here indicates
+  real breakage, not a long input): probes (`ffmpeg_utils.probe()`, 120s), hwaccel detection
+  (`detect_hardware_acceleration()`, 10s), `crop.py`'s VLM-check single-frame extracts and its
+  `should_run()` quick cropdetect sample (60s), `stabilize.py`'s `_detect_scenes()` 1fps frame
+  extraction for scene-change analysis (120s), `normalize_audio.py`'s loudnorm first-pass
+  loudness *measurement* (300s — the `-vn -sn -dn -f null -` analysis pass, not the actual
+  audio-encode pass, which IS configurable), and `core/analysis.py`'s `extract_clip()` (300s —
+  bounded by one scene's duration, not the whole video). `core/analysis.py` has no other
+  hardcoded whole-video-pass timeout to wire up (only that one `run_ffmpeg()` call site exists
+  in that module; its VLM/HTTP `urllib.request.urlopen()` timeouts are unrelated network
+  request budgets, not ffmpeg passes).
+- **Wired to the resolved timeout** (every stage's main processing/mux pass, including
+  multi-pass/chunked ones): `upscale`, `deblock`, `denoise_video` (traditional pass + AI mux),
+  `interpolate` (traditional single/chunked passes, chunk concat, final mux, AI/RIFE mux),
+  `encode`, `speed`, `hdr`, `remux`, `normalize_audio` (the actual normalization pass, not the
+  measurement pass above), `crop` (the real whole-scan `cropdetect` in `execute()`, and the
+  final crop encode), and `stabilize` (the `vidstabdetect` shake-detection pass, the
+  no-stabilization-needed passthrough copy, and the decode/transform pipe's `pipe_timeout` —
+  see `stages.stabilize.pipe_timeout` in `docs/config.example.yaml`, which now falls back to
+  this stage's own resolved timeout instead of a bespoke hardcoded `1800` when not explicitly
+  set).
+
 ## Gotchas
 
 - **stabilize.py `_get_video_dimensions` / `_get_video_framerate`**: Must use `stdout=subprocess.PIPE` (not `subprocess.DEVNULL`). Using DEVNULL discards output and forces fallback to 1920×1080 / 30fps, stretching portrait video to landscape.

@@ -95,7 +95,7 @@ class DenoiseVideoStage(BaseStage):
         def cb(p, m):
             self._report_progress(0.3 + p * 0.7, m, progress_callback)
 
-        result = run_ffmpeg(args, progress_callback=cb, timeout=600)
+        result = run_ffmpeg(args, progress_callback=cb, timeout=self.stage_timeout())
 
         if result.returncode != 0:
             return StageResult(
@@ -337,7 +337,7 @@ class DenoiseVideoStage(BaseStage):
                 mux_args = ["-i", input_path, "-i", temp_path]
                 mux_args += ["-map", "0:a:0", "-map", "1:v:0"] if has_audio else ["-map", "1:v:0"]
                 mux_args += ["-c:v", "copy", "-c:a", "copy", "-y", output_path]
-                mux_result = run_ffmpeg(mux_args, timeout=600)
+                mux_result = run_ffmpeg(mux_args, timeout=self.stage_timeout())
 
                 if mux_result.returncode != 0:
                     return StageResult(

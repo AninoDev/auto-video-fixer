@@ -342,7 +342,7 @@ def build_hwaccel_args(hwaccel: str) -> list[str]:
 def run_ffmpeg(
     args: list[str],
     progress_callback: callable | None = None,
-    timeout: int = 3600,
+    timeout: float | None = 3600,
     capture_stderr: bool = True,
 ) -> subprocess.CompletedProcess:
     """Run an FFmpeg command with optional progress reporting.
@@ -350,7 +350,16 @@ def run_ffmpeg(
     Args:
         args: FFmpeg command arguments
         progress_callback: Optional callback(progress: float, message: str)
-        timeout: Command timeout in seconds
+        timeout: Command timeout in seconds, or ``None`` for no timeout
+            (waits indefinitely -- ``subprocess.Popen.wait(timeout=None)``
+            blocks forever rather than raising). Most stage-level callers
+            resolve this via ``BaseStage.stage_timeout()``
+            (``stages.<name>.timeout`` -> ``pipeline.stage_timeout`` ->
+            ``None``) so a fixed wall-clock cap doesn't kill legitimately
+            long real-world inputs; short genuinely-bounded helper calls
+            (probes, hwaccel detection, single-frame extraction, etc.) still
+            pass a small fixed int here. The default of 3600 only applies to
+            callers that don't pass ``timeout`` at all.
         capture_stderr: Whether to capture stderr for parsing
 
     Returns:

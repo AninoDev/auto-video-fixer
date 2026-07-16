@@ -115,6 +115,27 @@ class TestEstimateSsimPsnr:
         # This path doesn't compute VMAF - it must not be populated from PSNR.
         assert result.vmaf_score == 0.0
 
+    @patch("autovideofixer.core.quality.run_ffmpeg")
+    def test_timeout_defaults_to_none_unlimited(self, mock_run):
+        """quality.timeout's DEFAULTS value is null (unlimited) -- a caller
+        that doesn't pass timeout explicitly must not silently fall back to
+        run_ffmpeg's own historical fixed default."""
+        mock_result = MagicMock(returncode=0, stderr="")
+        mock_run.return_value = mock_result
+
+        estimate_ssim_psnr("ref.mp4", "dist.mp4")
+
+        assert mock_run.call_args.kwargs["timeout"] is None
+
+    @patch("autovideofixer.core.quality.run_ffmpeg")
+    def test_explicit_timeout_reaches_run_ffmpeg(self, mock_run):
+        mock_result = MagicMock(returncode=0, stderr="")
+        mock_run.return_value = mock_result
+
+        estimate_ssim_psnr("ref.mp4", "dist.mp4", timeout=250)
+
+        assert mock_run.call_args.kwargs["timeout"] == 250
+
     @patch("autovideofixer.core.quality.run_ffmpeg", side_effect=RuntimeError("ffmpeg failed"))
     def test_estimate_ffmpeg_error(self, mock_run):
         result = estimate_ssim_psnr("ref.mp4", "dist.mp4")

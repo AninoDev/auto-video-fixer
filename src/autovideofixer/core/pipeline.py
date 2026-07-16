@@ -898,11 +898,15 @@ class Pipeline:
         quality_mode = quality_target.get("mode", "none")
         if job_result.success and quality_mode != "none" and final_output_path:
             try:
+                from autovideofixer.config import resolve_timeout
                 from autovideofixer.core.quality import estimate_ssim_psnr
 
                 target = quality_target.get("target")
+                quality_timeout = resolve_timeout(
+                    self.config.get("quality", "timeout", default=None), "quality.timeout"
+                )
                 quality_result = estimate_ssim_psnr(
-                    job.input_path, final_output_path, target=target
+                    job.input_path, final_output_path, target=target, timeout=quality_timeout
                 )
                 if quality_result.measurement_failed:
                     # The ffmpeg comparison itself failed (e.g. couldn't determine

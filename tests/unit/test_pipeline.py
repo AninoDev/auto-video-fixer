@@ -3,6 +3,7 @@
 import os
 import tempfile
 from pathlib import Path
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -555,6 +556,34 @@ class TestResolveStageOrder:
         assert all(isinstance(s, str) for s in ordered)
         assert ordered[-1] == "encode"
 
+    def test_per_occurrence_timeout_override_reaches_run_ffmpeg(self, tmp_path):
+        """pipeline.default_order's per-occurrence ``config: {timeout: ...}``
+        (StageOrderEntry.overrides) is the ONLY new machinery the timeout
+        feature needs at the occurrence level -- BaseStage.__init__ already
+        deep-merges it onto stages.<name> for that instance. This proves the
+        override actually reaches a real stage's resolved timeout AND the
+        ffmpeg call it makes, end-to-end through resolve_stage_order() +
+        create_stage(), not just BaseStage.stage_timeout() in isolation.
+        """
+        from autovideofixer.core.stages.base import create_stage
+
+        self.config.set(
+            [{"stage": "hdr", "config": {"timeout": 1200}}],
+            "pipeline",
+            "default_order",
+        )
+        entries = self.pipeline.resolve_stage_order(["hdr"])
+        assert entries[0].overrides == {"timeout": 1200}
+
+        stage = create_stage(entries[0].name, self.config, entries[0].overrides)
+        assert stage.stage_timeout() == 1200
+
+        with patch("autovideofixer.core.ffmpeg_utils.run_ffmpeg") as mock_run_ffmpeg:
+            mock_run_ffmpeg.return_value = MagicMock(returncode=0, stderr="")
+            stage.execute("in.mp4", output_path=str(tmp_path / "out.mp4"))
+
+        assert mock_run_ffmpeg.call_args.kwargs["timeout"] == 1200
+
 
 class TestOccurrenceAwareExecution:
     """Full execute_job() runs exercising per-occurrence semantics: forced
@@ -721,3 +750,26 @@ class TestOccurrenceAwareExecution:
 
         assert result.success is False
         assert any("max_stages" in e for e in result.errors)
+
+    def test_quality_gate_honors_quality_timeout_config(self, tmp_path, monkeypatch):
+        """The quality gate (execute_job()'s post-run estimate_ssim_psnr()
+        call) must resolve and pass quality.timeout, not silently run
+        unbounded/on some other stage's timeout."""
+        self._register_fakes(monkeypatch)
+        self.config.set("min", "quality", "quality_target", "mode")
+        self.config.set(250, "quality", "timeout")
+        self.config.set(["fake_record", "fake_final"], "pipeline", "default_order")
+
+        input_file = tmp_path / "in.mp4"
+        input_file.write_bytes(b"fake input")
+        job = self.pipeline.add_job(str(input_file))
+        job.stages = ["fake_record", "fake_final"]
+
+        with patch("autovideofixer.core.quality.estimate_ssim_psnr") as mock_estimate:
+            from autovideofixer.core.quality import QualityResult
+
+            mock_estimate.return_value = QualityResult(measurement_failed=False, score_override=99)
+            result = self.pipeline.execute_job(job)
+
+        assert result.success is True
+        assert mock_estimate.call_args.kwargs["timeout"] == 250

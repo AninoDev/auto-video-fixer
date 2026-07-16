@@ -130,7 +130,7 @@ class NormalizeAudioStage(BaseStage):
             def cb(p, m):
                 self._report_progress(0.5 + p * 0.5, m, progress_callback)
 
-            norm_result = run_ffmpeg(args, progress_callback=cb, timeout=600)
+            norm_result = run_ffmpeg(args, progress_callback=cb, timeout=self.stage_timeout())
 
             if norm_result.returncode != 0:
                 if in_place and os.path.exists(dest):

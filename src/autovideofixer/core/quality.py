@@ -84,6 +84,7 @@ def estimate_quality_vmaf(
     distorted: str,
     model: str = "vmaf_v0.6.1",
     features: str = "psnr,ssim,ms_ssim,fast",
+    timeout: float | None = None,
 ) -> QualityResult:
     """Estimate quality between reference and distorted video using VMAF.
 
@@ -99,6 +100,11 @@ def estimate_quality_vmaf(
         features: Additional metrics to compute (psnr, ssim, ms_ssim; "fast"
             is accepted for backwards compatibility but is not a real libvmaf
             feature and is ignored)
+        timeout: Timeout (seconds) for the whole-video VMAF ffmpeg pass, or
+            ``None`` (default) for unlimited. This is a plain function (no
+            ``Config`` access), so callers with a config resolve
+            ``quality.timeout`` (via ``config.resolve_timeout()``) and pass
+            it through -- see ``Pipeline.execute_job()``'s quality gate.
 
     Returns:
         QualityResult with scores
@@ -135,7 +141,7 @@ def estimate_quality_vmaf(
             "-",
         ]
 
-        result = run_ffmpeg(cmd, timeout=600, capture_stderr=True)
+        result = run_ffmpeg(cmd, timeout=timeout, capture_stderr=True)
 
         if result.returncode != 0:
             return QualityResult(
@@ -234,6 +240,7 @@ def estimate_ssim_psnr(
     distorted: str,
     max_frames: int = 100,
     target: float | None = None,
+    timeout: float | None = None,
 ) -> QualityResult:
     """Estimate quality using SSIM and PSNR (no VMAF required).
 
@@ -251,6 +258,12 @@ def estimate_ssim_psnr(
             trivially returning True (the QualityMode.NONE default). The
             comparison score is SSIM scaled to 0-100 to match VMAF/config's
             0-100 convention (see quality_target.target in config.py).
+        timeout: Timeout (seconds) for the whole-video SSIM/PSNR ffmpeg pass,
+            or ``None`` (default) for unlimited. This is the function
+            ``Pipeline.execute_job()``'s quality gate actually calls; it
+            resolves ``quality.timeout`` from config and passes it through
+            here rather than this function reading config itself (this
+            module has no ``Config`` dependency).
 
     Returns:
         QualityResult with SSIM and PSNR scores populated (ms_ssim mirrors ssim,
@@ -300,7 +313,7 @@ def estimate_ssim_psnr(
     ]
 
     try:
-        result = run_ffmpeg(cmd, capture_stderr=True)
+        result = run_ffmpeg(cmd, timeout=timeout, capture_stderr=True)
         if result.returncode != 0:
             return QualityResult(
                 mode=mode,

@@ -227,7 +227,7 @@ class InterpolateStage(BaseStage):
         def cb(p, m):
             self._report_progress(0.3 + p * 0.7, m, progress_callback)
 
-        result = run_ffmpeg(args, progress_callback=cb, timeout=600)
+        result = run_ffmpeg(args, progress_callback=cb, timeout=self.stage_timeout())
 
         if result.returncode != 0:
             return StageResult(
@@ -315,7 +315,7 @@ class InterpolateStage(BaseStage):
                 "-y",
                 chunk_paths[i],
             ]
-            result = run_ffmpeg(args, timeout=600)
+            result = run_ffmpeg(args, timeout=self.stage_timeout())
             return i, result.returncode == 0, result.stderr[:300]
 
         self._report_progress(
@@ -364,7 +364,7 @@ class InterpolateStage(BaseStage):
                 "-y",
                 os.path.join(tmp_dir, "concat_video.mp4"),
             ]
-            concat_result = run_ffmpeg(concat_args, timeout=300)
+            concat_result = run_ffmpeg(concat_args, timeout=self.stage_timeout())
             if concat_result.returncode != 0:
                 return StageResult(
                     status=StageStatus.FAILED,
@@ -383,7 +383,7 @@ class InterpolateStage(BaseStage):
             else:
                 mux_args += ["-map", "0:v:0", "-c:v", "copy", "-an"]
             mux_args += ["-y", output_path]
-            mux_result = run_ffmpeg(mux_args, timeout=300)
+            mux_result = run_ffmpeg(mux_args, timeout=self.stage_timeout())
             if mux_result.returncode != 0 or not os.path.exists(output_path):
                 return StageResult(
                     status=StageStatus.FAILED,
@@ -667,7 +667,7 @@ class InterpolateStage(BaseStage):
                     mux_args += ["-map", "1:v:0"]
                 mux_args += ["-c:v", "copy", "-c:a", "copy", "-y", output_path]
 
-                mux_result = run_ffmpeg(mux_args, timeout=600)
+                mux_result = run_ffmpeg(mux_args, timeout=self.stage_timeout())
 
                 if mux_result.returncode != 0 or not os.path.exists(output_path):
                     return StageResult(

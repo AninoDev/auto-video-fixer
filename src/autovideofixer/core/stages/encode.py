@@ -143,7 +143,7 @@ class EncodeStage(BaseStage):
             def cb(p, m):
                 self._report_progress(0.2 + p * 0.8, m, progress_callback)
 
-            result = run_ffmpeg(args, progress_callback=cb, timeout=3600)
+            result = run_ffmpeg(args, progress_callback=cb, timeout=self.stage_timeout())
 
             if result.returncode != 0:
                 return StageResult(

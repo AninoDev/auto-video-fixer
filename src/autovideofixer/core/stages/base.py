@@ -9,7 +9,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Callable
 
-from autovideofixer.config import Config, deep_merge
+from autovideofixer.config import Config, deep_merge, resolve_timeout
 
 
 class StageStatus(Enum):
@@ -166,6 +166,39 @@ class BaseStage(ABC):
     ) -> None:
         if callback:
             callback(min(1.0, max(0.0, progress)), message)
+
+    def stage_timeout(self) -> float | None:
+        """Resolve this stage's ffmpeg timeout (seconds) for its MAIN
+        processing/mux pass(es).
+
+        Resolution order: ``stages.<name>.timeout`` (this stage's cascaded
+        config -- including any per-occurrence ``pipeline.default_order``
+        ``config:`` override, since ``self._stage_config`` already has that
+        merged in by ``__init__``) -> ``pipeline.stage_timeout`` (global
+        default) -> ``None`` (unlimited).
+
+        Both levels share the same null-unlimited semantics: ``None``
+        (absent/explicit ``null``) or ``0`` mean "no timeout"; a positive
+        number is seconds; anything else (negative, non-numeric) raises
+        ``ValueError`` here -- i.e. at the point a stage actually resolves
+        its effective timeout ("at use time"), not eagerly at config-load
+        time. See ``resolve_timeout()`` in ``config.py``.
+
+        Callers pass the result straight through to
+        ``core.ffmpeg_utils.run_ffmpeg(..., timeout=...)``, which accepts
+        ``None`` to mean "wait forever" (``subprocess.Popen.wait(timeout=None)``
+        blocks indefinitely).
+
+        NOT for short, genuinely-bounded helper calls within a stage (probes,
+        single-frame extraction, quick detection samples) -- those keep their
+        own small fixed timeouts regardless of this resolution; only a
+        stage's whole-video main processing/mux pass(es) should use this.
+        """
+        per_stage = self._stage_config.get("timeout", None)
+        if per_stage is not None:
+            return resolve_timeout(per_stage, f"stages.{self.name}.timeout")
+        global_timeout = self.config.get("pipeline", "stage_timeout", default=None)
+        return resolve_timeout(global_timeout, "pipeline.stage_timeout")
 
     def is_ai_fallback_enabled(self) -> bool:
         """Whether this stage may silently fall back to its traditional

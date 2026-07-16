@@ -212,6 +212,40 @@ def deep_merge(base: dict, override: dict, _path: str = "") -> None:
             base[k] = v
 
 
+def resolve_timeout(value: Any, key: str) -> float | None:
+    """Resolve a raw config timeout value (seconds) to ``float | None``.
+
+    Shared by ``BaseStage.stage_timeout()`` (``stages.<name>.timeout`` /
+    ``pipeline.stage_timeout``) and ``core/quality.py`` (``quality.timeout``)
+    -- both use identical null-unlimited semantics, so the validation lives
+    here once instead of being duplicated per call site.
+
+    - ``None`` (absent/explicit ``null``) means "no timeout" (unlimited).
+    - ``0`` is accepted as an explicit alias for "unlimited" too, so
+      ``--set pipeline.stage_timeout=0`` (which parses as an int, not a YAML
+      null) also disables the timeout rather than making every ffmpeg call
+      time out instantly.
+    - A positive number is seconds.
+    - Anything else (negative, non-numeric) is a hard config error, raised
+      immediately here ("at use time", i.e. when a stage/quality check
+      actually resolves its effective timeout) rather than silently clamped
+      or coerced.
+    """
+    if value is None:
+        return None
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError) as e:
+        raise ValueError(f"Invalid timeout for {key!r}: {value!r} is not a number or null") from e
+    if numeric < 0:
+        raise ValueError(
+            f"Invalid timeout for {key!r}: {value!r} must be >= 0 (0 or null means unlimited)"
+        )
+    if numeric == 0:
+        return None
+    return numeric
+
+
 class Config:
     """Central configuration manager. Loads from disk and provides defaults."""
 
@@ -255,6 +289,16 @@ class Config:
         "quality": {
             "vmaf_model": "vmaf_v0.6.1",
             "vmaf_features": "psnr,ssim,ms_ssim,fast",
+            # Timeout (seconds) for the quality gate's whole-video VMAF/SSIM
+            # ffmpeg comparison pass (core/quality.py) -- not a stage, so it
+            # gets its own key rather than living under stages.<name>. None
+            # (default) = unlimited: a fixed wall-clock cap on a whole-video
+            # comparison pass is wrong-shaped for long inputs, same reasoning
+            # as pipeline.stage_timeout below. 0 is accepted as an alias for
+            # null. A positive number is seconds; negative/non-numeric raises
+            # a config error when the quality gate actually runs. See
+            # resolve_timeout() in this module.
+            "timeout": None,
             "quality_target": {
                 "mode": "none",  # none, min, avg, max
                 "target": 95.0,
@@ -307,6 +351,31 @@ class Config:
             # stage repeated via default_order counts once per repetition.
             "max_stages": 15,
             "skip_stage_on_error": True,
+            # Default timeout (seconds) for a stage's MAIN ffmpeg processing/mux
+            # pass(es) -- see BaseStage.stage_timeout() in core/stages/base.py.
+            # None (default) = unlimited. Real-world long videos legitimately
+            # take longer than any fixed wall-clock cap on a whole-video pass
+            # (the old hardcoded timeout=600/1800/3600 sprinkled across
+            # core/stages/*.py died with "timeout reached" on inputs that were
+            # simply long, not stuck) -- a hang is instead something the
+            # caller/OS-level job runner should notice from external
+            # inactivity, not something this pipeline should second-guess with
+            # an arbitrary per-run cap. Set a positive number of seconds here
+            # to restore a global cap (e.g. for a batch job runner that wants
+            # to bound worst-case wall time), or per-stage via
+            # stages.<name>.timeout (falls back to this key when absent), or
+            # per-occurrence via a pipeline.default_order mapping entry's
+            # ``config: {timeout: ...}`` (see that key's own docs above). 0 is
+            # accepted as an alias for null/unlimited. Negative/non-numeric
+            # values raise a config error when a stage actually resolves its
+            # effective timeout (BaseStage.stage_timeout() / resolve_timeout()
+            # in config.py) -- not validated eagerly at config-load time.
+            # Short, genuinely-bounded helper calls (probes, hwaccel
+            # detection, single-frame extraction, cropdetect quick samples,
+            # loudness measurement) intentionally keep their own small fixed
+            # timeouts regardless of this key -- a hang there indicates real
+            # breakage, not a long input.
+            "stage_timeout": None,
         },
         "stages": {
             "upscale": {

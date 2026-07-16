@@ -263,6 +263,41 @@ class TestStdinDetachment:
             assert kwargs["stdin"] == subprocess.DEVNULL
 
 
+class TestRunFfmpegTimeout:
+    """run_ffmpeg(timeout=None) must mean "wait forever", not "timeout
+    immediately" or coerce to some other default -- most stages now resolve
+    their timeout via BaseStage.stage_timeout(), which returns None whenever
+    neither stages.<name>.timeout nor pipeline.stage_timeout is set (the
+    default, see config.py's DEFAULTS)."""
+
+    def test_timeout_none_passed_through_to_proc_wait(self):
+        with patch("autovideofixer.core.ffmpeg_utils.subprocess.Popen") as mock_popen:
+            mock_proc = MagicMock()
+            mock_proc.wait.return_value = None
+            mock_proc.returncode = 0
+            mock_proc.stderr = iter([])
+            mock_popen.return_value = mock_proc
+
+            run_ffmpeg(["-i", "in.mp4", "out.mp4"], timeout=None, capture_stderr=False)
+
+            # subprocess.Popen.wait(timeout=None) blocks indefinitely rather
+            # than raising -- this is the "no timeout" behavior this feature
+            # relies on, not a special-cased branch in run_ffmpeg itself.
+            mock_proc.wait.assert_called_once_with(timeout=None)
+
+    def test_timeout_numeric_passed_through_to_proc_wait(self):
+        with patch("autovideofixer.core.ffmpeg_utils.subprocess.Popen") as mock_popen:
+            mock_proc = MagicMock()
+            mock_proc.wait.return_value = None
+            mock_proc.returncode = 0
+            mock_proc.stderr = iter([])
+            mock_popen.return_value = mock_proc
+
+            run_ffmpeg(["-i", "in.mp4", "out.mp4"], timeout=42, capture_stderr=False)
+
+            mock_proc.wait.assert_called_once_with(timeout=42)
+
+
 class TestPathGeneration:
     """Test temporary path generation."""
 

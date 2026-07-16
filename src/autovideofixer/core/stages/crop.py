@@ -100,7 +100,11 @@ class CropStage(BaseStage):
         if self._analyze_duration_sec and self._analyze_duration_sec > 0:
             sample_secs = min(sample_secs, self._analyze_duration_sec)
 
-        detected = _detect_crop(filepath, self._limit, self._round, sample_secs)
+        # Bounded helper call (sample_secs is capped at _QUICK_SAMPLE_SEC == 10s
+        # of content) -- a genuinely short scan, so this keeps a small fixed
+        # timeout rather than the resolved stage/global timeout that
+        # execute()'s real full-scan pass below uses.
+        detected = _detect_crop(filepath, self._limit, self._round, sample_secs, timeout=60)
         if detected is None:
             return True, None  # inconclusive -- let execute() decide properly
 
@@ -150,7 +154,16 @@ class CropStage(BaseStage):
             )
 
         self._report_progress(0.1, "Running cropdetect (whole-scan union)...", progress_callback)
-        detected = _detect_crop(input_path, self._limit, self._round, self._analyze_duration_sec)
+        # Whole-video (or configured analyze_duration_sec) scan -- uses the
+        # resolved stage/global timeout, not a small fixed one, since
+        # analyze_duration_sec=0 means "scan the entire input".
+        detected = _detect_crop(
+            input_path,
+            self._limit,
+            self._round,
+            self._analyze_duration_sec,
+            timeout=self.stage_timeout(),
+        )
         if detected is None:
             return StageResult(
                 status=StageStatus.SKIPPED,
@@ -244,7 +257,7 @@ class CropStage(BaseStage):
         def cb(p, m):
             self._report_progress(0.5 + p * 0.5, m, progress_callback)
 
-        result = run_ffmpeg(args, progress_callback=cb, timeout=3600)
+        result = run_ffmpeg(args, progress_callback=cb, timeout=self.stage_timeout())
         if result.returncode != 0:
             return StageResult(
                 status=StageStatus.FAILED,
@@ -365,6 +378,7 @@ def _detect_crop(
     limit: int,
     round_: int,
     analyze_duration_sec: float,
+    timeout: float | None = 1800,
 ) -> tuple[int, int, int, int] | None:
     """Run FFmpeg cropdetect over (a sample of) the video and return the LAST
     reported ``crop=w:h:x:y`` window.
@@ -380,13 +394,20 @@ def _detect_crop(
     file), never on a "no border found" result -- that case still yields a
     crop window equal to (or very close to) the full frame, which the caller
     compares against ``min_crop_px``.
+
+    ``timeout``: this is a free function (no ``self``/stage config access),
+    so the caller resolves the effective timeout and passes it through --
+    ``CropStage.should_run()``'s bounded quick-sample call passes a small
+    fixed value, ``CropStage.execute()``'s real whole-scan pass passes
+    ``self.stage_timeout()``. Defaults to the historical fixed 1800 for any
+    other/test caller that doesn't pass one explicitly.
     """
     args = ["-i", input_path]
     if analyze_duration_sec and analyze_duration_sec > 0:
         args += ["-t", str(analyze_duration_sec)]
     args += ["-vf", f"cropdetect=limit={limit}:round={round_}:reset=0", "-f", "null", "-"]
 
-    result = run_ffmpeg(args, timeout=1800)
+    result = run_ffmpeg(args, timeout=timeout)
     matches = _CROP_RE.findall(result.stderr or "")
     if not matches:
         return None

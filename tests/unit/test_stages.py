@@ -1,5 +1,7 @@
 """Tests for processing stages."""
 
+import pytest
+
 from autovideofixer.config import Config
 from autovideofixer.core.stages.base import (
     BaseStage,
@@ -146,6 +148,145 @@ class TestStageBase:
         info = {"resolution": (3840, 2160), "duration": 3600}
         complexity = stage.estimate_complexity(info)
         assert complexity > 1.0
+
+
+class TestStageTimeoutResolution:
+    """BaseStage.stage_timeout(): stages.<name>.timeout -> pipeline.stage_timeout
+    -> None (unlimited). See AGENTS.md's timeout section / config.py's
+    resolve_timeout()."""
+
+    def _register(self):
+        @register_stage
+        class TimeoutTestStage(BaseStage):
+            name = "timeout_test"
+            display_name = "Timeout Test"
+            category = "enhancement"
+
+            def execute(self, input_path, output_path=None, progress_callback=None, **kwargs):
+                return StageResult(status=StageStatus.COMPLETED)
+
+    def _config(self, tmp_path) -> Config:
+        self._register()
+        return Config(tmp_path / "nonexistent.yaml")
+
+    def test_default_is_none_unlimited(self, tmp_path):
+        """Neither stages.timeout_test.timeout nor pipeline.stage_timeout is
+        set -- both DEFAULTS are null, so the resolved timeout is None."""
+        config = self._config(tmp_path)
+        stage = create_stage("timeout_test", config)
+        assert stage.stage_timeout() is None
+
+    def test_global_pipeline_stage_timeout_applies(self, tmp_path):
+        config = self._config(tmp_path)
+        config.set(900, "pipeline", "stage_timeout")
+        stage = create_stage("timeout_test", config)
+        assert stage.stage_timeout() == 900
+
+    def test_per_stage_timeout_wins_over_global(self, tmp_path):
+        config = self._config(tmp_path)
+        config.set(900, "pipeline", "stage_timeout")
+        config.set(120, "stages", "timeout_test", "timeout")
+        stage = create_stage("timeout_test", config)
+        assert stage.stage_timeout() == 120
+
+    def test_per_stage_timeout_used_without_global_set(self, tmp_path):
+        config = self._config(tmp_path)
+        config.set(45, "stages", "timeout_test", "timeout")
+        stage = create_stage("timeout_test", config)
+        assert stage.stage_timeout() == 45
+
+    def test_global_null_explicit_means_unlimited(self, tmp_path):
+        config = self._config(tmp_path)
+        config.set(None, "pipeline", "stage_timeout")
+        stage = create_stage("timeout_test", config)
+        assert stage.stage_timeout() is None
+
+    def test_global_zero_means_unlimited(self, tmp_path):
+        config = self._config(tmp_path)
+        config.set(0, "pipeline", "stage_timeout")
+        stage = create_stage("timeout_test", config)
+        assert stage.stage_timeout() is None
+
+    def test_per_stage_zero_means_unlimited_even_with_global_set(self, tmp_path):
+        config = self._config(tmp_path)
+        config.set(900, "pipeline", "stage_timeout")
+        config.set(0, "stages", "timeout_test", "timeout")
+        stage = create_stage("timeout_test", config)
+        assert stage.stage_timeout() is None
+
+    def test_negative_global_raises(self, tmp_path):
+        config = self._config(tmp_path)
+        config.set(-5, "pipeline", "stage_timeout")
+        stage = create_stage("timeout_test", config)
+        with pytest.raises(ValueError):
+            stage.stage_timeout()
+
+    def test_negative_per_stage_raises(self, tmp_path):
+        config = self._config(tmp_path)
+        config.set(-1, "stages", "timeout_test", "timeout")
+        stage = create_stage("timeout_test", config)
+        with pytest.raises(ValueError):
+            stage.stage_timeout()
+
+    def test_garbage_value_raises(self, tmp_path):
+        config = self._config(tmp_path)
+        config.set("not-a-number", "stages", "timeout_test", "timeout")
+        stage = create_stage("timeout_test", config)
+        with pytest.raises(ValueError):
+            stage.stage_timeout()
+
+    def test_per_occurrence_override_via_base_stage_overrides_param(self, tmp_path):
+        """The per-occurrence pipeline.default_order ``config: {timeout: ...}``
+        mechanism deep-merges onto stages.<name> via BaseStage.__init__'s
+        ``overrides`` param -- verify stage_timeout() picks that up too (the
+        end-to-end StageOrderEntry version of this lives in
+        test_pipeline.py::TestResolveStageOrder)."""
+        config = self._config(tmp_path)
+        overridden = create_stage("timeout_test", config, overrides={"timeout": 30})
+        assert overridden.stage_timeout() == 30
+
+
+class TestEncodeStageUsesResolvedTimeout:
+    """At least one real stage's main ffmpeg pass must actually use
+    stage_timeout() -- not just define it. EncodeStage is the simplest
+    single-run_ffmpeg-call stage to verify this against."""
+
+    def test_encode_main_pass_passes_resolved_timeout(self, tmp_path):
+        from unittest.mock import MagicMock, patch
+
+        from autovideofixer.core.stages.encode import EncodeStage
+
+        config = Config(tmp_path / "nonexistent.yaml")
+        config.set(123, "pipeline", "stage_timeout")
+        stage = EncodeStage(config)
+
+        with patch("autovideofixer.core.ffmpeg_utils.run_ffmpeg") as mock_run_ffmpeg:
+            mock_run_ffmpeg.return_value = MagicMock(returncode=0, stderr="")
+            stage.execute(
+                "in.mp4",
+                output_path=str(tmp_path / "out.mp4"),
+                hwaccel="none",
+            )
+
+        assert mock_run_ffmpeg.call_args.kwargs["timeout"] == 123
+
+    def test_encode_main_pass_passes_none_when_unlimited(self, tmp_path):
+        from unittest.mock import MagicMock, patch
+
+        from autovideofixer.core.stages.encode import EncodeStage
+
+        config = Config(tmp_path / "nonexistent.yaml")
+        stage = EncodeStage(config)
+
+        with patch("autovideofixer.core.ffmpeg_utils.run_ffmpeg") as mock_run_ffmpeg:
+            mock_run_ffmpeg.return_value = MagicMock(returncode=0, stderr="")
+            stage.execute(
+                "in.mp4",
+                output_path=str(tmp_path / "out.mp4"),
+                hwaccel="none",
+            )
+
+        assert mock_run_ffmpeg.call_args.kwargs["timeout"] is None
 
 
 class TestStageRegistry:

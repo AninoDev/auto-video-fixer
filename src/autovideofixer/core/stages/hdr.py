@@ -86,7 +86,7 @@ class HDRStage(BaseStage):
             def cb(p, m):
                 self._report_progress(0.3 + p * 0.7, m, progress_callback)
 
-            result = run_ffmpeg(args, progress_callback=cb, timeout=600)
+            result = run_ffmpeg(args, progress_callback=cb, timeout=self.stage_timeout())
 
             if result.returncode != 0:
                 return StageResult(

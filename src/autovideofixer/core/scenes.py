@@ -31,7 +31,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from typing import Any
 
-from autovideofixer.config import Config
+from autovideofixer.config import Config, resolve_timeout
 from autovideofixer.core.analysis import SceneEvent, VideoAnalyzer, run_scene_coordinator
 from autovideofixer.core.ffmpeg_utils import probe, run_ffmpeg
 from autovideofixer.core.stages.base import StageStatus
@@ -53,7 +53,7 @@ class SceneModeResult:
     interpolated_scenes: list[int]
 
 
-def _run_ffmpeg_ok(args: list[str], timeout: int = 300) -> bool:
+def _run_ffmpeg_ok(args: list[str], timeout: float | None = None) -> bool:
     result = run_ffmpeg(args, timeout=timeout)
     return result.returncode == 0
 
@@ -64,6 +64,7 @@ def split_scene_video(
     out_path: str,
     crf: int = 14,
     preset: str = "veryfast",
+    timeout: float | None = None,
 ) -> bool:
     """Extract one scene's video-only frames as an independently re-encoded clip.
 
@@ -97,10 +98,12 @@ def split_scene_video(
         "-y",
         out_path,
     ]
-    return _run_ffmpeg_ok(args, timeout=600)
+    return _run_ffmpeg_ok(args, timeout=timeout)
 
 
-def split_scene_audio(input_path: str, scene: SceneEvent, out_path: str) -> bool:
+def split_scene_audio(
+    input_path: str, scene: SceneEvent, out_path: str, timeout: float | None = None
+) -> bool:
     """Extract one scene's audio as an independently re-encoded segment.
 
     Re-encoded (not stream-copied) for the same reason as
@@ -127,18 +130,26 @@ def split_scene_audio(input_path: str, scene: SceneEvent, out_path: str) -> bool
         "-y",
         out_path,
     ]
-    return _run_ffmpeg_ok(args, timeout=300)
+    return _run_ffmpeg_ok(args, timeout=timeout)
 
 
-def _concat_demuxer(paths: list[str], out_path: str, list_path: str, extra_args: list[str]) -> bool:
+def _concat_demuxer(
+    paths: list[str],
+    out_path: str,
+    list_path: str,
+    extra_args: list[str],
+    timeout: float | None = None,
+) -> bool:
     with open(list_path, "w") as f:
         for p in paths:
             f.write(f"file '{p.replace(chr(39), chr(92) + chr(39))}'\n")
     args = ["-f", "concat", "-safe", "0", "-i", list_path, *extra_args, "-y", out_path]
-    return _run_ffmpeg_ok(args, timeout=1800)
+    return _run_ffmpeg_ok(args, timeout=timeout)
 
 
-def concat_video_clips(clip_paths: list[str], out_path: str, work_dir: str) -> bool:
+def concat_video_clips(
+    clip_paths: list[str], out_path: str, work_dir: str, timeout: float | None = None
+) -> bool:
     """Concatenate video-only clips via the ffmpeg concat demuxer.
 
     Re-encodes during concat (rather than ``-c copy``) so minor
@@ -156,18 +167,25 @@ def concat_video_clips(clip_paths: list[str], out_path: str, work_dir: str) -> b
         out_path,
         list_path,
         ["-c:v", "libx264", "-crf", "14", "-preset", "veryfast", "-an"],
+        timeout=timeout,
     )
 
 
-def concat_audio_clips(clip_paths: list[str], out_path: str, work_dir: str) -> bool:
+def concat_audio_clips(
+    clip_paths: list[str], out_path: str, work_dir: str, timeout: float | None = None
+) -> bool:
     if len(clip_paths) == 1:
         shutil.copy2(clip_paths[0], out_path)
         return True
     list_path = os.path.join(work_dir, "concat_audio_list.txt")
-    return _concat_demuxer(clip_paths, out_path, list_path, ["-c:a", "aac", "-b:a", "192k"])
+    return _concat_demuxer(
+        clip_paths, out_path, list_path, ["-c:a", "aac", "-b:a", "192k"], timeout=timeout
+    )
 
 
-def mux_video_audio(video_path: str, audio_path: str | None, out_path: str) -> bool:
+def mux_video_audio(
+    video_path: str, audio_path: str | None, out_path: str, timeout: float | None = None
+) -> bool:
     if not audio_path:
         shutil.copy2(video_path, out_path)
         return True
@@ -185,7 +203,7 @@ def mux_video_audio(video_path: str, audio_path: str | None, out_path: str) -> b
         "-y",
         out_path,
     ]
-    return _run_ffmpeg_ok(args, timeout=600)
+    return _run_ffmpeg_ok(args, timeout=timeout)
 
 
 def stabilize_scene_clip(
@@ -410,6 +428,12 @@ def run_scene_pipeline(
         scene_workers, per_scene_chunks = _scene_worker_budget(len(kept_scenes), config)
         intermediate_crf = config.get("scenes", "intermediate_crf", default=14)
         intermediate_preset = config.get("scenes", "intermediate_preset", default="veryfast")
+        # Scene split/concat/mux passes scale with input length like any stage's
+        # main pass, so they share pipeline.stage_timeout (null = unlimited)
+        # rather than a fixed cap.
+        ffmpeg_timeout = resolve_timeout(
+            config.get("pipeline", "stage_timeout", default=None), "pipeline.stage_timeout"
+        )
 
         tiers: dict[int, str] = {}
         interpolated: list[int] = []
@@ -421,7 +445,12 @@ def run_scene_pipeline(
             idx, scene = pair
             raw_video = os.path.join(work_dir, f"scene_{idx:04d}_raw.mp4")
             if not split_scene_video(
-                input_path, scene, raw_video, crf=intermediate_crf, preset=intermediate_preset
+                input_path,
+                scene,
+                raw_video,
+                crf=intermediate_crf,
+                preset=intermediate_preset,
+                timeout=ffmpeg_timeout,
             ):
                 return idx, False
 
@@ -453,7 +482,7 @@ def run_scene_pipeline(
 
             if has_audio:
                 audio_out = os.path.join(work_dir, f"scene_{idx:04d}_audio.m4a")
-                if not split_scene_audio(input_path, scene, audio_out):
+                if not split_scene_audio(input_path, scene, audio_out, timeout=ffmpeg_timeout):
                     return idx, False
                 audio_clip_paths[idx] = audio_out
 
@@ -484,7 +513,7 @@ def run_scene_pipeline(
         ordered_indices = [idx for idx, _ in kept_scenes]
         video_clips = [video_clip_paths[i] for i in ordered_indices]
         concat_video = os.path.join(work_dir, "concat_video.mp4")
-        if not concat_video_clips(video_clips, concat_video, work_dir):
+        if not concat_video_clips(video_clips, concat_video, work_dir, timeout=ffmpeg_timeout):
             logger.warning("Scene mode: video concat failed; falling back to whole-video")
             return None
 
@@ -492,10 +521,10 @@ def run_scene_pipeline(
         if has_audio:
             audio_clips = [audio_clip_paths[i] for i in ordered_indices]
             concat_audio = os.path.join(work_dir, "concat_audio.m4a")
-            if not concat_audio_clips(audio_clips, concat_audio, work_dir):
+            if not concat_audio_clips(audio_clips, concat_audio, work_dir, timeout=ffmpeg_timeout):
                 logger.warning("Scene mode: audio concat failed; falling back to whole-video")
                 return None
-            if not mux_video_audio(concat_video, concat_audio, final_out):
+            if not mux_video_audio(concat_video, concat_audio, final_out, timeout=ffmpeg_timeout):
                 logger.warning("Scene mode: final mux failed; falling back to whole-video")
                 return None
         else:

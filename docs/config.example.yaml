@@ -133,6 +133,16 @@ quality:
   # VMAF feature set passed to libvmaf.
   vmaf_features: "psnr,ssim,ms_ssim,fast"
 
+  # Timeout (seconds) for the quality gate's whole-video VMAF/SSIM comparison ffmpeg pass
+  # (core/quality.py's estimate_quality_vmaf()/estimate_ssim_psnr(), called from
+  # Pipeline.execute_job()'s post-job quality gate below). This isn't a stage, so it gets its
+  # own key rather than living under stages.<name>.timeout. null (default) = unlimited: same
+  # reasoning as pipeline.stage_timeout below -- a fixed wall-clock cap on a whole-video
+  # comparison pass is wrong-shaped for long inputs. 0 is accepted as an explicit alias for
+  # null. A positive number is seconds; negative/non-numeric raises a config error when the
+  # quality gate actually runs (see resolve_timeout() in config.py).
+  timeout: null
+
   quality_target:
     # Whether/how Pipeline.execute_job()'s post-job quality gate checks output against a
     # target: none (skip the check entirely), min, avg, or max. This is a best-effort,
@@ -242,6 +252,27 @@ pipeline:
   #         strength: low
   #     - encode
 
+  # Example (commented out) of a PER-OCCURRENCE timeout override -- gives just this one
+  # "encode" occurrence 20 minutes regardless of stages.encode.timeout or the global
+  # pipeline.stage_timeout above (BaseStage.__init__'s `overrides` param deep-merges this
+  # `config:` mapping onto stages.encode for THIS occurrence only; stage_timeout() then
+  # resolves it exactly like any other stages.<name>.timeout value):
+  #   default_order:
+  #     - detect
+  #     - deblock
+  #     - stabilize
+  #     - crop
+  #     - denoise_video
+  #     - upscale
+  #     - interpolate
+  #     - normalize_volume
+  #     - normalize_audio
+  #     - speed
+  #     - hdr
+  #     - stage: encode
+  #       config:
+  #         timeout: 1200
+
   # Safety cap on how many stage OCCURRENCES a single job may run (guards against
   # pathological --stage/default_order repetition, not normal preset/auto-determined
   # pipelines -- must stay >= 12, the length of a full default run). A stage repeated via
@@ -254,7 +285,32 @@ pipeline:
   # (true, the default -- more resilient for unattended batch runs).
   skip_stage_on_error: true
 
+  # Default timeout (seconds) for a stage's MAIN ffmpeg processing/mux pass(es) -- see
+  # BaseStage.stage_timeout() in core/stages/base.py. null (default) = unlimited. Real-world
+  # long videos legitimately take longer than any fixed wall-clock cap on a whole-video pass
+  # (the old hardcoded timeout=600/1800/3600 sprinkled across core/stages/*.py died with
+  # "timeout reached" on inputs that were simply long, not stuck) -- a genuine hang is
+  # something an external job runner/OS watchdog should notice from inactivity, not something
+  # this pipeline should second-guess with an arbitrary per-run cap. Set a positive number of
+  # seconds here to restore a global cap (e.g. for a batch runner that wants to bound
+  # worst-case wall time per stage pass). 0 is accepted as an explicit alias for null. Negative
+  # or non-numeric values raise a config error when a stage actually resolves its effective
+  # timeout (BaseStage.stage_timeout() / resolve_timeout() in config.py), not eagerly at
+  # config-load time. Short, genuinely-bounded helper calls within a stage (probes, hwaccel
+  # detection, single-frame extraction, cropdetect quick samples, loudness measurement)
+  # intentionally keep their own small fixed timeouts regardless of this key -- a hang there
+  # indicates real breakage, not a long input.
+  stage_timeout: null
+
 stages:
+  # Per-stage timeout override: EVERY stage accepts an optional `timeout:` key (not listed
+  # explicitly on each stage below since it's absent -> inherits the global default), resolved
+  # by BaseStage.stage_timeout() as:
+  #   stages.<name>.timeout (this stage)  ->  pipeline.stage_timeout (global, above)  ->  null
+  # Same null/0-means-unlimited, positive-number-is-seconds, negative/non-numeric-is-an-error
+  # semantics as pipeline.stage_timeout at every level. See stages.deblock.timeout below for a
+  # worked example, and pipeline.default_order's commented-out mapping-entry example further
+  # up for the equivalent PER-OCCURRENCE form (`config: {timeout: ...}`).
   upscale:
     enabled: true
     # Real-ESRGAN checkpoint name from ai/model_cache.py's MODEL_REGISTRY. RRDB models (highest
@@ -379,6 +435,11 @@ stages:
     temp_crf: 16          # see stages.upscale.temp_crf above
     read_ahead: 2         # see stages.upscale.read_ahead above
     write_queue_depth: 4  # see stages.upscale.write_queue_depth above
+    # Example per-stage timeout override (see "stages:" intro comment above): caps THIS
+    # stage's main pass/mux at 20 minutes even if pipeline.stage_timeout is unset (null) or
+    # set to something else. Omitted (as on every other stage in this file) means "inherit
+    # pipeline.stage_timeout".
+    # timeout: 1200
 
   stabilize:
     enabled: true
@@ -421,6 +482,13 @@ stages:
     # `smoothness`), not an exact read of it -- see AGENTS.md's "Stabilization zoom coverage"
     # section for the accuracy caveat and verification methodology.
     zoom_coverage: 1.0
+    # Timeout (seconds) for the decode/transform pipe's whole-video wait (see execute()'s
+    # decode_proc/transform_proc.wait() calls) -- a stage-specific override of the same
+    # resolved timeout every other main pass in this stage uses (stages.stabilize.timeout ->
+    # pipeline.stage_timeout -> null/unlimited). Explicit pipe_timeout wins when set (same
+    # null/0-means-unlimited semantics as timeout above); omitted (as here) falls back to this
+    # stage's own resolved stage_timeout() instead of a bespoke hardcoded default.
+    # pipe_timeout: 1800
 
   normalize_volume:
     enabled: true

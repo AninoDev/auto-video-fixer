@@ -8,6 +8,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- **Real-world long videos no longer die at 600s ("timeout reached")**: nearly every stage's
+  main ffmpeg processing/mux pass hardcoded a fixed wall-clock `timeout=600` (some
+  `1800`/`3600`) in `core/stages/*.py` and `core/quality.py` -- wrong-shaped for a whole-video
+  pass, since a legitimately long input (not a stuck/hung ffmpeg process) would simply exceed
+  it and fail. These now resolve a configurable timeout that defaults to `null` (unlimited):
+  new `pipeline.stage_timeout` (global default) and per-stage `stages.<name>.timeout`
+  (`BaseStage.stage_timeout()` in `core/stages/base.py`, resolution order stage -> global ->
+  `None`), plus `quality.timeout` for `core/quality.py`'s VMAF/SSIM quality-gate comparison
+  pass (not a stage, so it gets its own key). All three share identical null/0-means-unlimited,
+  positive-number-is-seconds, negative/non-numeric-is-a-config-error semantics via the new
+  `resolve_timeout()` helper in `config.py`. `run_ffmpeg()` (`core/ffmpeg_utils.py`) now accepts
+  `timeout=None` to mean "wait forever" (`subprocess.Popen.wait(timeout=None)` already blocks
+  indefinitely -- no behavior change needed there). No new per-occurrence machinery was
+  needed: the existing `pipeline.default_order` mapping entry's `config: {timeout: ...}`
+  override already reaches a stage's resolved timeout through the same mechanism every other
+  per-occurrence config key uses. Short, genuinely-bounded helper calls (probes, hwaccel
+  detection, single-frame extraction, cropdetect quick samples, loudness measurement) were
+  deliberately left at their small fixed timeouts -- a hang there indicates real breakage, not
+  a long input. See AGENTS.md's "Stage/quality ffmpeg timeouts" section for the full list of
+  wired-up vs. kept-fixed call sites, and `docs/config.example.yaml` for worked examples
+  (including the per-occurrence form). Scene mode's split/concat/mux helpers
+  (`core/scenes.py`, previously fixed at 300/600/1800s) are wired to `pipeline.stage_timeout`
+  the same way.
+
 - **ffmpeg/ffprobe subprocess spawns could leave the user's terminal stuck in raw mode**: no
   spawn site in this codebase passed `-nostdin` (ffmpeg) or detached stdin, so whenever a spawned
   ffmpeg's stdin happened to be the controlling terminal, ffmpeg would switch that tty to raw mode
