@@ -95,29 +95,22 @@ class UpscaleStage(BaseStage):
                 target_width = target_width or tr[0]
                 target_height = target_height or tr[1]
 
-        if method is None:
-            info = getattr(self, "_input_info", {})
-            w, h = info.get("resolution", (0, 0))
-            if target_width and target_height and w > 0 and h > 0:
-                # Orientation-aware, same as should_run(): comparing raw w
-                # against the unrotated target_width alone (the previous
-                # behavior) picked "ai" for a portrait input against a
-                # landscape target even when the rotated target was already
-                # met.
-                bound_w, bound_h = self._effective_target_bounds(w, h, target_width, target_height)
-                needed_scale = max(bound_w / w, bound_h / h)
-                method = "ai" if needed_scale > self._SKIP_SCALE_THRESHOLD else "traditional"
-            elif target_width and w < target_width:
-                method = "ai"
-            else:
-                method = "traditional"
-
-        # Apply global AI override from CLI/config
-        use_ai = self.config.get("general", "use_ai", default=None)
-        if use_ai is True:
-            method = "ai"
-        elif use_ai is False:
-            method = "traditional"
+        # Resolve "ai" vs "traditional" per the shared precedence (explicit
+        # method= kwarg > stages.upscale.use_ai > general.use_ai > the
+        # stage's own scale-threshold auto default) -- see
+        # BaseStage.resolve_ai_method's docstring. The auto default itself
+        # still needs the scale-threshold logic below (step 4), computed
+        # regardless of whether it's actually used, since it's cheap.
+        auto_default = self._auto_method_for_scale(target_width, target_height)
+        method, source = self.resolve_ai_method(method, auto_default)
+        backend = self._stage_config.get("backend", "torch")
+        self._log_ai_method_choice(
+            method,
+            source,
+            ai_desc=f"AI upscaling (Real-ESRGAN '{self._ai_model}', backend {backend})",
+            traditional_desc="traditional lanczos scaling",
+            ai_hint=f"AI Real-ESRGAN model '{self._ai_model}'",
+        )
 
         try:
             if method == "ai":
@@ -145,6 +138,23 @@ class UpscaleStage(BaseStage):
                 error=str(e),
                 duration_sec=time.time() - start,
             )
+
+    def _auto_method_for_scale(self, target_width: int | None, target_height: int | None) -> str:
+        """The stage's own hardcoded "ai"/"traditional" default (step 4 of
+        resolve_ai_method) -- picks "ai" only when a real scale-up is
+        needed, mirroring should_run()'s orientation-aware comparison so
+        execute() and should_run() always agree on what "already at target"
+        means for a given input's orientation.
+        """
+        info = getattr(self, "_input_info", {})
+        w, h = info.get("resolution", (0, 0))
+        if target_width and target_height and w > 0 and h > 0:
+            bound_w, bound_h = self._effective_target_bounds(w, h, target_width, target_height)
+            needed_scale = max(bound_w / w, bound_h / h)
+            return "ai" if needed_scale > self._SKIP_SCALE_THRESHOLD else "traditional"
+        elif target_width and w < target_width:
+            return "ai"
+        return "traditional"
 
     def _execute_traditional(
         self,

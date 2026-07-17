@@ -213,6 +213,84 @@ class BaseStage(ABC):
             return bool(per_stage)
         return bool(self.config.get("general", "ai_fallback", default=True))
 
+    def resolve_ai_method(self, explicit_method: str | None, auto_default: str) -> tuple[str, str]:
+        """Resolve an AI-capable stage's method ("ai" or "traditional").
+
+        Mirrors the ``ai_fallback`` resolution convention (see
+        ``is_ai_fallback_enabled`` above) so all four AI-capable stages
+        (upscale, deblock, denoise_video, interpolate) pick their method the
+        same way. Precedence, highest first:
+
+          1. ``explicit_method`` -- an explicit ``method=`` kwarg passed by a
+             caller (e.g. scene mode, tests) wins outright, no matter what
+             config says.
+          2. ``stages.<name>.use_ai`` (True/False) if set (not null).
+          3. ``general.use_ai`` (True/False, set by CLI ``--ai``/``--no-ai``)
+             if set -- per this same convention, the global CLI flag does
+             NOT override an explicit per-stage config value (step 2 already
+             won if it applied).
+          4. ``auto_default`` -- the stage's own hardcoded default (e.g.
+             upscale/deblock default to "ai", denoise_video/interpolate
+             default to "traditional" -- both deliberate, not oversights).
+
+        Returns ``(method, source)`` -- ``source`` is a short human-readable
+        string describing which of the above resolved it, used by
+        ``_log_ai_method_choice`` for the INFO method-selection log line.
+        """
+        if explicit_method is not None:
+            return explicit_method, "explicit method= argument"
+        per_stage = self._stage_config.get("use_ai", None)
+        if per_stage is True:
+            return "ai", f"stages.{self.name}.use_ai: true"
+        if per_stage is False:
+            return "traditional", f"stages.{self.name}.use_ai: false"
+        general_use_ai = self.config.get("general", "use_ai", default=None)
+        if general_use_ai is True:
+            return "ai", "--ai"
+        if general_use_ai is False:
+            return "traditional", "--no-ai"
+        return auto_default, "auto default"
+
+    def _log_ai_method_choice(
+        self,
+        method: str,
+        source: str,
+        ai_desc: str,
+        traditional_desc: str,
+        ai_hint: str,
+    ) -> None:
+        """Log, once per execution, which method an AI-capable stage chose
+        and why -- at INFO, so it shows up in a normal ``--verbose`` run
+        without needing DEBUG. The user was confused for months about which
+        path a run actually took; a grep for "using traditional"/"using AI"
+        must always explain it.
+
+        Args:
+            method: "ai" or "traditional" (the resolve_ai_method() result).
+            source: The resolve_ai_method() source string.
+            ai_desc: Stage-specific description used when method == "ai",
+                e.g. "AI interpolation (RIFE 'rife_v4.6', backend torch)".
+            traditional_desc: Stage-specific description used when
+                method == "traditional", e.g. "traditional minterpolate".
+            ai_hint: Short AI-technology name/version used only in the
+                auto-default-traditional opt-in hint, e.g.
+                "AI/RIFE model 'rife_v4.6'".
+        """
+        if method == "ai":
+            self.logger.info("%s: using %s (selected by %s)", self.name, ai_desc, source)
+            return
+        if source == "auto default":
+            self.logger.info(
+                "%s: using %s (auto default; %s is configured but not selected -- "
+                "set stages.%s.use_ai: true or pass --ai to use it)",
+                self.name,
+                traditional_desc,
+                ai_hint,
+                self.name,
+            )
+        else:
+            self.logger.info("%s: using %s (%s)", self.name, traditional_desc, source)
+
     def _ai_fallback_or_fail(
         self,
         reason: str,

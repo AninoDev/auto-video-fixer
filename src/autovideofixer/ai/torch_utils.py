@@ -7,6 +7,7 @@ utilities with graceful fallback when PyTorch is not installed.
 from __future__ import annotations
 
 import logging
+import threading
 from typing import Any
 
 _logger: logging.Logger | None = None
@@ -19,6 +20,42 @@ def _get_logger() -> logging.Logger:
 
         _logger = get_logger("autovideofixer.ai.torch_utils")
     return _logger
+
+
+# Process-wide semaphore bounding concurrent GPU AI inferences, driven by
+# gpu.max_concurrent_inferences (Config.DEFAULTS, default 1). Currently only
+# scene-mode's AI/RIFE interpolation path (core/scenes.py's
+# interpolate_scene_clip) acquires this -- whole-video (non-scene) runs
+# execute stages serially already, so gating them would be a no-op. This is
+# the single-GPU placeholder for future multi-GPU inference distribution
+# (see docs/ROADMAP.md).
+_gpu_inference_semaphore: threading.Semaphore | None = None
+_gpu_inference_semaphore_limit: int | None = None
+_gpu_inference_semaphore_lock = threading.Lock()
+
+
+def get_gpu_inference_semaphore(config: Any) -> threading.Semaphore:
+    """Return the process-wide GPU inference semaphore, lazily created (or
+    recreated, if the configured limit changed) from
+    ``gpu.max_concurrent_inferences``.
+
+    Not re-read on every call in the hot sense -- the limit is expected to
+    be stable for a process's lifetime; recreating on a limit change exists
+    mainly so tests can pass distinct configs without cross-test pollution.
+    """
+    global _gpu_inference_semaphore, _gpu_inference_semaphore_limit
+    limit = config.get("gpu", "max_concurrent_inferences", default=1)
+    try:
+        limit = int(limit)
+    except TypeError, ValueError:
+        limit = 1
+    if limit < 1:
+        limit = 1
+    with _gpu_inference_semaphore_lock:
+        if _gpu_inference_semaphore is None or _gpu_inference_semaphore_limit != limit:
+            _gpu_inference_semaphore = threading.Semaphore(limit)
+            _gpu_inference_semaphore_limit = limit
+        return _gpu_inference_semaphore
 
 
 def is_torch_available() -> bool:

@@ -49,16 +49,19 @@ class DeblockStage(BaseStage):
         start = time.time()
         self._report_progress(0.0, "Running deblocking...", progress_callback)
 
-        # Apply global AI override from CLI/config
-        use_ai = self.config.get("general", "use_ai", default=None)
-        if method is None:
-            if use_ai is True:
-                method = "ai"
-            elif use_ai is False:
-                method = "traditional"
-            else:
-                # Default: AI (better quality)
-                method = "ai"
+        # Resolve "ai" vs "traditional" per the shared precedence (explicit
+        # method= kwarg > stages.deblock.use_ai > general.use_ai > the
+        # stage's own auto default) -- see BaseStage.resolve_ai_method's
+        # docstring. deblock's auto default stays "ai" (better quality),
+        # a deliberate choice, not an oversight.
+        method, source = self.resolve_ai_method(method, "ai")
+        self._log_ai_method_choice(
+            method,
+            source,
+            ai_desc=f"AI deblocking (Real-ESRGAN '{self._ai_model}')",
+            traditional_desc="traditional unsharp filter",
+            ai_hint=f"AI Real-ESRGAN model '{self._ai_model}'",
+        )
 
         try:
             if method == "ai":

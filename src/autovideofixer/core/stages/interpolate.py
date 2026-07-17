@@ -56,7 +56,8 @@ class InterpolateStage(BaseStage):
         output_path: str | None = None,
         progress_callback=None,
         target_fps: float | None = None,
-        method: str = "traditional",
+        method: str | None = None,
+        parallel_chunks: int | None = None,
         **kwargs,
     ) -> StageResult:
         start = time.time()
@@ -66,12 +67,21 @@ class InterpolateStage(BaseStage):
             quality_target = self.config.get("quality", "quality_target", default={})
             target_fps = quality_target.get("target_framerate")
 
-        # Apply global AI override from CLI/config
-        use_ai = self.config.get("general", "use_ai", default=None)
-        if use_ai is True:
-            method = "ai"
-        elif use_ai is False:
-            method = "traditional"
+        # Resolve "ai" vs "traditional" per the shared precedence (explicit
+        # method= kwarg > stages.interpolate.use_ai > general.use_ai > the
+        # deliberate hardcoded default below) -- see
+        # BaseStage.resolve_ai_method's docstring. interpolate's auto default
+        # stays "traditional" (minterpolate): fast with decent quality, a
+        # deliberate asymmetry vs. upscale/deblock defaulting to AI.
+        method, source = self.resolve_ai_method(method, "traditional")
+        backend = self._stage_config.get("backend", "torch")
+        self._log_ai_method_choice(
+            method,
+            source,
+            ai_desc=f"AI interpolation (RIFE '{self._ai_model}', backend {backend})",
+            traditional_desc="traditional minterpolate",
+            ai_hint=f"AI/RIFE model '{self._ai_model}'",
+        )
 
         try:
             from autovideofixer.core.ffmpeg_utils import get_video_info
@@ -95,6 +105,7 @@ class InterpolateStage(BaseStage):
                 start,
                 target_fps=target_fps,
                 current_fps=current_fps,
+                parallel_chunks=parallel_chunks,
             )
 
         except Exception as e:

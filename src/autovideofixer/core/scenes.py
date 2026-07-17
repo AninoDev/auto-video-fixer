@@ -31,6 +31,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from typing import Any
 
+from autovideofixer.ai.torch_utils import get_gpu_inference_semaphore
 from autovideofixer.config import Config, resolve_timeout
 from autovideofixer.core.analysis import SceneEvent, VideoAnalyzer, run_scene_coordinator
 from autovideofixer.core.ffmpeg_utils import probe, run_ffmpeg
@@ -274,6 +275,33 @@ def stabilize_scene_clip(
     return True, "aggressive"
 
 
+def _resolve_scene_interpolate_method(
+    config: Config, stage: InterpolateStage | None = None
+) -> tuple[str, str]:
+    """Resolve scene-mode interpolation's ai/traditional method and its source.
+
+    scenes.interpolate.use_ai (null default) is a scene-mode-ONLY override:
+    null resolves the method with EXACTLY the same precedence as the standard
+    "interpolate" stage (stages.interpolate.use_ai / general.use_ai / the
+    stage's traditional auto default -- see BaseStage.resolve_ai_method), so
+    both paths respond together to the same config; true/false forces
+    AI/traditional for the scene path only, without touching whole-video
+    interpolate behavior. The resolved method is passed to stage.execute() as
+    the explicit method= kwarg, so run_scene_pipeline logs the real source
+    once per job here (execute()'s own INFO line would otherwise only say
+    "explicit method= argument", hiding the why in exactly the scene-mode
+    runs where the user needs it).
+    """
+    scene_override = config.get("scenes", "interpolate", "use_ai", default=None)
+    if scene_override is True:
+        return "ai", "scenes.interpolate.use_ai: true"
+    if scene_override is False:
+        return "traditional", "scenes.interpolate.use_ai: false"
+    if stage is None:
+        stage = InterpolateStage(config)
+    return stage.resolve_ai_method(None, "traditional")
+
+
 def interpolate_scene_clip(
     clip_path: str,
     out_path: str,
@@ -305,8 +333,8 @@ def interpolate_scene_clip(
         shutil.copy2(clip_path, out_path)
         return True, False
 
-    use_ai = config.get("general", "use_ai", default=None)
-    method = "ai" if use_ai else "traditional"
+    method, _source = _resolve_scene_interpolate_method(config, stage)
+
     kwargs: dict[str, Any] = {"target_fps": target_fps, "method": method}
     if method == "traditional" and parallel_chunks_override is not None:
         # Bound the per-scene chunk pool so concurrently-processed scenes don't
@@ -314,22 +342,75 @@ def interpolate_scene_clip(
         # _scene_worker_budget / run_scene_pipeline).
         kwargs["parallel_chunks"] = parallel_chunks_override
 
-    result = stage.execute(clip_path, out_path, input_info=input_info, **kwargs)
+    if method == "ai":
+        # Bound concurrent GPU inference across scene-mode's thread pool
+        # (see ai/torch_utils.get_gpu_inference_semaphore) -- the
+        # traditional/chunked path below is NOT gated, only the AI/RIFE
+        # inference itself. Whole-video (non-scene) runs execute stages
+        # serially already, so they never need this.
+        semaphore = get_gpu_inference_semaphore(config)
+        if not semaphore.acquire(blocking=False):
+            logger.debug(
+                "Scene thread blocked waiting for the GPU inference semaphore "
+                "(gpu.max_concurrent_inferences) before running AI interpolation on %s",
+                clip_path,
+            )
+            semaphore.acquire()
+        try:
+            result = stage.execute(clip_path, out_path, input_info=input_info, **kwargs)
+        finally:
+            semaphore.release()
+    else:
+        result = stage.execute(clip_path, out_path, input_info=input_info, **kwargs)
     return result.status != StageStatus.FAILED, True
 
 
-def _scene_worker_budget(num_scenes: int, config: Config) -> tuple[int, int]:
+def _scene_worker_budget(
+    num_scenes: int, config: Config, resolution: tuple[int, int] | None = None
+) -> tuple[int, int]:
     """Split the CPU budget between "scenes run concurrently" and "chunks per
     scene's traditional interpolation run concurrently" so the two pools don't
-    oversubscribe each other.
+    oversubscribe each other -- and, since each concurrent whole-scene
+    minterpolate process's memory footprint scales with resolution, scale the
+    TOTAL budget down for high-resolution input before splitting it (a 4K
+    input running 6 concurrent whole-scene minterpolate processes was a real
+    OOM incident -- see CHANGELOG).
+
+    Heuristic (``resolution`` is the probed INPUT's own (width, height), None
+    if unavailable -- falls back to no memory scaling):
+      - ``pixels = width * height``; ``reference = 1920 * 1080``.
+      - ``mem_scale = max(1.0, pixels / (2 * reference))`` -- inputs up to
+        ~2x 1080p keep the full CPU-only budget; 4K (4x 1080p) halves it;
+        8K (16x 1080p) quarters it again.
+      - ``total_budget = max(1, round(min(cpu, 8) / mem_scale))``, then split
+        scene_workers / per_scene_chunks from that same total_budget as
+        before.
+
+    ``scenes.max_workers`` (config, default null), if set to a positive int,
+    caps the returned ``scene_workers`` explicitly -- it does not change
+    ``total_budget`` itself, so ``per_scene_chunks`` is still derived from
+    the (uncapped) total budget split across the (capped) worker count.
 
     Returns (scene_workers, per_scene_parallel_chunks).
     """
     cpu = os.cpu_count() or 4
-    total_budget = max(1, min(cpu, 8))
+    mem_scale = 1.0
+    if resolution:
+        width, height = resolution
+        pixels = (width or 0) * (height or 0)
+        if pixels > 0:
+            reference = 1920 * 1080
+            mem_scale = max(1.0, pixels / (2 * reference))
+    total_budget = max(1, round(min(cpu, 8) / mem_scale))
+
     if num_scenes <= 1:
-        return 1, total_budget
-    scene_workers = max(1, min(num_scenes, total_budget))
+        scene_workers = 1
+    else:
+        scene_workers = max(1, min(num_scenes, total_budget))
+        max_workers_cfg = config.get("scenes", "max_workers", default=None)
+        if max_workers_cfg is not None and max_workers_cfg > 0:
+            scene_workers = max(1, min(scene_workers, int(max_workers_cfg)))
+
     per_scene_chunks = max(1, total_budget // scene_workers)
     return scene_workers, per_scene_chunks
 
@@ -388,7 +469,15 @@ def run_scene_pipeline(
         dropped_info: list[dict[str, Any]] = []
         kept_scenes = list(enumerate(scenes))
 
-        if config.get("scenes", "drop_non_content", default=False):
+        drop_non_content = config.get("scenes", "drop_non_content", default=False)
+        vlm_enabled = config.get("analysis", "vlm", "enabled", default=False)
+        if drop_non_content and not vlm_enabled:
+            logger.warning(
+                "scenes.drop_non_content requires analysis.vlm.enabled; skipping VLM "
+                "scene classification -- keeping all %d scenes",
+                len(scenes),
+            )
+        elif drop_non_content:
             try:
                 summaries = _collect_scene_vlm_summaries(input_path, scenes, config)
                 coordinator_result = run_scene_coordinator(summaries, config)
@@ -424,8 +513,40 @@ def run_scene_pipeline(
             kept_scenes = list(enumerate(scenes))
             dropped_info = []
 
-        has_audio = probe(input_path).has_audio
-        scene_workers, per_scene_chunks = _scene_worker_budget(len(kept_scenes), config)
+        input_probe = probe(input_path)
+        has_audio = input_probe.has_audio
+        scene_workers, per_scene_chunks = _scene_worker_budget(
+            len(kept_scenes), config, input_probe.resolution
+        )
+        if run_interpolate:
+            # Log the ai/traditional choice and its true source ONCE per job:
+            # interpolate_scene_clip passes the resolved method to execute()
+            # explicitly, so the stage's own INFO line can only say "explicit
+            # method= argument" -- this line is where a scene-mode log
+            # explains WHY (and how to opt into AI when it's the auto
+            # default).
+            interp_method, interp_source = _resolve_scene_interpolate_method(config)
+            if interp_method == "ai":
+                logger.info(
+                    "Scene-mode interpolation: using AI (RIFE '%s') for all scenes "
+                    "(selected by %s; concurrent inference bounded by "
+                    "gpu.max_concurrent_inferences)",
+                    config.get("stages", "interpolate", "ai_model", default="rife_v4.6"),
+                    interp_source,
+                )
+            elif interp_source == "auto default":
+                logger.info(
+                    "Scene-mode interpolation: using traditional minterpolate for all "
+                    "scenes (auto default; AI/RIFE model '%s' is configured but not "
+                    "selected -- set stages.interpolate.use_ai: true, "
+                    "scenes.interpolate.use_ai: true, or pass --ai to use it)",
+                    config.get("stages", "interpolate", "ai_model", default="rife_v4.6"),
+                )
+            else:
+                logger.info(
+                    "Scene-mode interpolation: using traditional minterpolate for all scenes (%s)",
+                    interp_source,
+                )
         intermediate_crf = config.get("scenes", "intermediate_crf", default=14)
         intermediate_preset = config.get("scenes", "intermediate_preset", default="veryfast")
         # Scene split/concat/mux passes scale with input length like any stage's

@@ -40,24 +40,30 @@ class DenoiseVideoStage(BaseStage):
         input_path: str,
         output_path: str | None = None,
         progress_callback=None,
-        method: str = "traditional",
+        method: str | None = None,
         strength: str = "medium",
         **kwargs,
     ) -> StageResult:
         start = time.time()
         self._report_progress(0.0, "Running video denoising...", progress_callback)
 
-        # Apply global AI override from CLI/config. Unlike DeblockStage
-        # (which defaults to AI when general.use_ai is unset), this stage's
-        # `method` parameter itself defaults to "traditional" - denoising
-        # benefits less from Real-ESRGAN than deblocking does, and hqdn3d is
-        # far cheaper with no GPU/model dependency. That default is
-        # deliberate, not an oversight.
-        use_ai = self.config.get("general", "use_ai", default=None)
-        if use_ai is True:
-            method = "ai"
-        elif use_ai is False:
-            method = "traditional"
+        # Resolve "ai" vs "traditional" per the shared precedence (explicit
+        # method= kwarg > stages.denoise_video.use_ai > general.use_ai > the
+        # stage's own auto default) -- see BaseStage.resolve_ai_method's
+        # docstring. Unlike DeblockStage (which defaults to AI), this
+        # stage's auto default stays "traditional" - denoising benefits less
+        # from Real-ESRGAN than deblocking does, and hqdn3d is far cheaper
+        # with no GPU/model dependency. That default is deliberate, not an
+        # oversight.
+        method, source = self.resolve_ai_method(method, "traditional")
+        ai_model = self._stage_config.get("ai_model", "RealESRGAN_x4plus")
+        self._log_ai_method_choice(
+            method,
+            source,
+            ai_desc=f"AI denoising (Real-ESRGAN '{ai_model}')",
+            traditional_desc="traditional hqdn3d filter",
+            ai_hint=f"AI Real-ESRGAN model '{ai_model}'",
+        )
 
         try:
             if method == "ai":

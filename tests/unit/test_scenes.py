@@ -48,6 +48,116 @@ class TestSceneWorkerBudget:
         # exceed the total budget (loose bound, exact value is cpu-dependent).
         assert scene_workers * chunks <= 16
 
+    def test_1080p_budget_unchanged(self, tmp_path, monkeypatch):
+        """Fix 4: a 1080p (or smaller) input's mem_scale is 1.0, so the
+        budget must exactly match the pre-fix (resolution-blind) formula."""
+        monkeypatch.setattr("os.cpu_count", lambda: 8)
+        no_res = _scene_worker_budget(4, _cfg(tmp_path))
+        with_1080p = _scene_worker_budget(4, _cfg(tmp_path), (1920, 1080))
+        assert with_1080p == no_res
+
+    def test_4k_halves_total_budget(self, tmp_path, monkeypatch):
+        """Fix 4: the real OOM incident -- a 4K input yielded 6 concurrent
+        whole-scene minterpolate processes even with fix 1's chunk-forwarding
+        bug fixed, because _scene_worker_budget was memory-blind. 4K is 4x
+        1080p's pixel count, so mem_scale = max(1.0, 4/2) = 2.0 -> total
+        budget halves from 8 to 4."""
+        monkeypatch.setattr("os.cpu_count", lambda: 8)
+        scene_workers, chunks = _scene_worker_budget(4, _cfg(tmp_path), (3840, 2160))
+        assert scene_workers == 4
+        assert chunks == 1
+
+    def test_max_workers_caps_scene_workers(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("os.cpu_count", lambda: 8)
+        config = _cfg(tmp_path)
+        config.set(2, "scenes", "max_workers")
+        scene_workers, chunks = _scene_worker_budget(4, config, (3840, 2160))
+        assert scene_workers == 2
+        # Chunk split still derives from the same (uncapped) total budget (4),
+        # now spread across only 2 workers.
+        assert chunks == 2
+
+    def test_max_workers_does_not_affect_single_scene(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("os.cpu_count", lambda: 8)
+        config = _cfg(tmp_path)
+        config.set(2, "scenes", "max_workers")
+        scene_workers, chunks = _scene_worker_budget(1, config, (1920, 1080))
+        assert scene_workers == 1
+        assert chunks == 8
+
+
+class TestDropNonContentVlmGating:
+    """Fix 2: scenes.drop_non_content must not attempt VLM classification at
+    all when analysis.vlm.enabled is False -- previously it called
+    _collect_scene_vlm_summaries() unconditionally, which (with the VLM
+    endpoint down) meant ~8 minutes of 120s HTTP timeouts before "keeping
+    all scenes anyway" (see the OOM-incident writeup this fix addresses).
+    """
+
+    def test_vlm_disabled_skips_classification_and_keeps_all_scenes(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        from autovideofixer.core import scenes as scenes_mod
+        from autovideofixer.core.analysis import VideoAnalyzer
+
+        config = Config(tmp_path / "nonexistent.yaml")
+        config.set(True, "scenes", "drop_non_content")
+        # analysis.vlm.enabled is left at its False default.
+        assert config.get("analysis", "vlm", "enabled") is False
+
+        fake_scenes = [
+            SceneEvent(start_time=0.0, end_time=2.0),
+            SceneEvent(start_time=2.0, end_time=4.0),
+        ]
+        monkeypatch.setattr(VideoAnalyzer, "detect_events", lambda self, path: fake_scenes)
+
+        def _must_not_be_called(*_args, **_kwargs):
+            raise AssertionError(
+                "VLM scene classification must not run when analysis.vlm.enabled is False"
+            )
+
+        monkeypatch.setattr(scenes_mod, "_collect_scene_vlm_summaries", _must_not_be_called)
+        monkeypatch.setattr(scenes_mod, "run_scene_coordinator", _must_not_be_called)
+
+        def _fake_split_video(_input_path, _scene, out_path, **_kw):
+            open(out_path, "wb").close()
+            return True
+
+        def _fake_concat_video_clips(_paths, out_path, _work_dir, **_kw):
+            open(out_path, "wb").close()
+            return True
+
+        monkeypatch.setattr(scenes_mod, "split_scene_video", _fake_split_video)
+        monkeypatch.setattr(scenes_mod, "concat_video_clips", _fake_concat_video_clips)
+
+        class _FakeProbe:
+            has_audio = False
+            resolution = (1920, 1080)
+
+        monkeypatch.setattr(scenes_mod, "probe", lambda _path: _FakeProbe())
+
+        work_dir = tmp_path / "work"
+        work_dir.mkdir()
+
+        with caplog.at_level("WARNING"):
+            result = scenes_mod.run_scene_pipeline(
+                str(tmp_path / "input.mp4"),
+                config,
+                run_stabilize=False,
+                run_interpolate=False,
+                target_fps=None,
+                work_dir=str(work_dir),
+            )
+
+        assert result is not None
+        assert result.total_scenes == 2
+        assert result.kept_scenes == 2
+        assert result.dropped_scenes == []
+        assert any(
+            "scenes.drop_non_content requires analysis.vlm.enabled" in record.message
+            for record in caplog.records
+        )
+
 
 class TestSplitAndConcat:
     @pytest.mark.integration
@@ -160,6 +270,12 @@ class TestRunScenePipeline:
         fail open: every scene kept, nothing dropped."""
         config = _cfg(tmp_path)
         config.set(True, "scenes", "drop_non_content")
+        # VLM must be explicitly enabled for this test to actually exercise
+        # the "reachable but errors" fail-open path -- see Fix 2's
+        # unit-level test (TestDropNonContentVlmGating) for the
+        # vlm.enabled=False short-circuit that skips the network call
+        # entirely.
+        config.set(True, "analysis", "vlm", "enabled")
         # Point at a guaranteed-unreachable port so this doesn't depend on
         # whether the test host happens to have something on 11434.
         config.set("http://127.0.0.1:1", "analysis", "vlm", "api_url")

@@ -8,6 +8,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- **Scene-mode OOM incident: per-scene `parallel_chunks` override was silently swallowed**: a
+  real 2-minute 4K/30fps run in scene mode OOM-killed a 56 GiB container. Root cause:
+  `InterpolateStage.execute()` accepted `parallel_chunks` only via `**kwargs`, never forwarding it
+  to `_execute_traditional()` -- so scene mode's per-scene chunk-budget bound
+  (`_scene_worker_budget()`, `core/scenes.py`) was lost and every concurrently-processed scene's
+  traditional interpolation fell back to `stages.interpolate.parallel_chunks`'s own independent
+  auto-chunking (0 = auto = `min(cpu, 8)`) PER SCENE. Log evidence: 6 scenes processed
+  concurrently, each ALSO auto-chunking up to 8 ways, peaking at ~12 concurrent 4K `minterpolate`
+  ffmpeg processes. `execute()` now accepts `parallel_chunks` as a real named parameter (default
+  `None`) and forwards it through.
+- **Scene VLM classification ignored `analysis.vlm.enabled`**: `scenes.drop_non_content` called
+  the per-scene VLM sampling + coordinator pass unconditionally, even when VLM was disabled. With
+  the VLM endpoint down, this meant ~8 minutes of 120s HTTP timeouts before "keeping all scenes
+  anyway" (the same incident run above). `run_scene_pipeline()` now checks `analysis.vlm.enabled`
+  first: when `drop_non_content` is true but VLM is disabled, it logs one WARNING and keeps all
+  scenes without any VLM/network call.
+
 - **Volume/audio normalization no longer fails on silent or near-silent audio**: inputs with no
   real audio track get a silent stereo track added earlier in the pipeline, so by the time
   `normalize_volume`/`normalize_audio` (`core/stages/normalize_audio.py`) run there IS an audio
@@ -91,6 +108,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     blanket formatter the way the logging path does.
 
 ### Added
+- **Per-stage `use_ai` tristate, shared AI/traditional method resolution, and loud method-choice
+  logging**: the four AI-capable stages (upscale, deblock, denoise_video, interpolate) now resolve
+  "ai" vs "traditional" through one shared `BaseStage.resolve_ai_method(explicit_method,
+  auto_default)` helper (`core/stages/base.py`), called once at the top of each stage's
+  `execute()`. Precedence: an explicit `method=` kwarg from a caller (scene mode, tests) wins
+  outright; then the new `stages.<name>.use_ai` (tristate, default `null`); then `general.use_ai`
+  (unchanged, set by `--ai`/`--no-ai` -- per the existing `ai_fallback` convention, the global flag
+  does not override an explicit per-stage config value); then the stage's own hardcoded auto
+  default (upscale/deblock -> AI, denoise_video/interpolate -> traditional -- all four deliberate,
+  documented in `AGENTS.md`). `interpolate`'s `method` parameter changed from `str = "traditional"`
+  to `str | None = None`; `denoise_video`'s likewise, preserving its `"traditional"` auto default
+  exactly. Every stage now logs the resolved method + why at **INFO** (`_log_ai_method_choice()`)
+  -- visible in a normal `--verbose` run, so a grep for "using traditional"/"using AI" always
+  explains what happened, including an opt-in hint (e.g. "set stages.interpolate.use_ai: true or
+  pass --ai to use it") when the auto default landed on traditional.
+- **`scenes.interpolate.use_ai`** (tristate, default `null`): scene-mode-only override for
+  per-scene interpolation method selection. `null` resolves via the same shared
+  `resolve_ai_method()` the standard `interpolate` stage uses (so both paths respond together to
+  `stages.interpolate.use_ai`/`general.use_ai`, fixing scene mode previously hardcoding its method
+  from `general.use_ai` alone and mapping "auto" to traditional independently of the stage);
+  `true`/`false` forces AI/traditional for the scene path only.
+- **`gpu.max_concurrent_inferences`** (default `1`): process-wide cap on concurrent GPU AI
+  inferences, enforced by a lazily-created `threading.Semaphore`
+  (`ai.torch_utils.get_gpu_inference_semaphore()`). Scene mode acquires it around the AI/RIFE
+  inference call only (per-scene, when the resolved method is "ai") -- otherwise scene mode's
+  thread pool (`scene_workers` threads) would launch concurrent RIFE inferences contending for
+  VRAM instead of parallelizing. Whole-video (non-scene) runs execute stages serially already, so
+  they're unaffected. A thread blocking on the semaphore logs at DEBUG.
+- **Resolution-aware scene worker budget**: `_scene_worker_budget()` (`core/scenes.py`) was
+  memory-blind, splitting only the CPU count -- even with the `parallel_chunks`-forwarding fix
+  above, a 4K input could still run several concurrent multi-GB-footprint whole-scene
+  `minterpolate` processes. It now takes the input's already-probed resolution and scales the
+  total CPU budget down before splitting (`mem_scale = max(1.0, pixels / (2 * 1920*1080))` --
+  inputs up to ~2x 1080p keep the full budget, 4K halves it, 8K quarters it again). New
+  `scenes.max_workers` (default `null`): a positive int caps the resulting `scene_workers`
+  explicitly without changing the underlying total budget the per-scene chunk count still derives
+  from.
+
 - **CSS-like config cascade for `avf process`, plus `--set KEY=VALUE`**: config now resolves as
   an ordered stack of layers -- `Config.DEFAULTS` < the user `config.yaml` (or an explicit
   top-level `--config`/`AVF_CONFIG` path, unchanged) < each `process --preset NAME_OR_PATH` /

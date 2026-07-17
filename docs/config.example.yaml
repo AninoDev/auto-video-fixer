@@ -111,6 +111,17 @@ gpu:
   # `uv run python -c "import ncnn; [print(i, ncnn.get_gpu_info(i).device_name()) for i in range(ncnn.get_gpu_count())]"`.
   vulkan_device: 0
 
+  # Process-wide cap on concurrent GPU AI inferences. Currently only gates scene mode's AI/RIFE
+  # interpolation path (core/scenes.py's interpolate_scene_clip / ai/torch_utils.py's
+  # get_gpu_inference_semaphore) -- scene mode runs up to scenes.max_workers scenes concurrently
+  # in a thread pool, and without this, each thread resolving to the AI path would launch its own
+  # RIFE inference and contend for VRAM instead of parallelizing. Whole-video (non-scene) runs
+  # execute stages serially already, so this never gates them. 1 (default) = fully serialize GPU
+  # inference across scene threads -- the safe default on a single GPU. Raise only if you know
+  # your GPU has VRAM headroom for concurrent inferences. Also the single-GPU placeholder for
+  # future multi-GPU inference distribution -- see docs/ROADMAP.md.
+  max_concurrent_inferences: 1
+
 ffmpeg:
   # Path to the ffmpeg binary. null = auto-detect via `shutil.which` in PATH. ffprobe is
   # located relative to this path (or also auto-detected via PATH) -- see get_ffprobe_path().
@@ -355,6 +366,13 @@ stages:
     # Per-stage AI-fallback override: null = inherit general.ai_fallback above; true/false
     # overrides it for this stage only.
     ai_fallback: null
+    # Per-stage AI/traditional method override: null (default) = auto -- upscale's own
+    # scale-threshold logic picks AI when a real scale-up is needed, else traditional lanczos
+    # scaling. true/false forces AI/traditional for this stage only, overriding the auto
+    # scale-threshold logic but NOT an explicit method= kwarg from a caller. See AGENTS.md's
+    # "AI/Traditional Method Selection" for the full precedence (explicit method= kwarg > this
+    # key > general.use_ai > auto default).
+    use_ai: null
     # Inference backend: torch (PyTorch/CUDA) or ncnn (Vulkan via the in-process `ncnn` Python
     # package -- portable to AMD/Intel/integrated GPUs, no CUDA-matched torch build needed).
     # Falls through the ai_fallback policy if the ncnn package, a Vulkan device, or the ncnn
@@ -382,6 +400,12 @@ stages:
     # Traditional method: FFmpeg's minterpolate filter (motion-compensated frame blending).
     traditional_method: minterpolate
     ai_fallback: null  # see stages.upscale.ai_fallback above
+    # Per-stage AI/traditional override: null (default) = auto (traditional minterpolate --
+    # deliberate, fast with decent quality). true/false forces AI/traditional for this stage
+    # only. See stages.upscale.use_ai above for the full precedence. Scene mode has its OWN
+    # scenes.interpolate.use_ai override (see the scenes: section below) that supersedes this
+    # key for the per-scene interpolation path only.
+    use_ai: null
     # torch | ncnn -- see stages.upscale.backend. RIFE's ncnn backend uses a separate package,
     # rife-ncnn-vulkan-python (part of the "ncnn" extra), not the generic ncnn package upscale
     # uses -- RIFE's official graph needs a custom 'rife.Warp' ncnn layer only that package
@@ -410,6 +434,10 @@ stages:
     batch_size: 1       # see stages.upscale.batch_size above
     tile_batch_size: 1  # see stages.upscale.tile_batch_size above
     ai_fallback: null    # see stages.upscale.ai_fallback above
+    # Per-stage AI/traditional override: null (default) = auto (traditional hqdn3d -- deliberate,
+    # denoising benefits less from Real-ESRGAN than deblocking does and hqdn3d needs no GPU/model).
+    # true/false forces AI/traditional for this stage only. See stages.upscale.use_ai above.
+    use_ai: null
     temp_crf: 16          # see stages.upscale.temp_crf above
     read_ahead: 2         # see stages.upscale.read_ahead above
     write_queue_depth: 4  # see stages.upscale.write_queue_depth above
@@ -432,6 +460,10 @@ stages:
     batch_size: 1       # see stages.upscale.batch_size above
     tile_batch_size: 1  # see stages.upscale.tile_batch_size above
     ai_fallback: null    # see stages.upscale.ai_fallback above
+    # Per-stage AI/traditional override: null (default) = auto (AI -- deliberate, better quality
+    # than the traditional unsharp filter). true/false forces AI/traditional for this stage only.
+    # See stages.upscale.use_ai above.
+    use_ai: null
     temp_crf: 16          # see stages.upscale.temp_crf above
     read_ahead: 2         # see stages.upscale.read_ahead above
     write_queue_depth: 4  # see stages.upscale.write_queue_depth above
@@ -582,12 +614,30 @@ scenes:
   # the coordinator flags as not part of the main content (e.g. a "like and subscribe"
   # interstitial). Fails open (keeps every scene, logs a WARNING) on any failure -- unreachable
   # endpoint, malformed response, bad drop index -- never drops content on an LLM failure.
+  # Also requires analysis.vlm.enabled: true -- if drop_non_content is true but VLM is disabled,
+  # scene mode logs one WARNING and keeps all scenes WITHOUT attempting any VLM/network call (a
+  # real incident: with VLM disabled and its endpoint down, an earlier version still made the
+  # call unconditionally, burning ~8 minutes of HTTP timeouts before falling back open anyway).
   drop_non_content: false
   # Re-encode codec settings for the per-scene split/concat intermediate passes (re-encoded
   # again by the final whole-video "encode" stage, so this only needs to be visually
   # lossless-ish, not archival quality).
   intermediate_crf: 14
   intermediate_preset: veryfast
+  # null (default) = auto: _scene_worker_budget()'s cpu-and-resolution-based heuristic picks how
+  # many scenes process concurrently (mem_scale down-weights the CPU-only budget for
+  # higher-than-1080p input -- see AGENTS.md's "Scene mode" section for the exact formula). A
+  # positive int caps the resulting scene_workers explicitly; the per-scene traditional-
+  # interpolation chunk split still derives from the same underlying (uncapped) total budget.
+  max_workers: null
+  interpolate:
+    # Scene-mode-ONLY override for AI/traditional interpolation method selection. null (default)
+    # resolves via the EXACT same shared precedence as the standard "interpolate" stage
+    # (stages.interpolate.use_ai / general.use_ai / the stage's traditional auto default -- see
+    # AGENTS.md's "AI/Traditional Method Selection"), so both paths respond together to the same
+    # config. true/false forces AI/traditional for the scene-mode path only, without touching
+    # whole-video interpolate behavior.
+    use_ai: null
   stabilize:
     # Per-scene stabilize strength tiering. If false, stabilize still runs per-scene (never
     # across a cut) but with stages.stabilize's normal (non-tiered) config for every scene.

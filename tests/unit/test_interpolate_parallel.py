@@ -7,6 +7,7 @@ marked integration.
 
 from __future__ import annotations
 
+from typing import Any
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -101,6 +102,103 @@ class TestResolveChunkCount:
                 "x.mp4", chunks_cfg=4, min_chunk_dur=5.0, current_fps=30.0
             )
         assert n == 1
+
+
+class TestParallelChunksOverrideForwarded:
+    """Fix 1 (the OOM-incident regression test): execute() must forward an
+    explicit parallel_chunks= kwarg through to _execute_traditional(), not
+    silently swallow it into **kwargs. Before the fix, scene mode's
+    per-scene chunk budget (_scene_worker_budget) was lost and
+    _execute_traditional fell back to stages.interpolate.parallel_chunks
+    (0 = auto = min(cpu, 8)) PER SCENE -- 6 scenes x up to 8 chunks each
+    peaked at ~12 concurrent 4K minterpolate ffmpeg processes and OOM-killed
+    a 56 GiB container.
+    """
+
+    def test_execute_forwards_parallel_chunks_override(self, tmp_path):
+        stage = _stage(tmp_path)
+        video_info = {"framerate": 30.0, "resolution": (320, 240), "duration": 120.0}
+        # duration/frame_count long enough that auto-chunking (parallel_chunks=0,
+        # the config default) would pick more than 1 chunk.
+        probe_result = _fake_probe(120.0, 3600, framerate=30.0)
+
+        fake_ffmpeg_result = MagicMock(returncode=0, stderr="")
+        with (
+            patch("autovideofixer.core.ffmpeg_utils.get_video_info", return_value=video_info),
+            patch("autovideofixer.core.stages.interpolate.probe", return_value=probe_result),
+            patch(
+                "autovideofixer.core.stages.interpolate.run_ffmpeg",
+                return_value=fake_ffmpeg_result,
+            ),
+            patch("os.cpu_count", return_value=8),
+            patch(
+                "autovideofixer.core.stages.interpolate.InterpolateStage."
+                "_execute_traditional_parallel"
+            ) as mock_parallel,
+        ):
+            result = stage.execute(
+                "in.mp4",
+                str(tmp_path / "out.mp4"),
+                target_fps=60.0,
+                method="traditional",
+                parallel_chunks=1,
+            )
+
+        # The parallel executor must never be constructed -- parallel_chunks=1
+        # forces the single-pass path regardless of what auto-chunking would
+        # have picked for this duration/cpu count.
+        mock_parallel.assert_not_called()
+        assert result.status.value == "completed"
+        assert result.metadata["parallel_chunks"] == 1
+
+    def test_scenes_propagates_override_into_resolved_chunk_count(self, tmp_path):
+        """End-to-end at the scenes.py level: interpolate_scene_clip's
+        parallel_chunks_override must reach InterpolateStage.execute()'s
+        resolved chunk count."""
+        from autovideofixer.config import Config as _Config
+        from autovideofixer.core import scenes as scenes_mod
+
+        config = _Config(tmp_path / "nonexistent.yaml")
+        config.set(0, "stages", "interpolate", "parallel_chunks")  # auto
+
+        captured: dict[str, Any] = {}
+
+        class _FakeStage:
+            def __init__(self, _config):
+                pass
+
+            def should_run(self, _input_info):
+                return True, None
+
+            def resolve_ai_method(self, explicit_method, auto_default):
+                return (explicit_method or auto_default), "auto default"
+
+            def execute(self, _input_path, _output_path, input_info=None, **kwargs):
+                captured.update(kwargs)
+                from autovideofixer.core.stages.base import StageResult, StageStatus
+
+                return StageResult(
+                    status=StageStatus.COMPLETED,
+                    metadata={"parallel_chunks": kwargs.get("parallel_chunks")},
+                )
+
+        fake_probe_result = _fake_probe(30.0, 900, framerate=30.0)
+        with (
+            patch.object(scenes_mod, "InterpolateStage", _FakeStage),
+            patch.object(scenes_mod, "probe", return_value=fake_probe_result),
+        ):
+            ok, ran = scenes_mod.interpolate_scene_clip(
+                "clip.mp4",
+                str(tmp_path / "out.mp4"),
+                config,
+                target_fps=60.0,
+                parallel_chunks_override=3,
+            )
+
+        assert ok is True
+        assert ran is True
+        assert captured["parallel_chunks"] == 3
+        assert captured["method"] == "traditional"
 
 
 class TestParallelVsSerialInterpolation:

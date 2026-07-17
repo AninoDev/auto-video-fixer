@@ -244,12 +244,42 @@ The CLI `-o` flag sets `general.output_dir` in config. The pipeline reads it whe
 
 ## AI/Traditional Method Selection
 
-Stages with AI alternatives (upscale, denoise_video, interpolate, deblock) check `config.get("general", "use_ai")`:
-- `None` (default) — use preset or auto-detect
-- `True` (`--ai`) — force AI methods
-- `False` (`--no-ai`) — force traditional methods (much faster, no GPU needed)
+The four AI-capable stages (upscale, deblock, denoise_video, interpolate) all resolve their
+`method` ("ai" vs "traditional") through one shared helper, `BaseStage.resolve_ai_method(
+explicit_method, auto_default)` (`core/stages/base.py`), called at the top of each stage's
+`execute()`. Precedence, highest first:
 
-CLI: `--ai` / `--no-ai` (mutually exclusive flag_value pattern). Without either flag, falls back to preset/config.
+1. **An explicit `method=` kwarg** passed by a caller (scene mode, tests, direct `--stage`
+   invocations) — wins outright, no matter what config says.
+2. **`stages.<name>.use_ai`** (tristate: `null` (default) / `true` / `false`) — per-stage
+   override, set in config only (no dedicated CLI flag; use `--set stages.<name>.use_ai=true`).
+3. **`general.use_ai`** (tristate, same as before) — set by the CLI's `--ai`/`--no-ai`
+   (mutually exclusive flag_value pattern). Per the same convention as `ai_fallback` below, the
+   global CLI flag does **not** override an explicit per-stage config value — step 2 already won
+   if it applied.
+4. **The stage's own hardcoded auto default** — used only when nothing above resolved it.
+   These are deliberate, not oversights: **upscale** defaults to AI (its own scale-threshold
+   logic in `_auto_method_for_scale()` still decides "already at target" → traditional even at
+   this step), **deblock** defaults to AI (better quality), **denoise_video** and **interpolate**
+   both default to **traditional** (hqdn3d/minterpolate are far cheaper with no GPU/model
+   dependency, and minterpolate is fast with decent quality — a deliberate asymmetry vs.
+   upscale/deblock).
+
+`resolve_ai_method()` returns `(method, source)`; every stage immediately logs the choice at
+**INFO** via `BaseStage._log_ai_method_choice()` — this fires on every `--verbose` run (no need
+for DEBUG), so a grep for "using traditional"/"using AI" in a log always explains what happened.
+Format: stage name, chosen method + a stage-specific technology description, and the resolution
+source; when the auto default landed on traditional, the message also appends an opt-in hint
+(e.g. `set stages.interpolate.use_ai: true or pass --ai to use it`) — the hint is omitted once
+the traditional choice came from an explicit `use_ai: false`/`--no-ai` rather than the default,
+since there's nothing to "opt into" from an explicit choice. Example lines:
+```
+interpolate: using traditional minterpolate (auto default; AI/RIFE model 'rife_v4.6' is
+configured but not selected -- set stages.interpolate.use_ai: true or pass --ai to use it)
+interpolate: using traditional minterpolate (stages.interpolate.use_ai: false)
+interpolate: using AI interpolation (RIFE 'rife_v4.6', backend torch) (selected by
+stages.interpolate.use_ai: true)
+```
 
 ### AI-fallback policy
 
@@ -679,6 +709,21 @@ per-run number baked into this codebase.
   (matching `UpscaleStage`'s "already at target" / `StabilizeStage`'s "no stabilization needed"
   mid-execute skip convention) instead of failing.
 - **Preset stage enable**: Presets define `enable_stages` which controls which stages run. A stage not listed in a preset's `enable_stages` will not execute, even if it's in the default order.
+- **Stage `execute()` kwargs that matter must be named parameters, not left to `**kwargs`**: a
+  real incident -- `InterpolateStage.execute()` used to accept `parallel_chunks` only via
+  `**kwargs` (never forwarded to `_execute_traditional()`), so scene mode's per-scene chunk-budget
+  override (`_scene_worker_budget`) was silently dropped and every concurrently-processed scene
+  fell back to its own independent auto-chunking -- 6 scenes x up to 8 auto-chunks peaked at ~12
+  concurrent 4K `minterpolate` ffmpeg processes and OOM-killed a 56 GiB container. If a caller
+  (scene mode, tests, another stage) passes a kwarg that changes behavior, it needs an explicit
+  named parameter all the way down the call chain -- `**kwargs`'s tolerant-signature convention is
+  for genuinely-ignorable extras only.
+- **`scenes.drop_non_content` silently doing nothing is not "fail open enough"**: it must check
+  `analysis.vlm.enabled` BEFORE attempting any VLM/network call, not just fail open after a failed
+  call -- with VLM disabled and its endpoint unreachable, an unconditional VLM call still burns
+  full HTTP timeouts (minutes) before "keeping all scenes anyway". `run_scene_pipeline()` checks
+  `analysis.vlm.enabled` first and logs one WARNING + keeps all scenes with zero network calls
+  when it's false.
 - **Every new subprocess spawn must detach stdin**: an ffmpeg subprocess whose stdin is the
   caller's controlling terminal switches that tty to raw mode (to poll for interactive keys) and
   does **not** restore it if killed/crashed/backgrounded -- the classic symptom is a shell with no
@@ -747,6 +792,18 @@ after `current_path = job.input_path`, before the main stage loop).
   reassembled file, with `stabilize`/`interpolate` removed from the remaining stage list (they
   already ran) -- `upscale`/`denoise_video`/`deblock`/`normalize_*`/`encode` all run once on the
   whole reassembled video, not per-scene.
+- **Resolution-aware scene worker budget** (`_scene_worker_budget()`): splitting only the CPU
+  budget between "scenes run concurrently" and "chunks per scene's traditional interpolation" is
+  memory-blind -- each concurrent whole-scene `minterpolate` process's footprint scales with
+  resolution, so a 4K input could still run several concurrent multi-GB processes even with the
+  chunk-forwarding fix above. `run_scene_pipeline()` passes the already-probed input's
+  `(width, height)` (no extra probe) into `_scene_worker_budget()`, which scales the TOTAL budget
+  down before splitting: `pixels = width * height`, `reference = 1920*1080`,
+  `mem_scale = max(1.0, pixels / (2 * reference))` (inputs up to ~2x 1080p keep the full budget;
+  4K halves it; 8K quarters it again), `total_budget = max(1, round(min(cpu, 8) / mem_scale))`.
+  `scenes.max_workers` (config, default `null`) caps the resulting `scene_workers` explicitly when
+  set to a positive int -- it does not change `total_budget` itself, so `per_scene_chunks` is
+  still derived from the (uncapped) total budget split across the (capped) worker count.
 - **Fewer than 2 scenes detected, or any internal failure** (split/stabilize/interpolate/concat
   error, unexpected exception): `run_scene_pipeline()` returns `None` and the pipeline silently
   falls back to normal whole-video processing for that job -- scene mode can never turn a job that
@@ -764,8 +821,38 @@ after `current_path = job.input_path`, before the main stage loop).
   whole file when scene mode is on): each scene's own framerate is checked against the target via
   `should_run()` before interpolating, so a scene already at/above target framerate passes through
   unchanged instead of being redundantly processed.
+- **Scene-mode AI/traditional method selection** (`interpolate_scene_clip()`, `core/scenes.py`):
+  `scenes.interpolate.use_ai` (tristate, default `null`) is a scene-mode-ONLY override, resolved
+  separately from (but able to defer to) the standard interpolate stage's own resolution --
+  `null` resolves the method via the exact same shared `BaseStage.resolve_ai_method()` call the
+  standard `interpolate` stage uses (so both paths respond together to `stages.interpolate.use_ai`
+  / `general.use_ai`); `true`/`false` forces AI/traditional for the scene path only, without
+  touching whole-video `interpolate` behavior. Either way, the resolved method is passed to
+  `InterpolateStage.execute()` as the explicit `method=` kwarg (step 1 of the shared precedence,
+  see "AI/Traditional Method Selection" above), alongside the per-scene `parallel_chunks` override
+  (from `_scene_worker_budget`, see below) when traditional -- `execute()` accepts
+  `parallel_chunks` as a real named parameter (not swallowed into `**kwargs`) and forwards it to
+  `_execute_traditional()`, so this override actually takes effect per scene instead of every
+  concurrently-processed scene falling back to `stages.interpolate.parallel_chunks`'s own
+  independent auto-chunking (a real OOM incident: 6 scenes x up to 8 auto-chunks each peaked at
+  ~12 concurrent 4K minterpolate ffmpeg processes and OOM-killed a 56 GiB container).
+- **GPU inference semaphore** (`gpu.max_concurrent_inferences`, default `1`): scene mode runs up
+  to `scene_workers` scenes concurrently in a thread pool; when the resolved method for a scene is
+  "ai", each thread would otherwise launch a full RIFE inference and contend for VRAM instead of
+  parallelizing. `interpolate_scene_clip()` acquires a process-wide `threading.Semaphore` (lazily
+  created from config by `ai.torch_utils.get_gpu_inference_semaphore()`) around the AI-inference
+  `stage.execute()` call only -- the traditional/chunked path is NOT gated. A thread blocking on
+  the semaphore logs at DEBUG. Whole-video (non-scene) runs execute stages serially already, so
+  they never need this; it's also the single-GPU placeholder for future multi-GPU inference
+  distribution (see `docs/ROADMAP.md`).
 - **Drop non-content scenes** (`scenes.drop_non_content: false` default, `--drop-non-content`
-  CLI flag): per-scene VLM sampling (`VideoAnalyzer.run_vlm_analysis_for_scene` -- samples
+  CLI flag): requires `analysis.vlm.enabled: true` -- if `drop_non_content` is true but VLM is
+  disabled, `run_scene_pipeline()` logs one WARNING
+  ("scenes.drop_non_content requires analysis.vlm.enabled; skipping VLM scene classification --
+  keeping all N scenes") and keeps every scene without touching the network at all (a real
+  incident: with VLM disabled and its endpoint down, the old unconditional VLM call still fired,
+  costing ~8 minutes of 120s HTTP timeouts before "keeping all scenes anyway"). When VLM is
+  enabled, per-scene VLM sampling (`VideoAnalyzer.run_vlm_analysis_for_scene` -- samples
   `min(max_sample_frames, ceil(scene_duration / sample_interval_sec))` frames from within just
   that scene's time range, via `_extract_sample_frames_range`) feeds a coordinating text-LLM pass
   (`run_scene_coordinator`, config `analysis.llm.*`: `provider`/`model`/`api_key`/`api_url`/
