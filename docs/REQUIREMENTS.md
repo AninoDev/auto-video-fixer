@@ -680,3 +680,218 @@ If either of these ever needs a rewrite for a reason OTHER than raw speed (e.g. 
 bug in the subprocess lifecycle management, or a need for true OS-level concurrency that Python's
 `subprocess` module can't provide), revisit — but "rewrite it in Rust" alone isn't sufficient
 justification for these two given the current design.
+
+## 6. Output handling, run reporting, and config tooling (PLANNED 2026-07-18, user-approved)
+
+User-approved requirement set from the 2026-07-18 session (full detail preserved here because
+the approving conversation is closed; treat this section as the authoritative spec). Agreed
+delivery order — four commits:
+
+1. **Commit ①**: 6.1 + 6.2 + 6.3 (one decision path in `Pipeline.execute_job()`).
+2. **Commit ②**: 6.4 + 6.5 + 6.6 (one reporting/data-model effort — summary, timing, and JSON
+   all read the same new provenance fields).
+3. **Commit ③**: 6.7 (log infrastructure, independent).
+4. **Commit ④**: 6.8 (config tooling, independent).
+
+Standing process for all four: Sonnet subagent implements from a written spec; coordinator
+independently verifies (gates: `uv run pytest tests/unit -q` — baseline 720 passing;
+`uv run ruff check .`; `uv run ruff format --check .`;
+`uv run mypy src --ignore-missing-imports` <= 172 errors; cargo gates only if Rust touched),
+plus a live end-to-end test per commit; docs synced every commit (AGENTS.md, CHANGELOG.md,
+docs/config.example.yaml); user signs/pushes each commit (agents NEVER run git
+stash/checkout/restore/reset/add/rm/mv/commit).
+
+### 6.1 Existing output with overwrite disabled = SKIPPED, not FAILED
+
+Today `execute_job()` returns `success=False` + ERROR log ("Output already exists and
+general.overwrite is False") — the user found "failed" deeply confusing for videos that were
+simply already done from a previous run.
+
+- New first-class job outcome **SKIPPED**, distinct from COMPLETED/FAILED: carried on
+  `JobResult` (with a machine-readable skip sub-reason), counted separately in the end-of-run
+  summary, logged at INFO not ERROR.
+- `general.existing_output: "skip" | "fail"` — default **"skip"**; `"fail"` restores the old
+  classification exactly.
+- Exit code: a run whose jobs are all completed-or-skipped exits 0; only true failures make
+  the run exit non-zero.
+
+### 6.2 Spec-check existing outputs; rename-or-overwrite mismatches
+
+When an output exists and overwrite is false, optionally verify the existing file actually
+satisfies the CURRENT effective targets before deciding to skip.
+
+- `general.check_existing_target: true` — **default ON** (user decision: ffprobe is cheap and
+  the info is valuable). ffprobe the existing output; compare against effective targets.
+- **v1 spec set**: container (general.target_format), resolution, framerate, video codec,
+  audio codec. Codecs compared only against what the user's encoding settings actually
+  specify; bitrate deliberately excluded (nothing targets it). Extensible.
+- **Resolution comparison must be orientation-aware and tolerant**: reuse the same semantics
+  as `UpscaleStage._effective_target_bounds()` + the 1.05 `_SKIP_SCALE_THRESHOLD` — a
+  1080x1918 output SATISFIES a [1920,1080] target (rotated bounds; exact-aspect fits
+  legitimately land a few px short). Framerate satisfied within a small epsilon
+  (29.97 ~= 30). An unreadable/corrupt existing output counts as a MISMATCH.
+- Check on + reprocessing off => mismatch logged loudly, job still SKIPPED (classified per
+  6.1, with a distinct "exists-but-mismatched" sub-reason).
+- `general.reprocess_mismatched: false` — default OFF; when true, a mismatch triggers
+  reprocessing of that one video.
+- `general.existing_mismatched: "rename" | "overwrite"` — default **"rename"** — what happens
+  to the old mismatched file when reprocessing:
+  - rename: the existing file is renamed (NEVER overwritten) to `<stem><suffix><N><ext>`,
+    N starting at 1 and incrementing until an unused name is found; the new output is then
+    written at the original name.
+  - overwrite: replace directly.
+- `general.mismatched_rename_suffix: "_mismatched-"` — user-overridable; the stem+suffix+N+ext
+  pattern and the incrementing-N contract must hold for any custom suffix.
+- `general.mismatched_max_renames: null` — cap on N. null = unlimited (default). Exceeding
+  the cap => job FAILED with an explicit reason. **0 = renaming fully disabled**: a mismatch
+  in rename mode is then FAILED (documented as the intentional "never silently rename or
+  overwrite" strict posture — user explicitly accepted FAIL semantics for this combination;
+  it is deliberately allowed, not rejected at config-validation time).
+- **Logging contract**: every decision states what the existing file measured vs. what was
+  targeted, which specs mismatched, which flags drove the outcome, and — on rename — the
+  original name and the exact new name. Example shape: "output existed but mismatched
+  (framerate 30<60, vcodec h264!=libx265); renamed to video_enhanced_mismatched-2.mp4;
+  reprocessing".
+
+### 6.3 Input probe failure policy
+
+- **Audit current behavior first** (the user does not know what AVF does today), then
+  enforce: an input ffprobe CANNOT analyze fails that job (FAILED, ffprobe stderr surfaced in
+  log and summary); ffprobe WARNINGS never fail a job by default and are always surfaced to
+  the user. Applies uniformly to every input video.
+- `general.skip_invalid_inputs: false` — opt-in scavenge mode: unanalyzable inputs become
+  SKIPPED (sub-reason: invalid/unreadable input) instead of FAILED so a batch with
+  known-corrupt members completes; still listed distinctly in the summary (the failure is
+  noted either way).
+- `general.fail_on_probe_warnings: false` — opt-in strict mode; explicitly non-default.
+
+### 6.4 Per-video stage/mode summary
+
+- Per job and aggregated at end of run, each stage classified as: **ran+AI**,
+  **ran+traditional (chosen)**, **ran+traditional (fallback — the AI attempt failed first;
+  MUST be distinguished from chosen-traditional)**, **failed**, or **skipped (with reason)**.
+- Requires uniform provenance in `StageResult.metadata`: most stages already record
+  `method`; a fallback marker must be added at the `BaseStage._ai_fallback_or_fail()` seam
+  (e.g. `metadata["ai_fallback_used"] = True` + the failure cause) so reporting can tell
+  fallback-traditional from chosen-traditional.
+- Per input video at a glance: **completed** (output created) / **failed** (no output) /
+  **skipped** with sub-reason (already-exists; exists-but-mismatched-not-reprocessed;
+  invalid input). Reprocessed-mismatch jobs are ordinary completed jobs noted as reprocessed.
+- Scene-mode stats per video when it ran: scenes detected / kept / dropped.
+- Rendered as a Rich table on the console, plain lines in the log file, and stored on
+  `JobResult` for future GUI use.
+
+### 6.5 Media info printouts + timing instrumentation
+
+- **Media info**: at each job's start log the input's resolution, framerate, duration,
+  filesize, bitrate, video/audio codecs; at completion the same for the output
+  (side-by-side comparison). INFO level.
+- **Per-stage timing**: after each stage completes/fails/skips, log its wall-clock duration
+  (`StageResult.duration_sec` already exists — surface it).
+- **Per-video timing in the end summary, millisecond precision, two DISTINCT numbers**:
+  - job total wall time: from the moment the video's turn starts (INCLUDING the 6.1/6.2
+    exists/spec-check decision phase and input probing) to the moment the job result is
+    finalized;
+  - processing time: the stage-pipeline portion only (zero for skipped videos — the reason
+    the two must be separate).
+  - Whole-run elapsed shown once at the bottom.
+- **Stage-timing summary flags** (config keys + CLI flags, all off by default; three views):
+  per-video per-stage duration table; per-stage totals summed across the run; per-stage
+  average per video. **The average's divisor is the number of videos that actually RAN that
+  stage** — never total video count (a video that failed at stage 3 contributes nothing to
+  stages 4+; a skipped stage contributes nothing anywhere). **Failed stage executions are
+  excluded from the success-timing stats and shown in their own separate section** (a stage
+  that died in 2s must not drag the average down). Purpose: identify which stages dominate
+  runtime and correlate video characteristics with stage cost.
+
+### 6.6 Structured JSON run report
+
+- Optional: `--report-json PATH` CLI flag + config key. One JSON document per run:
+  run metadata (avf version, effective non-default settings, timestamps), per-job records
+  (input/output media info, outcome + sub-reason, the full 6.1/6.2 decision trail, scene
+  stats, job total/processing ms), per-stage records within each job (status, method,
+  fallback provenance, duration ms, skip reason, error).
+- **Non-redundancy is a hard design requirement**: each fact lives in exactly ONE canonical
+  place. Aggregates (per-stage totals/averages) are NOT stored — they are derivable from the
+  per-job stage records, and storing both invites selecting the wrong attribute during
+  analysis (the user's stated purpose is offline data analysis to guide performance work).
+- Machine-oriented: stable key names, numbers as numbers, no Rich formatting artifacts.
+- The JSON always contains the raw per-stage data regardless of the 6.5 display flags.
+
+### 6.7 PII-clean log variant
+
+- `general.log_type: "raw" | "clean" | "both" | "none"` (config + CLI flag; default "raw" =
+  today's behavior). Applies to FILE logging; the console stays raw.
+- **Clean mode** substitutes private values via a logging filter holding a per-run
+  consistent mapping (same real value -> same placeholder everywhere, numbered by first
+  appearance, so cross-referencing within the log still works for diagnosis):
+  - input filenames -> `input_video_01.mkv` (original extension preserved; 2-digit numbering
+    by first appearance);
+  - output filenames -> `output_video_01.mp4`;
+  - directories -> role-based placeholders, CONSISTENT naming: `/path/to/input/`,
+    `/path/to/output/`, `/path/to/config/` (note: "input" not "input_videos" — user
+    explicitly corrected this for consistency with `/path/to/output/`);
+  - network endpoints (VLM/LLM api_url hosts/IPs) -> e.g. `http://vlm-endpoint/...`;
+  - embedded video titles/metadata values when they appear in log text;
+  - stage temp filenames (`/tmp/avf_*`) left untouched (no PII by construction);
+  - secrets already covered by the existing `redact_secrets` convention.
+- Mapping is derived from KNOWN values (actual input/output/config paths, configured
+  endpoints) — substitution, not guesswork regexes; that is what makes it reliable enough
+  for users to publish logs when asking for help. Free-text PII inside e.g. DEBUG-logged VLM
+  responses cannot be reliably caught and is documented as out of scope for v1.
+- **both mode**: two files. Suffix insertion into a custom `--log-file` name: before the
+  extension if one exists, appended to the end otherwise (extensionless Unix names).
+  `general.log_suffix_raw` (default `""`) and `general.log_suffix_clean` (default
+  `"-clean"`); empty string = no suffix. If `both` would produce two identical paths (both
+  suffixes empty), that is a config error at startup — never a silent overwrite.
+
+### 6.8 Config tooling: `avf config clean | upgrade | dump`
+
+Three subcommands under a new `avf config` group (chosen over a standalone script for CLI
+consistency; user approved).
+
+- **clean**: input YAML -> normalized bare YAML: comments stripped, canonical formatting,
+  containing ONLY the keys actually present in the input (no defaults merged in).
+- **dump**: emit the EFFECTIVE config — defaults + config file(s) + preset(s) + --set/flags,
+  the full cascade — as clean YAML. Accepts the same --config/--preset/--set layering as
+  `process` so the user can dump exactly what a given invocation would run with. Secrets
+  (api_key etc.) redacted to "***" by default; explicit `--with-secrets` writes real values.
+- **upgrade**: apply an input config onto a template — default `docs/config.example.yaml`
+  (it is updated with every AVF release), optional explicit template path. Output = the
+  template's FULL text (comments, ordering, structure, new options at their documented
+  defaults) with each LEAF value present in the input replaced in place at the same tree
+  path. Strictly leaf-by-leaf, never subtree replacement — EXCEPT lists are atomic leaves
+  (e.g. `pipeline.default_order`: order and presence matter; replace wholesale). Requires
+  round-trip comment-preserving YAML editing of the template: use **ruamel.yaml** (one new
+  dependency) — plain PyYAML cannot preserve comments. Purpose: upgrading an existing user
+  config to a new AVF version's template so new options and improved comments become
+  visible while user settings are kept.
+- **Mismatch safety**: input keys absent from the template (renamed/removed/moved options)
+  are listed explicitly and the tool REFUSES to write unless `--drop-unknown` is passed,
+  which omits them with a per-key warning. (Semantic changes hiding behind unchanged key
+  names are undetectable; documented limitation.)
+- **File safety** (all three subcommands): never overwrite an existing destination file by
+  default. `--force` overwrites; `--backup` renames the existing file to the first unused
+  incremental name (`config.yaml.1`, `config.yaml.2`, ...), writes the new file, and prints
+  exactly what was renamed to what.
+
+### Design considerations / non-obvious implementation notes
+
+- 6.1/6.2's decision phase happens in `Pipeline.execute_job()` where the current
+  "Output already exists" ERROR-and-fail block sits (after scene mode, before stage loop as
+  of 2026-07-18 — search for `general.overwrite`). The per-stage input_info re-probe and the
+  plan-membership fix (see CHANGELOG 2026-07-18) already landed; do not regress them.
+- A SKIPPED job must not run ANY stage, must still produce a complete JobResult (for 6.4/6.6
+  reporting), and its processing time is 0 while its total wall time is real.
+- 6.2's spec comparison should live in a small dedicated helper (pure, unit-testable) taking
+  (existing_probe, effective_targets) -> (matches, mismatch_reasons list) — the logging
+  contract needs the reasons list anyway.
+- 6.4's fallback provenance: `_ai_fallback_or_fail()` in `core/stages/base.py` is the ONLY
+  seam through which AI->traditional fallback flows; mark metadata there once rather than in
+  each stage.
+- GPU note for agents: check `nvidia-smi --query-compute-apps` before any GPU-touching live
+  test; skip GPU tests if the user's jobs are running.
+- Rich console output is line-wrapped and unfriendly to grep — verification workflows should
+  use `--log-file` and grep the plain file (established practice).
+- Config keys should all be added to `DEFAULTS` in `config.py` AND documented in
+  docs/config.example.yaml with rationale comments, per the standing docs-sync rule.

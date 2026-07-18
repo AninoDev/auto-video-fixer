@@ -262,6 +262,12 @@ Also still open from earlier planning and not superseded by the above:
   AI inferences in scene mode to avoid VRAM contention on a *single* GPU -- that's the single-GPU
   placeholder this feature will generalize into a scheduler that's aware of which physical device
   each concurrent inference lands on and how much VRAM it has, rather than one process-wide count.
+- **Output handling, run reporting, and config tooling** (APPROVED 2026-07-18, next up): the
+  full requirement set lives in `docs/REQUIREMENTS.md` feature 6 (6.1-6.8) — skip-not-fail for
+  existing outputs, spec-checking existing outputs with rename-or-overwrite of mismatches,
+  input probe failure policy, per-video stage/mode summary, media-info + timing
+  instrumentation, structured JSON run report, PII-clean log variant, and
+  `avf config clean|upgrade|dump`. Agreed delivery: four commits, grouped as documented there.
 - Plugin/custom-stage system, face restoration (GFPGAN/CodeFormer), audio enhancement
   (Demucs-based denoise is a config stub — `stages.denoise_audio` exists in `Config.DEFAULTS` but
   there is no corresponding registered stage implementing it), enterprise/cloud/API-service
