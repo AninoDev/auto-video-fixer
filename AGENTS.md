@@ -232,6 +232,46 @@ FFmpeg must be in PATH. Verify with `avf gpu-info`.
 - `scan_directory()` (`core/analysis.py`) skips hidden files (dotfiles), including orphaned
   `.avf_*` intermediate temp files that may be left next to an input after a crash.
 - Stage outputs chain: each stage's `output_path` becomes the next stage's `input_path`.
+- **`input_info` is re-probed after every stage that produces a new output file**, not just
+  once up front. `execute_job()` probes `job.input_path` once before the loop starts, then
+  after a stage completes with a NEW `output_path` (different from the file that was just fed
+  in — a skipped stage or a passthrough that reuses the same path is not re-probed), calls
+  `get_video_info()` again on that new file and re-injects any pipeline-layered keys (currently
+  `general.target_format`, via `Pipeline._reprobe_input_info()`/`_INJECTED_INPUT_INFO_KEYS`)
+  before the next stage's `should_run()`/`execute()` see it. A probe failure on the re-probe
+  logs a WARNING and keeps the previous `input_info` rather than failing the job (fail-open, same
+  convention as other auxiliary info). This fixes a real bug: `crop` shrinking a
+  1080x1080 letterboxed input down to 1080x608 (or a 1920x1080 pillarboxed input down to
+  608x1080) used to be invisible to `upscale.should_run()`/`_effective_target_bounds()`, which
+  saw the ORIGINAL pre-crop resolution and either misjudged the orientation-aware target or
+  concluded (wrongly) that the input was already at target and skipped upscaling entirely. The
+  post-scene-mode re-probe (`scenes.enabled`, ~line 671 in `pipeline.py`) is unchanged and
+  covers the reassembled scene-mode file; the general per-stage mechanism above then re-probes
+  again from there on subsequent stages, same as any other stage transition.
+- **`auto_determine_stages()` never geometry-gates a stage's PLAN MEMBERSHIP against the
+  up-front probe** -- fixed alongside the re-probe bug above, since the two are the same root
+  cause wearing two hats. Previously it only appended `"upscale"` to the auto-determined stage
+  list when the original probe's resolution was already below `quality.quality_target
+  .target_resolution`; for an input already at (or, orientation-swapped, effectively at) that
+  target -- e.g. 1920x1080 vs. a `[1920, 1080]` target -- `"upscale"` never entered `job.stages`
+  at all, so the in-loop `should_run()` (even with fresh post-crop geometry) never got a chance
+  to run: a stage absent from the plan is never instantiated. Concretely, a 1920x1080 input with
+  pillarboxed 9:16 content that `crop` shrinks to 608x1080 needs upscaling back up to ~1080x1920,
+  but never got it, because `crop`'s ORIGINAL resolution comparison found nothing to do. Now,
+  `"upscale"` is appended to the plan whenever `target_resolution` is configured AT ALL,
+  regardless of the up-front probe's resolution -- `UpscaleStage.should_run()`/
+  `_effective_target_bounds()` (orientation-aware, and re-probed per-stage per the fix above) is
+  the sole authority on whether it actually runs. With no `target_resolution` configured,
+  `"upscale"` still never enters the auto-determined plan (unchanged). `interpolate`'s
+  `target_framerate`-vs-`framerate` check and `hdr`'s `is_hdr` check were deliberately left as
+  plan-time gates -- crop doesn't alter a video's framerate or HDR-ness, so those two remain
+  accurate at plan time. Audited the rest of `auto_determine_stages()` and the preset
+  `enable_stages` path (`core/presets.py`) for the same class of bug: no other stage's plan
+  membership is geometry-gated -- `enable_stages` entries are static per-stage `enabled: bool`
+  config writes, not probe-conditioned, and every other `auto_determine_stages()` branch
+  (`stabilize`/`denoise_video`/`deblock`/`normalize_volume`/`normalize_audio`/`speed`/`crop`) is
+  gated on `stages.<name>.enabled`/`speed.enabled`/`crop.enabled` config flags, not on the
+  input's probed geometry.
 
 ## Output Path Resolution
 
@@ -956,14 +996,16 @@ Opt-in, off by default (`stages.crop.enabled: false`). See `core/stages/crop.py`
   scan the first N seconds, for very long inputs where a full scan is too slow), `vlm_check`
   (default false), `vlm_policy` (`"warn"` default | `"skip"`).
 - **`should_run()` vs. `execute()`**: `should_run()` does a cheap ~10s cropdetect pre-filter
-  against `input_info`'s (possibly stale -- see "Pipeline Behavior") filepath purely to skip
-  obviously-nothing-to-do cases early; it is NOT authoritative. `execute()` always re-runs a full
-  cropdetect pass (respecting `analyze_duration_sec`) against the actual file it's handed and can
-  independently return `SKIPPED` (e.g. "cropdetect produced no result", "saves only Nx Mpx, below
+  against `input_info`'s filepath purely to skip obviously-nothing-to-do cases early; it is NOT
+  authoritative. Per "Pipeline Behavior"'s per-stage re-probing, that filepath is the actual file
+  this stage's `execute()` will receive (e.g. the post-stabilize intermediate, border and all) --
+  not a stale original-input snapshot. `execute()` always re-runs a full cropdetect pass
+  (respecting `analyze_duration_sec`) against the actual file it's handed and can independently
+  return `SKIPPED` (e.g. "cropdetect produced no result", "saves only Nx Mpx, below
   min_crop_px", or an invalid/larger-than-input crop window) -- a false "proceed" from
-  `should_run()` is harmless (`execute()` still catches it), a false "skip" (missing a border that
-  only appears after an earlier stage, e.g. stabilize) is the accepted risk of keeping the
-  pre-filter cheap.
+  `should_run()` is harmless (`execute()` still catches it), a false "skip" (this quick sample's
+  short window missing a border that only becomes visible later in the video) is the accepted
+  risk of keeping the pre-filter cheap.
 - **VLM assist** (`stages.crop.vlm_check`, requires `analysis.vlm.enabled: true`): a watermark/
   logo positioned relative to a letterboxed frame (i.e. sitting in the border area cropdetect
   would otherwise remove) can fool naive cropdetect either way -- brightness above `limit` widens

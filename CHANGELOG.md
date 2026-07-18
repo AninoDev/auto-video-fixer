@@ -8,6 +8,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- **Stages after the first geometry-changing one saw stale `input_info` (post-crop upscale bug)**:
+  `Pipeline.execute_job()` probed `input_info` once up front (plus once more after scene mode)
+  and never again, so every later stage's `should_run()` judged the ORIGINAL input's resolution
+  even after an earlier stage had already changed it. Concretely, once `crop` removes
+  letterboxing/pillarboxing: a 1080x1080 input with letterboxed 16:9 content cropped to
+  1080x608, but `upscale.should_run()` still saw 1080x1080, misjudged the orientation-aware
+  target bounds, and the final output stayed 1080x608 instead of upscaling to 1920x1080; a
+  1920x1080 input with pillarboxed 9:16 content cropped to 608x1080, but `upscale` still saw
+  1920x1080 == target and skipped entirely, leaving the output at 608x1080 instead of the
+  correct portrait 1080x1920. `UpscaleStage.should_run()`/`_effective_target_bounds()` were
+  themselves correct -- the input they were given was stale. `execute_job()` now re-probes
+  `input_info` (re-injecting any pipeline-layered keys, e.g. `general.target_format`) whenever a
+  stage completes with a new output file; a re-probe failure logs a WARNING and keeps the
+  previous `input_info` rather than failing the job. See AGENTS.md's "Pipeline Behavior" for the
+  mechanism.
+
+  A second half of the same bug survived the re-probe fix: `Pipeline.auto_determine_stages()`
+  decided whether `"upscale"` even entered the job's PLAN using that same up-front, pre-crop
+  probe (`if resolution[0] < target_w or resolution[1] < target_h: stages.append("upscale")`) --
+  orientation-blind, and evaluated before `crop` has run. For the 1920x1080-pillarboxed-to-
+  608x1080 case above, 1920x1080 already satisfies a `[1920, 1080]` target, so `"upscale"` never
+  entered `job.stages` at all; the re-probe fix couldn't help because a stage absent from the
+  plan is never instantiated, so its (now-correctly-fresh) `should_run()` never even runs. Live
+  end-to-end repro: `Processing pillarbox_wide.mp4: stages=['crop', 'detect', 'stabilize', ...]`
+  -- `upscale` absent from the plan, final output stuck at 608x1080 instead of ~1080x1918.
+  `auto_determine_stages()` now appends `"upscale"` to the plan whenever
+  `quality.quality_target.target_resolution` is configured at all, regardless of the up-front
+  probe's resolution, and leaves the actual run/skip decision entirely to the in-loop,
+  orientation-aware, freshly-reprobed `should_run()`. Behavior preserved: with no
+  `target_resolution` configured, `"upscale"` still never enters the auto-determined plan.
+  Audited the rest of `auto_determine_stages()` and the preset `enable_stages` path for the same
+  class of bug -- no other stage's plan membership is geometry-gated (`interpolate`/`hdr`'s
+  plan-time checks use framerate/HDR-ness, which `crop` doesn't alter, and were left unchanged).
 - **Scene-mode OOM incident: per-scene `parallel_chunks` override was silently swallowed**: a
   real 2-minute 4K/30fps run in scene mode OOM-killed a 56 GiB container. Root cause:
   `InterpolateStage.execute()` accepted `parallel_chunks` only via `**kwargs`, never forwarding it

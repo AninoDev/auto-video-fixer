@@ -72,20 +72,24 @@ class CropStage(BaseStage):
     def should_run(self, input_info: dict[str, Any]) -> tuple[bool, str | None]:
         """Quick pre-filter: is this even worth attempting?
 
-        NOT authoritative. ``input_info`` describes the job's ORIGINAL input
-        file (see Pipeline.execute_job() -- it's probed once up front and not
-        re-probed per stage outside of scene mode), not necessarily the actual
-        file this stage's execute() will receive as ``input_path`` (e.g. after
-        stabilize has already produced an intermediate). A short cropdetect
-        sample here can therefore say "nothing to crop" on the pre-stabilize
-        file even though stabilize goes on to add a border -- execute() always
-        re-runs a full, authoritative cropdetect pass against the real file it
-        gets and can independently return SKIPPED, so a false "proceed" here
-        is harmless. A false "skip" here (this quick sample missing a border
-        that only appears later in the video, or only after stabilize) is the
-        real risk this pre-filter accepts in exchange for staying cheap --
-        same class of limitation as every other stage's should_run() in this
-        codebase, which also only sees this one static input_info snapshot.
+        NOT authoritative. ``Pipeline.execute_job()`` re-probes ``input_info``
+        (including ``filepath``) after every stage that produces a new output
+        file, so by the time this runs, ``input_info`` describes the actual
+        file this stage's execute() will receive as ``input_path`` (e.g. the
+        stabilize-produced intermediate, border and all) -- not the job's
+        original input. The remaining gap is entirely temporal, not
+        positional: this quick cropdetect sample only looks at a short window
+        near the start of the (now-current) file, so it can still say
+        "nothing to crop" while a border/letterbox only becomes visible later
+        in the video. execute() always re-runs a full, authoritative
+        cropdetect pass against the real file it gets and can independently
+        return SKIPPED, so a false "proceed" here is harmless. A false "skip"
+        here (this quick sample missing something that only shows up later in
+        the timeline) is the real risk this pre-filter accepts in exchange
+        for staying cheap -- same class of limitation as every other stage's
+        should_run() in this codebase, which also only sees a point-in-time
+        input_info snapshot (freshened once per stage transition, not
+        continuously).
         """
         if not self.is_enabled():
             return False, "Stage disabled"

@@ -140,6 +140,57 @@ class TestPipeline:
         assert "detect" in stages
         assert "encode" in stages
 
+    def test_auto_determine_stages_includes_upscale_when_already_at_target(
+        self, tmp_path, monkeypatch
+    ):
+        """auto_determine_stages() must NOT geometry-gate "upscale"'s plan
+        membership against the up-front probe -- a later stage (crop) can
+        shrink the frame after this plan is built, and this up-front check
+        is also orientation-blind. So even an input that's already AT (or
+        above) target_resolution per this raw, un-rotated comparison must
+        still get "upscale" included in the plan; the in-loop, orientation-
+        aware, freshly-reprobed should_run() is the actual authority on
+        whether it runs (regression test for the "upscale absent from the
+        plan entirely" half of the post-crop upscale bug)."""
+        monkeypatch.setattr(
+            "autovideofixer.core.pipeline.get_video_info",
+            lambda path: {
+                "resolution": (1920, 1080),
+                "framerate": 30.0,
+                "is_hdr": False,
+            },
+        )
+        test_file = tmp_path / "in.mp4"
+        test_file.write_bytes(b"fake input")
+        job = self.pipeline.add_job(str(test_file))
+        self.config.set([1920, 1080], "quality", "quality_target", "target_resolution")
+
+        stages = self.pipeline.auto_determine_stages(job)
+
+        assert "upscale" in stages
+
+    def test_auto_determine_stages_excludes_upscale_without_target_resolution(
+        self, tmp_path, monkeypatch
+    ):
+        """Behavior to preserve: with no target_resolution configured at
+        all, "upscale" must still stay OUT of the auto-determined plan."""
+        monkeypatch.setattr(
+            "autovideofixer.core.pipeline.get_video_info",
+            lambda path: {
+                "resolution": (320, 240),
+                "framerate": 30.0,
+                "is_hdr": False,
+            },
+        )
+        test_file = tmp_path / "in.mp4"
+        test_file.write_bytes(b"fake input")
+        job = self.pipeline.add_job(str(test_file))
+        # No quality.quality_target.target_resolution set -- default is None.
+
+        stages = self.pipeline.auto_determine_stages(job)
+
+        assert "upscale" not in stages
+
     def test_optimize_stage_order(self):
         """Test stage ordering optimization."""
         stages = ["encode", "upscale", "stabilize", "denoise_video"]
@@ -773,3 +824,388 @@ class TestOccurrenceAwareExecution:
 
         assert result.success is True
         assert mock_estimate.call_args.kwargs["timeout"] == 250
+
+
+class TestPerStageReprobe:
+    """execute_job() must re-probe input_info after any stage that produces a
+    NEW output file, so later stages' should_run()/execute() see the current
+    geometry instead of a stale snapshot from before the job started
+    (regression coverage for the post-crop upscale bug -- see CHANGELOG and
+    AGENTS.md's "Pipeline Behavior")."""
+
+    def setup_method(self):
+        self.config = Config(Path(tempfile.mkdtemp()) / "nonexistent.yaml")
+        self.pipeline = Pipeline(self.config)
+
+    def _register_fakes(self, monkeypatch, probe_by_path):
+        """probe_by_path: dict[path -> info dict] (or an Exception instance to
+        raise), keyed by the exact path get_video_info() is called with, plus
+        a "default" fallback used for the job's original input path."""
+        from autovideofixer.core.stages.base import BaseStage
+
+        should_run_calls: list[dict] = []
+
+        class StageA(BaseStage):
+            name = "fake_a"
+            display_name = "Fake A"
+            description = "test-only stage producing a new output file"
+            category = "test"
+            priority = 10
+            produces_output = True
+
+            def should_run(self, input_info):
+                return True, None
+
+            def execute(self, input_path, output_path=None, progress_callback=None, **kwargs):
+                with open(output_path, "wb") as f:
+                    f.write(b"a-output")
+                return StageResult(status=StageStatus.COMPLETED, output_path=output_path)
+
+        class StageASkip(BaseStage):
+            """Variant of A that never produces output (should_run False)."""
+
+            name = "fake_a"
+            display_name = "Fake A Skip"
+            description = "test-only stage that always skips"
+            category = "test"
+            priority = 10
+            produces_output = True
+
+            def should_run(self, input_info):
+                return False, "nothing to do"
+
+            def execute(self, input_path, output_path=None, progress_callback=None, **kwargs):
+                raise AssertionError("StageASkip.execute should never be called")
+
+        class StageB(BaseStage):
+            name = "fake_b"
+            display_name = "Fake B"
+            description = "test-only stage recording the input_info it receives"
+            category = "test"
+            priority = 20
+            produces_output = True
+
+            def should_run(self, input_info):
+                should_run_calls.append(dict(input_info))
+                return True, None
+
+            def execute(self, input_path, output_path=None, progress_callback=None, **kwargs):
+                with open(output_path, "wb") as f:
+                    f.write(b"b-output")
+                return StageResult(status=StageStatus.COMPLETED, output_path=output_path)
+
+        registry = {"fake_a": StageA, "fake_b": StageB}
+
+        def fake_get_stage(name):
+            return registry.get(name)
+
+        def fake_create_stage(name, config, overrides=None):
+            cls = registry.get(name)
+            return cls(config, overrides) if cls else None
+
+        _MISSING = object()
+
+        def fake_get_video_info(path):
+            info = probe_by_path.get(path, _MISSING)
+            if info is _MISSING:
+                info = probe_by_path.get("default", _MISSING)
+            if isinstance(info, Exception):
+                raise info
+            assert info is not _MISSING, f"no mocked probe result for {path!r}"
+            return dict(info)
+
+        monkeypatch.setattr("autovideofixer.core.pipeline.get_stage", fake_get_stage)
+        monkeypatch.setattr("autovideofixer.core.pipeline.create_stage", fake_create_stage)
+        monkeypatch.setattr("autovideofixer.core.pipeline.get_video_info", fake_get_video_info)
+
+        return should_run_calls, registry
+
+    def test_stage_b_sees_refreshed_resolution_from_stage_a_output(self, tmp_path, monkeypatch):
+        input_file = tmp_path / "in.mp4"
+        input_file.write_bytes(b"fake input")
+
+        # StageA's own generated temp output path isn't known ahead of time,
+        # so key the fake probe on "any path that isn't the original input" --
+        # a-output geometry differs sharply from the original so a stale read
+        # is unambiguous.
+        original_info = {"resolution": (1920, 1080), "framerate": 30.0, "duration": 1.0}
+        refreshed_info = {"resolution": (608, 1080), "framerate": 30.0, "duration": 1.0}
+
+        # A custom mapping object whose .get() returns the ORIGINAL geometry
+        # only for the exact original input path, and the REFRESHED geometry
+        # for anything else (StageA's own generated temp output path isn't
+        # known ahead of time, so this is keyed by exclusion rather than by
+        # exact path).
+        class _ProbeMap(dict):
+            def get(self, key, default=None):
+                if key == str(input_file):
+                    return original_info
+                if key in self:
+                    return dict.get(self, key)
+                return refreshed_info
+
+        should_run_calls, _ = self._register_fakes(monkeypatch, _ProbeMap())
+        self.config.set(["fake_a", "fake_b"], "pipeline", "default_order")
+
+        job = self.pipeline.add_job(str(input_file))
+        job.stages = ["fake_a", "fake_b"]
+
+        result = self.pipeline.execute_job(job)
+
+        assert result.success is True
+        assert len(should_run_calls) == 1
+        assert should_run_calls[0]["resolution"] == (608, 1080)
+
+    def test_injected_target_format_key_survives_reprobe(self, tmp_path, monkeypatch):
+        input_file = tmp_path / "in.mp4"
+        input_file.write_bytes(b"fake input")
+
+        class _ProbeMap(dict):
+            def get(self, key, default=None):
+                return {"resolution": (320, 240), "framerate": 30.0, "duration": 1.0}
+
+        should_run_calls, _ = self._register_fakes(monkeypatch, _ProbeMap())
+        self.config.set(["fake_a", "fake_b"], "pipeline", "default_order")
+        self.config.set("mkv", "general", "target_format")
+
+        job = self.pipeline.add_job(str(input_file))
+        job.stages = ["fake_a", "fake_b"]
+
+        result = self.pipeline.execute_job(job)
+
+        assert result.success is True
+        assert should_run_calls[0].get("target_format") == "mkv"
+
+    def test_skipped_stage_produces_no_reprobe_call(self, tmp_path, monkeypatch):
+        from autovideofixer.core.stages.base import BaseStage
+
+        probe_calls: list[str] = []
+
+        class SkipA(BaseStage):
+            name = "fake_a"
+            display_name = "Fake A Skip"
+            description = "test-only stage that always skips (no output)"
+            category = "test"
+            priority = 10
+            produces_output = True
+
+            def should_run(self, input_info):
+                return False, "nothing to do"
+
+            def execute(self, input_path, output_path=None, progress_callback=None, **kwargs):
+                raise AssertionError("SkipA.execute should never be called")
+
+        class RecordB(BaseStage):
+            name = "fake_b"
+            display_name = "Fake B"
+            description = "test-only terminal stage"
+            category = "test"
+            priority = 20
+            produces_output = True
+
+            def should_run(self, input_info):
+                return True, None
+
+            def execute(self, input_path, output_path=None, progress_callback=None, **kwargs):
+                with open(output_path, "wb") as f:
+                    f.write(b"b-output")
+                return StageResult(status=StageStatus.COMPLETED, output_path=output_path)
+
+        registry = {"fake_a": SkipA, "fake_b": RecordB}
+
+        def fake_get_stage(name):
+            return registry.get(name)
+
+        def fake_create_stage(name, config, overrides=None):
+            cls = registry.get(name)
+            return cls(config, overrides) if cls else None
+
+        def fake_get_video_info(path):
+            probe_calls.append(path)
+            return {"resolution": (320, 240), "framerate": 30.0, "duration": 1.0}
+
+        monkeypatch.setattr("autovideofixer.core.pipeline.get_stage", fake_get_stage)
+        monkeypatch.setattr("autovideofixer.core.pipeline.create_stage", fake_create_stage)
+        monkeypatch.setattr("autovideofixer.core.pipeline.get_video_info", fake_get_video_info)
+
+        self.config.set(["fake_a", "fake_b"], "pipeline", "default_order")
+
+        input_file = tmp_path / "in.mp4"
+        input_file.write_bytes(b"fake input")
+        job = self.pipeline.add_job(str(input_file))
+        job.stages = ["fake_a", "fake_b"]
+
+        result = self.pipeline.execute_job(job)
+
+        assert result.success is True
+        # Exactly two probes: the initial up-front probe of the job's
+        # original input, and the re-probe after fake_b (which DOES produce
+        # a new output, as the terminal stage). fake_a was skipped (no
+        # output produced), so it must not have triggered a re-probe of its
+        # own -- if it had, there would be three calls instead of two, with
+        # the extra one repeating input_file back-to-back.
+        assert probe_calls == [str(input_file), job.output_path]
+
+    def test_reprobe_failure_logs_warning_and_keeps_previous_input_info(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        input_file = tmp_path / "in.mp4"
+        input_file.write_bytes(b"fake input")
+
+        original_info = {"resolution": (1920, 1080), "framerate": 30.0, "duration": 1.0}
+
+        class _ProbeMap(dict):
+            def get(self, key, default=None):
+                if key == str(input_file):
+                    return original_info
+                raise RuntimeError("ffprobe exploded")
+
+        should_run_calls, _ = self._register_fakes(monkeypatch, _ProbeMap())
+        self.config.set(["fake_a", "fake_b"], "pipeline", "default_order")
+
+        job = self.pipeline.add_job(str(input_file))
+        job.stages = ["fake_a", "fake_b"]
+
+        import logging
+
+        with caplog.at_level(logging.WARNING):
+            result = self.pipeline.execute_job(job)
+
+        assert result.success is True
+        # Re-probe failed -> stage B still gets the previous (original)
+        # input_info, and the job continues rather than failing.
+        assert should_run_calls[0]["resolution"] == (1920, 1080)
+        assert any("re-probe" in r.getMessage().lower() for r in caplog.records)
+
+    def test_upscale_should_run_true_with_refreshed_info_false_with_stale(self):
+        """End-to-end regression at the should_run() level for the user's
+        reported case: a 1920x1080 input with pillarboxed 9:16 content is
+        cropped down to 608x1080. The REAL UpscaleStage.should_run() must
+        return True once given the refreshed (post-crop) resolution, and
+        (demonstrating the fix matters) False if it were still given the
+        stale pre-crop resolution."""
+        from autovideofixer.core.stages.upscale import UpscaleStage
+
+        config = Config(Path(tempfile.mkdtemp()) / "nonexistent.yaml")
+        config.set([1920, 1080], "quality", "quality_target", "target_resolution")
+        stage = UpscaleStage(config)
+
+        stale_info = {"resolution": (1920, 1080), "framerate": 30.0}
+        refreshed_info = {"resolution": (608, 1080), "framerate": 30.0}
+
+        stale_should_run, stale_reason = stage.should_run(stale_info)
+        assert stale_should_run is False
+        assert stale_reason == "Already at target resolution"
+
+        fresh_should_run, _ = stage.should_run(refreshed_info)
+        assert fresh_should_run is True
+
+    def test_crop_then_upscale_end_to_end_plan_and_reprobe(self, tmp_path, monkeypatch):
+        """Full execute_job() regression for BOTH halves of the post-crop
+        upscale bug together: the input's ORIGINAL resolution already equals
+        quality_target.target_resolution (so the old plan-time geometry gate
+        in auto_determine_stages() would have excluded "upscale" from
+        job.stages entirely), and a real "crop" occurrence shrinks the frame
+        before "upscale" runs (so even if "upscale" WERE planned, a stale
+        should_run() would misjudge it). job.stages is left empty so
+        auto_determine_stages() actually decides plan membership -- this is
+        NOT calling auto_determine_stages() directly, it's the real
+        execute_job() path a preset/no-`--stage` run takes.
+        """
+        from autovideofixer.core.stages.base import BaseStage
+
+        should_run_calls: list[dict] = []
+
+        class FakeCrop(BaseStage):
+            name = "crop"
+            display_name = "Fake Crop"
+            description = "test-only stage simulating a real geometry-shrinking crop"
+            category = "test"
+            priority = 12
+            produces_output = True
+
+            def should_run(self, input_info):
+                return True, None
+
+            def execute(self, input_path, output_path=None, progress_callback=None, **kwargs):
+                with open(output_path, "wb") as f:
+                    f.write(b"cropped-output")
+                return StageResult(status=StageStatus.COMPLETED, output_path=output_path)
+
+        class FakeUpscale(BaseStage):
+            name = "upscale"
+            display_name = "Fake Upscale"
+            description = "test-only stage recording the input_info should_run() receives"
+            category = "test"
+            priority = 30
+            produces_output = True
+
+            def should_run(self, input_info):
+                should_run_calls.append(dict(input_info))
+                return True, None
+
+            def execute(self, input_path, output_path=None, progress_callback=None, **kwargs):
+                with open(output_path, "wb") as f:
+                    f.write(b"upscaled-output")
+                return StageResult(status=StageStatus.COMPLETED, output_path=output_path)
+
+        registry = {"crop": FakeCrop, "upscale": FakeUpscale}
+
+        def fake_get_stage(name):
+            return registry.get(name)
+
+        def fake_create_stage(name, config, overrides=None):
+            cls = registry.get(name)
+            return cls(config, overrides) if cls else None
+
+        input_file = tmp_path / "in.mp4"
+        input_file.write_bytes(b"fake input")
+
+        original_info = {
+            "resolution": (1920, 1080),
+            "framerate": 30.0,
+            "duration": 1.0,
+            "is_hdr": False,
+        }
+        # Any path other than the original input (i.e. crop's temp output,
+        # or upscale's own output) is the post-crop, pillarboxed-content
+        # geometry from the user's real repro.
+        refreshed_info = {
+            "resolution": (608, 1080),
+            "framerate": 30.0,
+            "duration": 1.0,
+            "is_hdr": False,
+        }
+
+        def fake_get_video_info(path):
+            if path == str(input_file):
+                return dict(original_info)
+            return dict(refreshed_info)
+
+        monkeypatch.setattr("autovideofixer.core.pipeline.get_stage", fake_get_stage)
+        monkeypatch.setattr("autovideofixer.core.pipeline.create_stage", fake_create_stage)
+        monkeypatch.setattr("autovideofixer.core.pipeline.get_video_info", fake_get_video_info)
+
+        # Real default_order already places "crop" before "upscale"; only
+        # unrecognized stage names (everything else auto_determine_stages()
+        # would normally add) get logged as "Unknown stage" and skipped --
+        # harmless for this test, which only cares about crop/upscale.
+        self.config.set(True, "stages", "crop", "enabled")
+        self.config.set([1920, 1080], "quality", "quality_target", "target_resolution")
+
+        job = self.pipeline.add_job(str(input_file))
+        # job.stages left empty -> execute_job() calls auto_determine_stages()
+        # for real, exercising the plan-membership fix.
+
+        result = self.pipeline.execute_job(job)
+
+        assert result.success is True
+        # Plan-membership fix: "upscale" was actually planned and ran, even
+        # though the ORIGINAL (pre-crop) resolution already equalled target.
+        assert "upscale" in job.stages
+        assert "upscale" in result.stage_results
+        assert result.stage_results["upscale"].status == StageStatus.COMPLETED
+        # Re-probe fix: should_run() received the POST-CROP geometry, not
+        # the original 1920x1080.
+        assert len(should_run_calls) == 1
+        assert should_run_calls[0]["resolution"] == (608, 1080)

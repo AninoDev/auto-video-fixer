@@ -246,8 +246,11 @@ class Pipeline:
         # 1. Analysis stage (always first)
         stages.append("detect")
 
-        # 2. Enhancement stages based on input properties
-        resolution = input_info.get("resolution", (0, 0))
+        # 2. Enhancement stages based on input properties. Note: resolution is
+        # deliberately NOT read here for the upscale membership decision --
+        # see the comment above `if target_resolution:` below for why a
+        # plan-time geometry check would be wrong (crop can shrink the frame
+        # after this plan is built).
         framerate = input_info.get("framerate", 0)
         is_hdr = input_info.get("is_hdr", False)
 
@@ -256,11 +259,34 @@ class Pipeline:
         target_resolution = quality_target.get("target_resolution")
         target_framerate = quality_target.get("target_framerate")
 
-        # Upscale if target resolution is higher
+        # Upscale: include it in the plan whenever a target resolution is
+        # configured at all -- do NOT gate membership on comparing this
+        # up-front probe's resolution against target_resolution. Two reasons
+        # a plan-time geometry check here is wrong even though it looks like
+        # an obvious "skip if already big enough" optimization:
+        # 1. A later stage (crop) can shrink the frame AFTER this plan is
+        #    built (e.g. a 1920x1080 input with pillarboxed 9:16 content
+        #    crops down to 608x1080) -- a plan-time check against the
+        #    ORIGINAL resolution would exclude "upscale" from job.stages
+        #    entirely, and the in-loop should_run() (which now sees
+        #    freshly-reprobed post-crop geometry, per the per-stage-reprobe
+        #    fix above) never even gets a chance to run, since a stage
+        #    dropped from the plan is never instantiated at all.
+        # 2. This up-front resolution/target_resolution comparison is also
+        #    orientation-blind (raw target, not rotated to the input's
+        #    orientation) -- UpscaleStage.should_run()/_effective_target_bounds()
+        #    is the single authoritative, orientation-aware implementation of
+        #    "is this already at target"; duplicating a cruder version of
+        #    that logic here to decide membership can only produce a
+        #    stricter (over-excluding) answer than should_run() itself.
+        # should_run() (called every time the loop reaches this occurrence,
+        # against current -- possibly post-crop -- geometry) remains the
+        # authoritative run/skip decision; a real "already at target, no crop
+        # involved" input just gets a should_run()-level SKIPPED instead of
+        # never being planned, which is harmless and the same outcome either
+        # way for that case.
         if target_resolution:
-            target_w, target_h = target_resolution
-            if resolution[0] < target_w or resolution[1] < target_h:
-                stages.append("upscale")
+            stages.append("upscale")
 
         # Frame interpolation if target framerate is higher
         if target_framerate and framerate > 0:
@@ -302,6 +328,38 @@ class Pipeline:
             stages = job.stages
 
         return stages
+
+    # Keys the pipeline itself layers onto a freshly-probed input_info dict, on
+    # top of whatever get_video_info()/probe().to_info_dict() returns (see
+    # execute_job()'s "target_format" injection, from general.target_format).
+    # Every re-probe (per-stage and the scene-mode one) must carry these
+    # forward onto the new probe dict, since a fresh probe never sets them
+    # itself. Extend this tuple, not the re-probe call sites, if a future
+    # change injects another key.
+    _INJECTED_INPUT_INFO_KEYS: tuple[str, ...] = ("target_format",)
+
+    def _reprobe_input_info(
+        self, path: str, previous_info: dict[str, Any], context: str
+    ) -> dict[str, Any]:
+        """Re-probe ``path`` and carry forward any pipeline-injected keys from
+        ``previous_info``. Fails open: a probe error is logged at WARNING and
+        ``previous_info`` is returned unchanged, matching the codebase's
+        fail-open convention for auxiliary info (this must never fail the job).
+        """
+        try:
+            fresh_info = get_video_info(path)
+        except Exception as e:
+            self.logger.warning(
+                "Failed to re-probe %s (%s); keeping previous input_info: %s",
+                path,
+                context,
+                e,
+            )
+            return previous_info
+        for key in self._INJECTED_INPUT_INFO_KEYS:
+            if key in previous_info:
+                fresh_info[key] = previous_info[key]
+        return fresh_info
 
     def _apply_config_encoding_overrides(self, job: Job) -> None:
         """Merge config["encoding"] (from a preset or user config) into
@@ -667,8 +725,14 @@ class Pipeline:
                 # input_info for resolution/framerate/duration -- reprobe the
                 # reassembled file so they see its actual (possibly
                 # interpolated-to-a-higher-fps, possibly shorter after drops)
-                # properties instead of the original input's.
-                input_info = get_video_info(current_path)
+                # properties instead of the original input's. Redundant with
+                # (but harmless ahead of) the general per-stage re-probe in
+                # the loop below, which would otherwise re-probe this same
+                # file again on the very next stage's transition; doing it
+                # here up front avoids that back-to-back double-probe.
+                input_info = self._reprobe_input_info(
+                    current_path, input_info, context="after scene mode"
+                )
 
         overwrite = self.config.get("general", "overwrite", default=False)
         if (
@@ -805,6 +869,22 @@ class Pipeline:
                             break
                     else:
                         if result.output_path:
+                            if result.output_path != current_path:
+                                # This stage produced a NEW file -- re-probe so any
+                                # later stage's should_run()/execute() sees the
+                                # actual current geometry/framerate/etc. instead of
+                                # the ORIGINAL input's stale probe (e.g. crop
+                                # shrinking 1080x1080 letterboxed content down to
+                                # 1080x608 must be visible to upscale's
+                                # should_run(), not just to its own execute()).
+                                # Skipped when output_path == current_path (a
+                                # passthrough result reusing the existing file) --
+                                # nothing changed, so a re-probe would be wasted.
+                                input_info = self._reprobe_input_info(
+                                    result.output_path,
+                                    input_info,
+                                    context=f"after stage '{stage_name}'",
+                                )
                             current_path = result.output_path
                         elif result.status == StageStatus.COMPLETED and stage.produces_output:
                             self.logger.warning(
