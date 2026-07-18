@@ -701,7 +701,7 @@ plus a live end-to-end test per commit; docs synced every commit (AGENTS.md, CHA
 docs/config.example.yaml); user signs/pushes each commit (agents NEVER run git
 stash/checkout/restore/reset/add/rm/mv/commit).
 
-### 6.1 Existing output with overwrite disabled = SKIPPED, not FAILED
+### 6.1 Existing output with overwrite disabled = SKIPPED, not FAILED (IMPLEMENTED 2026-07-18)
 
 Today `execute_job()` returns `success=False` + ERROR log ("Output already exists and
 general.overwrite is False") — the user found "failed" deeply confusing for videos that were
@@ -715,7 +715,7 @@ simply already done from a previous run.
 - Exit code: a run whose jobs are all completed-or-skipped exits 0; only true failures make
   the run exit non-zero.
 
-### 6.2 Spec-check existing outputs; rename-or-overwrite mismatches
+### 6.2 Spec-check existing outputs; rename-or-overwrite mismatches (IMPLEMENTED 2026-07-18)
 
 When an output exists and overwrite is false, optionally verify the existing file actually
 satisfies the CURRENT effective targets before deciding to skip.
@@ -753,7 +753,7 @@ satisfies the CURRENT effective targets before deciding to skip.
   (framerate 30<60, vcodec h264!=libx265); renamed to video_enhanced_mismatched-2.mp4;
   reprocessing".
 
-### 6.3 Input probe failure policy
+### 6.3 Input probe failure policy (IMPLEMENTED 2026-07-18)
 
 - **Audit current behavior first** (the user does not know what AVF does today), then
   enforce: an input ffprobe CANNOT analyze fails that job (FAILED, ffprobe stderr surfaced in

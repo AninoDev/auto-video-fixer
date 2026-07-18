@@ -154,6 +154,63 @@ class TestProbe:
         with pytest.raises(Exception):
             probe("/nonexistent/file.mp4")
 
+    def test_probe_uses_v_error_not_quiet(self):
+        """REQUIREMENTS.md § 6.3: probe() must request "-v error" (not the old
+        "-v quiet") so a failing probe's RuntimeError carries an actually
+        informative ffprobe stderr."""
+        with (
+            patch("autovideofixer.core.ffmpeg_utils.get_ffprobe_path", return_value="ffprobe"),
+            patch("autovideofixer.core.ffmpeg_utils.subprocess.run") as mock_run,
+        ):
+            mock_run.return_value = MagicMock(
+                returncode=0, stdout='{"format": {}, "streams": []}', stderr=""
+            )
+            probe("/some/file.mp4")
+
+        cmd = mock_run.call_args[0][0]
+        v_index = cmd.index("-v")
+        assert cmd[v_index + 1] == "error"
+
+    def test_probe_failure_stderr_surfaced_in_exception(self):
+        with (
+            patch("autovideofixer.core.ffmpeg_utils.get_ffprobe_path", return_value="ffprobe"),
+            patch("autovideofixer.core.ffmpeg_utils.subprocess.run") as mock_run,
+        ):
+            mock_run.return_value = MagicMock(returncode=1, stdout="", stderr="moov atom not found")
+            with pytest.raises(RuntimeError, match="moov atom not found"):
+                probe("/some/file.mp4")
+
+    def test_probe_success_with_stderr_warnings_is_surfaced_on_result(self):
+        """A successful (rc=0) probe can still have non-empty stderr (ffprobe
+        warnings) -- callers read it back via ProbeResult.stderr /
+        to_info_dict()["probe_stderr"]."""
+        with (
+            patch("autovideofixer.core.ffmpeg_utils.get_ffprobe_path", return_value="ffprobe"),
+            patch("autovideofixer.core.ffmpeg_utils.subprocess.run") as mock_run,
+        ):
+            mock_run.return_value = MagicMock(
+                returncode=0,
+                stdout='{"format": {}, "streams": []}',
+                stderr="Non-monotonous DTS in output stream",
+            )
+            result = probe("/some/file.mp4")
+
+        assert result.stderr == "Non-monotonous DTS in output stream"
+        assert result.to_info_dict()["probe_stderr"] == "Non-monotonous DTS in output stream"
+
+    def test_probe_success_with_empty_stderr(self):
+        with (
+            patch("autovideofixer.core.ffmpeg_utils.get_ffprobe_path", return_value="ffprobe"),
+            patch("autovideofixer.core.ffmpeg_utils.subprocess.run") as mock_run,
+        ):
+            mock_run.return_value = MagicMock(
+                returncode=0, stdout='{"format": {}, "streams": []}', stderr=""
+            )
+            result = probe("/some/file.mp4")
+
+        assert result.stderr == ""
+        assert result.to_info_dict()["probe_stderr"] == ""
+
 
 class TestStreamInfo:
     """Test stream information."""

@@ -7,6 +7,8 @@ import time
 from typing import Any
 
 from autovideofixer.core.ffmpeg_utils import probe, run_ffmpeg
+from autovideofixer.core.output_check import SKIP_SCALE_THRESHOLD
+from autovideofixer.core.output_check import effective_target_bounds as _effective_target_bounds_fn
 from autovideofixer.core.stages.base import BaseStage, StageResult, StageStatus
 
 
@@ -32,8 +34,10 @@ class UpscaleStage(BaseStage):
     # px off before upscale ran" case (e.g. 1072x1908 vs. a 1080x1920 target
     # is a 1.0075x scale) without masking any real upscale need -- a genuine
     # "needs upscaling" input is almost always well above this (e.g. 540x960
-    # -> 1080x1920 is 2.0x).
-    _SKIP_SCALE_THRESHOLD = 1.05
+    # -> 1080x1920 is 2.0x). Kept as an alias onto the shared
+    # core/output_check.py constant (also used by the § 6.2 existing-output
+    # resolution spec-check) so both stay in lockstep; not duplicated here.
+    _SKIP_SCALE_THRESHOLD = SKIP_SCALE_THRESHOLD
 
     def __init__(self, config, overrides: dict[str, Any] | None = None):
         super().__init__(config, overrides)
@@ -855,16 +859,16 @@ class UpscaleStage(BaseStage):
         three agree on what "already at target" means for a given input's
         orientation. If keep_aspect_ratio is False, returns the target
         unrotated (matching _calculate_target_dimensions' non-aspect path).
+
+        Thin instance-method wrapper (keeps the existing call sites/signature
+        unchanged) around the pure module-level
+        ``core.output_check.effective_target_bounds()``, which the § 6.2
+        existing-output resolution spec-check also uses -- the actual math
+        lives there once instead of being duplicated.
         """
-        if not self._keep_aspect_ratio:
-            return target_width, target_height
-        if input_height > input_width:  # Portrait input
-            return target_height, target_width
-        elif input_width > input_height:  # Landscape input
-            return target_width, target_height
-        else:  # Square input
-            side = min(target_width, target_height)
-            return side, side
+        return _effective_target_bounds_fn(
+            input_width, input_height, target_width, target_height, self._keep_aspect_ratio
+        )
 
     @staticmethod
     def _round_to_even(width: int, height: int) -> tuple[int, int]:

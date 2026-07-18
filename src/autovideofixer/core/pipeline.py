@@ -15,11 +15,17 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Callable
 
-from autovideofixer.config import Config, deep_merge, redact_secrets
+from autovideofixer.config import (
+    Config,
+    deep_merge,
+    redact_secrets,
+    validate_output_handling_config,
+)
 from autovideofixer.core.ffmpeg_utils import (
     generate_temp_path,
     get_video_info,
 )
+from autovideofixer.core.output_check import check_output_spec, effective_output_targets
 from autovideofixer.core.stages.base import (
     StageResult,
     StageStatus,
@@ -85,6 +91,10 @@ class PipelineStatus(Enum):
     COMPLETED = "completed"
     FAILED = "failed"
     CANCELLED = "cancelled"
+    # New first-class outcome (REQUIREMENTS.md § 6.1): an existing output with
+    # overwrite disabled is no longer classified as FAILED -- see
+    # JobResult.outcome/skip_reason and Pipeline._decide_existing_output().
+    SKIPPED = "skipped"
 
 
 @dataclass
@@ -121,6 +131,30 @@ class JobResult:
     success: bool = False
     quality_meets_target: bool | None = None  # None = not checked (quality_target.mode="none")
     quality_score: float | None = None
+    # --- REQUIREMENTS.md § 6.1/6.2/6.3 outcome model ---
+    # Canonical tri-state outcome; ``success`` is kept in sync for backward
+    # compat (``success == (outcome == "completed")``, enforced in
+    # __post_init__ below). Leave unset ("") at construction time to have it
+    # derived from ``success`` -- existing call sites that only ever set
+    # ``success`` (e.g. the main stage-loop result, execute_all()'s generic
+    # exception wrapper) don't need updating.
+    outcome: str = ""  # "completed" | "failed" | "skipped"
+    # Machine-readable sub-reason, populated only when outcome == "skipped":
+    # "output-exists" | "output-exists-mismatched" | "invalid-input".
+    skip_reason: str | None = None
+    # Human-readable record of the § 6.1/6.2 decision trail for this job (what
+    # was measured vs. targeted, which flags drove the outcome, rename
+    # actions) -- populated even when the decision was trivial ("no
+    # conflicting existing output"). This is what the future § 6.6 JSON report
+    # serializes verbatim; kept on every JobResult (not just SKIPPED ones) so
+    # that reporting work has a uniform field to read.
+    decision_log: list[str] = field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        if self.outcome:
+            self.success = self.outcome == "completed"
+        else:
+            self.outcome = "completed" if self.success else "failed"
 
     @property
     def all_stages_passed(self) -> bool:
@@ -157,6 +191,7 @@ class Pipeline:
 
     def __init__(self, config: Config | None = None):
         self.config = config or Config()
+        validate_output_handling_config(self.config)
         self._jobs: list[Job] = []
         self._running = False
         self._cancel_requested = False
@@ -235,12 +270,21 @@ class Pipeline:
                 jobs.append(self.add_job(p))
         return jobs
 
-    def auto_determine_stages(self, job: Job) -> list[str]:
+    def auto_determine_stages(
+        self, job: Job, input_info: dict[str, Any] | None = None
+    ) -> list[str]:
         """Determine optimal processing stages for a job based on input and settings.
 
         Uses quality targets, input analysis, and preset preferences.
+
+        ``input_info``: an already-probed info dict, when the caller (e.g.
+        ``execute_job()``) has one on hand -- avoids a redundant re-probe of
+        the same file. Probes ``job.input_path`` itself (raises ``RuntimeError``
+        on an unreadable input -- see ``core/ffmpeg_utils.probe()`` and
+        ``docs/REQUIREMENTS.md`` § 6.3) when omitted, e.g. direct callers/tests.
         """
-        input_info = get_video_info(job.input_path)
+        if input_info is None:
+            input_info = get_video_info(job.input_path)
         stages = []
 
         # 1. Analysis stage (always first)
@@ -551,6 +595,287 @@ class Pipeline:
         """
         return [entry.label for entry in self.resolve_stage_order(stages)]
 
+    def _finish_terminal(self, job: Job, result: JobResult) -> JobResult:
+        """Common bookkeeping for an early (pre-stage-loop) terminal JobResult:
+        set job.status/result/progress and return it. Shared by every § 6.1/
+        6.2/6.3 early-return path below."""
+        job.status = (
+            PipelineStatus.SKIPPED if result.outcome == "skipped" else PipelineStatus.FAILED
+        )
+        job.result = result
+        job.progress = 1.0
+        return result
+
+    def _terminal_probe_failure_result(self, job: Job, error: Exception) -> JobResult:
+        """§ 6.3: an input ffprobe that can't analyze the file at all (raised
+        RuntimeError, see core/ffmpeg_utils.probe()). FAILS the job by default
+        (ffprobe stderr -- surfaced via ``error``'s message -- in the log and
+        JobResult.errors); general.skip_invalid_inputs makes it SKIPPED
+        instead (sub-reason "invalid-input") so a batch with known-bad
+        members still completes. Used both when auto_determine_stages()'s own
+        probe fails and when execute_job()'s explicit probe fails, so the
+        policy is uniform regardless of which one hits the bad file first.
+        """
+        skip_invalid = self.config.get("general", "skip_invalid_inputs", default=False)
+        msg = f"Input probe failed for {job.input_path}: {error}"
+        if skip_invalid:
+            self.logger.warning(msg)
+            result = JobResult(
+                input_path=job.input_path,
+                output_path=None,
+                outcome="skipped",
+                skip_reason="invalid-input",
+                decision_log=[
+                    f"input probe failed ({error}); general.skip_invalid_inputs=true -> SKIPPED"
+                ],
+            )
+        else:
+            self.logger.error(msg)
+            result = JobResult(
+                input_path=job.input_path,
+                output_path=None,
+                errors=[msg],
+                outcome="failed",
+                decision_log=[
+                    f"input probe failed ({error}); general.skip_invalid_inputs=false -> FAILED"
+                ],
+            )
+        return self._finish_terminal(job, result)
+
+    def _handle_probe_warning(
+        self, job: Job, input_info: dict[str, Any], probe_stderr: str
+    ) -> JobResult | None:
+        """§ 6.3: a *successful* probe with non-empty ffprobe stderr. Always
+        surfaced as a WARNING (job continues); general.fail_on_probe_warnings
+        promotes it to a hard FAILED instead. Returns the terminal JobResult
+        in the strict-mode case, else None (caller should proceed)."""
+        fail_on_warnings = self.config.get("general", "fail_on_probe_warnings", default=False)
+        if not fail_on_warnings:
+            self.logger.warning(
+                "ffprobe reported warnings for %s (job continues): %s",
+                job.input_path,
+                probe_stderr,
+            )
+            return None
+        msg = f"ffprobe reported warnings for {job.input_path}: {probe_stderr}"
+        self.logger.error(msg)
+        result = JobResult(
+            input_path=job.input_path,
+            output_path=None,
+            errors=[msg],
+            input_info=input_info,
+            outcome="failed",
+            decision_log=[
+                f"input probe succeeded with warnings ({probe_stderr}); "
+                "general.fail_on_probe_warnings=true -> FAILED"
+            ],
+        )
+        return self._finish_terminal(job, result)
+
+    def _rename_mismatched_output(
+        self, output_path: str, suffix: str, max_renames: int | None
+    ) -> str | None:
+        """§ 6.2 rename-mismatched-output helper: renames ``output_path`` to
+        ``<stem><suffix><N><ext>``, N starting at 1, first unused name wins.
+        Returns the new path on success. Returns None when renaming is
+        disabled (``max_renames == 0``) or exhausted (every N up to
+        ``max_renames`` is already taken) -- caller treats that as FAILED.
+        ``max_renames=None`` means unlimited.
+        """
+        if max_renames is not None and max_renames <= 0:
+            return None
+        stem, ext = os.path.splitext(output_path)
+        n = 1
+        while max_renames is None or n <= max_renames:
+            candidate = f"{stem}{suffix}{n}{ext}"
+            if not os.path.exists(candidate):
+                os.rename(output_path, candidate)
+                return candidate
+            n += 1
+        return None
+
+    def _decide_existing_output(
+        self,
+        job: Job,
+        input_info: dict[str, Any],
+        stage_entries: list[StageOrderEntry],
+        decision_log: list[str],
+    ) -> JobResult | None:
+        """REQUIREMENTS.md § 6.1/6.2: classify an existing ``job.output_path``
+        as SKIPPED/FAILED, or clear the way for normal reprocessing.
+
+        Appends every decision made (including the trivial "nothing to
+        decide" case) to ``decision_log`` in place, so it can be attached to
+        whichever JobResult eventually gets built -- a terminal one returned
+        directly from here, or the normal end-of-pipeline one built later in
+        execute_job() when this returns None.
+
+        Returns a terminal JobResult (SKIPPED or FAILED) the caller must
+        return immediately without running any stage, or None when the job
+        should proceed normally (no conflicting existing output, or a
+        mismatch that's being reprocessed -- on a successful rename, the old
+        file is already moved out of the way by the time this returns).
+        """
+        overwrite = self.config.get("general", "overwrite", default=False)
+        if (
+            overwrite
+            or not job.output_path
+            or not os.path.exists(job.output_path)
+            or os.path.abspath(job.output_path) == os.path.abspath(job.input_path)
+        ):
+            decision_log.append("no conflicting existing output; proceeding")
+            return None
+
+        existing_output = self.config.get("general", "existing_output", default="skip")
+        decision_log.append(f"output already exists at {job.output_path} (general.overwrite=false)")
+
+        if existing_output == "fail":
+            # Old behavior, exactly: FAILED + ERROR log.
+            msg = f"Output already exists and general.overwrite is False: {job.output_path}"
+            self.logger.error(msg)
+            decision_log.append("general.existing_output=fail -> FAILED (legacy behavior)")
+            return self._finish_terminal(
+                job,
+                JobResult(
+                    input_path=job.input_path,
+                    output_path=None,
+                    errors=[msg],
+                    input_info=input_info,
+                    outcome="failed",
+                    decision_log=list(decision_log),
+                ),
+            )
+
+        check_existing = self.config.get("general", "check_existing_target", default=True)
+        if not check_existing:
+            self.logger.info(
+                "Output already exists at %s; skipping (general.check_existing_target=false, "
+                "not verified against targets)",
+                job.output_path,
+            )
+            decision_log.append(
+                "general.check_existing_target=false -> SKIPPED (not verified against targets)"
+            )
+            return self._finish_terminal(
+                job,
+                JobResult(
+                    input_path=job.input_path,
+                    output_path=job.output_path,
+                    input_info=input_info,
+                    outcome="skipped",
+                    skip_reason="output-exists",
+                    decision_log=list(decision_log),
+                ),
+            )
+
+        # Spec-check the existing output against the job's effective targets.
+        targets = effective_output_targets(self.config, job, stage_entries=stage_entries)
+        try:
+            existing_info = get_video_info(job.output_path)
+        except RuntimeError as e:
+            existing_info = None
+            decision_log.append(f"existing output unreadable while spec-checking: {e}")
+        matches, mismatch_reasons = check_output_spec(existing_info, targets)
+
+        if matches:
+            self.logger.info(
+                "Output already exists at %s and matches effective targets; skipping",
+                job.output_path,
+            )
+            decision_log.append("existing output verified against targets: match -> SKIPPED")
+            return self._finish_terminal(
+                job,
+                JobResult(
+                    input_path=job.input_path,
+                    output_path=job.output_path,
+                    input_info=input_info,
+                    outcome="skipped",
+                    skip_reason="output-exists",
+                    decision_log=list(decision_log),
+                ),
+            )
+
+        reason_str = "; ".join(mismatch_reasons)
+        reprocess = self.config.get("general", "reprocess_mismatched", default=False)
+        if not reprocess:
+            self.logger.warning(
+                "Output already exists at %s but MISMATCHED effective targets (%s); "
+                "general.reprocess_mismatched is false -- skipping without reprocessing",
+                job.output_path,
+                reason_str,
+            )
+            decision_log.append(
+                f"existing output mismatched ({reason_str}); "
+                "general.reprocess_mismatched=false -> SKIPPED"
+            )
+            return self._finish_terminal(
+                job,
+                JobResult(
+                    input_path=job.input_path,
+                    output_path=job.output_path,
+                    input_info=input_info,
+                    outcome="skipped",
+                    skip_reason="output-exists-mismatched",
+                    decision_log=list(decision_log),
+                ),
+            )
+
+        existing_mismatched = self.config.get("general", "existing_mismatched", default="rename")
+        if existing_mismatched == "overwrite":
+            self.logger.warning(
+                "Output already exists at %s but mismatched effective targets (%s); "
+                "reprocessing (general.existing_mismatched=overwrite, old file will be replaced)",
+                job.output_path,
+                reason_str,
+            )
+            decision_log.append(
+                f"existing output mismatched ({reason_str}); reprocessing "
+                "(general.existing_mismatched=overwrite; old file will be replaced)"
+            )
+            return None  # Proceed normally -- the stage loop writes over job.output_path.
+
+        # rename mode (default): never overwrite -- move the old mismatched
+        # file aside first, then proceed with a normal reprocessing run.
+        suffix = self.config.get("general", "mismatched_rename_suffix", default="_mismatched-")
+        max_renames = self.config.get("general", "mismatched_max_renames", default=None)
+        new_path = self._rename_mismatched_output(job.output_path, suffix, max_renames)
+        if new_path is None:
+            msg = (
+                f"Output already exists at {job.output_path} but mismatched effective "
+                f"targets ({reason_str}); renaming is disabled or exhausted "
+                f"(general.mismatched_max_renames={max_renames!r}) -- failing rather than "
+                "silently overwriting or skipping"
+            )
+            self.logger.error(msg)
+            decision_log.append(
+                f"existing output mismatched ({reason_str}); rename disabled/exhausted "
+                f"(general.mismatched_max_renames={max_renames!r}) -> FAILED"
+            )
+            return self._finish_terminal(
+                job,
+                JobResult(
+                    input_path=job.input_path,
+                    output_path=None,
+                    errors=[msg],
+                    input_info=input_info,
+                    outcome="failed",
+                    decision_log=list(decision_log),
+                ),
+            )
+
+        self.logger.warning(
+            "Output already exists at %s but mismatched effective targets (%s); renamed to "
+            "%s; reprocessing",
+            job.output_path,
+            reason_str,
+            new_path,
+        )
+        decision_log.append(
+            f"existing output mismatched ({reason_str}); renamed "
+            f"{job.output_path} -> {new_path}; reprocessing"
+        )
+        return None
+
     def execute_job(
         self,
         job: Job,
@@ -574,9 +899,15 @@ class Pipeline:
         # of silently skipping a stage the user explicitly asked for.
         explicit_stage_request = bool(job.stages)
 
-        # Determine stages if not specified
+        # Determine stages if not specified. auto_determine_stages() probes
+        # job.input_path itself (see its docstring) -- § 6.3 probe policy
+        # applies here too (an unreadable input must not crash the whole
+        # batch, see execute_all()'s per-job wrapper / general.skip_invalid_inputs).
         if not job.stages:
-            job.stages = self.auto_determine_stages(job)
+            try:
+                job.stages = self.auto_determine_stages(job)
+            except RuntimeError as e:
+                return self._terminal_probe_failure_result(job, e)
 
         # Resolve pipeline.default_order into occurrence records (order,
         # omission, repetition, per-occurrence enabled/config overrides --
@@ -648,8 +979,37 @@ class Pipeline:
                     "Stage '%s' effective config: %s", entry.label, redact_secrets(effective)
                 )
 
-        input_info = get_video_info(job.input_path)
+        # § 6.3 input-probe policy: an unreadable input FAILS the job by
+        # default (ffprobe stderr surfaced), or -- with
+        # general.skip_invalid_inputs -- is SKIPPED instead so a batch with
+        # known-bad members still completes. Applied uniformly regardless of
+        # whether job.stages was explicit or auto-determined above.
+        try:
+            input_info = get_video_info(job.input_path)
+        except RuntimeError as e:
+            return self._terminal_probe_failure_result(job, e)
         job.input_info = input_info
+
+        # A *successful* probe can still have non-empty ffprobe stderr (see
+        # core/ffmpeg_utils.probe()'s "-v error") -- always surfaced as a
+        # WARNING; general.fail_on_probe_warnings promotes it to a hard
+        # failure instead.
+        probe_stderr = str(input_info.get("probe_stderr") or "").strip()
+        if probe_stderr:
+            terminal = self._handle_probe_warning(job, input_info, probe_stderr)
+            if terminal is not None:
+                return terminal
+
+        # § 6.1/6.2 decision path: existing-output SKIPPED/FAILED/reprocess
+        # classification. Placed here -- right after the input probe, before
+        # any of the (potentially expensive) work below -- so a to-be-skipped
+        # job never pays for scene-mode preprocessing or a stage run. Needs
+        # stage_entries (resolved just above) to know whether "interpolate"
+        # would actually run, for the framerate spec-check target.
+        decision_log: list[str] = []
+        terminal = self._decide_existing_output(job, input_info, stage_entries, decision_log)
+        if terminal is not None:
+            return terminal
 
         # Surface preset/config-level "encoding" and "general.target_format" settings
         # (set via Preset.to_config()) into the per-stage machinery. Config values are
@@ -733,27 +1093,6 @@ class Pipeline:
                 input_info = self._reprobe_input_info(
                     current_path, input_info, context="after scene mode"
                 )
-
-        overwrite = self.config.get("general", "overwrite", default=False)
-        if (
-            not overwrite
-            and job.output_path
-            and os.path.exists(job.output_path)
-            and os.path.abspath(job.output_path) != os.path.abspath(job.input_path)
-        ):
-            msg = f"Output already exists and general.overwrite is False: {job.output_path}"
-            self.logger.error(msg)
-            job_result = JobResult(
-                input_path=job.input_path,
-                output_path=None,
-                errors=[msg],
-                input_info=input_info,
-                success=False,
-            )
-            job.status = PipelineStatus.FAILED
-            job.result = job_result
-            job.progress = 1.0
-            return job_result
 
         # Create output directory
         output_dir = os.path.dirname(job.output_path)
@@ -966,6 +1305,7 @@ class Pipeline:
             skipped=skipped,
             input_info=input_info,
             success=len(errors) == 0,
+            decision_log=decision_log,
         )
 
         # Quality gate: quality_target.mode/target were previously accepted from

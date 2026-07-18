@@ -262,7 +262,15 @@ class MainWindow(QMainWindow):
         for row in range(self.job_table.rowCount()):
             name_item = self.job_table.item(row, 0)
             if name_item is not None and name_item.data(Qt.ItemDataRole.UserRole) is job:
-                status = "Done" if result.success else "Failed"
+                # SKIPPED (REQUIREMENTS.md § 6.1 -- e.g. output already exists)
+                # must not render as "Failed" -- it's a distinct, non-error
+                # outcome.
+                if result.outcome == "completed":
+                    status = "Done"
+                elif result.outcome == "skipped":
+                    status = "Skipped"
+                else:
+                    status = "Failed"
                 self.job_table.setItem(row, 1, QTableWidgetItem(status))
                 self.job_table.setItem(row, 2, QTableWidgetItem("100%"))
                 self.job_table.setItem(row, 4, QTableWidgetItem(f"{result.total_duration:.1f}s"))

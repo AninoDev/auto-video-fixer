@@ -88,6 +88,64 @@ general:
   # `--no-ai-fallback`.
   ai_fallback: true
 
+  # --- REQUIREMENTS.md § 6.1/6.2/6.3: existing-output handling and input-probe policy ---
+  # Pipeline.execute_job()'s decision path runs right after the input probe, before any stage
+  # runs -- so a to-be-skipped job never pays for scene-mode preprocessing or a stage run.
+
+  # What happens when job.output_path already exists and overwrite (above) is false:
+  #   skip (default) = new first-class SKIPPED outcome, logged at INFO -- a video that's simply
+  #           already done from a previous run isn't a "failure". Counted separately in the
+  #           end-of-run summary; does NOT make the run exit non-zero.
+  #   fail  = the old behavior exactly: FAILED + ERROR log.
+  existing_output: skip
+
+  # When an existing output is about to be SKIPPED, verify it actually satisfies the CURRENT
+  # effective targets (container, resolution, framerate, video/audio codec -- see
+  # core/output_check.py) before trusting it, instead of accepting any file at that path at face
+  # value. Default ON: ffprobe-ing the existing file is cheap and the info is valuable (catches
+  # e.g. a config/preset change since the file was produced). Bitrate is deliberately excluded
+  # from the spec-check (nothing in this tool targets a bitrate).
+  check_existing_target: true
+
+  # A verified mismatch (check_existing_target found the existing file doesn't match) is SKIPPED
+  # by default, with the mismatch logged loudly (WARNING) -- sub-reason "output-exists-mismatched".
+  # Set true to have that one video actually reprocessed instead.
+  reprocess_mismatched: false
+
+  # What happens to the OLD mismatched file when reprocess_mismatched is true:
+  #   rename (default) = the existing file is renamed (NEVER overwritten) to
+  #           "<stem><mismatched_rename_suffix><N><ext>" (see below), then the new output is
+  #           written at the original name.
+  #   overwrite = replace the old file directly.
+  existing_mismatched: rename
+
+  # Rename pattern for a mismatched existing file being replaced (existing_mismatched: rename):
+  # "<stem><suffix><N><ext>", N starting at 1, first unused name wins (a collision at N=1 rolls
+  # over to N=2, etc.).
+  mismatched_rename_suffix: "_mismatched-"
+
+  # Cap on N above. null (default) = unlimited. A positive integer FAILS the job (with an
+  # explicit reason) once every N up to the cap is already taken -- i.e. renaming is exhausted,
+  # not "silently give up and overwrite/skip". 0 = renaming fully disabled: any mismatch in
+  # rename mode then FAILS outright. This is a deliberate "never silently rename or overwrite"
+  # strict posture, and is intentionally ALLOWED here (not rejected as invalid config) --
+  # existing_output/existing_mismatched values are validated at startup, but this combination is
+  # a legitimate strict choice, not a typo.
+  mismatched_max_renames: null
+
+  # An input ffprobe that can't analyze the file at all (corrupt/unreadable) FAILS that job by
+  # default, with ffprobe's stderr surfaced in the log/error. Set true for an opt-in "scavenge"
+  # batch mode: unanalyzable inputs become SKIPPED instead (sub-reason "invalid-input"), so a
+  # batch with a few known-bad members still completes -- the failure is still logged either way,
+  # just not fatal to the whole run.
+  skip_invalid_inputs: false
+
+  # ffprobe can emit warnings on stderr even on an otherwise-successful (rc=0) probe (see
+  # core/ffmpeg_utils.probe()'s "-v error" flag). Non-empty stderr on a successful probe is
+  # always surfaced as a WARNING log by default. Set true for an opt-in strict mode where that
+  # also fails the job outright instead of just warning.
+  fail_on_probe_warnings: false
+
 gpu:
   # Whether to auto-detect GPU capability at all (informational; auto-detection itself happens
   # in ai/torch_utils.py and core/ffmpeg_utils.py regardless -- this mainly gates whether

@@ -1209,3 +1209,361 @@ class TestPerStageReprobe:
         # the original 1920x1080.
         assert len(should_run_calls) == 1
         assert should_run_calls[0]["resolution"] == (608, 1080)
+
+
+_BARE_PROBE_INFO = {
+    "resolution": (0, 0),
+    "framerate": 0.0,
+    "duration": 1.0,
+    "video_codec": "",
+    "audio_codecs": [],
+    "format": "",
+    "probe_stderr": "",
+}
+
+
+class _FakeEncodeStage:
+    """Registered under "encode" in these tests -- always runs and writes
+    real bytes to output_path, so a decision-path "proceed" outcome is
+    directly observable (the file at job.output_path actually changes)."""
+
+    name = "encode"
+    display_name = "Fake Encode"
+    description = "test-only stage that writes real output"
+    category = "test"
+    priority = 100
+    produces_output = True
+    supports_gpu = False
+
+    def __init__(self, config, overrides=None):
+        self.config = config
+        self._force_enabled = False
+
+    def should_run(self, input_info):
+        return True, None
+
+    def execute(self, input_path, output_path=None, progress_callback=None, **kwargs):
+        from autovideofixer.core.stages.base import StageResult, StageStatus
+
+        with open(output_path, "wb") as f:
+            f.write(b"new content")
+        return StageResult(status=StageStatus.COMPLETED, output_path=output_path)
+
+
+class TestExistingOutputDecisionPath:
+    """REQUIREMENTS.md § 6.1/6.2: the existing-output decision path in
+    execute_job() -- SKIPPED (not FAILED) by default, optional spec-check
+    against effective targets, and rename-or-overwrite reprocessing of a
+    verified mismatch."""
+
+    def setup_method(self):
+        self.config = Config(Path(tempfile.mkdtemp()) / "nonexistent.yaml")
+        self.pipeline = Pipeline(self.config)
+
+    def _register_fakes(self, monkeypatch, probe_by_path):
+        def fake_get_stage(name):
+            return _FakeEncodeStage if name == "encode" else None
+
+        def fake_create_stage(name, config, overrides=None):
+            return _FakeEncodeStage(config, overrides) if name == "encode" else None
+
+        def fake_get_video_info(path):
+            if path in probe_by_path:
+                info = probe_by_path[path]
+                if isinstance(info, Exception):
+                    raise info
+                return dict(info)
+            return dict(_BARE_PROBE_INFO)
+
+        monkeypatch.setattr("autovideofixer.core.pipeline.get_stage", fake_get_stage)
+        monkeypatch.setattr("autovideofixer.core.pipeline.create_stage", fake_create_stage)
+        monkeypatch.setattr("autovideofixer.core.pipeline.get_video_info", fake_get_video_info)
+
+    def _make_job(self, tmp_path, write_existing_output=True):
+        input_file = tmp_path / "in.mp4"
+        input_file.write_bytes(b"original input")
+        job = self.pipeline.add_job(str(input_file))
+        job.stages = ["encode"]
+        if write_existing_output:
+            Path(job.output_path).write_bytes(b"pre-existing output")
+        return job
+
+    def test_existing_output_default_config_is_skipped(self, tmp_path, monkeypatch):
+        job = self._make_job(tmp_path)
+        self._register_fakes(monkeypatch, {})
+
+        result = self.pipeline.execute_job(job)
+
+        assert result.outcome == "skipped"
+        assert result.skip_reason == "output-exists"
+        assert result.success is False
+        assert result.stage_results == {}
+        assert result.total_duration == 0.0
+        assert job.status == PipelineStatus.SKIPPED
+        assert result.decision_log
+        # No stage ran -- the pre-existing content is untouched.
+        assert Path(job.output_path).read_bytes() == b"pre-existing output"
+
+    def test_existing_output_fail_mode_is_old_failed_behavior(self, tmp_path, monkeypatch):
+        job = self._make_job(tmp_path)
+        self._register_fakes(monkeypatch, {})
+        self.config.set("fail", "general", "existing_output")
+
+        result = self.pipeline.execute_job(job)
+
+        assert result.outcome == "failed"
+        assert result.success is False
+        assert result.skip_reason is None
+        assert any("Output already exists" in e for e in result.errors)
+        assert job.status == PipelineStatus.FAILED
+
+    def test_check_disabled_skips_without_probing_existing_output(self, tmp_path, monkeypatch):
+        job = self._make_job(tmp_path)
+        probed_paths: list[str] = []
+
+        def fake_get_video_info(path):
+            probed_paths.append(path)
+            return dict(_BARE_PROBE_INFO)
+
+        monkeypatch.setattr("autovideofixer.core.pipeline.get_video_info", fake_get_video_info)
+        monkeypatch.setattr(
+            "autovideofixer.core.pipeline.get_stage",
+            lambda name: _FakeEncodeStage if name == "encode" else None,
+        )
+        monkeypatch.setattr(
+            "autovideofixer.core.pipeline.create_stage",
+            lambda name, config, overrides=None: (
+                _FakeEncodeStage(config, overrides) if name == "encode" else None
+            ),
+        )
+        self.config.set(False, "general", "check_existing_target")
+
+        result = self.pipeline.execute_job(job)
+
+        assert result.outcome == "skipped"
+        assert result.skip_reason == "output-exists"
+        # Only the input was probed -- the existing output was never opened.
+        assert job.output_path not in probed_paths
+
+    def test_check_on_matching_existing_output_is_skipped(self, tmp_path, monkeypatch):
+        job = self._make_job(tmp_path)
+        self._register_fakes(
+            monkeypatch,
+            {
+                job.output_path: {
+                    **_BARE_PROBE_INFO,
+                    "format": "mov,mp4,m4a",
+                    "video_codec": "h264",
+                },
+            },
+        )
+        self.config.set("mp4", "general", "target_format")
+        self.config.set("libx264", "encoding", "video_codec")
+
+        result = self.pipeline.execute_job(job)
+
+        assert result.outcome == "skipped"
+        assert result.skip_reason == "output-exists"
+        assert any("match" in line for line in result.decision_log)
+
+    def test_check_on_mismatched_reprocess_off_is_skipped_with_reasons(self, tmp_path, monkeypatch):
+        job = self._make_job(tmp_path)
+        self._register_fakes(
+            monkeypatch,
+            {
+                job.output_path: {
+                    **_BARE_PROBE_INFO,
+                    "video_codec": "h264",
+                },
+            },
+        )
+        self.config.set("libx265", "encoding", "video_codec")
+
+        result = self.pipeline.execute_job(job)
+
+        assert result.outcome == "skipped"
+        assert result.skip_reason == "output-exists-mismatched"
+        assert any("vcodec" in line for line in result.decision_log)
+        assert Path(job.output_path).read_bytes() == b"pre-existing output"
+
+    def test_mismatch_reprocess_rename_default_suffix_and_collision(self, tmp_path, monkeypatch):
+        job = self._make_job(tmp_path)
+        self._register_fakes(
+            monkeypatch,
+            {
+                job.output_path: {**_BARE_PROBE_INFO, "video_codec": "h264"},
+            },
+        )
+        self.config.set("libx265", "encoding", "video_codec")
+        self.config.set(True, "general", "reprocess_mismatched")
+        # Pre-occupy "_mismatched-1" so the rename must roll over to "-2".
+        stem, ext = os.path.splitext(job.output_path)
+        collision_path = f"{stem}_mismatched-1{ext}"
+        Path(collision_path).write_bytes(b"already taken")
+
+        result = self.pipeline.execute_job(job)
+
+        assert result.outcome == "completed"
+        renamed_path = f"{stem}_mismatched-2{ext}"
+        assert os.path.exists(renamed_path)
+        assert Path(renamed_path).read_bytes() == b"pre-existing output"
+        assert Path(job.output_path).read_bytes() == b"new content"
+        assert any("renamed" in line for line in result.decision_log)
+
+    def test_mismatch_reprocess_rename_custom_suffix(self, tmp_path, monkeypatch):
+        job = self._make_job(tmp_path)
+        self._register_fakes(
+            monkeypatch,
+            {
+                job.output_path: {**_BARE_PROBE_INFO, "video_codec": "h264"},
+            },
+        )
+        self.config.set("libx265", "encoding", "video_codec")
+        self.config.set(True, "general", "reprocess_mismatched")
+        self.config.set("_old-", "general", "mismatched_rename_suffix")
+
+        result = self.pipeline.execute_job(job)
+
+        assert result.outcome == "completed"
+        stem, ext = os.path.splitext(job.output_path)
+        assert os.path.exists(f"{stem}_old-1{ext}")
+
+    def test_mismatch_reprocess_rename_cap_exhausted_fails(self, tmp_path, monkeypatch):
+        job = self._make_job(tmp_path)
+        self._register_fakes(
+            monkeypatch,
+            {
+                job.output_path: {**_BARE_PROBE_INFO, "video_codec": "h264"},
+            },
+        )
+        self.config.set("libx265", "encoding", "video_codec")
+        self.config.set(True, "general", "reprocess_mismatched")
+        self.config.set(1, "general", "mismatched_max_renames")
+        stem, ext = os.path.splitext(job.output_path)
+        Path(f"{stem}_mismatched-1{ext}").write_bytes(b"already taken")
+
+        result = self.pipeline.execute_job(job)
+
+        assert result.outcome == "failed"
+        assert job.status == PipelineStatus.FAILED
+        # The original mismatched file is untouched -- renaming never happened.
+        assert Path(job.output_path).read_bytes() == b"pre-existing output"
+
+    def test_mismatch_reprocess_rename_cap_zero_fails(self, tmp_path, monkeypatch):
+        job = self._make_job(tmp_path)
+        self._register_fakes(
+            monkeypatch,
+            {
+                job.output_path: {**_BARE_PROBE_INFO, "video_codec": "h264"},
+            },
+        )
+        self.config.set("libx265", "encoding", "video_codec")
+        self.config.set(True, "general", "reprocess_mismatched")
+        self.config.set(0, "general", "mismatched_max_renames")
+
+        result = self.pipeline.execute_job(job)
+
+        assert result.outcome == "failed"
+        assert Path(job.output_path).read_bytes() == b"pre-existing output"
+
+    def test_mismatch_reprocess_overwrite_runs_job(self, tmp_path, monkeypatch):
+        job = self._make_job(tmp_path)
+        self._register_fakes(
+            monkeypatch,
+            {
+                job.output_path: {**_BARE_PROBE_INFO, "video_codec": "h264"},
+            },
+        )
+        self.config.set("libx265", "encoding", "video_codec")
+        self.config.set(True, "general", "reprocess_mismatched")
+        self.config.set("overwrite", "general", "existing_mismatched")
+
+        result = self.pipeline.execute_job(job)
+
+        assert result.outcome == "completed"
+        assert Path(job.output_path).read_bytes() == b"new content"
+
+    def test_probe_failure_fails_job_with_stderr_surfaced(self, tmp_path, monkeypatch):
+        job = self._make_job(tmp_path, write_existing_output=False)
+        self._register_fakes(
+            monkeypatch,
+            {job.input_path: RuntimeError(f"ffprobe failed for {job.input_path}: bad atom size")},
+        )
+
+        result = self.pipeline.execute_job(job)
+
+        assert result.outcome == "failed"
+        assert any("bad atom size" in e for e in result.errors)
+        assert job.status == PipelineStatus.FAILED
+
+    def test_probe_failure_skip_invalid_inputs_is_skipped(self, tmp_path, monkeypatch):
+        job = self._make_job(tmp_path, write_existing_output=False)
+        self._register_fakes(
+            monkeypatch,
+            {job.input_path: RuntimeError(f"ffprobe failed for {job.input_path}: bad atom size")},
+        )
+        self.config.set(True, "general", "skip_invalid_inputs")
+
+        result = self.pipeline.execute_job(job)
+
+        assert result.outcome == "skipped"
+        assert result.skip_reason == "invalid-input"
+        assert job.status == PipelineStatus.SKIPPED
+
+    def test_probe_warning_surfaced_but_job_continues_by_default(self, tmp_path, monkeypatch):
+        job = self._make_job(tmp_path, write_existing_output=False)
+        self._register_fakes(
+            monkeypatch,
+            {
+                job.input_path: {
+                    **_BARE_PROBE_INFO,
+                    "probe_stderr": "Non-monotonous DTS",
+                },
+            },
+        )
+
+        result = self.pipeline.execute_job(job)
+
+        assert result.outcome == "completed"
+
+    def test_probe_warning_fails_job_when_strict_mode_enabled(self, tmp_path, monkeypatch):
+        job = self._make_job(tmp_path, write_existing_output=False)
+        self._register_fakes(
+            monkeypatch,
+            {
+                job.input_path: {
+                    **_BARE_PROBE_INFO,
+                    "probe_stderr": "Non-monotonous DTS",
+                },
+            },
+        )
+        self.config.set(True, "general", "fail_on_probe_warnings")
+
+        result = self.pipeline.execute_job(job)
+
+        assert result.outcome == "failed"
+        assert any("Non-monotonous DTS" in e for e in result.errors)
+
+
+class TestExitCodeCountsFailedOnly:
+    """CLI exit-code seam (cli.py's _count_failed()): only outcome=="failed"
+    jobs should make a run exit non-zero -- SKIPPED/completed never do."""
+
+    def test_all_skipped_or_completed_counts_zero_failed(self):
+        from autovideofixer.cli.cli import _count_failed
+
+        results = [
+            JobResult(input_path="/a.mp4", success=True),
+            JobResult(input_path="/b.mp4", outcome="skipped", skip_reason="output-exists"),
+        ]
+        assert _count_failed(results) == 0
+
+    def test_one_real_failure_counts_one(self):
+        from autovideofixer.cli.cli import _count_failed
+
+        results = [
+            JobResult(input_path="/a.mp4", success=True),
+            JobResult(input_path="/b.mp4", success=False, errors=["boom"]),
+            JobResult(input_path="/c.mp4", outcome="skipped", skip_reason="output-exists"),
+        ]
+        assert _count_failed(results) == 1

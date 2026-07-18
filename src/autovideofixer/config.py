@@ -246,6 +246,49 @@ def resolve_timeout(value: Any, key: str) -> float | None:
     return numeric
 
 
+_VALID_EXISTING_OUTPUT = ("skip", "fail")
+_VALID_EXISTING_MISMATCHED = ("rename", "overwrite")
+
+
+def validate_output_handling_config(config: "Config") -> None:
+    """Validate the § 6.1/6.2 ``general.*`` enum-valued keys eagerly.
+
+    Called once per ``Pipeline`` construction so a typo'd value (e.g.
+    ``general.existing_output: sikp``) is a clear startup error instead of a
+    confusing failure the first time ``execute_job()``'s decision path reads
+    it. Deliberately does NOT reject ``mismatched_max_renames == 0`` -- that's
+    an intentional, allowed "renaming fully disabled" strict posture (see
+    ``docs/REQUIREMENTS.md`` § 6.2's "0 = renaming fully disabled" note), not a
+    misconfiguration.
+    """
+    existing_output = config.get("general", "existing_output", default="skip")
+    if existing_output not in _VALID_EXISTING_OUTPUT:
+        raise ValueError(
+            f"Invalid general.existing_output: {existing_output!r} "
+            f"(must be one of {_VALID_EXISTING_OUTPUT!r})"
+        )
+    existing_mismatched = config.get("general", "existing_mismatched", default="rename")
+    if existing_mismatched not in _VALID_EXISTING_MISMATCHED:
+        raise ValueError(
+            f"Invalid general.existing_mismatched: {existing_mismatched!r} "
+            f"(must be one of {_VALID_EXISTING_MISMATCHED!r})"
+        )
+    max_renames = config.get("general", "mismatched_max_renames", default=None)
+    if max_renames is not None:
+        try:
+            max_renames = int(max_renames)
+        except (TypeError, ValueError) as e:
+            raise ValueError(
+                f"Invalid general.mismatched_max_renames: {max_renames!r} "
+                "(must be a non-negative integer or null)"
+            ) from e
+        if max_renames < 0:
+            raise ValueError(
+                f"Invalid general.mismatched_max_renames: {max_renames!r} "
+                "(must be >= 0; 0 disables renaming, null means unlimited)"
+            )
+
+
 class Config:
     """Central configuration manager. Loads from disk and provides defaults."""
 
@@ -268,6 +311,56 @@ class Config:
             # producing traditional output. Per-stage
             # stages.<name>.ai_fallback overrides this when not null.
             "ai_fallback": True,
+            # --- REQUIREMENTS.md § 6.1/6.2/6.3: existing-output handling and
+            # input-probe policy (Pipeline.execute_job()'s decision path, right
+            # after the input probe and before any stage runs) ---
+            #
+            # "skip" (default): an existing job.output_path with overwrite=False
+            # is a new first-class SKIPPED outcome (INFO log), not a failure --
+            # a video that's simply already done from a previous run shouldn't
+            # read as "failed". "fail" restores the old behavior exactly: FAILED
+            # + ERROR log.
+            "existing_output": "skip",
+            # When an output exists and is about to be SKIPPED, verify it
+            # actually satisfies the CURRENT effective targets (container,
+            # resolution, framerate, video/audio codec -- see
+            # core/output_check.py) before trusting it. Default ON: ffprobe-ing
+            # an existing file is cheap and the info is valuable (catches e.g.
+            # a config change since the file was produced). False skips the
+            # verification and always accepts an existing file at face value.
+            "check_existing_target": True,
+            # A verified mismatch (check_existing_target=true found the existing
+            # file doesn't match) is SKIPPED by default -- set true to have that
+            # one video actually reprocessed instead.
+            "reprocess_mismatched": False,
+            # What happens to the OLD mismatched file when reprocess_mismatched
+            # is true: "rename" (default, never overwrite -- see
+            # mismatched_rename_suffix/mismatched_max_renames below) or
+            # "overwrite" (replace it directly).
+            "existing_mismatched": "rename",
+            # Rename pattern for a mismatched existing file being replaced:
+            # "<stem><suffix><N><ext>", N from 1, first unused name wins.
+            "mismatched_rename_suffix": "_mismatched-",
+            # Cap on N above. null (default) = unlimited. A positive int fails
+            # the job (explicit reason) once every N up to the cap is taken.
+            # 0 = renaming fully disabled: a mismatch in rename mode then FAILS
+            # rather than silently overwriting or silently skipping -- a
+            # deliberate strict "never silently rename or overwrite" posture,
+            # intentionally allowed here (not rejected as invalid config).
+            "mismatched_max_renames": None,
+            # An input ffprobe can't analyze at all (corrupt/unreadable file)
+            # FAILS that job by default (ffprobe stderr surfaced in the log/
+            # error). Set true for an opt-in "scavenge" batch mode: unanalyzable
+            # inputs become SKIPPED (sub-reason "invalid-input") instead, so a
+            # batch with known-bad members still completes; the failure is still
+            # logged either way.
+            "skip_invalid_inputs": False,
+            # ffprobe can emit warnings on stderr even on a successful (rc=0)
+            # probe (see core/ffmpeg_utils.probe()'s "-v error"). Non-empty
+            # stderr on a successful probe is always surfaced as a WARNING log
+            # by default; set true for an opt-in strict mode where that also
+            # fails the job outright.
+            "fail_on_probe_warnings": False,
         },
         "gpu": {
             "auto_detect": True,

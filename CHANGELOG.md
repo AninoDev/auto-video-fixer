@@ -7,6 +7,61 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **2026-07-18: Job outcomes -- SKIPPED (not FAILED) for an existing output, existing-output
+  spec-check, input-probe policy (REQUIREMENTS.md § 6.1/6.2/6.3, commit 1/4 of the planned
+  output-handling/reporting work)**: `Pipeline.execute_job()`'s decision path (right after the
+  input probe, before scene mode/any stage runs) replaces the old
+  "Output already exists and general.overwrite is False" -> FAILED+ERROR block.
+  - New `PipelineStatus.SKIPPED` and `JobResult.outcome` (`"completed" | "failed" | "skipped"`,
+    canonical -- `JobResult.success` stays in sync automatically), `JobResult.skip_reason`
+    (`"output-exists"` / `"output-exists-mismatched"` / `"invalid-input"`), and
+    `JobResult.decision_log` (human-readable decision trail, populated on every job).
+  - `general.existing_output` (`"skip"` default / `"fail"` = exact old behavior). With `"skip"`
+    and `general.check_existing_target` (default `true`), the existing output is ffprobed and
+    spec-checked against effective targets (container, resolution, framerate, video/audio codec;
+    bitrate deliberately excluded) via new `core/output_check.py`
+    (`effective_output_targets()`/`check_output_spec()`) -- a match is SKIPPED
+    `"output-exists"`; a verified mismatch is SKIPPED `"output-exists-mismatched"` (WARNING) unless
+    `general.reprocess_mismatched: true`, in which case `general.existing_mismatched`
+    (`"rename"` default / `"overwrite"`) either renames the old file aside
+    (`<stem><general.mismatched_rename_suffix><N><ext>`, N from 1 first-unused;
+    `general.mismatched_max_renames` caps N, `0` disables renaming and FAILS the job on a
+    mismatch instead -- a deliberate strict posture, allowed at config-validation time) or
+    overwrites it directly, then proceeds with a normal reprocessing run. Resolution comparison
+    reuses `UpscaleStage`'s orientation-aware bounds/threshold math, refactored into
+    `core/output_check.py`'s `effective_target_bounds()`/`SKIP_SCALE_THRESHOLD` (shared by both,
+    not duplicated); framerate uses a small epsilon (29.97 ~= 30); codec comparison normalizes to
+    codec family (e.g. `libx265` satisfies an `"hevc"` target). An unspecified target is never a
+    mismatch.
+  - **Input-probe policy audit finding**: `core/ffmpeg_utils.probe()` ran ffprobe with `-v quiet`,
+    so a failing probe's `RuntimeError` carried an essentially empty `stderr` -- now `-v error`
+    (errors/warnings still isolated from routine output; JSON payload unaffected). Previously,
+    `execute_job()` never caught this `RuntimeError` at all: the only reason a bad input didn't
+    crash a whole `execute_all()` batch was that wrapper's own generic `except Exception`, which
+    produced an undifferentiated FAILED `JobResult` with just `str(e)` -- no distinguishing
+    invalid-input state, no opt-in skip, and a direct `execute_job()` call (outside
+    `execute_all()`) would have propagated the exception fully unhandled. Now: an unreadable
+    input FAILS the job by default (ffprobe stderr surfaced in the log/`JobResult.errors`);
+    `general.skip_invalid_inputs: true` makes it SKIPPED (`"invalid-input"`) instead, so one
+    corrupt file in a batch doesn't need to fail the whole run. A *successful* probe with
+    non-empty ffprobe stderr (a real warning ffprobe recovered from) is always surfaced as a
+    WARNING; `general.fail_on_probe_warnings: true` promotes that to FAILED. `ProbeResult` now
+    carries `.stderr` / `to_info_dict()["probe_stderr"]`.
+  - CLI: `avf process`'s exit code now only counts true `outcome == "failed"` jobs (new
+    `cli.py::_count_failed()`) -- a run whose jobs are all completed-or-skipped exits 0.
+    `_print_summary()` reports Skipped as its own line/section, separate from Failed. GUI job
+    table renders SKIPPED as "Skipped", not "Failed".
+  - New config keys (all under `general`, documented in `docs/config.example.yaml`):
+    `existing_output`, `check_existing_target`, `reprocess_mismatched`, `existing_mismatched`,
+    `mismatched_rename_suffix`, `mismatched_max_renames`, `skip_invalid_inputs`,
+    `fail_on_probe_warnings`. `config.py`'s `validate_output_handling_config()` rejects an invalid
+    `existing_output`/`existing_mismatched` value or a negative `mismatched_max_renames` at
+    `Pipeline()` construction (`mismatched_max_renames: 0` is explicitly allowed, not rejected).
+  - Not yet implemented (later commits per REQUIREMENTS.md § 6's delivery order): § 6.4 (per-video
+    stage/mode summary table), § 6.5 (media info/timing instrumentation), § 6.6 (structured JSON
+    report), § 6.7 (PII-clean log variant), § 6.8 (`avf config clean|upgrade|dump`).
+
 ### Fixed
 - **Stages after the first geometry-changing one saw stale `input_info` (post-crop upscale bug)**:
   `Pipeline.execute_job()` probed `input_info` once up front (plus once more after scene mode)

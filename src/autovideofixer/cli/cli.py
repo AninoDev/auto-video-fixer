@@ -29,7 +29,7 @@ from autovideofixer.config import (
     sanitize_console_text,
 )
 from autovideofixer.core.analysis import is_video_file, scan_directory
-from autovideofixer.core.pipeline import Pipeline
+from autovideofixer.core.pipeline import JobResult, Pipeline
 from autovideofixer.core.presets import get_preset, list_presets, load_preset
 from autovideofixer.logger import get_logger, setup_logging
 
@@ -822,8 +822,10 @@ def process(
     console.print(f"\nProcessing {len(jobs)} job(s)...")
     results = pipeline.execute_all(callback=_on_job_complete)
 
-    # Summary
-    failed = sum(1 for r in results if not r.success)
+    # Summary. A run whose jobs are all completed-or-skipped exits 0 -- only
+    # true failures (outcome == "failed") make the run exit non-zero (see
+    # docs/REQUIREMENTS.md § 6.1).
+    failed = _count_failed(results)
     _print_summary(results)
     if failed > 0:
         sys.exit(1)
@@ -1468,25 +1470,59 @@ def _list_presets() -> None:
     console.print(table)
 
 
+def _count_failed(results: list[JobResult]) -> int:
+    """Count of jobs whose outcome is a true FAILED (REQUIREMENTS.md § 6.1).
+
+    A run's exit code is driven by this, not ``JobResult.success`` --
+    SKIPPED jobs have ``success=False`` too (see ``JobResult.__post_init__``)
+    but must NOT make an otherwise-clean run exit non-zero. Extracted as its
+    own function so the exit-code seam is directly unit-testable without a
+    live pipeline run.
+    """
+    return sum(1 for r in results if r.outcome == "failed")
+
+
 def _on_job_complete(job, result) -> None:
     """Callback when a job completes."""
-    status_icon = "[green]OK[/green]" if result.success else "[red]FAIL[/red]"
+    if result.outcome == "completed":
+        status_icon = "[green]OK[/green]"
+    elif result.outcome == "skipped":
+        status_icon = "[yellow]SKIP[/yellow]"
+    else:
+        status_icon = "[red]FAIL[/red]"
     console.print(f"  {status_icon} {_safe(os.path.basename(job.input_path))}")
 
 
 def _print_summary(results) -> None:
-    """Print processing summary."""
+    """Print processing summary.
+
+    SKIPPED jobs (REQUIREMENTS.md § 6.1 -- an existing output, or an
+    unreadable input with general.skip_invalid_inputs) are counted
+    separately from both success and failure -- they don't count as a
+    "Failed" job, and don't drive the run's exit code (see the `process`
+    command's exit-code logic).
+    """
     total = len(results)
-    success = sum(1 for r in results if r.success)
-    failed = total - success
+    success = sum(1 for r in results if r.outcome == "completed")
+    skipped = sum(1 for r in results if r.outcome == "skipped")
+    failed = total - success - skipped
 
     console.print("\n[bold]Summary:[/bold]")
     console.print(f"  Total: {total}")
     console.print(f"  Success: {success}")
+    if skipped:
+        console.print(f"  Skipped: {skipped}")
     console.print(f"  Failed: {failed}")
+
+    if skipped:
+        console.print("\n[yellow]Skipped jobs:[/yellow]")
+        for r in results:
+            if r.outcome == "skipped":
+                reason = f" ({_safe(r.skip_reason)})" if r.skip_reason else ""
+                console.print(f"  - {_safe(r.input_path)}{reason}")
 
     if failed > 0:
         console.print("\n[red]Failed jobs:[/red]")
         for r in results:
-            if not r.success:
+            if r.outcome == "failed":
                 console.print(f"  - {_safe(r.input_path)}: {_safe('; '.join(r.errors))}")

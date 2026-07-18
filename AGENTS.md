@@ -336,6 +336,62 @@ Output path is resolved in this priority order:
 
 The CLI `-o` flag sets `general.output_dir` in config. The pipeline reads it when creating jobs.
 
+## Job outcomes (SKIPPED, existing-output spec-check, input-probe policy)
+
+`docs/REQUIREMENTS.md` § 6.1/6.2/6.3 (implemented as one decision path in
+`Pipeline.execute_job()`, right after the input probe and before scene mode/any stage runs — see
+`Pipeline._decide_existing_output()`/`_terminal_probe_failure_result()`/`_handle_probe_warning()`
+in `core/pipeline.py`):
+
+- **`JobResult.outcome`**: `"completed" | "failed" | "skipped"` — canonical; `JobResult.success`
+  (`bool`) is kept in sync automatically (`success == (outcome == "completed")`, enforced in
+  `JobResult.__post_init__`). `PipelineStatus.SKIPPED` mirrors this on `job.status`.
+  `JobResult.skip_reason` is a machine-readable sub-reason when `outcome == "skipped"`:
+  `"output-exists"` / `"output-exists-mismatched"` / `"invalid-input"`. `JobResult.decision_log`
+  (`list[str]`) records the human-readable decision trail (what was measured vs. targeted, which
+  flags drove the outcome, rename actions) for every job, not just skipped ones — this is what a
+  future structured JSON report (§ 6.6, not yet implemented) will serialize.
+- **Existing output, `general.overwrite: false`**: no longer an automatic FAILED. Controlled by
+  `general.existing_output` (`"skip"` default / `"fail"` restores the old FAILED+ERROR behavior
+  exactly). When `"skip"` and `general.check_existing_target` (default `true`) is on, the existing
+  file is ffprobed and spec-checked against the job's effective targets (container, resolution,
+  framerate, video/audio codec — bitrate deliberately excluded) via
+  `core/output_check.py`'s `effective_output_targets()`/`check_output_spec()`. A match is SKIPPED
+  `"output-exists"`; a verified mismatch is SKIPPED `"output-exists-mismatched"` (logged at
+  WARNING) unless `general.reprocess_mismatched: true`, in which case
+  `general.existing_mismatched` (`"rename"` default / `"overwrite"`) decides whether the old file
+  is renamed aside (`<stem><general.mismatched_rename_suffix><N><ext>`, N from 1, first unused —
+  `general.mismatched_max_renames` caps N; `null` unlimited, `0` disables renaming entirely and
+  turns a rename-mode mismatch into a FAILED job — a deliberate strict "never silently rename or
+  overwrite" posture, allowed at config-validation time, not rejected) or overwritten directly.
+  Resolution comparison reuses `UpscaleStage`'s orientation-aware bounds/threshold math, now
+  shared via `core/output_check.py`'s `effective_target_bounds()`/`SKIP_SCALE_THRESHOLD` (also
+  aliased as `UpscaleStage._SKIP_SCALE_THRESHOLD`) so both stay in lockstep. Framerate uses a
+  small epsilon (`FRAMERATE_EPSILON = 0.11`, e.g. 29.97 ≈ 30); codec comparison normalizes to
+  codec FAMILY (e.g. `libx265`/`hevc_nvenc` both satisfy an `"hevc"` target), never the literal
+  encoder string. An unspecified target (e.g. no `quality.quality_target.target_resolution` set)
+  is NEVER a mismatch — `effective_output_targets()` is deliberately conservative about what
+  counts as "the user actually specified this".
+- **Input probe failure policy** (`core/ffmpeg_utils.probe()` now runs ffprobe with `-v error`,
+  not the old `-v quiet`, so a raised `RuntimeError`'s message actually carries ffprobe's stderr):
+  an unreadable input FAILS the job by default (stderr surfaced in the log/`JobResult.errors`);
+  `general.skip_invalid_inputs: true` makes it SKIPPED (`"invalid-input"`) instead, so one corrupt
+  file doesn't need to fail an entire batch. Applied uniformly whether `auto_determine_stages()`'s
+  own probe or `execute_job()`'s explicit probe hits the bad file first (both funnel through
+  `Pipeline._terminal_probe_failure_result()`). Separately, a *successful* probe can still have
+  non-empty ffprobe stderr (a real warning ffprobe recovered from) — always surfaced as a WARNING
+  log; `general.fail_on_probe_warnings: true` promotes that to a hard FAILED instead. `ProbeResult`
+  carries this as `.stderr` / `to_info_dict()["probe_stderr"]`.
+- **CLI/GUI**: `avf process`'s exit code is driven by `cli.py`'s `_count_failed()`
+  (`outcome == "failed"` only) — a run whose jobs are all completed-or-skipped exits 0.
+  `_print_summary()` reports Skipped as its own line (with sub-reasons), separate from Failed. The
+  GUI's job table renders a SKIPPED job as "Skipped", not "Failed"
+  (`gui/main_window.py::_on_job_complete`).
+- Not yet implemented: § 6.4 (per-video stage/mode summary table), § 6.5 (media info/timing
+  instrumentation), § 6.6 (structured JSON report), § 6.7 (PII-clean log variant), § 6.8 (`avf
+  config clean|upgrade|dump`) — see `docs/REQUIREMENTS.md` § 6 for the full planned set and
+  delivery order.
+
 ## AI/Traditional Method Selection
 
 The four AI-capable stages (upscale, deblock, denoise_video, interpolate) all resolve their

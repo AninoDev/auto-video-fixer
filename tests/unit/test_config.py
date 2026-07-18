@@ -5,7 +5,7 @@ from pathlib import Path
 import pytest
 import yaml
 
-from autovideofixer.config import Config
+from autovideofixer.config import Config, validate_output_handling_config
 
 
 class TestConfig:
@@ -369,3 +369,41 @@ class TestConfigCascadeLayers:
         joined = "\n".join(r.getMessage() for r in caplog.records)
         assert "sk-supersecret" not in joined
         assert "***" in joined
+
+
+class TestValidateOutputHandlingConfig:
+    """REQUIREMENTS.md § 6.1/6.2 general.* enum validation -- a clear startup
+    error on a typo'd value, but mismatched_max_renames=0 is allowed (it's a
+    deliberate "renaming disabled" posture, not a misconfiguration)."""
+
+    def test_defaults_pass(self, tmp_path):
+        config = Config(tmp_path / "nonexistent.yaml")
+        validate_output_handling_config(config)  # must not raise
+
+    def test_invalid_existing_output_raises(self, tmp_path):
+        config = Config(tmp_path / "nonexistent.yaml")
+        config.set("sikp", "general", "existing_output")
+        with pytest.raises(ValueError, match="existing_output"):
+            validate_output_handling_config(config)
+
+    def test_invalid_existing_mismatched_raises(self, tmp_path):
+        config = Config(tmp_path / "nonexistent.yaml")
+        config.set("delete", "general", "existing_mismatched")
+        with pytest.raises(ValueError, match="existing_mismatched"):
+            validate_output_handling_config(config)
+
+    def test_negative_max_renames_raises(self, tmp_path):
+        config = Config(tmp_path / "nonexistent.yaml")
+        config.set(-1, "general", "mismatched_max_renames")
+        with pytest.raises(ValueError, match="mismatched_max_renames"):
+            validate_output_handling_config(config)
+
+    def test_max_renames_zero_is_allowed(self, tmp_path):
+        config = Config(tmp_path / "nonexistent.yaml")
+        config.set(0, "general", "mismatched_max_renames")
+        validate_output_handling_config(config)  # must not raise
+
+    def test_max_renames_null_is_allowed(self, tmp_path):
+        config = Config(tmp_path / "nonexistent.yaml")
+        config.set(None, "general", "mismatched_max_renames")
+        validate_output_handling_config(config)  # must not raise

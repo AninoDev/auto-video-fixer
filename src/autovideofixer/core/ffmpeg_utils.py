@@ -69,6 +69,12 @@ class ProbeResult:
     format_name: str = ""
     format_long_name: str = ""
     streams: list[StreamInfo] = field(default_factory=list)
+    # ffprobe's stderr from the run that produced this result, even on a
+    # successful (rc=0) probe -- see probe()'s "-v error" flag below. Non-empty
+    # here means ffprobe emitted warnings/errors about the file despite still
+    # producing usable JSON on stdout (e.g. a slightly malformed container);
+    # surfaced by Pipeline's § 6.3 probe policy (general.fail_on_probe_warnings).
+    stderr: str = ""
 
     @property
     def video_stream(self) -> StreamInfo | None:
@@ -136,6 +142,7 @@ class ProbeResult:
             "audio_codecs": [s.codec_name for s in self.audio_streams],
             "audio_count": len(self.audio_streams),
             "streams": len(self.streams),
+            "probe_stderr": self.stderr,
         }
 
 
@@ -172,12 +179,21 @@ def get_ffprobe_path(config: Config | None = None) -> str:
 
 
 def probe(filepath: str, config: Config | None = None) -> ProbeResult:
-    """Probe a media file and return detailed information."""
+    """Probe a media file and return detailed information.
+
+    Uses ``-v error`` (not ``-v quiet``) so a failing probe's ``RuntimeError``
+    carries an actually-informative ``stderr`` (ffprobe still only writes
+    errors/warnings there, never routine progress chatter -- the JSON payload
+    stays on stdout either way) -- see docs/REQUIREMENTS.md § 6.3. This also
+    means a *successful* (rc=0) probe can still have non-empty stderr (e.g. a
+    slightly malformed container ffprobe recovers from); callers that care
+    read it back via ``ProbeResult.stderr``/``to_info_dict()["probe_stderr"]``.
+    """
     ffprobe = get_ffprobe_path(config)
     cmd = [
         ffprobe,
         "-v",
-        "quiet",
+        "error",
         "-print_format",
         "json",
         "-show_format",
@@ -192,7 +208,9 @@ def probe(filepath: str, config: Config | None = None) -> ProbeResult:
         raise RuntimeError(f"ffprobe failed for {filepath}: {result.stderr}")
 
     data = json.loads(result.stdout)
-    return _parse_probe_result(data, filepath)
+    parsed = _parse_probe_result(data, filepath)
+    parsed.stderr = result.stderr
+    return parsed
 
 
 def _parse_probe_result(data: dict, filepath: str) -> ProbeResult:
