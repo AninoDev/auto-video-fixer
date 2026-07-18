@@ -30,6 +30,7 @@ dependencies = [
     "avf-scenes",
     "avf-hashing",
     "avf-framepipe",
+    "avf-borders",
 ]
 
 [project.optional-dependencies]
@@ -118,9 +119,11 @@ members = [
     "rust/avf_scenes",
     "rust/avf_hashing",
     "rust/avf_framepipe",
+    "rust/avf_borders",
 ]
 
 [tool.uv.sources]
 avf-scenes = { workspace = true, editable = true }
 avf-hashing = { workspace = true, editable = true }
 avf-framepipe = { workspace = true, editable = true }
+avf-borders = { workspace = true, editable = true }

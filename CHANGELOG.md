@@ -157,6 +157,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   authoritative window).
 
 ### Added
+- **Rust per-edge, arbitrary-color border detection (`rust/avf_borders/`)**: `crop` stage
+  detection can now see white/gray/colored letterbox and pillarbox borders, not just black/dark
+  ones -- FFmpeg's `cropdetect` filter (the pre-existing detection method, still the default
+  fallback) is luma-threshold-only and cannot see those at all. New PyO3/`maturin` extension
+  `avf_borders` (`detect_border_frames()`), following the exact same
+  `[tool.uv.workspace]`/lazy-import-with-fallback pattern as `avf_scenes`/`avf_hashing`/
+  `avf_framepipe` -- see AGENTS.md's "Mixed Python/Rust" section for the full algorithm writeup.
+  Per sampled frame and per edge, it reports the DOMINANT border color (4-bit-per-channel
+  quantization, largest bin's mean actual color) plus a "solidity" percentage (how consistent the
+  border is), then walks inward line-by-line while a majority of each line still matches -- a
+  logo/overlay occupying a minority of a border line doesn't stop the walk, and an edge whose
+  solidity never clears a minimum threshold is treated as having no solid border at all (protects
+  blurred-video-background pillarboxing from being cropped). The rust detector's per-frame windows
+  feed the SAME `aggregate_crop_windows()` transition-exclusion/union aggregation the cropdetect
+  path already used -- only the per-frame detection step changed. New config keys under
+  `stages.crop`: `detector` (`"auto"` default | `"rust"` | `"cropdetect"`), `border_tolerance`
+  (default `24`), `border_majority` (default `0.90`), `border_solidity_min` (default `0.60`),
+  `border_strip_px` (default `4`), `sample_fps` (default `0` = every frame). `execute()` logs the
+  final per-edge color + solidity at INFO on every rust-detector run (e.g. `borders: top 140px
+  solid #000000 (99.8%), bottom 140px solid #000000 (99.7%), left none, right none`) so both
+  signals are visible without digging into stage metadata. `should_run()`'s cheap prefilter is
+  luma-only (cropdetect), so it's skipped entirely (returns `True` unconditionally) whenever the
+  resolved detector isn't `"cropdetect"` -- otherwise a white/colored-bordered video would look
+  like "no border" to that prefilter and get skipped before the rust pass (which would see it)
+  ever ran.
 - **`stages.crop.max_outlier_ratio`** (default `0.2`, range `0..0.5`; `0` = disabled/strict):
   converted at detection time into cropdetect's `max_outliers=<N>` (`N = round(max_outlier_ratio *
   min(width, height))`), letting a border line contain up to N non-black pixels and still count as
@@ -165,8 +190,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (1920x800 centered content, 140px black bars, a bright ~200x60 logo drawn in the bottom bar):
   `max_outliers=0` detected `crop=1920:920:0:140` (logo included); `max_outliers=216`
   (`round(0.2*1080)`) correctly detected `crop=1920:800:0:140` (true content box). Non-black
-  borders remain out of scope for this option (planned Rust per-edge color detector, separate
-  work).
+  borders were out of scope for this specific option (cropdetect is luma-only regardless of
+  `max_outliers`) -- see the `avf_borders` Rust detector entry above for arbitrary-color border
+  detection, landed separately.
 - **`stages.crop.transition_max_run_sec`** (default `2.0`), **`transition_window_sec`** (default
   `4.0`), **`transition_tolerance_px`** (default `16`): tuning for the transition-resilient
   per-frame aggregation described above (`aggregate_crop_windows()` in `core/stages/crop.py`).

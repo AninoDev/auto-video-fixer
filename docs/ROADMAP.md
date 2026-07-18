@@ -111,7 +111,12 @@ draws an explicit VERIFIED / UNVERIFIED line instead of a flat done/not-done che
   text-fallback parsing, fail-open on error) and integration-tested with a mocked
   `run_crop_vlm_check` (`vlm_policy: "skip"` correctly leaves the video uncropped) — like the
   rest of the VLM foundation (see "0. Foundation" in REQUIREMENTS.md), it has **not** been
-  exercised against a live VLM endpoint as part of this pass.
+  exercised against a live VLM endpoint as part of this pass. **Arbitrary-color border
+  detection** (`stages.crop.detector: "rust"`, default `"auto"`) is now also implemented — a new
+  Rust extension (`rust/avf_borders/`) detects per-edge borders of ANY color (not just black/dark,
+  which is `cropdetect`'s limit), reporting both a dominant color and a "solidity" percentage per
+  edge, logged at INFO on every run. See REQUIREMENTS.md's R3.5 and AGENTS.md's "Mixed
+  Python/Rust"/"Auto-crop" sections.
 
 ### Implemented but not independently verified
 

@@ -668,6 +668,52 @@ class Config:
                 # flagged region) was considered and rejected -- VLMs don't return
                 # reliable pixel coordinates, so there's nothing to expand *to*.
                 "vlm_policy": "warn",
+                # Which per-frame border detector execute() uses. "cropdetect"
+                # (the FFmpeg filter above) is luma-threshold-only -- white/gray/
+                # colored borders and any non-dark padding are invisible to it.
+                # "rust" is the avf_borders extension (see rust/avf_borders/ and
+                # AGENTS.md's Auto-crop section): per edge, per sampled frame, it
+                # detects the DOMINANT color of the outer border strip (any
+                # color, not just black) plus a "solidity" percentage, then walks
+                # inward while a majority of each line still matches -- both
+                # signals (color + consistency) are logged at INFO. "auto"
+                # (default) uses "rust" when the avf_borders extension is
+                # importable, else falls back to "cropdetect" (logged at DEBUG,
+                # matching the avf_scenes/avf_hashing fallback convention). The
+                # rust detector's per-frame windows feed the SAME
+                # aggregate_crop_windows() aggregation as cropdetect -- only the
+                # per-frame detection step changes.
+                "detector": "auto",
+                # avf_borders: max per-channel absolute color difference (0-255)
+                # for two colors to "match" -- used both for a border strip's
+                # solidity and for the inward line-by-line walk.
+                "border_tolerance": 24,
+                # avf_borders: fraction of a line's pixels that must match the
+                # border's dominant color for the inward walk to continue past
+                # it. Lets a logo/overlay occupying a MINORITY of a border line
+                # (e.g. a small watermark sitting in the letterbox area) pass
+                # through without stopping the walk early. 0.80 tolerates
+                # overlays covering up to 20% of a line -- deliberately
+                # consistent with max_outlier_ratio's 0.2 default so the rust
+                # and cropdetect detectors agree on the same borderline logo.
+                "border_majority": 0.80,
+                # avf_borders: minimum fraction of an edge's outer strip that
+                # must match its own dominant color for that edge to be treated
+                # as having a solid border at all (below this, border_px = 0 for
+                # that edge). Protects blurred-video-background pillarboxing (a
+                # real but non-uniform edge) from being cropped away in v1 --
+                # see AGENTS.md's Auto-crop section.
+                "border_solidity_min": 0.60,
+                # avf_borders: depth (px) of the outer strip sampled per edge to
+                # compute the dominant color + solidity signal, before the
+                # line-by-line inward walk begins.
+                "border_strip_px": 4,
+                # avf_borders: frames-per-second to sample at (0 = every decoded
+                # frame, matching cropdetect's own reset=1 per-frame behavior
+                # modulo its default skip=2). >0 inserts an ffmpeg `fps=` filter
+                # before detection, trading temporal resolution for speed on
+                # long inputs.
+                "sample_fps": 0,
             },
         },
         "scenes": {

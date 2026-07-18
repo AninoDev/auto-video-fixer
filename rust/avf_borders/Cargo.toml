@@ -1,0 +1,45 @@
+[package]
+name = "avf_borders"
+version = "0.1.0"
+edition = "2024"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+[lib]
+name = "avf_borders"
+crate-type = ["cdylib"]
+
+[dependencies]
+pyo3 = { version = "0.29.0" }
+
+# `extension-module` links against libpython lazily (symbols resolved by the
+# embedding CPython interpreter at dlopen time) -- correct for the cdylib
+# maturin builds, but it means a standalone `cargo test` binary (which needs
+# to link libpython for real, since nothing is embedding it) fails with
+# undefined-symbol errors if the feature is unconditionally enabled. Gating
+# it behind a default-on feature lets `cargo test --no-default-features`
+# build a working test binary while `cargo build`/`maturin develop` (which
+# use the default feature set) still get the extension-module behavior
+# required for the module to load inside CPython. Same convention as
+# `avf_hashing`/`avf_framepipe` (see those crates' Cargo.toml for the full
+# rationale). This crate has real Rust unit tests (see `mod tests` below).
+[features]
+default = ["extension-module"]
+extension-module = ["pyo3/extension-module"]
+
+# This crate's unit tests call `Python::attach` directly (to build PyDict/
+# PyList test fixtures and exercise `detect_border_frames_rs`) outside of a
+# module import -- `extension-module` builds rely on the embedding CPython
+# interpreter having already called `Py_Initialize`, which doesn't happen in
+# a standalone `cargo test` binary. `auto-initialize` makes pyo3 call
+# `Py_Initialize` itself on first use. It's incompatible with
+# `extension-module` (pyo3 hard-errors if both are enabled), so it's added
+# only as a dev-dependency: Cargo unifies features across the normal and dev
+# dependency edges of the same crate version for test builds, so `cargo test
+# --no-default-features` (which drops the default `extension-module`
+# feature) picks it up, while `cargo build` / `maturin develop` (non-test,
+# default features) never see it. Same convention as `avf_framepipe`.
+[dev-dependencies]
+pyo3 = { version = "0.29.0", features = ["auto-initialize"] }
+
+[profile.release]
+lto = true

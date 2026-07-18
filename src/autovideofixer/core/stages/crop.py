@@ -39,10 +39,28 @@ import time
 from dataclasses import dataclass, field
 from typing import Any
 
-from autovideofixer.core.ffmpeg_utils import probe, run_ffmpeg
+from autovideofixer.core.ffmpeg_utils import get_ffmpeg_path, probe, run_ffmpeg
 from autovideofixer.core.stages.base import BaseStage, StageResult, StageStatus
 
 logger = logging.getLogger(__name__)
+
+# Lazily-imported PyO3/maturin Rust extension implementing per-edge,
+# arbitrary-color border detection (dominant color + solidity + majority-walk
+# -- see rust/avf_borders/src/lib.rs and AGENTS.md's Auto-crop section).
+# cropdetect (the FFmpeg filter used elsewhere in this module) is
+# luma-threshold-only and cannot see white/gray/colored borders at all. Not
+# available means the compiled wheel wasn't built for this
+# environment/platform -- fall back to cropdetect rather than hard-failing,
+# same fallback contract as avf_scenes/avf_hashing (core/analysis.py).
+try:
+    from avf_borders import detect_border_frames as _detect_border_frames_rs_native
+except ImportError:
+    _detect_border_frames_rs_native = None
+    logger.debug(
+        "avf_borders Rust extension not available; crop stage's detector=auto/rust "
+        "will fall back to cropdetect (see rust/avf_borders/ and AGENTS.md's Setup "
+        "& Commands for the build step)."
+    )
 
 _CROP_RE = re.compile(r"crop=(\d+):(\d+):(\d+):(\d+)")
 # Per-frame reset=1 cropdetect lines look like:
@@ -92,6 +110,38 @@ class CropStage(BaseStage):
         self._transition_tolerance_px = self._stage_config.get("transition_tolerance_px", 16)
         self._vlm_check = self._stage_config.get("vlm_check", False)
         self._vlm_policy = self._stage_config.get("vlm_policy", "warn")
+        self._detector = self._stage_config.get("detector", "auto")
+        self._border_tolerance = self._stage_config.get("border_tolerance", 24)
+        self._border_majority = self._stage_config.get("border_majority", 0.80)
+        self._border_solidity_min = self._stage_config.get("border_solidity_min", 0.60)
+        self._border_strip_px = self._stage_config.get("border_strip_px", 4)
+        self._sample_fps = self._stage_config.get("sample_fps", 0)
+
+    def _resolve_detector(self) -> str:
+        """Resolve ``stages.crop.detector`` ("auto"/"rust"/"cropdetect") to an
+        actual detector to use: "rust" (the avf_borders extension -- sees
+        borders of ANY color, not just black/dark) or "cropdetect" (the
+        FFmpeg filter used elsewhere in this module -- luma-threshold-only).
+
+        "auto" (default) picks "rust" when the avf_borders extension is
+        importable, else falls back to "cropdetect" (the module-level
+        import above already logged this at DEBUG once, matching the
+        avf_scenes/avf_hashing fallback convention -- AGENTS.md's "Mixed
+        Python/Rust" section). An explicit ``detector: "rust"`` that turns
+        out to be unavailable also falls back, but logs a WARNING instead
+        (the user asked for it by name, so silence would be surprising).
+        """
+        if self._detector == "cropdetect":
+            return "cropdetect"
+        if _detect_border_frames_rs_native is not None:
+            return "rust"
+        if self._detector == "rust":
+            self.logger.warning(
+                "crop: stages.crop.detector=rust requested but the avf_borders Rust "
+                "extension is not available; falling back to cropdetect (see "
+                "rust/avf_borders/ and AGENTS.md's Setup & Commands for the build step)"
+            )
+        return "cropdetect"
 
     def should_run(self, input_info: dict[str, Any]) -> tuple[bool, str | None]:
         """Quick pre-filter: is this even worth attempting?
@@ -114,9 +164,27 @@ class CropStage(BaseStage):
         should_run() in this codebase, which also only sees a point-in-time
         input_info snapshot (freshened once per stage transition, not
         continuously).
+
+        **Detector-dependent skip**: this prefilter is ALWAYS the old
+        luma-threshold ``cropdetect`` single-pass sample, regardless of which
+        detector ``execute()`` will actually use -- it's cheap specifically
+        because it's the least-precise check available. That's fine when
+        ``execute()`` will also use cropdetect (same blind spots either way),
+        but WRONG when ``execute()`` will use the rust detector: a
+        white/gray/colored-bordered video would look like "no border" to
+        this luma-only sample and get skipped here before the rust pass
+        (which WOULD see it) ever runs. Fix: when the resolved detector
+        isn't cropdetect, skip this prefilter entirely and return True --
+        simpler than teaching this quick sample to run a bounded rust pass,
+        and acceptable because execute()'s full rust pass is the thing that
+        actually needs to be fast/authoritative here, not this prefilter
+        (see AGENTS.md's Auto-crop section for the tradeoff writeup).
         """
         if not self.is_enabled():
             return False, "Stage disabled"
+
+        if self._resolve_detector() != "cropdetect":
+            return True, None
 
         filepath = input_info.get("filepath") or ""
         width, height = input_info.get("resolution", (0, 0))
@@ -185,32 +253,76 @@ class CropStage(BaseStage):
                 duration_sec=time.time() - start,
             )
 
-        self._report_progress(
-            0.1,
-            "Running cropdetect (per-frame + transition-resilient aggregation)...",
-            progress_callback,
-        )
-        # Whole-video (or configured analyze_duration_sec) scan -- uses the
-        # resolved stage/global timeout, not a small fixed one, since
-        # analyze_duration_sec=0 means "scan the entire input".
-        detected = _detect_crop_full(
-            input_path,
-            self._limit,
-            self._round,
-            self._analyze_duration_sec,
-            max_outlier_ratio=self._max_outlier_ratio,
-            transition_max_run_sec=self._transition_max_run_sec,
-            transition_window_sec=self._transition_window_sec,
-            transition_tolerance_px=self._transition_tolerance_px,
-            orig_width=orig_w,
-            orig_height=orig_h,
-            timeout=self.stage_timeout(),
-            logger_=self.logger,
-        )
+        resolved_detector = self._resolve_detector()
+
+        detected: tuple[int, int, int, int] | None = None
+        detector_used = resolved_detector
+        if resolved_detector == "rust":
+            self._report_progress(
+                0.1,
+                "Running rust border detector (per-frame dominant-color + solidity)...",
+                progress_callback,
+            )
+            try:
+                ffmpeg_path = get_ffmpeg_path(self.config)
+                detected = _detect_crop_full_rust(
+                    input_path,
+                    sample_fps=self._sample_fps,
+                    strip_px=self._border_strip_px,
+                    tolerance=self._border_tolerance,
+                    majority=self._border_majority,
+                    solidity_min=self._border_solidity_min,
+                    round_=self._round,
+                    transition_max_run_sec=self._transition_max_run_sec,
+                    transition_window_sec=self._transition_window_sec,
+                    transition_tolerance_px=self._transition_tolerance_px,
+                    orig_width=orig_w,
+                    orig_height=orig_h,
+                    ffmpeg_path=ffmpeg_path,
+                    logger_=self.logger,
+                )
+            except RuntimeError as e:
+                # Fail open, same spirit as the VLM check below: a rust
+                # decode failure (bad ffmpeg binary, unreadable stream, etc.)
+                # falls back to cropdetect for this run rather than failing
+                # the whole stage.
+                self.logger.warning(
+                    "crop: rust border detector failed (%s); falling back to cropdetect "
+                    "for this run",
+                    e,
+                )
+                detector_used = "cropdetect"
+
+        if detector_used == "cropdetect":
+            self._report_progress(
+                0.1,
+                "Running cropdetect (per-frame + transition-resilient aggregation)...",
+                progress_callback,
+            )
+            # Whole-video (or configured analyze_duration_sec) scan -- uses the
+            # resolved stage/global timeout, not a small fixed one, since
+            # analyze_duration_sec=0 means "scan the entire input".
+            detected = _detect_crop_full(
+                input_path,
+                self._limit,
+                self._round,
+                self._analyze_duration_sec,
+                max_outlier_ratio=self._max_outlier_ratio,
+                transition_max_run_sec=self._transition_max_run_sec,
+                transition_window_sec=self._transition_window_sec,
+                transition_tolerance_px=self._transition_tolerance_px,
+                orig_width=orig_w,
+                orig_height=orig_h,
+                timeout=self.stage_timeout(),
+                logger_=self.logger,
+            )
+
         if detected is None:
             return StageResult(
                 status=StageStatus.SKIPPED,
-                skipped_reason="cropdetect produced no result (unreadable video or filter failure)",
+                skipped_reason=(
+                    f"{detector_used} produced no result (unreadable video or filter failure)"
+                ),
                 duration_sec=time.time() - start,
             )
 
@@ -779,5 +891,154 @@ def _detect_crop_full(
         x,
         y,
     )
+
+    return w, h, x, y
+
+
+def _format_border_edge(name: str, border_px: int, edge_info: dict[str, Any] | None) -> str:
+    """Format one edge's summary line for the rust-detector INFO log --
+    e.g. ``"top 140px solid #000000 (99.8%)"`` or ``"left none"``."""
+    if border_px <= 0 or edge_info is None:
+        return f"{name} none"
+    b, g, r = edge_info.get("color", (0, 0, 0))
+    hex_color = f"#{r:02x}{g:02x}{b:02x}"
+    solidity_pct = float(edge_info.get("solidity", 0.0)) * 100
+    return f"{name} {border_px}px solid {hex_color} ({solidity_pct:.1f}%)"
+
+
+def _log_border_summary(
+    log: logging.Logger,
+    raw_frames: list[dict[str, Any]],
+    agg: _AggregationResult,
+    final_w: int,
+    final_h: int,
+    final_x: int,
+    final_y: int,
+    orig_width: int,
+    orig_height: int,
+) -> None:
+    """Log the per-edge final border color + solidity so the user's
+    requested color/consistency signals are visible in every rust-detector
+    run (not just buried in metadata) -- see AGENTS.md's Auto-crop section
+    and the spec this implements. Representative per-edge color/solidity is
+    taken from whichever surviving (non-transition) frame's own border
+    reaches the final aggregated extent on that edge -- e.g. the frame with
+    the smallest ``x`` is the one whose left-edge detection produced the
+    final left border.
+    """
+    excluded_ids = {id(r) for r in agg.excluded_runs}
+    surviving = [f for r in agg.runs if id(r) not in excluded_ids for f in r.frames]
+    if not surviving:
+        return
+
+    raw_by_t = {f["t"]: f for f in raw_frames}
+
+    left_frame = min(surviving, key=lambda f: f.x)
+    top_frame = min(surviving, key=lambda f: f.y)
+    right_frame = max(surviving, key=lambda f: f.x + f.w)
+    bottom_frame = max(surviving, key=lambda f: f.y + f.h)
+
+    left_px = final_x
+    top_px = final_y
+    right_px = max(0, orig_width - (final_x + final_w))
+    bottom_px = max(0, orig_height - (final_y + final_h))
+
+    def _edges_for(frame: CropFrame) -> dict[str, Any]:
+        raw = raw_by_t.get(frame.t)
+        return raw.get("edges", {}) if raw else {}
+
+    parts = [
+        _format_border_edge("top", top_px, _edges_for(top_frame).get("top")),
+        _format_border_edge("bottom", bottom_px, _edges_for(bottom_frame).get("bottom")),
+        _format_border_edge("left", left_px, _edges_for(left_frame).get("left")),
+        _format_border_edge("right", right_px, _edges_for(right_frame).get("right")),
+    ]
+    log.info("crop: [rust detector] borders: %s", ", ".join(parts))
+
+
+def _detect_crop_full_rust(
+    input_path: str,
+    *,
+    sample_fps: float,
+    strip_px: int,
+    tolerance: int,
+    majority: float,
+    solidity_min: float,
+    round_: int,
+    transition_max_run_sec: float,
+    transition_window_sec: float,
+    transition_tolerance_px: int,
+    orig_width: int,
+    orig_height: int,
+    ffmpeg_path: str,
+    logger_: logging.Logger | None = None,
+) -> tuple[int, int, int, int] | None:
+    """Authoritative crop detection via the ``avf_borders`` Rust extension:
+    per-edge dominant-color + solidity + majority-walk border detection
+    (see ``rust/avf_borders/src/lib.rs`` and AGENTS.md's Auto-crop section),
+    fed through the SAME ``aggregate_crop_windows`` transition-exclusion
+    aggregation the cropdetect path uses (see ``_detect_crop_full`` above)
+    -- only the per-frame detection step differs.
+
+    Raises ``RuntimeError`` (propagated from the native extension) on a real
+    ffmpeg failure (spawn failure, non-zero exit, truncated stream) --
+    callers should catch this and fall back to ``_detect_crop_full()``
+    (cropdetect) if desired, same fail-open spirit as the rest of this
+    stage's error handling (e.g. the VLM check).
+
+    Note: unlike ``_detect_crop_full``, this does not support
+    ``analyze_duration_sec`` -- the ``avf_borders.detect_border_frames``
+    Rust API always scans the whole input. For very long inputs where a
+    full scan is too slow, use ``stages.crop.detector: cropdetect`` (which
+    does support it) or raise ``stages.crop.sample_fps`` to reduce the
+    number of frames the rust pass decodes.
+    """
+    assert _detect_border_frames_rs_native is not None
+    raw_frames: list[dict[str, Any]] = _detect_border_frames_rs_native(
+        input_path,
+        ffmpeg_path,
+        sample_fps,
+        strip_px,
+        tolerance,
+        majority,
+        solidity_min,
+    )
+    if not raw_frames:
+        return None
+
+    frames = [CropFrame(t=f["t"], w=f["w"], h=f["h"], x=f["x"], y=f["y"]) for f in raw_frames]
+    agg = _aggregate_runs(
+        frames,
+        tolerance_px=transition_tolerance_px,
+        transition_max_run_sec=transition_max_run_sec,
+        transition_window_sec=transition_window_sec,
+    )
+    if agg.window is None:
+        return None
+
+    w, h, x, y = agg.window
+    # Same "round UP, never down" rule as the cropdetect path -- never cuts
+    # real content, keeps MORE content rather than less.
+    w = _round_up_to_multiple(w, round_)
+    h = _round_up_to_multiple(h, round_)
+
+    log = logger_ or logger
+    excluded_ranges = ", ".join(f"{r.start_t:.2f}-{r.end_t:.2f}s" for r in agg.excluded_runs[:5])
+    more = f" (+{len(agg.excluded_runs) - 5} more)" if len(agg.excluded_runs) > 5 else ""
+    log.info(
+        "crop: [rust detector] analyzed %d frame(s) into %d run(s); excluded %d run(s) as "
+        "transitions%s%s; final window %d:%d:%d:%d",
+        len(frames),
+        len(agg.runs),
+        len(agg.excluded_runs),
+        f" ({excluded_ranges}{more})" if excluded_ranges else "",
+        " [pathological all-transition fallback]" if agg.fallback_triggered else "",
+        w,
+        h,
+        x,
+        y,
+    )
+
+    _log_border_summary(log, raw_frames, agg, w, h, x, y, orig_width, orig_height)
 
     return w, h, x, y

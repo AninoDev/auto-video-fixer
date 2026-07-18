@@ -115,6 +115,60 @@ final count once `close()` returns). New config keys `stages.<name>.read_ahead` 
 `stages.<name>.write_queue_depth` (default `4`) on `upscale`/`deblock`/`denoise_video` plumb into
 these factories; `chunk_size` (`25`) stays a call-site constant, not a config key.
 
+A fourth crate, `rust/avf_borders/` (per-edge, arbitrary-color border/letterbox detection for the
+`crop` stage), followed the same workspace/build pattern (`[tool.uv.workspace]` member,
+`avf-borders` dependency + `[tool.uv.sources]` editable-workspace entry, built automatically by `uv
+sync --all-extras`) and the same `extension-module` default-on Cargo feature split as
+`avf_hashing`/`avf_framepipe` (`cargo test --no-default-features` from `rust/avf_borders/` for a
+linkable test binary; `cargo clippy --no-default-features -- -D warnings` / `cargo fmt --check` for
+the rest of the Rust-side gates). It exists because FFmpeg's `cropdetect` filter (used by the rest
+of the `crop` stage, see "Auto-crop" below) is luma-threshold-only -- white, gray, or otherwise
+colored borders are invisible to it, only black/dark ones. `avf_borders` exposes one function,
+`detect_border_frames(path, ffmpeg_path, sample_fps, strip_px, tolerance, majority, solidity_min,
+ffprobe_path="ffprobe") -> list[dict]`: per sampled frame and per edge (top/bottom/left/right), it
+computes the DOMINANT color of the outermost `strip_px`-deep strip (4-bit-per-channel quantization,
+largest bin's mean actual color -- robust to slight gradients/compression noise) plus a "solidity"
+percentage (fraction of the strip matching that color within `tolerance`, using max-per-channel-
+absolute-difference as the distance metric), then -- only if solidity is >= `solidity_min` (default
+0.60, keeps blurred-video-background pillarboxing, a real but non-uniform edge, from being cropped
+in v1) -- walks inward line by line while >= `majority` (default 0.90) of each line still matches,
+capped at 45% of that edge's dimension (never deeper -- a "border" spanning close to half the frame
+isn't a border; without this cap a solid-color transition frame would report a near-full-depth
+border on every edge). Self-contained like `avf_scenes`/`avf_hashing`: dimensions and fps are
+probed internally via `ffprobe`, not passed in from Python. Unlike `avf_scenes`/`avf_hashing`
+(which silently return empty/zero on any ffmpeg failure), this crate's contract requires a real
+diagnosable error -- ffmpeg spawn failure, non-zero exit, or a truncated mid-frame read all raise
+`RuntimeError` in Python with an ffmpeg stderr tail (captured on a background thread, same
+`StderrTail` shape as `avf_framepipe`, not discarded to `Stdio::null()` like the other two crates);
+the child is always reaped (no zombies) and a clean zero-frame decode (exit 0) returns an empty
+list rather than erroring. Has real Rust unit tests (5 ffmpeg-lavfi-generated-fixture cases per the
+spec: black letterbox, white letterbox -- the case cropdetect literally cannot detect --, a small
+(~8%-width) logo that the default `majority=0.90` tolerates without stopping the walk, the same
+large (~25%-width) logo tested at both the default majority (walk stops at the logo) and an
+explicitly relaxed `majority=0.70` (walk tolerates it and reaches the true border), and a
+corrupt/nonexistent input erroring without a hang or zombie -- plus small pure-function tests for
+the quantization/distance helpers).
+
+At the Python call site, `core/stages/crop.py`'s `CropStage` follows the identical lazy-import-
+with-fallback pattern: `try: from avf_borders import detect_border_frames as
+_detect_border_frames_rs_native` / `except ImportError`, logged at DEBUG on failure. New
+`stages.crop.detector` config key (`"auto"` (default) | `"rust"` | `"cropdetect"`) picks which
+per-frame detector `execute()` uses -- `"auto"` resolves to `"rust"` when the extension is
+importable, else falls back to `"cropdetect"`; an explicit `"rust"` that turns out unavailable also
+falls back, but logs a WARNING instead of silence (the user asked for it by name). The rust
+detector's per-frame `(t, x, y, w, h)` rects feed the SAME `aggregate_crop_windows()` (transition-
+exclusion + union) the cropdetect path uses -- see "Auto-crop" below -- only the per-frame detection
+step differs; a rust decode failure (`RuntimeError`) falls back to the cropdetect path for that run
+(fail-open, same spirit as the VLM check), logged at WARNING. `should_run()`'s cheap prefilter is
+luma-threshold-only (it always uses the old single-pass `cropdetect`, cheap specifically because
+it's the least-precise check available) -- when the resolved detector isn't `"cropdetect"`, a
+white/colored-bordered video would look like "no border" to that prefilter and get skipped before
+the rust pass (which WOULD see it) ever runs, so `should_run()` skips the prefilter entirely and
+returns `True` whenever the resolved detector != `"cropdetect"`, deferring to `execute()`'s full
+rust pass -- simpler than teaching the quick sample to run a bounded rust pass itself, and
+acceptable because the quick sample's whole point is staying cheap, not being authoritative (same
+tradeoff `should_run()` already accepts elsewhere in this stage).
+
 ## Architecture
 
 ```
@@ -1015,21 +1069,43 @@ Opt-in, off by default (`stages.crop.enabled: false`). See `core/stages/crop.py`
   validated against ffmpeg (1920x1080 clip, 1920x800 centered content, 140px black bars, a bright
   ~200x60 logo in the bottom bar): `max_outliers=0` -> `crop=1920:920:0:140` (logo included);
   `max_outliers=216` (`round(0.2*1080)`) -> `crop=1920:800:0:140` (true content box). Non-black
-  borders are out of scope for this option (a Rust per-edge color detector is planned separately).
+  borders are out of scope for `max_outliers`/cropdetect specifically -- see the `avf_borders` Rust
+  detector below (`stages.crop.detector`) for arbitrary-color border detection, which was landed
+  separately and IS in scope for those.
 - **`should_run()` keeps the OLD `reset=0` single-pass behavior** for its cheap ~10s prefilter
   sample (`_detect_crop()`, unchanged) -- it only decides "worth attempting?", not the actual crop
   window, so it doesn't need max_outliers/aggregation precision; `execute()` always re-derives the
-  real window via `_detect_crop_full()`.
+  real window via `_detect_crop_full()` (cropdetect) or `_detect_crop_full_rust()` (rust detector),
+  whichever `stages.crop.detector` resolves to. This prefilter is skipped entirely (returns `True`
+  unconditionally) when the resolved detector isn't `"cropdetect"` -- see the "Mixed Python/Rust"
+  section's `avf_borders` writeup above for why (a luma-only prefilter would wrongly skip
+  white/colored-bordered videos the rust pass could actually crop).
 - **Stage order**: right after `stabilize`, before every other enhancement/AI stage -- see the
   "Pipeline Behavior" note above for why.
 - **Config** (`stages.crop`): `limit` (cropdetect luma threshold, default 24), `round` (even-
   dimension rounding, default 2), `min_crop_px` (skip entirely if the detected crop would save
   fewer than this many pixels in BOTH width and height, default 8 -- avoids a pointless 2px crop
   from encoder rounding noise), `analyze_duration_sec` (0 = full-video scan (default); >0 = only
-  scan the first N seconds, for very long inputs where a full scan is too slow), `max_outlier_ratio`
-  (default 0.2, see above), `transition_max_run_sec` (default 2.0), `transition_window_sec`
-  (default 4.0), `transition_tolerance_px` (default 16, see aggregation above), `vlm_check`
-  (default false), `vlm_policy` (`"warn"` default | `"skip"`).
+  scan the first N seconds, for very long inputs where a full scan is too slow -- cropdetect path
+  only, the rust detector always scans the whole input), `max_outlier_ratio` (default 0.2, see
+  above), `transition_max_run_sec` (default 2.0), `transition_window_sec` (default 4.0),
+  `transition_tolerance_px` (default 16, see aggregation above), `vlm_check` (default false),
+  `vlm_policy` (`"warn"` default | `"skip"`), `detector` (`"auto"` default | `"rust"` |
+  `"cropdetect"`, see "Mixed Python/Rust" above), `border_tolerance` (max per-channel absolute
+  color difference for the rust detector's color matching, default 24), `border_majority`
+  (fraction of a line that must match for the rust detector's inward walk to continue, default
+  0.80 -- tolerates overlays up to 20% of a line, matching max_outlier_ratio's 0.2 default), `border_solidity_min` (minimum strip-match fraction for the rust detector to treat an edge
+  as having a solid border at all, default 0.60), `border_strip_px` (depth of the outer strip the
+  rust detector samples for its dominant-color/solidity signal, default 4), `sample_fps` (rust
+  detector only: 0 = every decoded frame (default), >0 samples at that rate via an ffmpeg `fps=`
+  filter).
+- **Rust detector INFO logging**: when `execute()` uses the rust detector, it logs (at INFO, same
+  level as the frames/runs/final-window summary above) a per-edge color+solidity summary, e.g.
+  `crop: [rust detector] borders: top 140px solid #000000 (99.8%), bottom 140px solid #000000
+  (99.7%), left none, right none` -- both signals the user asked for (color, and whether the border
+  is consistent/solid) are visible in every run, not just buried in stage metadata. The
+  representative color/solidity per edge is taken from whichever surviving (non-transition) sampled
+  frame's own detection reaches the final aggregated extent on that edge.
 - **`should_run()` vs. `execute()`**: `should_run()` does a cheap ~10s cropdetect pre-filter
   against `input_info`'s filepath purely to skip obviously-nothing-to-do cases early; it is NOT
   authoritative. Per "Pipeline Behavior"'s per-stage re-probing, that filepath is the actual file

@@ -225,6 +225,23 @@ built implementation.
   the detected window is degenerate (zero/negative or larger than the input), the stage returns
   `StageStatus.SKIPPED` with a specific reason rather than applying a wrong/degenerate crop —
   the original video passes through to the next stage unchanged.
+- **R3.5** [IMPLEMENTED] Arbitrary-color border detection: `cropdetect` (R3.1) is luma-threshold-
+  only — white, gray, or otherwise colored letterbox/pillarbox borders are invisible to it. A new
+  Rust extension, `rust/avf_borders/` (`detect_border_frames()`), detects per-edge borders of ANY
+  color: per sampled frame, it computes the DOMINANT color of the outer border strip (4-bit-per-
+  channel quantization, largest bin's mean actual color) plus a "solidity" percentage, then walks
+  inward line-by-line while a majority of each line still matches that color — a logo/overlay
+  occupying a minority of a border line doesn't stop the walk, and an edge whose solidity never
+  clears `stages.crop.border_solidity_min` (default `0.60`) is treated as having no solid border
+  at all (protects blurred-video-background pillarboxing, a real but non-uniform edge, from being
+  cropped away in v1). Its per-frame windows feed the SAME `aggregate_crop_windows()` transition-
+  exclusion/union aggregation the cropdetect path uses (R3.1) — only the per-frame detection step
+  differs. Selected via `stages.crop.detector` (`"auto"` default, `"rust"`, `"cropdetect"`),
+  following the same lazy-import-with-fallback convention as `avf_scenes`/`avf_hashing`/
+  `avf_framepipe` (R5.1-R5.3) — see AGENTS.md's "Mixed Python/Rust" and "Auto-crop" sections for
+  the full algorithm, config keys, and `should_run()` prefilter interaction (the luma-only
+  prefilter is skipped whenever the resolved detector isn't `"cropdetect"`, since it would
+  otherwise wrongly skip a white/colored-bordered video the rust pass could actually crop).
 
 ### Design considerations
 
