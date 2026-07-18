@@ -980,20 +980,55 @@ Opt-in, off by default (`stages.crop.enabled: false`). See `core/stages/crop.py`
 `Config.DEFAULTS["stages"]["crop"]`, `core/analysis.py::run_crop_vlm_check`/
 `_parse_crop_vlm_response`, and `docs/REQUIREMENTS.md` feature 3.
 
-- **What it does**: detects a video's true content bounds -- the union over the whole video (the
-  furthest real content ever reaches toward each edge), NOT a per-frame crop -- via FFmpeg
-  `cropdetect=limit=<L>:round=<R>:reset=0 -f null -`, and crops to that single window with a
-  `crop=w:h:x:y` re-encode (`libx264 -crf 18`, `-c:a copy`). `reset=0` never resets cropdetect's
-  accumulated box between frames, so the LAST `crop=` line in ffmpeg's stderr is the union of the
-  whole scanned range -- exactly the whole-video bound this stage wants, not a window that
-  flickers scene-to-scene.
+- **What it does**: detects a video's true content bounds -- a transition-resilient union over
+  the whole video (the furthest real content geometry ever reaches toward each edge, EXCLUDING
+  isolated transient bursts), NOT a per-frame flickering crop -- and crops to that single window
+  with a `crop=w:h:x:y` re-encode (`libx264 -crf 18`, `-c:a copy`).
+- **Detection** (`_detect_crop_full()`, `execute()`'s authoritative pass): FFmpeg `cropdetect`
+  runs with `reset=1` (recompute per analyzed frame, still subject to cropdetect's own default
+  `skip=2` frame-skip) and `max_outliers=<N>` (see below), printing one `crop=w:h:x:y` / `t:
+  <seconds>` line per frame. Every line is parsed (`_parse_crop_frames()`) and fed to
+  `aggregate_crop_windows()` (pure, module-level, heavily unit-tested):
+  1. Group consecutive (by timestamp) frames into runs whose windows all match the run's first
+     window within `transition_tolerance_px` (per edge: left/top/right/bottom).
+  2. A run is a TRANSITION (excluded) iff its duration <= `transition_max_run_sec` AND no other
+     run within `transition_window_sec` before/after it has a similar window -- an isolated
+     deviant burst (e.g. one bright full-frame flash) is excluded; the same window recurring
+     nearby, or a deviant run outlasting `transition_max_run_sec` even in isolation, is kept as
+     real content geometry (moving logo, letterbox change, etc.).
+  3. Result = the union (max extent toward every edge) of the surviving runs' windows, rounded UP
+     (never down, never cuts real content) to `round`.
+  4. Edge cases: empty input -> `None`; every run classified transition (pathological) -> falls
+     back to the union of everything (logged at DEBUG); single run -> its own window.
+
+  This replaces an earlier `reset=0` "union that can only grow" design, where a single bright
+  full-frame transition anywhere in the scanned range permanently widened the crop window (in the
+  worst case, degrading the crop to the full frame) for the rest of the scan. `execute()` logs at
+  INFO after aggregation: frames/runs analyzed, runs excluded as transitions (with time ranges,
+  capped at ~5), and the final window.
+- **`max_outliers` (overlay tolerance)**: `stages.crop.max_outlier_ratio` (default 0.2, range
+  0..0.5, 0 disables) is converted to cropdetect's `max_outliers=<N>` via `N =
+  round(max_outlier_ratio * min(probed_width, probed_height))` -- lets a border line contain up
+  to N non-black pixels and still count as border, so a logo/overlay sitting in the letterbox area
+  no longer widens the crop to "protect" it. `min(width, height)` is used because cropdetect
+  applies one absolute `max_outliers` count to both the row-scan and column-scan axes. Live-
+  validated against ffmpeg (1920x1080 clip, 1920x800 centered content, 140px black bars, a bright
+  ~200x60 logo in the bottom bar): `max_outliers=0` -> `crop=1920:920:0:140` (logo included);
+  `max_outliers=216` (`round(0.2*1080)`) -> `crop=1920:800:0:140` (true content box). Non-black
+  borders are out of scope for this option (a Rust per-edge color detector is planned separately).
+- **`should_run()` keeps the OLD `reset=0` single-pass behavior** for its cheap ~10s prefilter
+  sample (`_detect_crop()`, unchanged) -- it only decides "worth attempting?", not the actual crop
+  window, so it doesn't need max_outliers/aggregation precision; `execute()` always re-derives the
+  real window via `_detect_crop_full()`.
 - **Stage order**: right after `stabilize`, before every other enhancement/AI stage -- see the
   "Pipeline Behavior" note above for why.
 - **Config** (`stages.crop`): `limit` (cropdetect luma threshold, default 24), `round` (even-
   dimension rounding, default 2), `min_crop_px` (skip entirely if the detected crop would save
   fewer than this many pixels in BOTH width and height, default 8 -- avoids a pointless 2px crop
   from encoder rounding noise), `analyze_duration_sec` (0 = full-video scan (default); >0 = only
-  scan the first N seconds, for very long inputs where a full scan is too slow), `vlm_check`
+  scan the first N seconds, for very long inputs where a full scan is too slow), `max_outlier_ratio`
+  (default 0.2, see above), `transition_max_run_sec` (default 2.0), `transition_window_sec`
+  (default 4.0), `transition_tolerance_px` (default 16, see aggregation above), `vlm_check`
   (default false), `vlm_policy` (`"warn"` default | `"skip"`).
 - **`should_run()` vs. `execute()`**: `should_run()` does a cheap ~10s cropdetect pre-filter
   against `input_info`'s filepath purely to skip obviously-nothing-to-do cases early; it is NOT
@@ -1019,7 +1054,10 @@ Opt-in, off by default (`stages.crop.enabled: false`). See `core/stages/crop.py`
   `vlm_policy: "warn"` (default) logs a WARNING and crops anyway; `"skip"` skips cropping this
   video entirely. **Fails open** on any VLM error (unreachable endpoint, exception, unparseable
   response) -- logs a WARNING and proceeds with the plain cropdetect result, never blocks on VLM
-  availability.
+  availability. Note: the ORIGINAL intent (per the user) was for the VLM to SHRINK the detected
+  window to exclude a non-content overlay sitting in the border area; `max_outlier_ratio`'s
+  outlier-tolerant detector now handles that numerically (see above), so this VLM check is an
+  optional secondary safety verification, not the primary overlay defense.
 - **`"expand"` policy was considered and rejected**: growing the crop box to include only the
   flagged region isn't feasible because VLMs don't reliably return pixel coordinates for what they
   flag -- there's nothing to expand *to*. Only `"warn"`/`"skip"` are implemented.

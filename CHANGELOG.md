@@ -140,7 +140,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     site, since Rich's own `[style]` markup tags need to keep working and can't go through a
     blanket formatter the way the logging path does.
 
+- **Auto-crop's whole-scan union could be permanently poisoned by a single transition**: the crop
+  stage's authoritative detection pass used `cropdetect=...:reset=0`, which never resets its
+  accumulated bounding box -- so ONE bright full-frame transition anywhere in the scanned range
+  (or a logo/overlay sitting in the letterbox area breaking the all-pixels-black line test)
+  permanently widened the crop window for the rest of the scan, silently degrading the crop
+  toward "no crop at all". `CropStage.execute()`'s detection (`_detect_crop_full()`,
+  `core/stages/crop.py`) now runs `cropdetect` with `reset=1` (one `crop=w:h:x:y` window per
+  analyzed frame) and feeds every frame to the new `aggregate_crop_windows()`: consecutive
+  similar-window frames are grouped into runs, an isolated short-lived run (<=
+  `stages.crop.transition_max_run_sec`, no similar window recurring within
+  `transition_window_sec`) is excluded as a transition, and the final window is the union of the
+  surviving runs -- moving/drifting content geometry is never cropped off, but a transient flash
+  no longer poisons the whole scan. `should_run()`'s cheap ~10s pre-filter sample intentionally
+  keeps the old single-pass `reset=0` behavior (it's just a "worth attempting?" prefilter, not the
+  authoritative window).
+
 ### Added
+- **`stages.crop.max_outlier_ratio`** (default `0.2`, range `0..0.5`; `0` = disabled/strict):
+  converted at detection time into cropdetect's `max_outliers=<N>` (`N = round(max_outlier_ratio *
+  min(width, height))`), letting a border line contain up to N non-black pixels and still count as
+  border -- the fix for a logo/overlay sitting in the letterbox area otherwise widening the
+  detected crop to "protect" it. Live-validated against ffmpeg on a synthetic 1920x1080 clip
+  (1920x800 centered content, 140px black bars, a bright ~200x60 logo drawn in the bottom bar):
+  `max_outliers=0` detected `crop=1920:920:0:140` (logo included); `max_outliers=216`
+  (`round(0.2*1080)`) correctly detected `crop=1920:800:0:140` (true content box). Non-black
+  borders remain out of scope for this option (planned Rust per-edge color detector, separate
+  work).
+- **`stages.crop.transition_max_run_sec`** (default `2.0`), **`transition_window_sec`** (default
+  `4.0`), **`transition_tolerance_px`** (default `16`): tuning for the transition-resilient
+  per-frame aggregation described above (`aggregate_crop_windows()` in `core/stages/crop.py`).
 - **Per-stage `use_ai` tristate, shared AI/traditional method resolution, and loud method-choice
   logging**: the four AI-capable stages (upscale, deblock, denoise_video, interpolate) now resolve
   "ai" vs "traditional" through one shared `BaseStage.resolve_ai_method(explicit_method,

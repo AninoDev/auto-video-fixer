@@ -4,33 +4,53 @@ Detects a video's true content bounds (stripping letterboxing/pillarboxing,
 including any residual border stabilize can introduce) and crops to them.
 Strictly opt-in -- see docs/REQUIREMENTS.md feature 3.
 
-Detection is FFmpeg's ``cropdetect`` filter run with ``reset=0``, which never
-resets its accumulated bounding box between frames: the crop window can only
-grow (loosen) as the scan progresses, so the LAST ``crop=w:h:x:y`` line ffmpeg
-reports is the union across the whole scanned range -- the furthest the real
-content ever reaches toward each edge. This is deliberately NOT a per-frame
-crop (which would flicker the window scene-to-scene as content moves); it's a
-single crop window applied to the whole video/re-encode.
+Detection (``execute()``'s authoritative pass, via ``_detect_crop_full()``) runs
+FFmpeg's ``cropdetect`` filter with ``reset=1`` (recompute per analyzed frame,
+subject to cropdetect's own default ``skip=2`` frame-skip) and
+``max_outliers=<N>`` (``stages.crop.max_outlier_ratio``-derived -- lets a
+bright logo/overlay sitting in the letterbox area still count as border,
+instead of widening the crop to "protect" it). Every per-frame
+``crop=w:h:x:y`` / ``t:<seconds>`` line is parsed and fed to
+``aggregate_crop_windows()``, which groups frames into runs of matching
+windows, excludes isolated short-lived runs as transitions (e.g. a single
+bright full-frame flash), and returns the union of the surviving runs'
+windows. This replaces an earlier ``reset=0`` "union that can only grow"
+design: a single full-frame transition anywhere in the scan used to
+permanently widen the crop window to the full frame for the rest of the scan.
+``should_run()``'s cheap ~10s pre-filter sample (``_detect_crop()``) keeps the
+old single-pass ``reset=0`` behavior -- it only decides whether cropping is
+worth attempting at all, so it doesn't need max_outliers/aggregation
+precision.
 
-Optional VLM assist (``stages.crop.vlm_check``) helps distinguish a genuine
-content edge from a watermark/logo that sits outside the true content area
-(e.g. positioned relative to a letterboxed frame) and would otherwise "widen"
-cropdetect's result. See ``_run_vlm_check`` and ``core.analysis.run_crop_vlm_check``.
+Optional VLM assist (``stages.crop.vlm_check``) is a secondary safety check,
+not the primary overlay defense (that's ``max_outlier_ratio`` above): it can
+still flag content outside the detected box for review. See
+``_run_vlm_check`` and ``core.analysis.run_crop_vlm_check``.
 """
 
 from __future__ import annotations
 
+import logging
 import os
 import re
 import shutil
 import tempfile
 import time
+from dataclasses import dataclass, field
 from typing import Any
 
 from autovideofixer.core.ffmpeg_utils import probe, run_ffmpeg
 from autovideofixer.core.stages.base import BaseStage, StageResult, StageStatus
 
+logger = logging.getLogger(__name__)
+
 _CROP_RE = re.compile(r"crop=(\d+):(\d+):(\d+):(\d+)")
+# Per-frame reset=1 cropdetect lines look like:
+#   [Parsed_cropdetect_0 @ 0x1] x1:0 x2:639 y1:60 y2:419 w:640 h:360 x:0 y:60
+#   pts:25 t:1.00 crop=640:360:0:60
+# -- the t:<seconds> and crop=w:h:x:y fields we need are on the same line, in
+# that order, separated by the pts field.
+_CROP_FRAME_RE = re.compile(r"t:(?P<t>[\d.]+).*?crop=(?P<w>\d+):(?P<h>\d+):(?P<x>\d+):(?P<y>\d+)")
 
 # Cheap pre-filter window for should_run(): a real full-scan (the authoritative
 # check) happens in execute() against whatever file the pipeline actually hands
@@ -66,6 +86,10 @@ class CropStage(BaseStage):
         self._round = self._stage_config.get("round", 2)
         self._min_crop_px = self._stage_config.get("min_crop_px", 8)
         self._analyze_duration_sec = self._stage_config.get("analyze_duration_sec", 0)
+        self._max_outlier_ratio = self._stage_config.get("max_outlier_ratio", 0.2)
+        self._transition_max_run_sec = self._stage_config.get("transition_max_run_sec", 2.0)
+        self._transition_window_sec = self._stage_config.get("transition_window_sec", 4.0)
+        self._transition_tolerance_px = self._stage_config.get("transition_tolerance_px", 16)
         self._vlm_check = self._stage_config.get("vlm_check", False)
         self._vlm_policy = self._stage_config.get("vlm_policy", "warn")
 
@@ -107,7 +131,11 @@ class CropStage(BaseStage):
         # Bounded helper call (sample_secs is capped at _QUICK_SAMPLE_SEC == 10s
         # of content) -- a genuinely short scan, so this keeps a small fixed
         # timeout rather than the resolved stage/global timeout that
-        # execute()'s real full-scan pass below uses.
+        # execute()'s real full-scan pass below uses. Deliberately still the
+        # OLD single-pass reset=0 union (no max_outliers, no per-frame
+        # aggregation): this is only a cheap "worth attempting?" prefilter, not
+        # the authoritative crop window, so aggregation/transition precision
+        # doesn't matter here -- execute() always re-derives the real window.
         detected = _detect_crop(filepath, self._limit, self._round, sample_secs, timeout=60)
         if detected is None:
             return True, None  # inconclusive -- let execute() decide properly
@@ -157,16 +185,27 @@ class CropStage(BaseStage):
                 duration_sec=time.time() - start,
             )
 
-        self._report_progress(0.1, "Running cropdetect (whole-scan union)...", progress_callback)
+        self._report_progress(
+            0.1,
+            "Running cropdetect (per-frame + transition-resilient aggregation)...",
+            progress_callback,
+        )
         # Whole-video (or configured analyze_duration_sec) scan -- uses the
         # resolved stage/global timeout, not a small fixed one, since
         # analyze_duration_sec=0 means "scan the entire input".
-        detected = _detect_crop(
+        detected = _detect_crop_full(
             input_path,
             self._limit,
             self._round,
             self._analyze_duration_sec,
+            max_outlier_ratio=self._max_outlier_ratio,
+            transition_max_run_sec=self._transition_max_run_sec,
+            transition_window_sec=self._transition_window_sec,
+            transition_tolerance_px=self._transition_tolerance_px,
+            orig_width=orig_w,
+            orig_height=orig_h,
             timeout=self.stage_timeout(),
+            logger_=self.logger,
         )
         if detected is None:
             return StageResult(
@@ -417,3 +456,328 @@ def _detect_crop(
         return None
     w, h, x, y = matches[-1]
     return int(w), int(h), int(x), int(y)
+
+
+def _compute_max_outliers(max_outlier_ratio: float, width: int, height: int) -> int:
+    """Convert ``stages.crop.max_outlier_ratio`` into cropdetect's
+    ``max_outliers`` pixel count for a given probed resolution.
+
+    ``max_outliers`` is a single absolute pixel count applied by cropdetect to
+    BOTH the row scan (bounded by height) and column scan (bounded by width),
+    so basing it on ``min(width, height)`` keeps the tolerance conservative on
+    whichever axis is smaller, rather than letting a ratio computed off the
+    larger axis blow past a reasonable fraction of the smaller one.
+    """
+    ratio = max(0.0, min(0.5, max_outlier_ratio))
+    if ratio <= 0:
+        return 0
+    return round(ratio * min(width, height))
+
+
+def _cropdetect_filter(limit: int, round_: int, reset: int, max_outliers: int = 0) -> str:
+    filt = f"cropdetect=limit={limit}:round={round_}:reset={reset}"
+    if max_outliers > 0:
+        filt += f":max_outliers={max_outliers}"
+    return filt
+
+
+def _round_up_to_multiple(value: int, multiple: int) -> int:
+    """Round ``value`` UP to the nearest multiple of ``multiple`` -- never
+    down, so a rounded crop window is never smaller (never cuts real content)
+    than the aggregated union it was derived from. ``multiple <= 1`` is a
+    no-op (nothing to align to)."""
+    if multiple <= 1:
+        return value
+    remainder = value % multiple
+    if remainder == 0:
+        return value
+    return value + (multiple - remainder)
+
+
+@dataclass(frozen=True)
+class CropFrame:
+    """One per-frame cropdetect observation: timestamp + crop window."""
+
+    t: float
+    w: int
+    h: int
+    x: int
+    y: int
+
+
+def _parse_crop_frames(stderr: str) -> list[CropFrame]:
+    """Parse every per-frame ``t:<seconds> ... crop=w:h:x:y`` cropdetect line
+    from a ``reset=1`` run's captured stderr.
+
+    NOTE on memory: ``reset=1`` makes cropdetect emit one line per analyzed
+    frame (still subject to cropdetect's own default ``skip=2``). For very
+    long inputs, ``run_ffmpeg``'s captured stderr -- and this parsed list --
+    can reach tens of MB. Acceptable for now (every other stage already
+    buffers full stderr), but worth knowing if a multi-hour input ever shows
+    up as a memory complaint.
+    """
+    frames: list[CropFrame] = []
+    for line in (stderr or "").splitlines():
+        m = _CROP_FRAME_RE.search(line)
+        if not m:
+            continue
+        frames.append(
+            CropFrame(
+                t=float(m.group("t")),
+                w=int(m.group("w")),
+                h=int(m.group("h")),
+                x=int(m.group("x")),
+                y=int(m.group("y")),
+            )
+        )
+    return frames
+
+
+def _windows_similar_edges(a: CropFrame, b: CropFrame, tolerance_px: int) -> bool:
+    """Two windows are "the same" if every edge (left, top, right, bottom)
+    differs by at most ``tolerance_px``."""
+    return (
+        abs(a.x - b.x) <= tolerance_px
+        and abs(a.y - b.y) <= tolerance_px
+        and abs((a.x + a.w) - (b.x + b.w)) <= tolerance_px
+        and abs((a.y + a.h) - (b.y + b.h)) <= tolerance_px
+    )
+
+
+def _union(frames: list[CropFrame]) -> tuple[int, int, int, int]:
+    """Union (max extent toward every edge) of a set of crop windows."""
+    min_x = min(f.x for f in frames)
+    min_y = min(f.y for f in frames)
+    max_right = max(f.x + f.w for f in frames)
+    max_bottom = max(f.y + f.h for f in frames)
+    return max_right - min_x, max_bottom - min_y, min_x, min_y
+
+
+@dataclass(frozen=True)
+class _Run:
+    """A maximal sequence of consecutive (by timestamp) frames whose windows
+    all match the run's first ("anchor") frame's window within tolerance."""
+
+    frames: list[CropFrame] = field(default_factory=list)
+
+    @property
+    def start_t(self) -> float:
+        return self.frames[0].t
+
+    @property
+    def end_t(self) -> float:
+        return self.frames[-1].t
+
+    @property
+    def duration(self) -> float:
+        return self.end_t - self.start_t
+
+    @property
+    def anchor(self) -> CropFrame:
+        return self.frames[0]
+
+
+def _run_gap_sec(a: _Run, b: _Run) -> float:
+    """Time gap between two runs' timestamp ranges; 0 if they overlap."""
+    if a.end_t < b.start_t:
+        return b.start_t - a.end_t
+    if b.end_t < a.start_t:
+        return a.start_t - b.end_t
+    return 0.0
+
+
+@dataclass(frozen=True)
+class _AggregationResult:
+    runs: list[_Run]
+    excluded_runs: list[_Run]
+    window: tuple[int, int, int, int] | None
+    fallback_triggered: bool = False
+
+
+def _aggregate_runs(
+    frames: list[CropFrame],
+    *,
+    tolerance_px: int,
+    transition_max_run_sec: float,
+    transition_window_sec: float,
+) -> _AggregationResult:
+    if not frames:
+        return _AggregationResult(runs=[], excluded_runs=[], window=None)
+
+    # Sort defensively by timestamp -- ffmpeg emits per-frame lines in decode
+    # order, which should already be monotonic in t, but don't assume it.
+    ordered = sorted(frames, key=lambda f: f.t)
+
+    runs: list[_Run] = []
+    current: list[CropFrame] = [ordered[0]]
+    for frame in ordered[1:]:
+        if _windows_similar_edges(current[0], frame, tolerance_px):
+            current.append(frame)
+        else:
+            runs.append(_Run(frames=current))
+            current = [frame]
+    runs.append(_Run(frames=current))
+
+    def _is_transition(idx: int) -> bool:
+        run = runs[idx]
+        # Rule: a run is a transition iff it's short-lived AND no OTHER run
+        # nearby (in time) has a similar window. The same window recurring
+        # nearby (or a run outlasting transition_max_run_sec even in
+        # isolation) means it's real content geometry, not a transient flash.
+        if run.duration > transition_max_run_sec:
+            return False
+        for j, other in enumerate(runs):
+            if j == idx:
+                continue
+            if _run_gap_sec(run, other) <= transition_window_sec and _windows_similar_edges(
+                run.anchor, other.anchor, tolerance_px
+            ):
+                return False
+        return True
+
+    flags = [_is_transition(i) for i in range(len(runs))]
+    surviving = [r for r, is_t in zip(runs, flags) if not is_t]
+    excluded = [r for r, is_t in zip(runs, flags) if is_t]
+    fallback_triggered = False
+
+    if not surviving:
+        # Pathological: every run got classified as a transition (e.g. a
+        # single video with nothing but brief, non-recurring windows). Fall
+        # back to the union of everything rather than returning nothing --
+        # per spec, moving/drifting content should never get cropped off.
+        logger.debug(
+            "aggregate_crop_windows: all %d run(s) classified as transitions; "
+            "falling back to union of all frames",
+            len(runs),
+        )
+        surviving = runs
+        excluded = []
+        fallback_triggered = True
+
+    window = _union([f for r in surviving for f in r.frames])
+    return _AggregationResult(
+        runs=runs, excluded_runs=excluded, window=window, fallback_triggered=fallback_triggered
+    )
+
+
+def aggregate_crop_windows(
+    frames: list[CropFrame],
+    *,
+    tolerance_px: int,
+    transition_max_run_sec: float,
+    transition_window_sec: float,
+) -> tuple[int, int, int, int] | None:
+    """Aggregate per-frame ``reset=1`` cropdetect windows into a single
+    transition-resilient crop window. Pure function, no I/O (other than an
+    internal DEBUG log for the pathological all-transition fallback) --
+    designed for heavy unit testing.
+
+    Algorithm:
+      1. Group consecutive (by timestamp) frames into runs whose windows all
+         match the run's first window within ``tolerance_px`` (per edge
+         coordinate: left/top/right/bottom).
+      2. A run is a TRANSITION (excluded from the result) iff its duration
+         is <= ``transition_max_run_sec`` AND no other run within
+         ``transition_window_sec`` before or after it (by timestamp) has a
+         similar (``tolerance_px``) window. An isolated deviant burst is a
+         transition; the same window recurring nearby means it's real
+         content geometry and must be kept.
+      3. The result is the UNION (max extent toward every edge) of all
+         windows in the surviving runs, unrounded -- callers that need
+         encoder-friendly (e.g. even) dimensions should round the result UP
+         (never down) to their target multiple.
+      4. Edge cases: empty input -> None. All runs classified as transitions
+         (pathological) -> fall back to the union of every run (logged at
+         DEBUG). A single run -> its own window.
+
+    Returns None for empty ``frames``.
+    """
+    return _aggregate_runs(
+        frames,
+        tolerance_px=tolerance_px,
+        transition_max_run_sec=transition_max_run_sec,
+        transition_window_sec=transition_window_sec,
+    ).window
+
+
+def _detect_crop_full(
+    input_path: str,
+    limit: int,
+    round_: int,
+    analyze_duration_sec: float,
+    *,
+    max_outlier_ratio: float,
+    transition_max_run_sec: float,
+    transition_window_sec: float,
+    transition_tolerance_px: int,
+    orig_width: int,
+    orig_height: int,
+    timeout: float | None = 1800,
+    logger_: logging.Logger | None = None,
+) -> tuple[int, int, int, int] | None:
+    """Authoritative crop detection for ``CropStage.execute()``: FFmpeg
+    ``cropdetect`` with ``reset=1`` (one crop window per analyzed frame,
+    still subject to cropdetect's default ``skip=2``) and
+    ``max_outliers=<N>`` derived from ``max_outlier_ratio`` (see
+    ``_compute_max_outliers``), aggregated via ``aggregate_crop_windows``
+    into a single transition-resilient crop window.
+
+    Returns None if cropdetect produced no per-frame output at all (e.g. an
+    unreadable file) -- mirrors ``_detect_crop``'s contract.
+    """
+    max_outliers = _compute_max_outliers(max_outlier_ratio, orig_width, orig_height)
+
+    args = ["-i", input_path]
+    if analyze_duration_sec and analyze_duration_sec > 0:
+        args += ["-t", str(analyze_duration_sec)]
+    args += [
+        "-vf",
+        _cropdetect_filter(limit, round_, reset=1, max_outliers=max_outliers),
+        "-f",
+        "null",
+        "-",
+    ]
+
+    # See _parse_crop_frames()'s docstring for the stderr-size memory note --
+    # reset=1 prints one crop= line per analyzed frame.
+    result = run_ffmpeg(args, timeout=timeout)
+    frames = _parse_crop_frames(result.stderr or "")
+    if not frames:
+        return None
+
+    agg = _aggregate_runs(
+        frames,
+        tolerance_px=transition_tolerance_px,
+        transition_max_run_sec=transition_max_run_sec,
+        transition_window_sec=transition_window_sec,
+    )
+    if agg.window is None:
+        return None
+
+    w, h, x, y = agg.window
+    # Each per-frame window cropdetect reports is already rounded to `round_`,
+    # but the union combines left/top from one frame with right/bottom from
+    # another, so the resulting w/h is not guaranteed to still be a multiple
+    # of round_. Round UP (never down) so the final window never shrinks
+    # below the aggregated union (never cuts real content).
+    w = _round_up_to_multiple(w, round_)
+    h = _round_up_to_multiple(h, round_)
+
+    log = logger_ or logger
+    excluded_ranges = ", ".join(f"{r.start_t:.2f}-{r.end_t:.2f}s" for r in agg.excluded_runs[:5])
+    more = f" (+{len(agg.excluded_runs) - 5} more)" if len(agg.excluded_runs) > 5 else ""
+    log.info(
+        "crop: analyzed %d frame(s) into %d run(s); excluded %d run(s) as transitions%s%s; "
+        "final window %d:%d:%d:%d",
+        len(frames),
+        len(agg.runs),
+        len(agg.excluded_runs),
+        f" ({excluded_ranges}{more})" if excluded_ranges else "",
+        " [pathological all-transition fallback]" if agg.fallback_triggered else "",
+        w,
+        h,
+        x,
+        y,
+    )
+
+    return w, h, x, y

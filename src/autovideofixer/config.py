@@ -595,12 +595,59 @@ class Config:
                 # this many pixels in BOTH width and height -- avoids a pointless
                 # 2px crop from encoder rounding noise.
                 "min_crop_px": 8,
-                # 0 = scan the whole video (reset=0 accumulates the tightest safe
-                # crop across every frame scanned, i.e. the furthest real content
-                # ever reaches toward each edge -- a per-frame crop would flicker).
-                # >0 = seconds to sample from the start of the video instead, for
-                # very long inputs where a full scan is too slow.
+                # 0 = scan the whole video. >0 = seconds to sample from the start
+                # of the video instead, for very long inputs where a full scan is
+                # too slow. The real (execute()) detection pass runs cropdetect
+                # with reset=1 (one crop=w:h:x:y line per analyzed frame) and
+                # aggregates those per-frame windows with transition-exclusion
+                # logic -- see aggregate_crop_windows() in core/stages/crop.py and
+                # AGENTS.md's Auto-crop section. should_run()'s cheap 10s prefilter
+                # sample keeps the old single-pass reset=0 union behavior (it only
+                # decides "worth attempting", not the actual crop window, so it
+                # doesn't need max_outliers/aggregation precision).
                 "analyze_duration_sec": 0,
+                # cropdetect's max_outliers option (int, ffmpeg default 0): a
+                # border line may contain up to N pixels above `limit` and still
+                # count as black/border. Without this, a single logo/overlay
+                # sitting in the letterbox area breaks the all-pixels-black line
+                # test and permanently widens the detected crop to include it.
+                # We expose a RATIO (not a raw pixel count) because an overlay
+                # typically covers a minority of the border line it sits on
+                # regardless of resolution, and a ratio scales sanely across
+                # resolutions where a fixed pixel count wouldn't. At detection
+                # time this is converted to max_outliers = round(max_outlier_ratio
+                # * min(width, height)) -- min(w, h) is used (rather than the
+                # dimension of each scanned axis individually) because cropdetect
+                # applies a single absolute max_outliers count to both the
+                # row-scan (height-driven) and column-scan (width-driven) axes, so
+                # basing it on the smaller dimension keeps the tolerance
+                # conservative on both axes. Range 0..0.5; 0 disables (strict
+                # cropdetect behavior, matching pre-max_outliers versions of this
+                # stage). Live-validated against ffmpeg: on a 1920x1080 clip with
+                # 1920x800 centered content (140px black bars) and a bright
+                # ~200x60 logo drawn in the bottom bar, max_outliers=0 detected
+                # crop=1920:920:0:140 (the logo widened the window); with
+                # max_outliers=round(0.2*1080)=216, cropdetect correctly returned
+                # crop=1920:800:0:140 (the true content box).
+                "max_outlier_ratio": 0.2,
+                # Transition-exclusion tuning for the per-frame aggregation that
+                # replaces the old reset=0 "can only grow" union (which let a
+                # single bright full-frame transition permanently widen the crop
+                # to the full frame). A run of consecutive similar per-frame
+                # windows lasting <= transition_max_run_sec, with no similar
+                # window recurring within transition_window_sec before/after it,
+                # is treated as a transition and excluded from the final union.
+                # The same window recurring nearby (or lasting longer than
+                # transition_max_run_sec even in isolation) is kept -- that's real
+                # content geometry (e.g. a moving logo/letterbox change), not a
+                # transient flash. See aggregate_crop_windows() in
+                # core/stages/crop.py.
+                "transition_max_run_sec": 2.0,
+                "transition_window_sec": 4.0,
+                # Per-edge (left/top/right/bottom) pixel tolerance for treating two
+                # per-frame crop windows as "the same" window when grouping frames
+                # into runs and comparing runs to each other.
+                "transition_tolerance_px": 16,
                 # Optional VLM-assisted disambiguation: a watermark/logo sitting
                 # outside the true content area (e.g. positioned relative to a
                 # letterboxed frame) can fool naive cropdetect into "protecting" it
@@ -608,7 +655,12 @@ class Config:
                 # true, one frame is rendered twice (plain + the proposed crop box
                 # drawn via drawbox) and sent to the VLM with a narrow fixed
                 # question. Off by default; fails open (WARNING + proceed with the
-                # plain cropdetect result) on any VLM error.
+                # plain cropdetect result) on any VLM error. The original intent
+                # here was for the VLM to SHRINK the detected window to exclude a
+                # non-content overlay sitting in the border area; the
+                # outlier-tolerant detector above now handles that numerically, so
+                # this check remains an optional safety verification layer (warn/
+                # skip policies below), not the primary defense against overlays.
                 "vlm_check": False,
                 # "warn" (default): log the VLM's objection but still crop.
                 # "skip": don't crop this video at all if the VLM flags content
