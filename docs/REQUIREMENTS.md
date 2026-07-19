@@ -818,7 +818,7 @@ satisfies the CURRENT effective targets before deciding to skip.
 - Machine-oriented: stable key names, numbers as numbers, no Rich formatting artifacts.
 - The JSON always contains the raw per-stage data regardless of the 6.5 display flags.
 
-### 6.7 PII-clean log variant
+### 6.7 PII-clean log variant (IMPLEMENTED 2026-07-19)
 
 - `general.log_type: "raw" | "clean" | "both" | "none"` (config + CLI flag; default "raw" =
   today's behavior). Applies to FILE logging; the console stays raw.

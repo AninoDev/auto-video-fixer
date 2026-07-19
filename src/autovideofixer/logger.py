@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import logging
+import os
 from typing import Optional
 
 from rich.console import Console
 from rich.logging import RichHandler
 
-from autovideofixer.config import sanitize_console_text
+from autovideofixer.config import VALID_LOG_TYPES, sanitize_console_text
+from autovideofixer.logclean import get_pii_cleaner
 
 # All module loggers are named "autovideofixer.<module>" (see get_logger() call
 # sites). Handlers are attached ONLY here, once, so setup_logging()'s console/file
@@ -60,12 +62,49 @@ class _SanitizingConsoleFormatter(logging.Formatter):
         return sanitize_console_text(formatted)
 
 
+class _CleaningFileFormatter(logging.Formatter):
+    """File formatter for the "clean" log_type variant (REQUIREMENTS.md §
+    6.7): runs the normal plain ``_PLAIN_FILE_FORMAT`` formatting, then
+    substitutes every KNOWN value the current run has registered with
+    ``logclean.get_pii_cleaner()`` (input/output paths, directories, VLM/LLM
+    endpoints, embedded titles) for its placeholder.
+
+    Reads the singleton at format() time (emit time), not __init__ time --
+    registration only has to happen before the LOG CALL that contains a given
+    value, not before setup_logging() itself. See AGENTS.md's "Log types"
+    note for the known v1 gaps in registration ordering (e.g. the group
+    callback's "Invocation:" line).
+    """
+
+    def format(self, record: logging.LogRecord) -> str:
+        formatted = super().format(record)
+        return get_pii_cleaner().clean(formatted)
+
+
+def _insert_log_suffix(path: str, suffix: str) -> str:
+    """Insert `suffix` into `path`'s filename for "both" log_type mode.
+
+    Before the extension when one exists (``run.log`` -> ``run-clean.log``);
+    appended to the end for an extensionless name (``run`` -> ``run-clean``).
+    An empty suffix returns `path` unchanged.
+    """
+    if not suffix:
+        return path
+    root, ext = os.path.splitext(path)
+    if ext:
+        return f"{root}{suffix}{ext}"
+    return f"{path}{suffix}"
+
+
 def setup_logging(
     level: str = "INFO",
     log_file: str | None = None,
     file_level: str | None = None,
     auto_log_file: str | None = None,
-) -> None:
+    log_type: str = "raw",
+    log_suffix_raw: str = "",
+    log_suffix_clean: str = "-clean",
+) -> list[str]:
     """Configure the single shared "autovideofixer" logger.
 
     Every module logger (get_logger("autovideofixer.<x>")) has no handlers of
@@ -76,7 +115,10 @@ def setup_logging(
     Args:
         level: Console log level (DEBUG/INFO/WARNING/ERROR).
         log_file: If given, also log to this ADDITIONAL explicit file (e.g.
-            CLI --log-file), at `file_level`/`level`.
+            a direct caller that isn't the `avf` CLI group callback), at
+            `file_level`/`level`. Kept ALWAYS raw regardless of `log_type`
+            (backward compatibility for direct callers that predate § 6.7 --
+            the CLI itself never passes this, see cli.py's `main()`).
         file_level: Log level for the `log_file` handler. Defaults to `level`
             if not given, so `--log-file` without `--file-log-level` behaves
             as users would expect (same verbosity as the console).
@@ -84,8 +126,32 @@ def setup_logging(
             config.get_log_dir()). Unlike `log_file`, this is always attached
             at DEBUG regardless of the console level, with a plain (no Rich
             markup) formatter, so an uploaded log is maximally useful
-            independent of what the user had the console set to.
+            independent of what the user had the console set to. `log_type`
+            below governs what variant(s) of THIS file get written.
+        log_type: "raw" (default; today's behavior, unredacted) | "clean"
+            (PII-substituted via logclean.PIICleaner) | "both" (two files,
+            suffixed per log_suffix_raw/log_suffix_clean) | "none" (no file
+            handler for `auto_log_file` at all). Only applies to
+            `auto_log_file` -- the console is always raw, and the separate
+            `log_file` param (see above) is always raw too.
+        log_suffix_raw: "both" mode only -- suffix for the raw file's name.
+        log_suffix_clean: "both" mode only -- suffix for the clean file's name.
+
+    Returns:
+        The list of file paths actually opened for `auto_log_file` (0, 1, or
+        2 entries depending on `log_type`), PLUS `log_file` if given (in that
+        order) -- callers (e.g. cli.py) use this to report the real path(s)
+        instead of assuming `auto_log_file` unconditionally.
+
+    Raises:
+        ValueError: `log_type` isn't one of the four valid values, or "both"
+            mode's raw/clean suffixes would produce two IDENTICAL paths (a
+            silent overwrite of one file by the other is never acceptable --
+            this is a config error the caller should report and exit on).
     """
+    if log_type not in VALID_LOG_TYPES:
+        raise ValueError(f"Invalid log_type: {log_type!r} (must be one of {VALID_LOG_TYPES!r})")
+
     numeric_level = getattr(logging, level.upper(), logging.INFO)
 
     root = logging.getLogger(_ROOT_NAME)
@@ -109,12 +175,35 @@ def setup_logging(
     root.addHandler(console_handler)
 
     effective_root_level = numeric_level
+    opened_files: list[str] = []
 
-    if auto_log_file:
-        auto_handler = logging.FileHandler(auto_log_file)
-        auto_handler.setFormatter(logging.Formatter(_PLAIN_FILE_FORMAT))
-        auto_handler.setLevel(logging.DEBUG)
-        root.addHandler(auto_handler)
+    if auto_log_file and log_type != "none":
+        if log_type == "both":
+            raw_path = _insert_log_suffix(auto_log_file, log_suffix_raw)
+            clean_path = _insert_log_suffix(auto_log_file, log_suffix_clean)
+            if raw_path == clean_path:
+                raise ValueError(
+                    "general.log_type=both requires distinct log_suffix_raw/"
+                    f"log_suffix_clean -- both currently resolve to the same path "
+                    f"({raw_path!r}); refusing to silently overwrite one file with "
+                    "the other"
+                )
+            variants = [(raw_path, False), (clean_path, True)]
+        elif log_type == "clean":
+            variants = [(auto_log_file, True)]
+        else:  # "raw"
+            variants = [(auto_log_file, False)]
+
+        for path, clean in variants:
+            handler = logging.FileHandler(path)
+            handler.setFormatter(
+                _CleaningFileFormatter(_PLAIN_FILE_FORMAT)
+                if clean
+                else logging.Formatter(_PLAIN_FILE_FORMAT)
+            )
+            handler.setLevel(logging.DEBUG)
+            root.addHandler(handler)
+            opened_files.append(path)
         effective_root_level = min(effective_root_level, logging.DEBUG)
 
     if log_file:
@@ -124,8 +213,11 @@ def setup_logging(
         file_handler.setLevel(file_numeric_level)
         root.addHandler(file_handler)
         effective_root_level = min(effective_root_level, file_numeric_level)
+        opened_files.append(log_file)
 
     # The root logger's effective level gates what reaches handlers at all,
     # so if any attached file handler wants more verbosity than the console,
     # the logger itself must be set to the most verbose of all of them.
     root.setLevel(effective_root_level)
+
+    return opened_files

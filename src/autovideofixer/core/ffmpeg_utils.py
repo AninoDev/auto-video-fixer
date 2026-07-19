@@ -75,6 +75,12 @@ class ProbeResult:
     # producing usable JSON on stdout (e.g. a slightly malformed container);
     # surfaced by Pipeline's § 6.3 probe policy (general.fail_on_probe_warnings).
     stderr: str = ""
+    # Embedded video title, from format.tags.title, falling back to the video
+    # stream's own tags.title when the format-level tag is absent. "" when
+    # neither is set. Captured (not logged anywhere new by this alone) so
+    # it's a KNOWN value § 6.7's PII cleaner can register -- see
+    # logclean.PIICleaner.register_title() / Pipeline.execute_job().
+    title: str = ""
 
     @property
     def video_stream(self) -> StreamInfo | None:
@@ -143,6 +149,7 @@ class ProbeResult:
             "audio_count": len(self.audio_streams),
             "streams": len(self.streams),
             "probe_stderr": self.stderr,
+            "title": self.title,
         }
 
 
@@ -216,7 +223,9 @@ def probe(filepath: str, config: Config | None = None) -> ProbeResult:
 def _parse_probe_result(data: dict, filepath: str) -> ProbeResult:
     """Parse ffprobe JSON output into ProbeResult."""
     streams = []
+    video_stream_title = ""
     for i, s in enumerate(data.get("streams", [])):
+        tags = s.get("tags", {})
         stream = StreamInfo(
             index=i,
             codec_type=s.get("codec_type", ""),
@@ -235,12 +244,17 @@ def _parse_probe_result(data: dict, filepath: str) -> ProbeResult:
             color_range=s.get("color_range", ""),
             color_transfer=s.get("color_transfer", ""),
             is_default=s.get("disposition", {}).get("default", 0) != 0,
-            language=s.get("tags", {}).get("language", ""),
+            language=tags.get("language", ""),
             nb_frames=_safe_int(s.get("nb_frames", 0)),
         )
         streams.append(stream)
+        if stream.is_video and not video_stream_title:
+            video_stream_title = tags.get("title", "")
 
     fmt = data.get("format", {})
+    # REQUIREMENTS.md § 6.7: format-level title wins, falling back to the
+    # video stream's own tags.title when the format-level tag is absent.
+    title = fmt.get("tags", {}).get("title", "") or video_stream_title
     return ProbeResult(
         filepath=filepath,
         filename=os.path.basename(filepath),
@@ -249,6 +263,7 @@ def _parse_probe_result(data: dict, filepath: str) -> ProbeResult:
         format_name=fmt.get("format_name", ""),
         format_long_name=fmt.get("format_long_name", ""),
         streams=streams,
+        title=title,
     )
 
 

@@ -8,6 +8,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **2026-07-19: PII-clean log variant (REQUIREMENTS.md § 6.7, commit 3/4 of the planned
+  output-handling/reporting work)**: `general.log_type` (`"raw"` default / `"clean"` / `"both"`
+  / `"none"`) + `avf --log-type` (top-level CLI flag) control what the automatic per-run log
+  FILE contains -- the console always stays raw.
+  - New `src/autovideofixer/logclean.py`: `PIICleaner` (module singleton via
+    `get_pii_cleaner()`/`reset_pii_cleaner()`) holds a per-run, thread-safe KNOWN-value ->
+    placeholder mapping and a `clean()` substitution method -- input files ->
+    `input_video_01.<ext>`, output files -> `output_video_01.<ext>` (2-digit, numbered by first
+    appearance, extension preserved), directories -> `/path/to/input|output|config/`
+    (role-based), VLM/LLM endpoints -> `http://vlm-endpoint` (host/port only, path/query kept
+    intact), embedded video titles -> `video_title_01`. Substitution, not guesswork regexes --
+    only registered values are ever replaced; free-text PII (e.g. DEBUG-logged VLM responses) is
+    documented out of scope for v1. `/tmp/avf_*` stage temp files are never registered, so
+    they're always left untouched.
+  - `core/ffmpeg_utils.py`: `ProbeResult` gained a `title` field (`format.tags.title`, falling
+    back to the video stream's own `tags.title`), threaded through `to_info_dict()["title"]" --
+    a KNOWN value the cleaner can register (`Pipeline.execute_job()` does so right after the
+    input probe).
+  - Registration call sites (all idempotent): `cli.py`'s group callback (config directory +
+    best-effort `sys.argv` scan before the raw `"Invocation:"` line -- documented v1 gap: that
+    ONE line can still show a raw path the scan didn't catch), `process()` (VLM/LLM endpoints,
+    `--config` layer directories, output dir, then each resolved input file + parent directory),
+    `Pipeline.add_job()` (every job's input/output path -- covers GUI/programmatic use),
+    `Pipeline._rename_mismatched_output()` (the renamed path, as an output).
+  - `logger.py`: new `_CleaningFileFormatter` (plain format then `get_pii_cleaner().clean(...)`
+    at emit time) attached to the clean file handler(s); `setup_logging()` grew
+    `log_type`/`log_suffix_raw`/`log_suffix_clean` params, builds 0/1/2 file handlers for
+    `auto_log_file` per mode, and now returns the list of paths actually opened. `"both"` mode's
+    `general.log_suffix_raw` (default `""`) / `general.log_suffix_clean` (default `"-clean"`)
+    insert before the extension (`run.log` -> `run-clean.log`) or append for an extensionless
+    name; identical resulting paths (e.g. both suffixes empty) is a config error at startup
+    (`ValueError`, reported and non-zero exit), never a silent overwrite.
+  - `config.py`: `VALID_LOG_TYPES` + `general.log_type`/`log_suffix_raw`/`log_suffix_clean`
+    DEFAULTS; `validate_output_handling_config()` extended to also reject an invalid
+    `general.log_type`.
+  - **Known limitation**: `general.log_type`/suffixes are only read from the BASE config
+    (DEFAULTS + user `config.yaml`, or an explicit top-level `avf --config PATH`) -- a
+    `process`-level `--set`/`--config`/`--preset` layer does NOT affect logging, since the group
+    callback attaches log handlers before `process` builds its own cascade. Command-line users
+    should pass `avf --log-type clean process ...` (the CLI flag wins over config when both are
+    given); config-file users set `general.log_type` in their user config.
 - **2026-07-18: Job outcomes -- SKIPPED (not FAILED) for an existing output, existing-output
   spec-check, input-probe policy (REQUIREMENTS.md § 6.1/6.2/6.3, commit 1/4 of the planned
   output-handling/reporting work)**: `Pipeline.execute_job()`'s decision path (right after the

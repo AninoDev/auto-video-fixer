@@ -12,7 +12,16 @@ from __future__ import annotations
 
 import logging
 
-from autovideofixer.logger import _SanitizingConsoleFormatter, get_logger, setup_logging
+import pytest
+
+from autovideofixer.logclean import get_pii_cleaner, reset_pii_cleaner
+from autovideofixer.logger import (
+    _CleaningFileFormatter,
+    _insert_log_suffix,
+    _SanitizingConsoleFormatter,
+    get_logger,
+    setup_logging,
+)
 
 
 def _make_record(msg: str, *args: object) -> logging.LogRecord:
@@ -127,3 +136,182 @@ class TestSetupLoggingWiresSanitizer:
         # The replacement marker did appear, proving sanitization actually ran
         # (rather than the assertions above passing because nothing matched).
         assert "�" in captured.err
+
+
+class TestInsertLogSuffix:
+    """REQUIREMENTS.md § 6.7 "both" mode suffix insertion."""
+
+    def test_extension_suffix_inserted_before_extension(self):
+        assert _insert_log_suffix("run.log", "-clean") == "run-clean.log"
+
+    def test_extensionless_suffix_appended_to_end(self):
+        assert _insert_log_suffix("run", "-clean") == "run-clean"
+
+    def test_empty_suffix_returns_path_unchanged(self):
+        assert _insert_log_suffix("run.log", "") == "run.log"
+
+    def test_custom_suffix(self):
+        assert _insert_log_suffix("run.log", "_RAW") == "run_RAW.log"
+
+    def test_path_with_directory_and_extension(self):
+        assert _insert_log_suffix("/var/log/avf/run.log", "-clean") == "/var/log/avf/run-clean.log"
+
+
+class TestLogTypeValidation:
+    def test_invalid_log_type_raises(self):
+        with pytest.raises(ValueError, match="log_type"):
+            setup_logging(level="INFO", log_type="verbose")
+        setup_logging(level="INFO")  # reset to a clean default state
+
+
+class TestLogTypeNone:
+    def test_none_attaches_no_file_handler(self, tmp_path):
+        log_path = tmp_path / "run.log"
+        opened = setup_logging(level="INFO", auto_log_file=str(log_path), log_type="none")
+        try:
+            assert opened == []
+            assert not log_path.exists()
+            for h in logging.getLogger("autovideofixer").handlers:
+                assert not isinstance(h, logging.FileHandler)
+        finally:
+            setup_logging(level="INFO")
+
+
+class TestLogTypeRaw:
+    def test_raw_returns_single_path_and_is_unredacted(self, tmp_path):
+        log_path = tmp_path / "run.log"
+        opened = setup_logging(level="INFO", auto_log_file=str(log_path), log_type="raw")
+        try:
+            assert opened == [str(log_path)]
+            logger = get_logger("autovideofixer.test_logtype_raw")
+            logger.info("processing /data/in/secret_video.mkv")
+            for h in logging.getLogger("autovideofixer").handlers:
+                h.flush()
+            content = log_path.read_text()
+            assert "/data/in/secret_video.mkv" in content
+        finally:
+            setup_logging(level="INFO")
+
+
+class TestLogTypeClean:
+    def test_clean_file_gets_cleaned_content(self, tmp_path):
+        """The clean file's content is redacted while a raw console/handler
+        stays raw -- captured here via a temp log file (clean) + an
+        in-memory handler attached separately (kept raw)."""
+        reset_pii_cleaner()
+        get_pii_cleaner().register_input("/data/in/secret_video.mkv")
+
+        log_path = tmp_path / "run.log"
+        opened = setup_logging(level="INFO", auto_log_file=str(log_path), log_type="clean")
+        try:
+            assert opened == [str(log_path)]
+
+            # A separate, always-raw in-memory handler attached directly to
+            # the root logger (simulating some other raw sink) must NOT be
+            # affected by the clean file formatter.
+            import io
+
+            raw_stream = io.StringIO()
+            raw_handler = logging.StreamHandler(raw_stream)
+            raw_handler.setFormatter(logging.Formatter("%(message)s"))
+            root = logging.getLogger("autovideofixer")
+            root.addHandler(raw_handler)
+
+            logger = get_logger("autovideofixer.test_logtype_clean")
+            logger.info("processing /data/in/secret_video.mkv")
+            for h in root.handlers:
+                h.flush()
+
+            file_content = log_path.read_text()
+            assert "secret_video" not in file_content
+            assert "input_video_01.mkv" in file_content
+
+            raw_content = raw_stream.getvalue()
+            assert "/data/in/secret_video.mkv" in raw_content
+
+            root.removeHandler(raw_handler)
+        finally:
+            setup_logging(level="INFO")
+            reset_pii_cleaner()
+
+    def test_clean_file_handler_uses_cleaning_formatter(self, tmp_path):
+        log_path = tmp_path / "run.log"
+        setup_logging(level="INFO", auto_log_file=str(log_path), log_type="clean")
+        try:
+            root = logging.getLogger("autovideofixer")
+            file_handlers = [h for h in root.handlers if isinstance(h, logging.FileHandler)]
+            assert len(file_handlers) == 1
+            assert isinstance(file_handlers[0].formatter, _CleaningFileFormatter)
+        finally:
+            setup_logging(level="INFO")
+
+
+class TestLogTypeBoth:
+    def test_both_mode_writes_two_files(self, tmp_path):
+        log_path = tmp_path / "run.log"
+        opened = setup_logging(
+            level="INFO",
+            auto_log_file=str(log_path),
+            log_type="both",
+            log_suffix_raw="",
+            log_suffix_clean="-clean",
+        )
+        try:
+            assert set(opened) == {str(log_path), str(tmp_path / "run-clean.log")}
+            assert (tmp_path / "run-clean.log").exists()
+            assert log_path.exists()
+        finally:
+            setup_logging(level="INFO")
+
+    def test_both_mode_raw_file_raw_clean_file_clean(self, tmp_path):
+        reset_pii_cleaner()
+        get_pii_cleaner().register_input("/data/in/secret_video.mkv")
+        log_path = tmp_path / "run.log"
+        setup_logging(
+            level="INFO",
+            auto_log_file=str(log_path),
+            log_type="both",
+            log_suffix_raw="",
+            log_suffix_clean="-clean",
+        )
+        try:
+            logger = get_logger("autovideofixer.test_logtype_both")
+            logger.info("processing /data/in/secret_video.mkv")
+            for h in logging.getLogger("autovideofixer").handlers:
+                h.flush()
+
+            raw_content = log_path.read_text()
+            clean_content = (tmp_path / "run-clean.log").read_text()
+            assert "secret_video" in raw_content
+            assert "secret_video" not in clean_content
+            assert "input_video_01.mkv" in clean_content
+        finally:
+            setup_logging(level="INFO")
+            reset_pii_cleaner()
+
+    def test_both_mode_identical_paths_is_a_startup_error(self, tmp_path):
+        """If both suffixes are empty (or otherwise equal), that's a config
+        error at startup -- never a silent overwrite of one file by the
+        other."""
+        log_path = tmp_path / "run.log"
+        with pytest.raises(ValueError, match="log_type=both"):
+            setup_logging(
+                level="INFO",
+                auto_log_file=str(log_path),
+                log_type="both",
+                log_suffix_raw="",
+                log_suffix_clean="",
+            )
+        setup_logging(level="INFO")  # reset to a clean default state
+
+    def test_both_mode_custom_equal_suffixes_is_also_an_error(self, tmp_path):
+        log_path = tmp_path / "run.log"
+        with pytest.raises(ValueError, match="log_type=both"):
+            setup_logging(
+                level="INFO",
+                auto_log_file=str(log_path),
+                log_type="both",
+                log_suffix_raw="-x",
+                log_suffix_clean="-x",
+            )
+        setup_logging(level="INFO")

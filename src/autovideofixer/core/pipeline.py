@@ -299,6 +299,35 @@ class Pipeline:
             priority=priority,
         )
         self._jobs.append(job)
+
+        # REQUIREMENTS.md § 6.7: register this job's real input/output paths
+        # with the PII-clean-log singleton -- covers GUI/programmatic use
+        # (the CLI's `process` command also registers resolved input files
+        # directly; registration is idempotent, so the redundancy is
+        # harmless and keeps both call sites simple).
+        from autovideofixer.logclean import get_pii_cleaner
+
+        cleaner = get_pii_cleaner()
+        cleaner.register_input(input_path)
+        cleaner.register_output(output_path)
+        # Also register the parent directories (role-based placeholders) --
+        # without this, a GUI/programmatic run (which never goes through the
+        # CLI's directory registration) would substitute the filename but
+        # leak the real directory path around it in a clean log.
+        # Both the verbatim dirname (what clean() composes full-path
+        # substitutions from) and the absolute one (what other log lines may
+        # render) -- register_directory() is idempotent, dupes are free.
+        for d in {os.path.dirname(input_path), os.path.dirname(os.path.abspath(input_path))}:
+            if d:
+                cleaner.register_directory(d, "input")
+        if output_path:
+            for d in {
+                os.path.dirname(output_path),
+                os.path.dirname(os.path.abspath(output_path)),
+            }:
+                if d:
+                    cleaner.register_directory(d, "output")
+
         return job
 
     def add_files(self, paths: list[str]) -> list[Job]:
@@ -747,6 +776,12 @@ class Pipeline:
             candidate = f"{stem}{suffix}{n}{ext}"
             if not os.path.exists(candidate):
                 os.rename(output_path, candidate)
+                # REQUIREMENTS.md § 6.7: the renamed file is a real output
+                # path this run created -- register it so a clean log can
+                # still show a placeholder for it, same as any other output.
+                from autovideofixer.logclean import get_pii_cleaner
+
+                get_pii_cleaner().register_output(candidate)
                 return candidate
             n += 1
         return None
@@ -1066,6 +1101,15 @@ class Pipeline:
         except RuntimeError as e:
             return self._terminal_probe_failure_result(job, e, job_start)
         job.input_info = input_info
+
+        # REQUIREMENTS.md § 6.7: register the embedded video title (if any)
+        # as a KNOWN value the PII cleaner can substitute -- registered here,
+        # right after the probe that produced it, so it's available before
+        # any later log line could echo it verbatim. Does not itself log the
+        # title anywhere new.
+        from autovideofixer.logclean import get_pii_cleaner
+
+        get_pii_cleaner().register_title(input_info.get("title"))
 
         # § 6.5 media info: log the input's resolution/framerate/duration/
         # filesize/bitrate/codecs at job start, before any decision/stage runs.

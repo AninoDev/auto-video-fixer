@@ -20,9 +20,11 @@ from rich.table import Table
 
 from autovideofixer import __version__
 from autovideofixer.config import (
+    VALID_LOG_TYPES,
     Config,
     _looks_like_secret_key,
     diff_from_defaults,
+    get_config_dir,
     get_log_dir,
     prune_old_logs,
     redact_secrets,
@@ -41,6 +43,7 @@ from autovideofixer.core.reporting import (
     stage_table_rows,
     write_json_report,
 )
+from autovideofixer.logclean import get_pii_cleaner
 from autovideofixer.logger import get_logger, setup_logging
 
 if TYPE_CHECKING:
@@ -270,6 +273,56 @@ def _set_nested(d: dict[str, Any], key_path: list[str], value: Any) -> None:
     node[key_path[-1]] = value
 
 
+def _register_argv_known_paths() -> None:
+    """Best-effort REQUIREMENTS.md § 6.7 registration pass over `sys.argv`.
+
+    Runs in the group callback, before the "Invocation:" log line (which
+    prints raw argv verbatim and fires before `process` has resolved
+    anything). Not exhaustive -- covers only what's cheaply knowable from
+    argv alone, without knowing which subcommand or option each token
+    belongs to:
+      - the value following `--config`/`-o`/`--output` gets registered as a
+        directory (role "config"/"output" respectively) -- for `--config`,
+        its PARENT directory (the token itself is a file);
+      - the value following `--log-file` is skipped entirely -- by the time
+        this scan runs, `setup_logging()` has already created that file, so
+        it would otherwise look like an "existing file" below and get
+        mis-registered as an input;
+      - `argv[0]` (the `avf` executable's own path) is always skipped for
+        the same reason -- it's a real file too, just never a video;
+      - any OTHER token that `is_video_file()` recognizes (extension-based,
+        see core/analysis.py) is registered as an input. Deliberately NOT
+        "any existing file" -- that would also catch e.g. the log file
+        itself, a --config YAML, or the `avf` binary, all real files that
+        aren't video inputs.
+    Anything not covered here (e.g. a relative path that only resolves once
+    `process` applies its own cwd-relative logic, or an output path that
+    doesn't exist yet) stays raw in the "Invocation:" line specifically --
+    documented v1 limitation; `process`'s own registration (resolved input
+    files, output dir, config/endpoint values) still covers every later log
+    line.
+    """
+    cleaner = get_pii_cleaner()
+    argv = sys.argv
+    skip_next = False
+    for i, tok in enumerate(argv):
+        if i == 0:
+            continue  # the avf executable's own path -- never an input
+        if skip_next:
+            skip_next = False
+            continue
+        if tok == "--config" and i + 1 < len(argv):
+            cleaner.register_directory(os.path.dirname(os.path.abspath(argv[i + 1])), "config")
+            skip_next = True
+        elif tok in ("-o", "--output") and i + 1 < len(argv):
+            cleaner.register_directory(argv[i + 1], "output")
+            skip_next = True
+        elif tok == "--log-file" and i + 1 < len(argv):
+            skip_next = True  # avoid mis-registering the log file as input
+        elif is_video_file(tok):
+            cleaner.register_input(tok)
+
+
 @click.group()
 @click.version_option(version=__version__, prog_name="avf")
 @click.option("--verbose", "-v", is_flag=True, help="Enable verbose logging (DEBUG level)")
@@ -295,6 +348,20 @@ def _set_nested(d: dict[str, Any], key_path: list[str], value: Any) -> None:
     "ffmpeg commands, to the file)",
 )
 @click.option(
+    "--log-type",
+    type=click.Choice(list(VALID_LOG_TYPES), case_sensitive=False),
+    default=None,
+    help="Which log FILE variant(s) to write: raw (default -- today's behavior, "
+    "unredacted), clean (PII-substituted via known input/output paths, directories, "
+    "VLM/LLM endpoints, and embedded titles -- safe to share when asking for help), "
+    "both (two files, see general.log_suffix_raw/log_suffix_clean), or none (no file "
+    "logging at all). The CONSOLE always stays raw regardless of this setting. Wins "
+    "over general.log_type in config when both are given; NOTE: `--set "
+    "general.log_type=...`/`--config` passed to `process` does NOT affect logging -- "
+    "handlers are attached here, before `process` builds its config cascade -- so "
+    "config-file users must set this in their user config.yaml (or pass this flag).",
+)
+@click.option(
     "--config",
     "config_path",
     type=click.Path(),
@@ -311,6 +378,7 @@ def main(
     log_level: str | None,
     log_file: str | None,
     file_log_level: str | None,
+    log_type: str | None,
     config_path: str | None,
 ) -> None:
     """Auto Video Fixer - Automated video enhancement and processing.
@@ -324,6 +392,8 @@ def main(
       --log-file PATH        Write the run's log file here instead of the
                              automatic location
       --file-log-level LEVEL Set file-only logging level, if different from console
+      --log-type TYPE        raw (default) | clean | both | none -- see AGENTS.md's
+                             "Log types" note
 
     Every run logs to a file at DEBUG level independent of console verbosity:
     a timestamped file under the platform log directory by default (the exact
@@ -332,6 +402,36 @@ def main(
     ctx.ensure_object(dict)
 
     console_level = "DEBUG" if verbose else (log_level or "INFO")
+
+    # Config is constructed here (before logging is set up) rather than
+    # after, so general.log_type/log_suffix_raw/log_suffix_clean can be read
+    # from it when --log-type is absent -- this is the one config read cheap
+    # enough (DEFAULTS + one YAML file) to justify doing before setup_logging()
+    # (see AGENTS.md's "Log types" note for why this only ever reads the base
+    # config, never a `process`-level --set/--config/--preset layer).
+    try:
+        if config_path:
+            config = Config(config_path, require_exists=True)
+        else:
+            config = Config()
+    except FileNotFoundError as e:
+        console.print(f"[red]{_safe(e)}[/red]")
+        sys.exit(1)
+
+    ctx.obj["config"] = config
+    ctx.obj["config_path_source"] = config_path
+
+    resolved_log_type = (
+        log_type or config.get("general", "log_type", default="raw") or "raw"
+    ).lower()
+    if resolved_log_type not in VALID_LOG_TYPES:
+        console.print(
+            f"[red]Invalid log_type: {resolved_log_type!r} "
+            f"(must be one of {VALID_LOG_TYPES!r})[/red]"
+        )
+        sys.exit(1)
+    log_suffix_raw = config.get("general", "log_suffix_raw", default="")
+    log_suffix_clean = config.get("general", "log_suffix_clean", default="-clean")
 
     # An explicit --log-file replaces the automatic state-dir log rather than
     # adding a second file: the run's canonical log lives wherever the user
@@ -344,24 +444,51 @@ def main(
         prune_old_logs(log_dir, keep=MAX_RETAINED_LOGS)
         auto_log_file = str(log_dir / f"avf-{datetime.now():%Y%m%d-%H%M%S}.log")
 
-    setup_logging(
-        console_level, log_file=None, file_level=file_log_level, auto_log_file=auto_log_file
-    )
-
-    logger = get_logger("autovideofixer.cli")
-    logger.info("avf %s -- log file: %s", __version__, auto_log_file)
-    logger.info("Invocation: %s", " ".join(sys.argv))
-
     try:
-        if config_path:
-            ctx.obj["config"] = Config(config_path, require_exists=True)
-        else:
-            ctx.obj["config"] = Config()
-    except FileNotFoundError as e:
+        opened_files = setup_logging(
+            console_level,
+            log_file=None,
+            file_level=file_log_level,
+            auto_log_file=auto_log_file,
+            log_type=resolved_log_type,
+            log_suffix_raw=log_suffix_raw,
+            log_suffix_clean=log_suffix_clean,
+        )
+    except ValueError as e:
         console.print(f"[red]{_safe(e)}[/red]")
         sys.exit(1)
 
-    ctx.obj["config_path_source"] = config_path
+    logger = get_logger("autovideofixer.cli")
+
+    # REQUIREMENTS.md § 6.7: register KNOWN values BEFORE the first log lines
+    # that can echo them (substitution happens at emit time, so registration
+    # only has to precede the log call): the log files' own directories (the
+    # "avf ... log file(s)" line and Invocation's --log-file value would
+    # otherwise leak the user's home/state dir), the config directory (and
+    # any explicit --config path's directory), the VLM/LLM endpoints from the
+    # base config (the effective-settings dumps below echo api_url), plus a
+    # best-effort pass over the rest of sys.argv before "Invocation:" (which
+    # prints raw argv verbatim and fires before `process` gets a chance to do
+    # its own full registration -- resolved input files, output dir, layered
+    # config endpoints). Not exhaustive -- see _register_argv_known_paths()'s
+    # docstring and AGENTS.md's "Log types" note for what's NOT covered here.
+    cleaner = get_pii_cleaner()
+    for opened in opened_files:
+        log_parent = os.path.dirname(os.path.abspath(opened))
+        if log_parent:
+            cleaner.register_directory(log_parent, "logs")
+    cleaner.register_directory(str(get_config_dir()), "config")
+    if config_path:
+        cleaner.register_directory(os.path.dirname(os.path.abspath(config_path)), "config")
+    for section in ("vlm", "llm"):
+        cleaner.register_endpoint(config.get("analysis", section, "api_url", default=None))
+    _register_argv_known_paths()
+
+    if opened_files:
+        logger.info("avf %s -- log file(s): %s", __version__, ", ".join(opened_files))
+    else:
+        logger.info("avf %s -- log file: none (general.log_type=none)", __version__)
+    logger.info("Invocation: %s", " ".join(sys.argv))
 
     _log_effective_settings(logger, ctx.obj["config"], config_path)
 
@@ -846,6 +973,22 @@ def process(
     if final_layer:
         config.apply_layer(final_layer, "cli-flags")
 
+    # REQUIREMENTS.md § 6.7: register what's known from the EFFECTIVE config
+    # (VLM/LLM endpoints, this run's config layer files, the output dir if
+    # set) before re-logging effective settings below -- that DEBUG dump
+    # prints api_urls/directories verbatim, so registration must happen
+    # before that log call, not merely before setup_logging(). Resolved
+    # input files (below) aren't known yet at this point -- registered
+    # right after they're collected instead.
+    cleaner = get_pii_cleaner()
+    cleaner.register_endpoint(config.get("analysis", "vlm", "api_url", default=""))
+    cleaner.register_endpoint(config.get("analysis", "llm", "api_url", default=""))
+    for layer_path in config_layers:
+        cleaner.register_directory(os.path.dirname(os.path.abspath(layer_path)), "config")
+    configured_output_dir = config.get("general", "output_dir", default=None)
+    if configured_output_dir:
+        cleaner.register_directory(configured_output_dir, "output")
+
     # Re-log the effective settings now that every preset/config/set/CLI
     # layer above has been folded in -- the group-level log in main() only
     # reflects the config as loaded from disk, before any of this command's
@@ -865,6 +1008,16 @@ def process(
     if not input_files:
         console.print("[red]No video files found.[/red]")
         sys.exit(1)
+
+    # REQUIREMENTS.md § 6.7: register each resolved input file + its parent
+    # directory (role "input") now that they're known -- before dry-run/job
+    # creation, so even a --dry-run run's logging is covered. `Pipeline.
+    # add_job()` also registers each job's input/output path (idempotent
+    # no-op here for inputs already registered by this loop); this is what
+    # actually numbers/registers each job's OUTPUT path.
+    for f in input_files:
+        cleaner.register_input(f)
+        cleaner.register_directory(os.path.dirname(os.path.abspath(f)), "input")
 
     if output_name and len(input_files) != 1:
         console.print(

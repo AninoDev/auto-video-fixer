@@ -248,10 +248,16 @@ def resolve_timeout(value: Any, key: str) -> float | None:
 
 _VALID_EXISTING_OUTPUT = ("skip", "fail")
 _VALID_EXISTING_MISMATCHED = ("rename", "overwrite")
+# Also the canonical set logger.setup_logging()/cli.py validate CLI-flag/
+# config values against -- kept here (not duplicated in logger.py) since
+# config.py is the layer both cli.py and Pipeline construction already import
+# from, and this tuple is otherwise a plain data constant with no logging-
+# specific behavior attached.
+VALID_LOG_TYPES = ("raw", "clean", "both", "none")
 
 
 def validate_output_handling_config(config: "Config") -> None:
-    """Validate the § 6.1/6.2 ``general.*`` enum-valued keys eagerly.
+    """Validate the § 6.1/6.2/6.7 ``general.*`` enum-valued keys eagerly.
 
     Called once per ``Pipeline`` construction so a typo'd value (e.g.
     ``general.existing_output: sikp``) is a clear startup error instead of a
@@ -260,7 +266,18 @@ def validate_output_handling_config(config: "Config") -> None:
     an intentional, allowed "renaming fully disabled" strict posture (see
     ``docs/REQUIREMENTS.md`` § 6.2's "0 = renaming fully disabled" note), not a
     misconfiguration.
+
+    Also validates ``general.log_type`` (§ 6.7) for programmatic ``Config``/
+    ``Pipeline`` users that bypass the CLI entirely -- the CLI's own group
+    callback validates it separately (and earlier, before logging is even set
+    up) since ``Pipeline`` isn't constructed until well after that point; see
+    ``cli.py``'s ``main()``.
     """
+    log_type = config.get("general", "log_type", default="raw")
+    if log_type not in VALID_LOG_TYPES:
+        raise ValueError(
+            f"Invalid general.log_type: {log_type!r} (must be one of {VALID_LOG_TYPES!r})"
+        )
     existing_output = config.get("general", "existing_output", default="skip")
     if existing_output not in _VALID_EXISTING_OUTPUT:
         raise ValueError(
@@ -361,6 +378,39 @@ class Config:
             # by default; set true for an opt-in strict mode where that also
             # fails the job outright.
             "fail_on_probe_warnings": False,
+            # --- REQUIREMENTS.md § 6.7: PII-clean log variant ---
+            #
+            # Which log FILE variant(s) get written: "raw" (default, today's
+            # behavior -- unredacted paths/endpoints/titles), "clean"
+            # (substitutes known real values -- input/output filenames,
+            # input/output/config directories, VLM/LLM endpoint hosts, embedded
+            # video titles -- with per-run-consistent placeholders, safe to
+            # share when asking for help), "both" (two files, see
+            # log_suffix_raw/log_suffix_clean below), or "none" (no file
+            # logging at all). The CONSOLE is always raw regardless of this
+            # setting -- only file logging is affected. Only takes effect for
+            # command-line runs when the `avf --log-type` flag is absent (the
+            # CLI flag wins when both are given) -- see AGENTS.md's "Log
+            # types" note for why a `--set general.log_type=...`/`--config`
+            # passed to `process` does NOT affect logging: the group callback
+            # attaches log handlers before `process` builds its config
+            # cascade, so this key is only read from the user config file (or
+            # an explicit top-level `avf --config PATH`), never from a
+            # `process`-level layer.
+            "log_type": "raw",
+            # Suffix inserted into the log filename for the RAW file in "both"
+            # mode (before the extension when one exists, e.g. "run.log" ->
+            # "run-raw.log"; appended to the end for an extensionless name).
+            # Empty string (default) = no suffix -- the raw file keeps the
+            # base name exactly (custom --log-file or the auto-generated
+            # timestamped name).
+            "log_suffix_raw": "",
+            # Same as log_suffix_raw but for the CLEAN file in "both" mode.
+            # If both suffixes would produce IDENTICAL paths (e.g. both left
+            # empty), that's a config error at startup (clear message,
+            # non-zero exit) -- never a silent overwrite of one file by the
+            # other.
+            "log_suffix_clean": "-clean",
         },
         "gpu": {
             "auto_detect": True,

@@ -407,3 +407,18 @@ class TestValidateOutputHandlingConfig:
         config = Config(tmp_path / "nonexistent.yaml")
         config.set(None, "general", "mismatched_max_renames")
         validate_output_handling_config(config)  # must not raise
+
+    def test_invalid_log_type_raises(self, tmp_path):
+        """REQUIREMENTS.md § 6.7: general.log_type is validated the same way
+        as the § 6.1/6.2 enum keys above -- a clear startup error, not a
+        confusing failure the first time logging tries to read it."""
+        config = Config(tmp_path / "nonexistent.yaml")
+        config.set("verbose", "general", "log_type")
+        with pytest.raises(ValueError, match="log_type"):
+            validate_output_handling_config(config)
+
+    def test_valid_log_types_pass(self, tmp_path):
+        for value in ("raw", "clean", "both", "none"):
+            config = Config(tmp_path / "nonexistent.yaml")
+            config.set(value, "general", "log_type")
+            validate_output_handling_config(config)  # must not raise

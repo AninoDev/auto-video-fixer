@@ -146,6 +146,39 @@ general:
   # also fails the job outright instead of just warning.
   fail_on_probe_warnings: false
 
+  # --- REQUIREMENTS.md § 6.7: PII-clean log variant ---
+  #
+  # Which log FILE variant(s) to write: "raw" (default -- today's behavior, unredacted paths/
+  # endpoints/titles), "clean" (substitutes KNOWN real values -- input/output filenames,
+  # input/output/config directories, VLM/LLM endpoint hosts, embedded video titles -- with
+  # per-run-consistent placeholders, e.g. "input_video_01.mkv"/"/path/to/input/"/
+  # "http://vlm-endpoint" -- safe to share when asking for help), "both" (two files, see
+  # log_suffix_raw/log_suffix_clean below), or "none" (no file logging at all). The CONSOLE
+  # always stays raw regardless of this setting -- only file logging is affected.
+  # Substitution is KNOWN-value-based, not guesswork regexes -- only values some code path
+  # actually registered get replaced (see src/autovideofixer/logclean.py). Free-text PII
+  # embedded in e.g. a DEBUG-logged VLM response is NOT caught -- documented out of scope
+  # for v1. Stage temp filenames (/tmp/avf_*) are never registered (no PII by construction),
+  # so they're always left as-is.
+  #
+  # IMPORTANT LIMITATION: this key is only read from THIS file (or an explicit top-level
+  # `avf --config PATH`) -- a `--set general.log_type=...`/`--config`/`--preset` layer given to
+  # `avf process` does NOT affect logging, because the `avf` group callback attaches log
+  # handlers before `process` builds its own config cascade. Command-line users should pass
+  # `avf --log-type clean process ...` instead (the CLI flag wins when both are given).
+  log_type: "raw"
+
+  # "both" mode only: suffix inserted into the log filename for the RAW file -- before the
+  # extension when one exists ("run.log" -> "run-raw.log"), appended to the end for an
+  # extensionless name. Empty (default) = no suffix, i.e. the raw file keeps the base name
+  # exactly (a custom --log-file name or the auto-generated timestamped name).
+  log_suffix_raw: ""
+
+  # Same as log_suffix_raw but for the CLEAN file in "both" mode. If both suffixes would
+  # produce IDENTICAL paths (e.g. both left empty), that's a config error at startup (clear
+  # message, non-zero exit) -- never a silent overwrite of one file by the other.
+  log_suffix_clean: "-clean"
+
 gpu:
   # Whether to auto-detect GPU capability at all (informational; auto-detection itself happens
   # in ai/torch_utils.py and core/ffmpeg_utils.py regardless -- this mainly gates whether

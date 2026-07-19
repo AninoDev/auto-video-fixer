@@ -212,6 +212,54 @@ class TestProbe:
         assert result.to_info_dict()["probe_stderr"] == ""
 
 
+class TestProbeTitle:
+    """REQUIREMENTS.md § 6.7: ProbeResult.title, from format.tags.title,
+    falling back to the video stream's own tags.title when absent -- a KNOWN
+    value the PII cleaner registers (see Pipeline.execute_job())."""
+
+    def _probe_with_json(self, stdout_json: str):
+        with (
+            patch("autovideofixer.core.ffmpeg_utils.get_ffprobe_path", return_value="ffprobe"),
+            patch("autovideofixer.core.ffmpeg_utils.subprocess.run") as mock_run,
+        ):
+            mock_run.return_value = MagicMock(returncode=0, stdout=stdout_json, stderr="")
+            return probe("/some/file.mp4")
+
+    def test_title_from_format_tags(self):
+        result = self._probe_with_json(
+            '{"format": {"tags": {"title": "My Vacation"}}, "streams": []}'
+        )
+        assert result.title == "My Vacation"
+        assert result.to_info_dict()["title"] == "My Vacation"
+
+    def test_title_falls_back_to_video_stream_tags(self):
+        result = self._probe_with_json(
+            '{"format": {"tags": {}}, "streams": '
+            '[{"codec_type": "video", "tags": {"title": "Stream Title"}}]}'
+        )
+        assert result.title == "Stream Title"
+
+    def test_format_title_wins_over_stream_title(self):
+        result = self._probe_with_json(
+            '{"format": {"tags": {"title": "Format Title"}}, "streams": '
+            '[{"codec_type": "video", "tags": {"title": "Stream Title"}}]}'
+        )
+        assert result.title == "Format Title"
+
+    def test_no_title_present(self):
+        result = self._probe_with_json('{"format": {}, "streams": [{"codec_type": "video"}]}')
+        assert result.title == ""
+        assert result.to_info_dict()["title"] == ""
+
+    def test_audio_stream_title_ignored_for_fallback(self):
+        """Only the VIDEO stream's tags.title is a fallback candidate."""
+        result = self._probe_with_json(
+            '{"format": {}, "streams": [{"codec_type": "audio", "tags": {"title": "Audio"}}, '
+            '{"codec_type": "video", "tags": {}}]}'
+        )
+        assert result.title == ""
+
+
 class TestStreamInfo:
     """Test stream information."""
 

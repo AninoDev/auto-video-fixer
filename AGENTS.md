@@ -387,8 +387,70 @@ in `core/pipeline.py`):
   `_print_summary()` reports Skipped as its own line (with sub-reasons), separate from Failed. The
   GUI's job table renders a SKIPPED job as "Skipped", not "Failed"
   (`gui/main_window.py::_on_job_complete`).
-- Not yet implemented: § 6.7 (PII-clean log variant), § 6.8 (`avf config clean|upgrade|dump`) —
-  see `docs/REQUIREMENTS.md` § 6 for the full planned set and delivery order.
+- Not yet implemented: § 6.8 (`avf config clean|upgrade|dump`) — see `docs/REQUIREMENTS.md` § 6
+  for the full planned set and delivery order.
+
+## Log types: raw / clean / both / none (REQUIREMENTS.md § 6.7)
+
+`general.log_type` (config) / `avf --log-type` (CLI flag, next to `--log-file`, on the
+top-level `avf` group) controls what the automatic per-run log FILE contains — the CONSOLE is
+always raw regardless. Four values: `"raw"` (default, today's behavior — unredacted paths/
+endpoints/titles), `"clean"` (PII-substituted), `"both"` (two files), `"none"` (no file
+logging at all). Invalid values are rejected at startup (clear message, non-zero exit) —
+`config.VALID_LOG_TYPES`, checked both by `validate_output_handling_config()` (programmatic
+`Config`/`Pipeline` users) and directly in `cli.py`'s group callback (which runs before any
+`Pipeline` exists).
+
+- **The cleaner**: `src/autovideofixer/logclean.py`'s `PIICleaner` (module singleton via
+  `get_pii_cleaner()`/`reset_pii_cleaner()`) holds a per-run, thread-safe mapping of KNOWN real
+  values → placeholders, substituted (not regex-guessed) in `clean()`: input files →
+  `input_video_01.<ext>`, output files → `output_video_01.<ext>` (2-digit, numbered by first
+  appearance, extension preserved — includes `Pipeline._rename_mismatched_output()`'s renamed
+  outputs), directories → `/path/to/input/` / `/path/to/output/` / `/path/to/config/` /
+  `/path/to/logs/` (role-based, not numbered; the logs role covers the run's own log-file
+  directory, which would otherwise leak the user's home/state dir in the startup lines),
+  VLM/LLM endpoints → `http://vlm-endpoint` (host/port only — path/
+  query kept intact so the log still shows which route was hit; not numbered, all endpoints
+  share the one placeholder), embedded video titles (`ProbeResult.title`, from
+  `format.tags.title` falling back to the video stream's own `tags.title`) →
+  `video_title_01`. Substitution composes full paths (directory placeholder + file placeholder)
+  ahead of bare directories/basenames via longest-match-first ordering. `/tmp/avf_*` stage temp
+  files are never registered by any call site (no PII by construction), so they're always left
+  untouched. **v1 limitation**: this only catches values some code path explicitly registered —
+  free-text PII embedded in e.g. a DEBUG-logged VLM response is NOT caught and is out of scope.
+- **Registration call sites** (all idempotent — redundant registration from multiple call
+  sites doesn't affect numbering): `cli.py`'s group callback registers the config directory
+  (+ explicit `--config` path's directory) and does a best-effort `sys.argv` scan (existing-file
+  tokens → input, `-o`/`--output` value → output directory) before logging the raw
+  `"Invocation: ..."` line; `process()` registers VLM/LLM endpoints, `--config` layer
+  directories, and the configured output dir before its own "Effective settings"/DEBUG "Full
+  effective config" dumps, then each resolved input file + its parent directory right after
+  they're collected; `Pipeline.add_job()` registers every job's input/output path (covers GUI/
+  programmatic use); `Pipeline.execute_job()` registers the probed input's title right after the
+  input probe. **Known v1 gap**: the group callback's `"Invocation:"` line prints raw `sys.argv`
+  and fires before `process` has resolved anything beyond the best-effort argv scan above — a
+  relative path that only resolves once `process` applies its own logic, or an output path that
+  doesn't exist yet, stays raw on that ONE line; every other log line is covered.
+- **Wiring**: `logger.py`'s `_CleaningFileFormatter` runs the normal plain
+  `_PLAIN_FILE_FORMAT` formatting then `get_pii_cleaner().clean(...)` at emit time (so
+  registration only has to happen before the log CALL, not before `setup_logging()`);
+  `setup_logging()` grows a `log_type`/`log_suffix_raw`/`log_suffix_clean` param set and builds
+  0/1/2 file handlers for `auto_log_file` accordingly, returning the actual path(s) opened (the
+  separate, mostly-unused `log_file` param stays unconditionally raw for direct-caller backward
+  compatibility — GUI's `setup_logging("INFO")` call is unaffected either way).
+- **"both" mode**: `general.log_suffix_raw` (default `""`) / `general.log_suffix_clean`
+  (default `"-clean"`) are inserted before the extension when one exists (`run.log` ->
+  `run-clean.log`) or appended to the end for an extensionless name — applies to both a custom
+  `--log-file` name and the auto-generated timestamped name. Two suffixes resolving to the
+  SAME path (e.g. both left empty) is a config error at startup (`setup_logging()` raises
+  `ValueError`, `cli.py` reports it and exits non-zero) — never a silent overwrite.
+- **Config-cascade timing limitation**: `general.log_type`/`log_suffix_raw`/`log_suffix_clean`
+  are only ever read from the BASE config (DEFAULTS + user `config.yaml`, or an explicit
+  top-level `avf --config PATH`) — a `process`-level `--set`/`--config`/`--preset` layer does
+  NOT affect logging, because `avf`'s group callback attaches log handlers before `process`
+  builds its own cascade. Command-line users should use `avf --log-type clean process ...`
+  instead (the CLI flag wins over config when both are given); config-file users set
+  `general.log_type` in their user `config.yaml`.
 
 ## Reporting: per-video stage summary, media info + timing, JSON run report
 
