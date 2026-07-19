@@ -129,7 +129,9 @@ class SpeedStage(BaseStage):
             return StageResult(
                 status=StageStatus.COMPLETED,
                 output_path=output_path,
-                metadata={"speed_factor": speed},
+                # REQUIREMENTS.md § 6.4: speed is traditional-only (FFmpeg
+                # setpts/atempo, no AI path) -- uniform provenance.
+                metadata={"method": "traditional", "speed_factor": speed},
                 duration_sec=time.time() - start,
             )
 

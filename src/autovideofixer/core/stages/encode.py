@@ -157,6 +157,9 @@ class EncodeStage(BaseStage):
                 status=StageStatus.COMPLETED,
                 output_path=output_path,
                 metadata={
+                    # REQUIREMENTS.md § 6.4: encode is traditional-only (FFmpeg
+                    # encode, no AI path) -- uniform provenance.
+                    "method": "traditional",
                     "codec": codec,
                     "preset": preset,
                     "crf": crf,

@@ -422,6 +422,11 @@ class CropStage(BaseStage):
 
         self._report_progress(1.0, "Auto-crop complete", progress_callback)
         metadata = {
+            # REQUIREMENTS.md § 6.4: analysis-type stage reports its own
+            # method string (which detector actually produced the crop),
+            # classified as "ran-traditional" by classify_stage() (anything
+            # != "ai" without an ai_fallback_used marker).
+            "method": detector_used,
             "detected_crop": f"{crop_w}:{crop_h}:{crop_x}:{crop_y}",
             "original_resolution": f"{orig_w}x{orig_h}",
             "cropped_resolution": f"{crop_w}x{crop_h}",

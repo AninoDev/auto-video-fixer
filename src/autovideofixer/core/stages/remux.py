@@ -94,7 +94,9 @@ class RemuxStage(BaseStage):
             return StageResult(
                 status=StageStatus.COMPLETED,
                 output_path=dest,
-                metadata={"format": target_format},
+                # REQUIREMENTS.md § 6.4: remux is traditional-only (container
+                # remux, no AI path) -- uniform provenance.
+                metadata={"method": "traditional", "format": target_format},
                 duration_sec=time.time() - start,
             )
 

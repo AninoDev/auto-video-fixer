@@ -8,7 +8,7 @@ import csv
 import logging
 import os
 import sys
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -29,8 +29,18 @@ from autovideofixer.config import (
     sanitize_console_text,
 )
 from autovideofixer.core.analysis import is_video_file, scan_directory
-from autovideofixer.core.pipeline import JobResult, Pipeline
+from autovideofixer.core.pipeline import Job, JobResult, Pipeline
 from autovideofixer.core.presets import get_preset, list_presets, load_preset
+from autovideofixer.core.reporting import (
+    aggregate_stage_timing,
+    build_json_report,
+    build_run_meta,
+    job_summary_line,
+    run_classification_aggregate,
+    run_outcome_aggregate,
+    stage_table_rows,
+    write_json_report,
+)
 from autovideofixer.logger import get_logger, setup_logging
 
 if TYPE_CHECKING:
@@ -569,6 +579,42 @@ def _log_effective_settings(
     "tile_batch_size for all three; default 1 = one tile at a time, today's behavior). This is "
     "the batching knob that matters at e.g. 4K, where every frame always tiles.",
 )
+@click.option(
+    "--stage-timing-per-video/--no-stage-timing-per-video",
+    "stage_timing_per_video",
+    default=None,
+    help="Print a per-video per-stage duration table (overrides "
+    "reporting.stage_timing_per_video; off by default).",
+)
+@click.option(
+    "--stage-timing-totals/--no-stage-timing-totals",
+    "stage_timing_totals",
+    default=None,
+    help="Print per-stage total duration summed across the whole run at the end (overrides "
+    "reporting.stage_timing_totals; off by default). Averaged/totaled by base stage name -- "
+    "an occurrence label like 'upscale#2' rolls up into 'upscale'.",
+)
+@click.option(
+    "--stage-timing-averages/--no-stage-timing-averages",
+    "stage_timing_averages",
+    default=None,
+    help="Print per-stage average duration per video that actually ran it at the end "
+    "(overrides reporting.stage_timing_averages; off by default). The divisor is videos "
+    "that ran the stage successfully, never the total video count -- failed stage "
+    "executions are excluded and shown separately.",
+)
+@click.option(
+    "--report-json",
+    "report_json",
+    type=click.Path(),
+    default=None,
+    help="Write a single structured JSON run report to PATH once at the end of the run "
+    "(also on partial failure -- whatever jobs finished) -- overrides reporting.report_json. "
+    "Contains run metadata, per-job records (media info, outcome, decision trail, scene "
+    "stats, timing), and per-stage records within each job (method/fallback provenance, "
+    "duration, skip reason/error). No aggregates -- those are derivable from the per-job "
+    "stage records.",
+)
 @click.pass_context
 def process(
     ctx: click.Context,
@@ -602,6 +648,10 @@ def process(
     zoom_coverage: float | None,
     batch_size: int | None,
     tile_batch_size: int | None,
+    stage_timing_per_video: bool | None,
+    stage_timing_totals: bool | None,
+    stage_timing_averages: bool | None,
+    report_json: str | None,
 ) -> None:
     """Process video files with the specified settings."""
     if list_presets_flag:
@@ -725,6 +775,32 @@ def process(
                     tile_batch_size,
                 )
             )
+    if stage_timing_per_video is not None:
+        cli_candidates.append(
+            (
+                ("--stage-timing-per-video", "--no-stage-timing-per-video"),
+                ["reporting", "stage_timing_per_video"],
+                stage_timing_per_video,
+            )
+        )
+    if stage_timing_totals is not None:
+        cli_candidates.append(
+            (
+                ("--stage-timing-totals", "--no-stage-timing-totals"),
+                ["reporting", "stage_timing_totals"],
+                stage_timing_totals,
+            )
+        )
+    if stage_timing_averages is not None:
+        cli_candidates.append(
+            (
+                ("--stage-timing-averages", "--no-stage-timing-averages"),
+                ["reporting", "stage_timing_averages"],
+                stage_timing_averages,
+            )
+        )
+    if report_json is not None:
+        cli_candidates.append((("--report-json",), ["reporting", "report_json"], report_json))
     for stage_name in enable_stages:
         cli_candidates.append((("--enable-stage",), ["stages", stage_name, "enabled"], True))
     for stage_name in disable_stages:
@@ -820,13 +896,46 @@ def process(
             job.stages = list(stages)
 
     console.print(f"\nProcessing {len(jobs)} job(s)...")
-    results = pipeline.execute_all(callback=_on_job_complete)
+
+    def _job_complete_cb(job: Job, result: JobResult) -> None:
+        _on_job_complete(job, result)
+        _print_job_report(logger, result, config)
+
+    # REQUIREMENTS.md § 6.6: the JSON report is written once at the end of
+    # the run, including on partial failure -- whatever jobs finished by the
+    # time something goes wrong. `results` starts empty and the whole
+    # reporting tail (per-job/aggregate console+log output, JSON write) runs
+    # in `finally` so an unexpected exception escaping execute_all() (per-job
+    # exceptions are already caught inside it) still gets a report for
+    # whatever's in `results` so far.
+    results: list[JobResult] = []
+    run_started_at = datetime.now(timezone.utc)
+    try:
+        results = pipeline.execute_all(callback=_job_complete_cb)
+    finally:
+        run_finished_at = datetime.now(timezone.utc)
+        _print_summary(results)
+        _print_run_stage_timing(console, logger, config, results)
+        console.print(
+            f"\nWhole run elapsed: {(run_finished_at - run_started_at).total_seconds():.3f}s"
+        )
+        logger.info(
+            "Whole run elapsed: %.1fms",
+            (run_finished_at - run_started_at).total_seconds() * 1000.0,
+        )
+
+        report_json_path = config.get("reporting", "report_json", default=None)
+        if report_json_path:
+            run_meta = build_run_meta(__version__, config, run_started_at, run_finished_at)
+            report = build_json_report(run_meta, results)
+            write_json_report(report_json_path, report)
+            console.print(f"[green]Wrote JSON run report to {_safe(report_json_path)}[/green]")
+            logger.info("Wrote JSON run report to %s", report_json_path)
 
     # Summary. A run whose jobs are all completed-or-skipped exits 0 -- only
     # true failures (outcome == "failed") make the run exit non-zero (see
     # docs/REQUIREMENTS.md § 6.1).
     failed = _count_failed(results)
-    _print_summary(results)
     if failed > 0:
         sys.exit(1)
 
@@ -1526,3 +1635,139 @@ def _print_summary(results) -> None:
         for r in results:
             if r.outcome == "failed":
                 console.print(f"  - {_safe(r.input_path)}: {_safe('; '.join(r.errors))}")
+
+    # REQUIREMENTS.md § 6.4 end-of-run aggregate: counts per stage
+    # classification bucket (ran-ai/ran-traditional/ran-traditional-fallback/
+    # failed/skipped), across every stage occurrence in every job.
+    class_counts = run_classification_aggregate(results)
+    if class_counts:
+        console.print("\n[bold]Stage outcomes (all jobs):[/bold]")
+        for cls, count in sorted(class_counts.items()):
+            console.print(f"  {cls}: {count}")
+        get_logger("autovideofixer.cli").info(
+            "Stage outcomes aggregate: %s", dict(sorted(class_counts.items()))
+        )
+
+    outcome_counts = run_outcome_aggregate(results)
+    get_logger("autovideofixer.cli").info(
+        "Job outcomes aggregate: %s", dict(sorted(outcome_counts.items()))
+    )
+
+
+def _print_job_report(logger: logging.Logger, result: JobResult, config: Config) -> None:
+    """§ 6.4 per-job stage summary: a Rich table (stage | classification |
+    method/fallback | duration | skip reason/error), the video-level "at a
+    glance" line (outcome, reprocessed note, scene stats, timing), and the
+    same content logged as plain lines (grep-friendly -- Rich console output
+    is line-wrapped, see AGENTS.md)."""
+    rows = stage_table_rows(result.stage_results)
+    if rows:
+        table = Table(title=f"Stages: {_safe(os.path.basename(result.input_path))}")
+        table.add_column("Stage")
+        table.add_column("Outcome")
+        table.add_column("Method/Fallback")
+        table.add_column("Duration (s)")
+        table.add_column("Skip reason / error")
+        for row in rows:
+            method_col = row["method"] or ""
+            if row["ai_fallback_used"]:
+                method_col = f"{method_col} (fallback: {row['ai_fallback_reason']})"
+            detail = row["skipped_reason"] or row["error"] or ""
+            table.add_row(
+                _safe(row["label"]),
+                _safe(row["classification"]),
+                _safe(method_col),
+                f"{row['duration_sec']:.2f}",
+                _safe(detail),
+            )
+        console.print(table)
+        logger.info(
+            "Stage summary for %s: %s",
+            os.path.basename(result.input_path),
+            [
+                f"{r['label']}={r['classification']}"
+                + (f" ({r['method']})" if r["method"] else "")
+                + f" {r['duration_sec']:.2f}s"
+                for r in rows
+            ],
+        )
+
+    summary_line = job_summary_line(result)
+    console.print(f"[bold]{_safe(summary_line)}[/bold]")
+    logger.info(summary_line)
+
+    if config.get("reporting", "stage_timing_per_video", default=False) and rows:
+        timing_table = Table(title=f"Stage timing: {_safe(os.path.basename(result.input_path))}")
+        timing_table.add_column("Stage")
+        timing_table.add_column("Duration (s)")
+        for row in rows:
+            timing_table.add_row(_safe(row["label"]), f"{row['duration_sec']:.2f}")
+        console.print(timing_table)
+        logger.info(
+            "Per-video stage timing for %s: %s",
+            os.path.basename(result.input_path),
+            {r["label"]: round(r["duration_sec"], 3) for r in rows},
+        )
+
+
+def _print_run_stage_timing(
+    console_: Console, logger: logging.Logger, config: Config, results: list[JobResult]
+) -> None:
+    """§ 6.5 stage-timing summary flags: per-stage totals/averages across the
+    whole run, plus a separate "failed stage executions" section -- all OFF
+    by default, computed at display time (never stored) from
+    ``aggregate_stage_timing()``."""
+    want_totals = config.get("reporting", "stage_timing_totals", default=False)
+    want_averages = config.get("reporting", "stage_timing_averages", default=False)
+    if not (want_totals or want_averages):
+        return
+
+    agg = aggregate_stage_timing(results)
+
+    if want_totals and agg["totals"]:
+        table = Table(title="Stage totals (whole run)")
+        table.add_column("Stage")
+        table.add_column("Total duration (s)")
+        table.add_column("Successful runs")
+        for name in sorted(agg["totals"]):
+            table.add_row(
+                name, f"{agg['totals'][name] / 1000.0:.2f}", str(agg["counts"].get(name, 0))
+            )
+        console_.print(table)
+        logger.info(
+            "Stage totals (ms) across run: %s",
+            {name: round(v, 1) for name, v in sorted(agg["totals"].items())},
+        )
+
+    if want_averages and agg["averages"]:
+        table = Table(title="Stage averages (per video that ran it)")
+        table.add_column("Stage")
+        table.add_column("Average duration (s)")
+        table.add_column("Videos")
+        for name in sorted(agg["averages"]):
+            table.add_row(
+                name,
+                f"{agg['averages'][name] / 1000.0:.2f}",
+                str(agg["counts"].get(name, 0)),
+            )
+        console_.print(table)
+        logger.info(
+            "Stage averages (ms) per video that ran it: %s",
+            {name: round(v, 1) for name, v in sorted(agg["averages"].items())},
+        )
+
+    if agg["failed"]:
+        table = Table(title="Failed stage executions")
+        table.add_column("Stage")
+        table.add_column("Video")
+        table.add_column("Duration (s)")
+        table.add_column("Error")
+        for entry in agg["failed"]:
+            table.add_row(
+                _safe(entry["stage"]),
+                _safe(os.path.basename(entry["video"])),
+                f"{entry['duration_ms'] / 1000.0:.2f}",
+                _safe(entry["error"] or ""),
+            )
+        console_.print(table)
+        logger.info("Failed stage executions: %s", agg["failed"])

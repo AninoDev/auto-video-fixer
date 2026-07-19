@@ -77,6 +77,11 @@ class DetectStage(BaseStage):
         """
         vs = info.video_stream
         metadata = {
+            # REQUIREMENTS.md § 6.4 uniform provenance: an analysis-type stage
+            # (no AI/traditional choice) reports its own method string, which
+            # classify_stage() (core/reporting.py) treats as "ran-traditional"
+            # (anything != "ai" without an ai_fallback_used marker).
+            "method": "ffprobe",
             "has_video": info.has_video,
             "has_audio": info.has_audio,
             "duration": info.duration,

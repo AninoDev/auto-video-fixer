@@ -58,9 +58,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     `fail_on_probe_warnings`. `config.py`'s `validate_output_handling_config()` rejects an invalid
     `existing_output`/`existing_mismatched` value or a negative `mismatched_max_renames` at
     `Pipeline()` construction (`mismatched_max_renames: 0` is explicitly allowed, not rejected).
-  - Not yet implemented (later commits per REQUIREMENTS.md § 6's delivery order): § 6.4 (per-video
-    stage/mode summary table), § 6.5 (media info/timing instrumentation), § 6.6 (structured JSON
-    report), § 6.7 (PII-clean log variant), § 6.8 (`avf config clean|upgrade|dump`).
+  - Not yet implemented (later commits per REQUIREMENTS.md § 6's delivery order): § 6.7 (PII-clean
+    log variant), § 6.8 (`avf config clean|upgrade|dump`).
+- **2026-07-19: Per-video stage/mode summary, media info + timing instrumentation, structured
+  JSON run report (REQUIREMENTS.md § 6.4/6.5/6.6, commit 2/4 of the planned output-handling/
+  reporting work)**: new `core/reporting.py` (pure, unit-tested functions) plus new `JobResult`
+  fields and `cli.py` display/write wiring -- no live pipeline behavior change, purely additive
+  reporting.
+  - `classify_stage(StageResult)` buckets every stage occurrence into `"ran-ai"` /
+    `"ran-traditional"` / `"ran-traditional-fallback"` / `"failed"` / `"skipped"`.
+    `BaseStage._ai_fallback_or_fail()` (the one seam every AI->traditional fallback flows
+    through) now marks `metadata["ai_fallback_used"]`/`metadata["ai_fallback_reason"]` on its
+    returned result, so reporting can distinguish "AI failed, fell back" from "chose traditional
+    outright". Audited every stage for `metadata["method"]` coverage and patched the gaps:
+    `crop` (now reports its detector name), `detect` (`"ffprobe"`), and
+    `encode`/`remux`/`speed`/`stabilize`/`normalize_audio`/`normalize_volume` (all
+    `"traditional"` -- none have an AI path).
+  - New `JobResult` fields, populated on EVERY return path including every § 6.1-6.3 early
+    terminal: `scene_stats` (scene-mode total/kept/dropped + per-scene drop detail, or `None`),
+    `job_wall_ms` (job-turn wall time, including input probing and the § 6.1/6.2 decision phase),
+    `processing_ms` (stage-pipeline portion only; `0.0` for any skipped/early-failed job),
+    `reprocessed_mismatch` (`True` when § 6.2's rename/overwrite path reprocessed a verified
+    mismatch). `JobResult.output_info` -- present as a field before but never populated -- is now
+    filled in (reusing the stage loop's already-fresh `input_info`, no extra ffprobe call).
+  - Console: per-job Rich table (stage | classification | method/fallback | duration | skip
+    reason/error) plus a video-level "at a glance" summary line; end-of-run stage-classification
+    and job-outcome aggregates extend `_print_summary()`. Same content also logged as plain
+    `logger.info` lines (Rich output is line-wrapped and unfriendly to grep). Per-stage wall-clock
+    duration now logged at INFO right after each stage completes/fails/skips; input/output media
+    info (resolution, framerate, duration, filesize, bitrate, codecs) logged at job start/finish.
+  - New `reporting` config section (all OFF by default) + matching `avf process` flags:
+    `stage_timing_per_video` / `--stage-timing-per-video` (per-video per-stage duration table),
+    `stage_timing_totals` / `--stage-timing-totals` (per-stage totals across the run),
+    `stage_timing_averages` / `--stage-timing-averages` (per-stage average per video that ran it
+    -- divisor is videos that ran the stage successfully, never total video count; failed
+    executions excluded and shown separately), `report_json` / `--report-json PATH` (writes a
+    single structured JSON run report once at the end of `process`, including on partial
+    failure -- run metadata, per-job records, per-stage records; deliberately no aggregates,
+    those are derivable from the per-job stage records).
 
 ### Fixed
 - **Stages after the first geometry-changing one saw stale `input_info` (post-crop upscale bug)**:

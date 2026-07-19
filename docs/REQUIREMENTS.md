@@ -765,7 +765,7 @@ satisfies the CURRENT effective targets before deciding to skip.
   noted either way).
 - `general.fail_on_probe_warnings: false` — opt-in strict mode; explicitly non-default.
 
-### 6.4 Per-video stage/mode summary
+### 6.4 Per-video stage/mode summary (IMPLEMENTED 2026-07-19)
 
 - Per job and aggregated at end of run, each stage classified as: **ran+AI**,
   **ran+traditional (chosen)**, **ran+traditional (fallback — the AI attempt failed first;
@@ -781,7 +781,7 @@ satisfies the CURRENT effective targets before deciding to skip.
 - Rendered as a Rich table on the console, plain lines in the log file, and stored on
   `JobResult` for future GUI use.
 
-### 6.5 Media info printouts + timing instrumentation
+### 6.5 Media info printouts + timing instrumentation (IMPLEMENTED 2026-07-19)
 
 - **Media info**: at each job's start log the input's resolution, framerate, duration,
   filesize, bitrate, video/audio codecs; at completion the same for the output
@@ -804,7 +804,7 @@ satisfies the CURRENT effective targets before deciding to skip.
   that died in 2s must not drag the average down). Purpose: identify which stages dominate
   runtime and correlate video characteristics with stage cost.
 
-### 6.6 Structured JSON run report
+### 6.6 Structured JSON run report (IMPLEMENTED 2026-07-19)
 
 - Optional: `--report-json PATH` CLI flag + config key. One JSON document per run:
   run metadata (avf version, effective non-default settings, timestamps), per-job records

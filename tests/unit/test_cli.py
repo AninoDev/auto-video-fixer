@@ -732,6 +732,61 @@ class TestConfigCascadeCli:
         assert result2.exit_code == 0
         assert "crf':10" in _plain(result2.output)
 
+    def test_report_json_flag_sets_config_key(self, tmp_path):
+        test_file = self._video(tmp_path)
+        report_path = str(tmp_path / "report.json")
+        result = self.runner.invoke(
+            main, ["process", str(test_file), "--report-json", report_path, "--dry-run"]
+        )
+        assert result.exit_code == 0
+        assert f"'report_json':'{report_path}'" in _plain(result.output)
+
+    def test_stage_timing_flags_set_config_keys(self, tmp_path):
+        test_file = self._video(tmp_path)
+        result = self.runner.invoke(
+            main,
+            [
+                "process",
+                str(test_file),
+                "--stage-timing-per-video",
+                "--stage-timing-totals",
+                "--stage-timing-averages",
+                "--dry-run",
+            ],
+        )
+        assert result.exit_code == 0
+        plain = _plain(result.output)
+        assert "'stage_timing_per_video':True" in plain
+        assert "'stage_timing_totals':True" in plain
+        assert "'stage_timing_averages':True" in plain
+
+    def test_stage_timing_negative_flag_beats_config_default_true(self, tmp_path, monkeypatch):
+        """--no-stage-timing-totals must override a config file that has it
+        enabled (default is already False, so this exercises the CLI-flags
+        layer actually overriding rather than just matching the default)."""
+        from autovideofixer.config import Config as ConfigCls
+
+        config_path = tmp_path / "config.yaml"
+        config_path.write_text("reporting:\n  stage_timing_totals: true\n")
+        monkeypatch.setenv("AVF_CONFIG", str(config_path))
+
+        captured = {}
+        real_apply_layer = ConfigCls.apply_layer
+
+        def spy_apply_layer(self, layer, source_label):
+            real_apply_layer(self, layer, source_label)
+            if source_label == "cli-flags":
+                captured["value"] = self.get("reporting", "stage_timing_totals")
+
+        test_file = self._video(tmp_path)
+        with patch.object(ConfigCls, "apply_layer", spy_apply_layer):
+            result = self.runner.invoke(
+                main, ["process", str(test_file), "--no-stage-timing-totals", "--dry-run"]
+            )
+
+        assert result.exit_code == 0
+        assert captured.get("value") is False
+
     def test_set_scalar_parsing(self, tmp_path):
         test_file = self._video(tmp_path)
         result = self.runner.invoke(

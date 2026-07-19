@@ -938,6 +938,22 @@ class Config:
                 # rust/avf_hashing/ for why pHash replaced both.
             },
         },
+        # --- REQUIREMENTS.md § 6.4/6.5/6.6: per-video stage/mode summary,
+        # media info + timing instrumentation, structured JSON run report ---
+        "reporting": {
+            # Three independent stage-timing console/log views (core/reporting.py's
+            # aggregate_stage_timing()), all OFF by default -- the per-job
+            # classification table (§ 6.4) and per-stage duration logging (§ 6.5)
+            # always happen regardless of these flags; these three only add extra
+            # cross-video views for correlating stage cost with video characteristics.
+            "stage_timing_per_video": False,  # per-video per-stage duration table
+            "stage_timing_totals": False,  # per-stage totals summed across the run
+            "stage_timing_averages": False,  # per-stage average per video that ran it
+            # Optional path to write a single § 6.6 structured JSON run report to
+            # (one document per run, written once at the end -- also on partial
+            # failure). null (default) = don't write one. See --report-json.
+            "report_json": None,
+        },
     }
 
     def __init__(

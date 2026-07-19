@@ -1545,6 +1545,157 @@ class TestExistingOutputDecisionPath:
         assert any("Non-monotonous DTS" in e for e in result.errors)
 
 
+class TestReportingFields:
+    """REQUIREMENTS.md § 6.4/6.5: job_wall_ms/processing_ms populated on every
+    JobResult return path, reprocessed_mismatch threaded from the § 6.2
+    decision path, and scene_stats stored when scene mode runs."""
+
+    def setup_method(self):
+        self.config = Config(Path(tempfile.mkdtemp()) / "nonexistent.yaml")
+        self.pipeline = Pipeline(self.config)
+
+    def _register_fakes(self, monkeypatch, probe_by_path):
+        def fake_get_stage(name):
+            return _FakeEncodeStage if name in ("encode", "stabilize") else None
+
+        def fake_create_stage(name, config, overrides=None):
+            return _FakeEncodeStage(config, overrides) if name in ("encode", "stabilize") else None
+
+        def fake_get_video_info(path):
+            if path in probe_by_path:
+                info = probe_by_path[path]
+                if isinstance(info, Exception):
+                    raise info
+                return dict(info)
+            return dict(_BARE_PROBE_INFO)
+
+        monkeypatch.setattr("autovideofixer.core.pipeline.get_stage", fake_get_stage)
+        monkeypatch.setattr("autovideofixer.core.pipeline.create_stage", fake_create_stage)
+        monkeypatch.setattr("autovideofixer.core.pipeline.get_video_info", fake_get_video_info)
+
+    def _make_job(self, tmp_path, write_existing_output=True):
+        input_file = tmp_path / "in.mp4"
+        input_file.write_bytes(b"original input")
+        job = self.pipeline.add_job(str(input_file))
+        job.stages = ["encode"]
+        if write_existing_output:
+            Path(job.output_path).write_bytes(b"pre-existing output")
+        return job
+
+    def test_completed_job_has_positive_timing_fields(self, tmp_path, monkeypatch):
+        job = self._make_job(tmp_path, write_existing_output=False)
+        self._register_fakes(monkeypatch, {})
+
+        result = self.pipeline.execute_job(job)
+
+        assert result.outcome == "completed"
+        assert result.job_wall_ms > 0
+        assert result.processing_ms > 0
+        # processing is a subset of the whole job's turn.
+        assert result.processing_ms <= result.job_wall_ms
+
+    def test_failed_probe_job_has_wall_time_but_zero_processing(self, tmp_path, monkeypatch):
+        job = self._make_job(tmp_path, write_existing_output=False)
+        self._register_fakes(
+            monkeypatch,
+            {job.input_path: RuntimeError(f"ffprobe failed for {job.input_path}: corrupt")},
+        )
+
+        result = self.pipeline.execute_job(job)
+
+        assert result.outcome == "failed"
+        assert result.job_wall_ms > 0
+        assert result.processing_ms == 0.0
+
+    def test_skipped_existing_output_has_wall_time_but_zero_processing(self, tmp_path, monkeypatch):
+        job = self._make_job(tmp_path)
+        self._register_fakes(monkeypatch, {})
+
+        result = self.pipeline.execute_job(job)
+
+        assert result.outcome == "skipped"
+        assert result.job_wall_ms > 0
+        assert result.processing_ms == 0.0
+
+    def test_reprocessed_mismatch_true_on_rename_reprocess(self, tmp_path, monkeypatch):
+        job = self._make_job(tmp_path)
+        self._register_fakes(
+            monkeypatch,
+            {job.output_path: {**_BARE_PROBE_INFO, "video_codec": "h264"}},
+        )
+        self.config.set("libx265", "encoding", "video_codec")
+        self.config.set(True, "general", "reprocess_mismatched")
+
+        result = self.pipeline.execute_job(job)
+
+        assert result.outcome == "completed"
+        assert result.reprocessed_mismatch is True
+
+    def test_reprocessed_mismatch_true_on_overwrite_reprocess(self, tmp_path, monkeypatch):
+        job = self._make_job(tmp_path)
+        self._register_fakes(
+            monkeypatch,
+            {job.output_path: {**_BARE_PROBE_INFO, "video_codec": "h264"}},
+        )
+        self.config.set("libx265", "encoding", "video_codec")
+        self.config.set(True, "general", "reprocess_mismatched")
+        self.config.set("overwrite", "general", "existing_mismatched")
+
+        result = self.pipeline.execute_job(job)
+
+        assert result.outcome == "completed"
+        assert result.reprocessed_mismatch is True
+
+    def test_reprocessed_mismatch_false_on_ordinary_completed_job(self, tmp_path, monkeypatch):
+        job = self._make_job(tmp_path, write_existing_output=False)
+        self._register_fakes(monkeypatch, {})
+
+        result = self.pipeline.execute_job(job)
+
+        assert result.outcome == "completed"
+        assert result.reprocessed_mismatch is False
+
+    def test_scene_stats_none_when_scene_mode_off(self, tmp_path, monkeypatch):
+        job = self._make_job(tmp_path, write_existing_output=False)
+        self._register_fakes(monkeypatch, {})
+
+        result = self.pipeline.execute_job(job)
+
+        assert result.scene_stats is None
+
+    def test_scene_stats_stored_when_scene_mode_runs(self, tmp_path, monkeypatch):
+        from types import SimpleNamespace
+
+        (tmp_path / "in.mp4").write_bytes(b"original input")
+        job = self.pipeline.add_job(str(tmp_path / "in.mp4"))
+        job.stages = ["stabilize", "encode"]
+        self._register_fakes(monkeypatch, {})
+        self.config.set(True, "scenes", "enabled")
+
+        scene_output = tmp_path / "scene_out.mp4"
+        scene_output.write_bytes(b"scene mode output")
+        fake_scene_result = SimpleNamespace(
+            output_path=str(scene_output),
+            total_scenes=5,
+            kept_scenes=4,
+            dropped_scenes=[{"index": 2, "start_time": 1.0, "end_time": 2.0, "reason": "dupe"}],
+            stabilize_tiers={},
+            interpolated_scenes=[],
+        )
+        monkeypatch.setattr(
+            "autovideofixer.core.scenes.run_scene_pipeline", lambda *a, **k: fake_scene_result
+        )
+
+        result = self.pipeline.execute_job(job)
+
+        assert result.scene_stats == {
+            "total": 5,
+            "kept": 4,
+            "dropped": 1,
+            "dropped_detail": [{"index": 2, "start_time": 1.0, "end_time": 2.0, "reason": "dupe"}],
+        }
+
+
 class TestExitCodeCountsFailedOnly:
     """CLI exit-code seam (cli.py's _count_failed()): only outcome=="failed"
     jobs should make a run exit non-zero -- SKIPPED/completed never do."""

@@ -103,6 +103,38 @@ class TestAiFallbackOrFail:
         assert any("torch missing" in r.message for r in caplog.records)
         assert any(r.levelno == logging.WARNING for r in caplog.records)
 
+    def test_enabled_marks_fallback_provenance(self, tmp_path):
+        """REQUIREMENTS.md § 6.4: the ONE seam every AI->traditional fallback
+        flows through must mark ai_fallback_used/ai_fallback_reason on the
+        returned result so reporting can tell "fell back" from "chose
+        traditional outright" (core/reporting.py's classify_stage())."""
+        config = Config(tmp_path / "c.yaml")
+        stage = _DummyAIStage(config)
+
+        def traditional():
+            return StageResult(
+                status=StageStatus.COMPLETED,
+                output_path="/x",
+                metadata={"method": "traditional"},
+            )
+
+        result = stage._ai_fallback_or_fail("torch missing", time.time(), traditional)
+
+        assert result.metadata["ai_fallback_used"] is True
+        assert result.metadata["ai_fallback_reason"] == "torch missing"
+
+    def test_disabled_does_not_mark_fallback_provenance(self, tmp_path):
+        config = Config(tmp_path / "c.yaml")
+        config.set(False, "general", "ai_fallback")
+        stage = _DummyAIStage(config)
+
+        def traditional():
+            return StageResult(status=StageStatus.COMPLETED, output_path="/x")
+
+        result = stage._ai_fallback_or_fail("torch missing", time.time(), traditional)
+
+        assert "ai_fallback_used" not in result.metadata
+
 
 class TestStageLevelFallback:
     """End-to-end through a real AI-capable stage, with torch availability
@@ -145,6 +177,10 @@ class TestStageLevelFallback:
         assert result.metadata["method"] == "traditional"
         assert any("PyTorch not installed" in r.message for r in caplog.records)
         mock_run_ffmpeg.assert_called_once()
+
+        from autovideofixer.core.reporting import classify_stage
+
+        assert classify_stage(result) == "ran-traditional-fallback"
 
     def test_denoise_video_fallback_disabled_fails(self, tmp_path, monkeypatch):
         from autovideofixer.core.stages.denoise_video import DenoiseVideoStage

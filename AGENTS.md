@@ -387,10 +387,63 @@ in `core/pipeline.py`):
   `_print_summary()` reports Skipped as its own line (with sub-reasons), separate from Failed. The
   GUI's job table renders a SKIPPED job as "Skipped", not "Failed"
   (`gui/main_window.py::_on_job_complete`).
-- Not yet implemented: § 6.4 (per-video stage/mode summary table), § 6.5 (media info/timing
-  instrumentation), § 6.6 (structured JSON report), § 6.7 (PII-clean log variant), § 6.8 (`avf
-  config clean|upgrade|dump`) — see `docs/REQUIREMENTS.md` § 6 for the full planned set and
-  delivery order.
+- Not yet implemented: § 6.7 (PII-clean log variant), § 6.8 (`avf config clean|upgrade|dump`) —
+  see `docs/REQUIREMENTS.md` § 6 for the full planned set and delivery order.
+
+## Reporting: per-video stage summary, media info + timing, JSON run report
+
+`docs/REQUIREMENTS.md` § 6.4/6.5/6.6, implemented in `core/reporting.py` (pure, unit-tested
+functions) plus new `JobResult` fields and `cli.py` display/write wiring:
+
+- **`core/reporting.py`**: `classify_stage(StageResult) -> str` buckets a stage occurrence into
+  `"ran-ai" | "ran-traditional" | "ran-traditional-fallback" | "failed" | "skipped"` — FAILED/
+  SKIPPED status wins outright; `metadata["ai_fallback_used"]` (set once, at
+  `BaseStage._ai_fallback_or_fail()`'s enabled-fallback branch — the ONLY seam AI→traditional
+  fallback flows through) beats `metadata["method"] == "ai"`; everything else COMPLETED is
+  `"ran-traditional"`, which also covers analysis-type stages (crop, detect) that report their
+  own method string (detector name, `"ffprobe"`) instead of a literal `"ai"`/`"traditional"`.
+  Every stage now sets `metadata["method"]` — audited and patched: `crop` (detector used),
+  `detect` (`"ffprobe"`), `encode`/`remux`/`speed`/`stabilize`/`normalize_audio` (all
+  `"traditional"`, no AI path). Note: `hdr`'s existing `method` kwarg is the tonemap algorithm
+  name (`"bt2020"` etc.), an unrelated pre-existing overload of the same key — harmless for
+  `classify_stage()` (anything ≠ `"ai"` classifies as traditional) but don't confuse the two.
+  Also: `base_stage_name()` (strips a `pipeline.default_order` repeat's `"#N"` suffix),
+  `stage_table_rows()`/`job_summary_line()` (per-job console+log content),
+  `run_classification_aggregate()`/`run_outcome_aggregate()` (end-of-run counts),
+  `format_media_info_lines()` (input-vs-output "field: in -> out" lines — resolution, framerate,
+  duration, bitrate, codecs, filesize via `os.path.getsize`), `aggregate_stage_timing()` (totals/
+  averages/failed-executions, computed at display time from `stage_results`, never stored —
+  average divisor is videos that ran the stage SUCCESSFULLY, never the total job count; failed
+  executions excluded and reported separately), `build_run_meta()`/`build_json_report()`/
+  `write_json_report()` (§ 6.6 JSON, `default=str` fallback for non-serializable metadata).
+- **New `JobResult` fields** (`core/pipeline.py`), populated on EVERY return path including every
+  § 6.1-6.3 early terminal: `scene_stats` (`{"total", "kept", "dropped", "dropped_detail"}` or
+  `None` when scene mode didn't run), `job_wall_ms` (from the job's turn starting — including
+  input probing and the § 6.1/6.2 decision phase — to result finalization), `processing_ms`
+  (stage-pipeline portion only; 0.0 for any SKIPPED/early-FAILED job), `reprocessed_mismatch`
+  (`True` when § 6.2's rename/overwrite path reprocessed a verified mismatch — threaded out of
+  `_decide_existing_output()` via its `_ExistingOutputDecision` return dataclass rather than a
+  raw `JobResult | None`, since the caller needs both the terminal-or-None AND this fact).
+  `total_duration` (seconds) keeps working as before; `job_wall_ms`/`processing_ms` are the new
+  canonical millisecond numbers. `JobResult.output_info` is now actually populated (it existed as
+  a field before but nothing ever filled it in) by reusing `input_info` at job-result-construction
+  time — `input_info` is already kept fresh by the stage loop's per-stage re-probe, so this is
+  free (no second ffprobe on the same file).
+- **Console/log**: per-job Rich table (stage | classification | method/fallback | duration | skip
+  reason/error) + an "at a glance" summary line, both ALSO logged as plain `logger.info` lines
+  (`cli.py::_print_job_report()`) — Rich console output is line-wrapped and unfriendly to grep,
+  the plain log file is what verification workflows should use (see `--log-file`). End-of-run:
+  `_print_summary()` now also prints/logs the stage-classification aggregate and job-outcome
+  aggregate. Per-stage wall-clock duration is logged at INFO right after each stage completes/
+  fails in the stage loop, and input/output media info is logged at job start/finish.
+- **`reporting.*` config section + CLI flags** (all OFF by default): `stage_timing_per_video` /
+  `--stage-timing-per-video` (per-video per-stage duration table), `stage_timing_totals` /
+  `--stage-timing-totals` (per-stage totals across the run), `stage_timing_averages` /
+  `--stage-timing-averages` (per-stage average per video that ran it) — `cli.py::
+  _print_run_stage_timing()`. `report_json` / `--report-json PATH` writes the § 6.6 JSON report
+  once at the end of `process` (in a `finally` block around `execute_all()`, so partial-failure
+  runs still get a report for whatever finished) — deliberately contains NO aggregates (derivable
+  from per-job stage records; storing both invites picking the wrong one during analysis).
 
 ## AI/Traditional Method Selection
 
@@ -1276,6 +1329,11 @@ Global (before the subcommand):
   see "Stabilization zoom coverage" above
 - `--batch-size INT` / `--tile-batch-size INT`: set `stages.{upscale,deblock,denoise_video}.
   batch_size`/`tile_batch_size` (all three at once) — see "Batched inference" above
+- `--stage-timing-per-video` / `--stage-timing-totals` / `--stage-timing-averages`: three
+  independent, OFF-by-default stage-timing console/log views (`reporting.stage_timing_*`) — see
+  "Reporting" above
+- `--report-json PATH`: write the § 6.6 structured JSON run report once at the end of the run
+  (`reporting.report_json`) — see "Reporting" above
 
 `avf analyze PATHS...`: like `process`, accepts multiple files and/or directories (directories
 scanned via `scan_directory`, hidden files skipped) and analyzes each in sequence; a per-file

@@ -638,6 +638,9 @@ class StabilizeStage(BaseStage):
                     status=StageStatus.COMPLETED,
                     output_path=output_path,
                     metadata={
+                        # REQUIREMENTS.md § 6.4: stabilize is traditional-only
+                        # (FFmpeg vidstab, no AI path) -- uniform provenance.
+                        "method": "traditional",
                         "smoothness": smooth,
                         "threshold": thresh,
                         "skipped": True,
@@ -943,6 +946,9 @@ class StabilizeStage(BaseStage):
                 status=StageStatus.COMPLETED,
                 output_path=output_path,
                 metadata={
+                    # REQUIREMENTS.md § 6.4: stabilize is traditional-only
+                    # (FFmpeg vidstab, no AI path) -- uniform provenance.
+                    "method": "traditional",
                     "smoothness": smooth,
                     "threshold": thresh,
                     "avg_shake": avg_value,

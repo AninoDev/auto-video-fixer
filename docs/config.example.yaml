@@ -953,6 +953,38 @@ analysis:
     # "Perceptual Hashing & Duplicate Detection" section and rust/avf_hashing/ for why
     # this replaced the old ahash/dhash/combined choice.
 
+# REQUIREMENTS.md § 6.4/6.5/6.6: per-video stage/mode summary, media info + timing
+# instrumentation, and the structured JSON run report. The per-job classification table (§ 6.4)
+# and per-stage duration logging (§ 6.5) always happen regardless of these settings -- the
+# three stage_timing_* flags below only add extra cross-video views for correlating stage cost
+# with video characteristics, and report_json is the only one that produces a file.
+reporting:
+  # Print a per-video per-stage duration table (also `avf process --stage-timing-per-video`).
+  # Off by default -- the always-on per-job stage table (§ 6.4) already shows duration per
+  # stage; this is a focused duration-only view for videos with many stages.
+  stage_timing_per_video: false
+  # Print per-stage total duration summed across the whole run at the end (also
+  # `avf process --stage-timing-totals`). Aggregated by BASE stage name -- an occurrence label
+  # like "upscale#2" (a stage repeated via pipeline.default_order) rolls up into "upscale".
+  stage_timing_totals: false
+  # Print per-stage average duration per video that actually ran it (also
+  # `avf process --stage-timing-averages`). The divisor is videos that ran the stage
+  # SUCCESSFULLY -- never the total video count: a video that failed at an earlier stage
+  # contributes nothing to later stages, and a skipped stage contributes nothing anywhere.
+  # Failed stage executions are excluded from both totals and averages and shown in their own
+  # "Failed stage executions" section instead (a stage that died in 2s must not drag the
+  # average down).
+  stage_timing_averages: false
+  # Optional path to write a single structured JSON run report to (also
+  # `avf process --report-json PATH`). One document per run, written once at the end --
+  # including on partial failure (whatever jobs finished). Contains run metadata (avf version,
+  # timestamps, effective non-default settings), per-job records (media info, outcome,
+  # decision trail, scene stats, timing), and per-stage records within each job (method/
+  # fallback provenance, duration, skip reason/error). Deliberately contains NO aggregates
+  # (totals/averages) -- those are derivable from the per-job stage records, and storing both
+  # invites picking the wrong one during offline analysis. null (default) = don't write one.
+  report_json: null
+
 # --- Not part of Config.DEFAULTS, but read elsewhere and worth knowing about ---
 #
 # encoding:

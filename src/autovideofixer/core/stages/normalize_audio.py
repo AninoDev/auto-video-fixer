@@ -157,6 +157,10 @@ class NormalizeAudioStage(BaseStage):
             status=StageStatus.COMPLETED,
             output_path=dest,
             metadata={
+                # REQUIREMENTS.md § 6.4: normalize_audio/normalize_volume are
+                # traditional-only (FFmpeg loudnorm, no AI path) -- uniform
+                # provenance.
+                "method": "traditional",
                 "skipped": True,
                 "measured_i": measured_i,
                 "threshold_db": threshold_db,
@@ -295,7 +299,7 @@ class NormalizeAudioStage(BaseStage):
             return StageResult(
                 status=StageStatus.COMPLETED,
                 output_path=dest,
-                metadata={"target_db": target, "true_peak": peak},
+                metadata={"method": "traditional", "target_db": target, "true_peak": peak},
                 duration_sec=time.time() - start,
             )
 

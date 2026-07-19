@@ -322,7 +322,15 @@ class BaseStage(ABC):
                 self.name,
                 reason,
             )
-            return traditional()
+            result = traditional()
+            # REQUIREMENTS.md § 6.4: mark provenance HERE, the one seam every
+            # AI->traditional fallback flows through, so reporting can tell
+            # "chose traditional" from "AI failed, fell back to traditional"
+            # without each stage's traditional() implementation needing to
+            # know it was called as a fallback.
+            result.metadata["ai_fallback_used"] = True
+            result.metadata["ai_fallback_reason"] = reason
+            return result
         self.logger.error(
             "Stage '%s': AI method unavailable (%s); ai_fallback is disabled, failing stage",
             self.name,
