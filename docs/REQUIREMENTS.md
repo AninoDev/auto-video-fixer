@@ -845,7 +845,7 @@ satisfies the CURRENT effective targets before deciding to skip.
   `"-clean"`); empty string = no suffix. If `both` would produce two identical paths (both
   suffixes empty), that is a config error at startup — never a silent overwrite.
 
-### 6.8 Config tooling: `avf config clean | upgrade | dump`
+### 6.8 Config tooling: `avf config clean | upgrade | dump` (IMPLEMENTED 2026-07-20)
 
 Three subcommands under a new `avf config` group (chosen over a standalone script for CLI
 consistency; user approved).

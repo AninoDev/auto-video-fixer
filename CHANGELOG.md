@@ -8,6 +8,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **2026-07-20: Config tooling `avf config clean | dump | upgrade` (REQUIREMENTS.md § 6.8,
+  commit 4/4 — final commit of the output-handling/reporting work)**: new `avf config` command
+  group backed by pure helpers in `cli/config_tools.py`. `clean` normalizes a config to bare
+  YAML (comments stripped, only present keys, order preserved); `dump` emits the effective
+  config (accepting the same `--preset`/`--config`/`--set` argv-order layering as `process`,
+  secrets redacted unless `--with-secrets`); `upgrade` applies an input config's leaf values
+  onto a comment-preserving template (default: the packaged `config.example.yaml`) via
+  **ruamel.yaml** round-trip mode — lists are atomic leaves replaced wholesale, and input keys
+  absent from the template are refused unless `--drop-unknown`. Shared file-safety across all
+  three: an existing `-o` destination is never overwritten by default (`--force` overwrites,
+  `--backup` renames to the first free `PATH.N`). Each subcommand writes YAML to stdout when no
+  `-o` is given, with all diagnostics on stderr so a `> out.yaml` redirect stays clean. New
+  dependency: `ruamel.yaml`. A byte-identical copy of the template ships in the package
+  (`data/config.example.yaml`) so `upgrade` works without a repo checkout (drift guarded by a
+  unit test).
 - **2026-07-19: PII-clean log variant (REQUIREMENTS.md § 6.7, commit 3/4 of the planned
   output-handling/reporting work)**: `general.log_type` (`"raw"` default / `"clean"` / `"both"`
   / `"none"`) + `avf --log-type` (top-level CLI flag) control what the automatic per-run log
@@ -99,8 +114,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     `fail_on_probe_warnings`. `config.py`'s `validate_output_handling_config()` rejects an invalid
     `existing_output`/`existing_mismatched` value or a negative `mismatched_max_renames` at
     `Pipeline()` construction (`mismatched_max_renames: 0` is explicitly allowed, not rejected).
-  - Not yet implemented (later commits per REQUIREMENTS.md § 6's delivery order): § 6.7 (PII-clean
-    log variant), § 6.8 (`avf config clean|upgrade|dump`).
+  - Now implemented in later commits (see the § 6.7 and § 6.8 entries above): the PII-clean
+    log variant and the `avf config clean|dump|upgrade` tooling.
 - **2026-07-19: Per-video stage/mode summary, media info + timing instrumentation, structured
   JSON run report (REQUIREMENTS.md § 6.4/6.5/6.6, commit 2/4 of the planned output-handling/
   reporting work)**: new `core/reporting.py` (pure, unit-tested functions) plus new `JobResult`

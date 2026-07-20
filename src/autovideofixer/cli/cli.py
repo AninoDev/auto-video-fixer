@@ -19,6 +19,7 @@ from rich.panel import Panel
 from rich.table import Table
 
 from autovideofixer import __version__
+from autovideofixer.cli import config_tools
 from autovideofixer.config import (
     VALID_LOG_TYPES,
     Config,
@@ -50,6 +51,12 @@ if TYPE_CHECKING:
     from autovideofixer.core.analysis import VideoAnalysis
 
 console = Console()
+# Diagnostics stream for the `avf config` subcommands: their stdout is a data
+# payload (clean/dumped/upgraded YAML), so every error, warning, and
+# backup-rename notice must go to stderr instead -- otherwise
+# `avf config upgrade in.yaml --drop-unknown > out.yaml` would prepend
+# ANSI-coloured "Warning:" lines into the YAML file and corrupt it.
+err_console = Console(stderr=True)
 
 
 def _safe(value: object) -> str:
@@ -135,28 +142,44 @@ _BOOL_FLAGS = {
 }
 
 
-def _scan_process_argv() -> list[tuple[str, str | None, int]]:
-    """Walk sys.argv from the `process` subcommand token onward.
+def _find_subcommand_start(argv: list[str], tokens: tuple[str, ...]) -> int | None:
+    """Return the argv index right after the first occurrence of `tokens`
+    appearing consecutively (e.g. ("config", "dump")), or None if not found.
 
-    Returns an ordered list of (flag, value, argv_index) for every
-    recognized config-affecting flag occurrence (see _VALUE_FLAGS/
-    _BOOL_FLAGS). Returns [] if "process" isn't found in sys.argv at all --
-    callers must treat that (or a value mismatch against what Click actually
-    parsed) as "argv unavailable" and fall back to a fixed order.
+    Shared by every subcommand-scoped argv scan below -- each subcommand
+    (possibly nested, like `config dump`) scans only the flags that appear
+    after its own token sequence, so a flag of the same name typed for a
+    *different* subcommand (or before the subcommand at all) is never
+    mistaken for this one's.
     """
-    argv = sys.argv
-    try:
-        start = argv.index("process") + 1
-    except ValueError:
-        return []
+    n = len(tokens)
+    if n == 0:
+        return None
+    for i in range(len(argv) - n + 1):
+        if tuple(argv[i : i + n]) == tokens:
+            return i + n
+    return None
 
+
+def _scan_argv_flags(
+    argv: list[str],
+    start: int,
+    value_flags: set[str],
+    bool_flags: set[str],
+) -> list[tuple[str, str | None, int]]:
+    """Walk `argv` from `start` onward, recording every recognized flag.
+
+    Returns an ordered list of (flag, value, argv_index) for occurrences of
+    `value_flags` (takes a following token or `--flag=value`) and
+    `bool_flags` (mere presence is the signal, value is always None).
+    """
     out: list[tuple[str, str | None, int]] = []
     i = start
     n = len(argv)
     while i < n:
         tok = argv[i]
         matched = False
-        for flag in _VALUE_FLAGS:
+        for flag in value_flags:
             if tok == flag:
                 val = argv[i + 1] if i + 1 < n else None
                 out.append((flag, val, i))
@@ -170,10 +193,40 @@ def _scan_process_argv() -> list[tuple[str, str | None, int]]:
         if matched:
             i += 1
             continue
-        if tok in _BOOL_FLAGS:
+        if tok in bool_flags:
             out.append((tok, None, i))
         i += 1
     return out
+
+
+def _scan_process_argv() -> list[tuple[str, str | None, int]]:
+    """Walk sys.argv from the `process` subcommand token onward.
+
+    Returns an ordered list of (flag, value, argv_index) for every
+    recognized config-affecting flag occurrence (see _VALUE_FLAGS/
+    _BOOL_FLAGS). Returns [] if "process" isn't found in sys.argv at all --
+    callers must treat that (or a value mismatch against what Click actually
+    parsed) as "argv unavailable" and fall back to a fixed order.
+    """
+    argv = sys.argv
+    start = _find_subcommand_start(argv, ("process",))
+    if start is None:
+        return []
+    return _scan_argv_flags(argv, start, _VALUE_FLAGS, _BOOL_FLAGS)
+
+
+# `avf config dump` accepts only the layering flags (--preset/--config/--set)
+# -- a subset of _VALUE_FLAGS -- and no boolean flags.
+_DUMP_VALUE_FLAGS = {"--preset", "-p", "--config", "--set"}
+
+
+def _scan_config_dump_argv() -> list[tuple[str, str | None, int]]:
+    """Same as `_scan_process_argv`, scoped to `avf config dump`."""
+    argv = sys.argv
+    start = _find_subcommand_start(argv, ("config", "dump"))
+    if start is None:
+        return []
+    return _scan_argv_flags(argv, start, _DUMP_VALUE_FLAGS, set())
 
 
 def _repeatable_matches(
@@ -1251,6 +1304,219 @@ def _make_progress_reporter(
             status.update(f"{prefix}{os.path.basename(filepath)} -- {message}")
 
     return _callback
+
+
+# ─── `avf config clean | upgrade | dump` (docs/REQUIREMENTS.md § 6.8) ───────
+#
+# Pure logic (YAML normalization, ruamel-based template upgrade, file-safety
+# rename/overwrite rules) lives in cli/config_tools.py; this is thin Click
+# wiring only. See AGENTS.md's "Config tooling" section for the full model.
+
+
+@main.group("config")
+def config_group() -> None:
+    """Config file tooling: clean, upgrade, and dump the effective config."""
+
+
+def _write_config_output(text: str, output: str | None, *, force: bool, backup: bool) -> None:
+    """Shared file-safety-aware output writer for all three config subcommands.
+
+    stdout (output=None) never needs any safety handling. Otherwise: refuse
+    an existing destination by default, `--force` overwrites, `--backup`
+    renames the existing file aside first (see
+    config_tools.apply_file_safety) and prints exactly what was renamed.
+    """
+    if output is None:
+        click.echo(text, nl=False)
+        return
+    out_path = Path(output)
+    try:
+        message = config_tools.apply_file_safety(out_path, force=force, backup=backup)
+    except (ValueError, FileExistsError) as e:
+        err_console.print(f"[red]{e}[/red]")
+        sys.exit(1)
+    out_path.write_text(text)
+    if message:
+        err_console.print(message)
+
+
+@config_group.command("clean")
+@click.argument("input_path", type=click.Path(exists=True, dir_okay=False))
+@click.option(
+    "-o", "--output", type=click.Path(), default=None, help="Write to this path instead of stdout."
+)
+@click.option("--force", is_flag=True, help="Overwrite an existing --output file.")
+@click.option(
+    "--backup",
+    is_flag=True,
+    help="Rename an existing --output file aside (PATH.1, PATH.2, ...) before writing.",
+)
+def config_clean(input_path: str, output: str | None, force: bool, backup: bool) -> None:
+    """Normalize INPUT config YAML: strip comments, canonical formatting.
+
+    Emits ONLY the keys actually present in INPUT (no DEFAULTS merged in) --
+    this is a formatter, not a validator. Unknown keys pass through
+    untouched.
+    """
+    text = Path(input_path).read_text()
+    try:
+        cleaned = config_tools.clean_config_text(text)
+    except ValueError as e:
+        err_console.print(f"[red]{e}[/red]")
+        sys.exit(1)
+    _write_config_output(cleaned, output, force=force, backup=backup)
+
+
+@config_group.command("dump")
+@click.option(
+    "--preset",
+    "-p",
+    "presets",
+    multiple=True,
+    help="Same as `process --preset` -- applied as its own cascade layer, interleaved with "
+    "--config in command-line order.",
+)
+@click.option(
+    "--config",
+    "config_layers",
+    type=click.Path(),
+    multiple=True,
+    help="Same as `process --config` -- an additional layer merged on top, interleaved with "
+    "--preset in command-line order. Must already exist.",
+)
+@click.option(
+    "--set",
+    "set_overrides",
+    multiple=True,
+    help="Same as `process --set KEY=VALUE` -- applied last, repeatable.",
+)
+@click.option(
+    "--with-secrets",
+    is_flag=True,
+    help="Emit real secret values (api_key, etc.) instead of redacting them to '***'.",
+)
+@click.option(
+    "-o", "--output", type=click.Path(), default=None, help="Write to this path instead of stdout."
+)
+@click.option("--force", is_flag=True, help="Overwrite an existing --output file.")
+@click.option(
+    "--backup",
+    is_flag=True,
+    help="Rename an existing --output file aside (PATH.1, PATH.2, ...) before writing.",
+)
+@click.pass_context
+def config_dump(
+    ctx: click.Context,
+    presets: tuple[str, ...],
+    config_layers: tuple[str, ...],
+    set_overrides: tuple[str, ...],
+    with_secrets: bool,
+    output: str | None,
+    force: bool,
+    backup: bool,
+) -> None:
+    """Dump the EFFECTIVE config (DEFAULTS + user config.yaml + these layers).
+
+    Accepts the same --preset/--config/--set layering `process` does (only
+    these three config-affecting options -- other `process` flags aren't
+    part of `dump`), so you can see exactly what a given invocation would
+    run with. Secrets are redacted to "***" by default.
+    """
+    config = copy.deepcopy(ctx.obj["config"])
+
+    occurrences = _scan_config_dump_argv()
+    argv_usable = (
+        _repeatable_matches(occurrences, {"--preset", "-p"}, presets)
+        and _repeatable_matches(occurrences, {"--config"}, config_layers)
+        and _repeatable_matches(occurrences, {"--set"}, set_overrides)
+    )
+    if argv_usable and occurrences:
+        layer_seq = [
+            (("preset" if flag in ("--preset", "-p") else "config"), val)
+            for flag, val, _idx in occurrences
+            if flag in ("--preset", "-p", "--config") and val is not None
+        ]
+    else:
+        layer_seq = [("preset", v) for v in presets] + [("config", v) for v in config_layers]
+
+    for kind, value in layer_seq:
+        if kind == "preset":
+            config.apply_layer(_resolve_preset_layer(value), f"preset:{value}")
+        else:
+            config.apply_layer(_resolve_config_layer(value), f"config:{value}")
+
+    final_layer: dict[str, Any] = {}
+    for raw in set_overrides:
+        key_path, value = _parse_set_option(raw)
+        _set_nested(final_layer, key_path, value)
+    if final_layer:
+        config.apply_layer(final_layer, "cli-flags")
+
+    data = config.data if with_secrets else redact_secrets(config.data)
+    text = config_tools.dump_config_text(data)
+    _write_config_output(text, output, force=force, backup=backup)
+
+
+@config_group.command("upgrade")
+@click.argument("input_path", type=click.Path(exists=True, dir_okay=False))
+@click.option(
+    "-o", "--output", type=click.Path(), default=None, help="Write to this path instead of stdout."
+)
+@click.option(
+    "--template",
+    "template_path",
+    type=click.Path(exists=True, dir_okay=False),
+    default=None,
+    help="Use this template instead of the packaged default (docs/config.example.yaml).",
+)
+@click.option(
+    "--drop-unknown",
+    is_flag=True,
+    help="Omit INPUT keys absent from the template (with a per-key warning) instead of "
+    "refusing to write.",
+)
+@click.option("--force", is_flag=True, help="Overwrite an existing --output file.")
+@click.option(
+    "--backup",
+    is_flag=True,
+    help="Rename an existing --output file aside (PATH.1, PATH.2, ...) before writing.",
+)
+def config_upgrade(
+    input_path: str,
+    output: str | None,
+    template_path: str | None,
+    drop_unknown: bool,
+    force: bool,
+    backup: bool,
+) -> None:
+    """Apply INPUT's settings onto the config template, leaf by leaf.
+
+    Output is the template's FULL text (comments, ordering, new options at
+    their documented defaults) with each leaf value INPUT specifies replaced
+    in place at the same tree path -- lists (e.g. pipeline.default_order)
+    are atomic leaves, replaced wholesale, never merged element-wise. Input
+    keys absent from the template (renamed/removed/moved options) are
+    refused unless --drop-unknown.
+    """
+    input_text = Path(input_path).read_text()
+    template_text = (
+        Path(template_path).read_text() if template_path else config_tools.default_template_text()
+    )
+    try:
+        upgraded, warnings = config_tools.upgrade_config_text(
+            input_text, template_text, drop_unknown=drop_unknown
+        )
+    except config_tools.ConfigUpgradeError as e:
+        err_console.print(f"[red]{e}[/red]")
+        sys.exit(1)
+    except ValueError as e:
+        err_console.print(f"[red]{e}[/red]")
+        sys.exit(1)
+    for key in warnings:
+        err_console.print(
+            f"[yellow]Warning: dropping unknown key not present in template: {key}[/yellow]"
+        )
+    _write_config_output(upgraded, output, force=force, backup=backup)
 
 
 @main.command()

@@ -387,8 +387,39 @@ in `core/pipeline.py`):
   `_print_summary()` reports Skipped as its own line (with sub-reasons), separate from Failed. The
   GUI's job table renders a SKIPPED job as "Skipped", not "Failed"
   (`gui/main_window.py::_on_job_complete`).
-- Not yet implemented: § 6.8 (`avf config clean|upgrade|dump`) — see `docs/REQUIREMENTS.md` § 6
-  for the full planned set and delivery order.
+## Config tooling: `avf config clean | dump | upgrade` (REQUIREMENTS.md § 6.8)
+
+An `avf config` command group (`cli.py`, thin Click wiring only) over pure helpers in
+`cli/config_tools.py` (all unit-testable without a `CliRunner`). Each subcommand writes to
+`-o/--output` or, with no `-o`, to **stdout** — and stdout is a pure YAML data stream, so all
+diagnostics (errors, warnings, backup notices) go to `err_console` (stderr) instead, or piping
+to a file would corrupt it.
+
+- **`clean INPUT`**: normalize a config to canonical bare YAML — comments stripped, only the
+  keys actually present in INPUT (no DEFAULTS merged), key order preserved. A formatter, not a
+  validator (unknown keys pass through); a non-mapping root is a hard error.
+- **`dump`**: emit the EFFECTIVE config (DEFAULTS + user `config.yaml` + layers) as bare YAML.
+  Accepts the same config-affecting layering `process` does — `--preset`/`--config`/`--set`,
+  argv-order-interleaved via `_scan_config_dump_argv()` + `_repeatable_matches()` (the same
+  recovery mechanism `process` uses; other `process` flags are NOT part of `dump`). Secrets
+  redacted to `***` via `redact_secrets()` unless `--with-secrets`.
+- **`upgrade INPUT`**: apply INPUT's leaf values onto a template (`--template`, default the
+  packaged `config.example.yaml`) using **ruamel.yaml** round-trip mode so the template's
+  comments/order/new-option defaults survive; only leaves INPUT specifies are overwritten
+  in place. **Lists are atomic leaves** (e.g. `pipeline.default_order`) — replaced wholesale,
+  never merged. Input keys ABSENT from the template (renamed/removed/moved, or a dict-vs-leaf
+  type mismatch) → `ConfigUpgradeError` (refuse, exit 1) unless `--drop-unknown`, which omits
+  them with a per-key stderr warning. Template keys that exist only inside a comment count as
+  absent (documented limitation).
+- **File safety** (all three, when `-o` names an existing file): refuse by default (exit 1),
+  `--force` overwrites, `--backup` renames the existing file to the first unused `PATH.1`,
+  `PATH.2`, … and prints the rename to stderr. `--force`+`--backup` together is an error.
+  `config_tools.apply_file_safety()`.
+- **Packaged template**: `docs/config.example.yaml` is the human-edited canonical source;
+  `src/autovideofixer/data/config.example.yaml` is a byte-identical shipped copy (hatchling
+  includes it automatically under the package dir; `default_template_text()` reads it via
+  `importlib.resources`) so `upgrade` works without a repo checkout. A unit test asserts the
+  two never drift — when you edit the docs file, copy it to `data/` in the same change.
 
 ## Log types: raw / clean / both / none (REQUIREMENTS.md § 6.7)
 
