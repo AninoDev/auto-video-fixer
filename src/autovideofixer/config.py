@@ -628,6 +628,8 @@ class Config:
                 # per-chunk ffmpeg startup/concat overhead and the input runs as one chunk.
                 "min_chunk_duration_sec": 5.0,
                 "temp_crf": 16,  # see "upscale".temp_crf above; only used by the AI/RIFE path
+                "read_ahead": 2,  # see "upscale".read_ahead above; AI/RIFE path only
+                "write_queue_depth": 4,  # see "upscale".write_queue_depth above; AI/RIFE path only
             },
             "denoise_video": {
                 "enabled": True,

@@ -7,6 +7,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **2026-07-20: RIFE AI-interpolation RAM blow-up (streamed output, crash-resilient MKV temp)**:
+  `InterpolateStage._execute_ai` used to accumulate the ENTIRE interpolated output in RAM before
+  writing it out once -- the chunked path (`frame_count > 1000`) did
+  `all_interpolated.extend(chunk_interp)` every chunk, holding every OUTPUT frame for the whole
+  clip, and the non-chunked path (`<= 1000` frames) called `extract_frames()` to load the ENTIRE
+  input up front. Because interpolation produces `factor`x MORE frames than it reads, a 61s 4K
+  30->60fps scene meant ~3667 output frames * ~24.9MB ~= 91GB resident -- a real incident hit a
+  56GB LXC memory cap, swapped to ~76GB, and froze the host until `pkill`, made worse by scene
+  mode's up-to-4 concurrent scene workers each holding their own buffer. `interpolate` was the
+  last of the four AI-capable stages (`upscale`/`deblock`/`denoise_video` were fixed earlier)
+  still on this pattern. Now mirrors those three: streams every chunk straight to
+  `ai/frame_pipe.get_frame_reader()`/`get_frame_writer()` and discards it immediately after
+  `write_batch()`, so peak memory is bounded by `chunk_size * factor` (~50 frames at the default
+  `chunk_size=25`, factor 2) instead of `total_frames * factor`. The old `use_chunked`/
+  `frame_count > 1000` threshold and its `extract_frames()`/`frames_to_video()` full-buffer route
+  are gone entirely -- all videos stream regardless of length. The interpolation-specific
+  cross-chunk carry-frame logic (prepend the previous chunk's last frame so a real interpolated
+  frame is generated across chunk boundaries instead of a hard stutter every `chunk_size` source
+  frames, then drop the re-emitted duplicate from the next chunk's output) is preserved exactly.
+  New `stages.interpolate.read_ahead`/`write_queue_depth` config keys (default `2`/`4`, matching
+  the other three AI stages).
+  - **MKV crash-resilient temp**: the AI/RIFE path's internal temp file is now Matroska (`.mkv`,
+    H.264) instead of `.mp4` -- Matroska is written incrementally, so a partial file stays
+    playable/recoverable if the process is killed mid-write (OOM, host shutdown, power loss),
+    unlike MP4, whose `moov` index is only written at clean finalize. H.264-in-MKV remains
+    stream-copyable (`-c:v copy`) into the stage's final MP4 output, so the existing audio-mux
+    finalize pass already IS the MKV->MP4 remux, unchanged. On a hard kill, the temp simply
+    survives on disk (the `finally` cleanup never runs) -- the primary benefit, and free. On a
+    graceful in-stage failure (mux failure, write failure, inference exception), the partial is
+    now renamed to a visible `<output_stem>_interp_partial.mkv` sibling and logged at WARNING
+    instead of silently deleted, so a user can inspect how far it got and judge whether a rerun
+    is worthwhile.
+  - New `tests/unit/test_interpolate_streaming.py`: streaming/no-accumulation regression guard
+    (per-chunk `write_batch()` calls, bounded peak batch size), exact carry-frame dedup total
+    across multi-chunk boundaries, `frames_out` metadata, `.mkv` temp path, partial-preservation
+    on graceful failure, and empty-interpolator-output FAILED handling.
+
 ### Added
 - **2026-07-20: Config tooling `avf config clean | dump | upgrade` (REQUIREMENTS.md § 6.8,
   commit 4/4 — final commit of the output-handling/reporting work)**: new `avf config` command

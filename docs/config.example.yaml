@@ -525,7 +525,13 @@ stages:
     # the input runs as a single (serial) chunk regardless of parallel_chunks.
     min_chunk_duration_sec: 5.0
     # See stages.upscale.temp_crf above -- only used by the AI/RIFE path's internal temp encode.
+    # The AI/RIFE path's internal temp encode is Matroska (.mkv, H.264), not .mp4: MKV is written
+    # incrementally, so a partial file stays playable/recoverable even if the process is killed
+    # mid-write (OOM, host shutdown, power loss) -- unlike MP4, whose moov index is only written
+    # at clean finalize. Stream-copyable into the final MP4 output either way.
     temp_crf: 16
+    read_ahead: 2         # see stages.upscale.read_ahead above; AI/RIFE path only
+    write_queue_depth: 4  # see stages.upscale.write_queue_depth above; AI/RIFE path only
 
   denoise_video:
     enabled: true

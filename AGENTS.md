@@ -103,17 +103,20 @@ avf_framepipe` / `except ImportError`, falling back to thin Python wrapper class
 (`FrameProcessor.stream_frames_prefetched()` for reading, `AsyncVideoWriter(StreamingVideoWriter(...))`
 for writing) — exposing the identical `next_batch()`/`frames_read()`/`close()` (reader) and
 `write_batch()`/`frames_written()`/`close()` (writer) surface either way, so `upscale`/`deblock`/
-`denoise_video`'s stage loops never branch on backend. `frame_processor.py` itself is **untouched**
-by this — it's still the fallback implementation and still directly usable by anything that doesn't
-need transport-backend selection (e.g. `interpolate`'s AI/RIFE path, which still buffers frames in
-a list rather than streaming — see "Kill the ≤1000-frame full-buffering path" below). Two fallback
-parity gaps worth knowing: `write_queue`/`write_queue_depth` only actually varies the Rust
-backend's channel bound (`AsyncVideoWriter`'s queue depth is a hardcoded constant `frame_processor.py`
-wasn't modified to expose); and the Python fallback's `frames_written()` counts frames as they're
-*enqueued* rather than as they're actually flushed to the ffmpeg pipe (both converge to the same
-final count once `close()` returns). New config keys `stages.<name>.read_ahead` (default `2`) and
-`stages.<name>.write_queue_depth` (default `4`) on `upscale`/`deblock`/`denoise_video` plumb into
-these factories; `chunk_size` (`25`) stays a call-site constant, not a config key.
+`denoise_video`/`interpolate`'s stage loops never branch on backend. `frame_processor.py` itself is
+**untouched** by this — it's still the fallback implementation and still directly usable by
+anything that doesn't need transport-backend selection. Two fallback parity gaps worth knowing:
+`write_queue`/`write_queue_depth` only actually varies the Rust backend's channel bound
+(`AsyncVideoWriter`'s queue depth is a hardcoded constant `frame_processor.py` wasn't modified to
+expose); and the Python fallback's `frames_written()` counts frames as they're *enqueued* rather
+than as they're actually flushed to the ffmpeg pipe (both converge to the same final count once
+`close()` returns). New config keys `stages.<name>.read_ahead` (default `2`) and
+`stages.<name>.write_queue_depth` (default `4`) on `upscale`/`deblock`/`denoise_video`/`interpolate`
+plumb into these factories; `chunk_size` (`25`) stays a call-site constant, not a config key.
+`interpolate`'s AI/RIFE path used to be the one holdout still buffering its ENTIRE output in a
+Python list before writing (see "AI stage temp-encode quality and the chunked streaming path"
+below) — it now streams through `get_frame_reader()`/`get_frame_writer()` exactly like the other
+three AI stages.
 
 A fourth crate, `rust/avf_borders/` (per-edge, arbitrary-color border/letterbox detection for the
 `crop` stage), followed the same workspace/build pattern (`[tool.uv.workspace]` member,
@@ -712,35 +715,75 @@ uniform instead of fragmenting the CUDA caching allocator with a one-off `N`.
 ### AI stage temp-encode quality and the chunked streaming path
 
 `upscale`/`deblock`/`denoise_video`/`interpolate`'s AI paths each write AI-processed frames to an
-internal temp `.mp4` (`StreamingVideoWriter` or `FrameProcessor.frames_to_video()`), then mux that
-temp file's video track against the original audio to produce the stage's real output. Both the
-temp encode and the mux pass now take **explicit** `crf`/`preset` args instead of relying on
-implicit defaults:
-- The temp encode passes `stages.<name>.temp_crf` (new config key, default `16`) and the
-  hardcoded preset `"medium"` (not itself a config key). Previously this write had NO `-crf`/
-  `-preset` at all, silently landing on libx264's own default (CRF 23).
+internal temp file (`get_frame_writer()`/`StreamingVideoWriter`), then mux that temp file's video
+track against the original audio to produce the stage's real output. Both the temp encode and the
+mux pass take **explicit** `crf`/`preset` args instead of relying on implicit defaults:
+- The temp encode passes `stages.<name>.temp_crf` (config key, default `16`) and the hardcoded
+  preset `"medium"` (not itself a config key). Previously this write had NO `-crf`/`-preset` at
+  all, silently landing on libx264's own default (CRF 23).
 - The mux pass now uses `-c:v copy` (verified bit-identical to the temp file's video stream via
   stream-hash comparison), NOT a second `-crf 18` re-encode. Previously every AI stage muxed with
   `-c:v libx264 -crf 18`, meaning AI-processed frames were encoded TWICE at two different quality
   levels — a real quality bug (the temp's CRF-23 generation was baked in before the mux's CRF-18
   pass ever saw it) plus a wasted full x264 pass over the whole video for no benefit.
 - `interpolate`'s AI/RIFE path had the identical double-encode pattern in its own internal temp +
-  mux and got the same fix (also gained its own `stages.interpolate.temp_crf`, default 16) — it's
-  architecturally separate from the other three (still buffers frames in a list before writing,
-  not the streaming path below) but shared the exact same bug.
+  mux and got the same fix (also gained its own `stages.interpolate.temp_crf`, default 16).
 
-All AI-capable videos (`upscale`/`deblock`/`denoise_video`) now go through the chunked streaming
-path (`ai/frame_pipe.get_frame_reader()`/`get_frame_writer()`, `chunk_size=25` — see "Mixed
-Python/Rust" above for the Rust-backed `avf_framepipe` transport and its Python fallback)
-regardless of frame count — the old `total_est > 1000` frame-count threshold and its full-buffer
-`extract_frames()` → flat list → `frames_to_video()` route are gone from these three stages'
-`_execute_ai()`/`_run_single_ai_pass()`. That threshold was resolution-blind: a short but
-large-resolution (e.g. 4K) clip could still fall under 1000 frames while materializing its ENTIRE
-frame set in RAM (a 33s 4K clip is ~25GB uncompressed), with zero decode/inference/write overlap.
-Streaming has no measurable downside for short clips either, so there's no longer a reason to keep
-two code paths. `extract_frames()`/`frames_to_video()` themselves are untouched in
-`ai/frame_processor.py` — other callers (`interpolate`'s AI path, `frames_to_temp_video()`) still
-use them directly (not through `ai/frame_pipe.py`).
+All AI-capable videos (`upscale`/`deblock`/`denoise_video`/`interpolate`) now go through the
+chunked streaming path (`ai/frame_pipe.get_frame_reader()`/`get_frame_writer()`, `chunk_size=25` —
+see "Mixed Python/Rust" above for the Rust-backed `avf_framepipe` transport and its Python
+fallback) regardless of frame count — the old `total_est > 1000`/`frame_count > 1000` frame-count
+thresholds and their full-buffer `extract_frames()` → flat list → `frames_to_video()` routes are
+gone from all four stages' `_execute_ai()`/`_run_single_ai_pass()`. That threshold was
+resolution-blind: a short but large-resolution (e.g. 4K) clip could still fall under 1000 frames
+while materializing its ENTIRE frame set in RAM (a 33s 4K clip is ~25GB uncompressed), with zero
+decode/inference/write overlap. Streaming has no measurable downside for short clips either, so
+there's no longer a reason to keep two code paths.
+
+**`interpolate` was the last holdout, fixed separately (2026-07-20)**: unlike the other three
+stages (which read N frames and write N frames, so a chunk's output size equals its input size),
+interpolation's `_execute_ai` writes `factor`x MORE frames than it reads per chunk — the old
+`all_interpolated.extend(chunk_interp)` accumulation (chunked path, `frame_count > 1000`) held
+every OUTPUT frame in RAM for the whole clip, and the non-chunked path (`<= 1000` frames) called
+`extract_frames()` to load the ENTIRE input up front. For a 61s 4K 30→60fps scene that's ~3667
+output frames * ~24.9MB ≈ 91GB resident — enough to OOM/swap-thrash the host (confirmed real
+incident: hit a 56GB LXC cap, swapped to ~76GB, froze the host until `pkill`), amplified further by
+scene mode's up-to-4 concurrent scene workers each holding their own buffer. `_execute_ai` now
+streams each chunk straight to `get_frame_writer()` and discards it immediately after
+`write_batch()` — peak memory is bounded by `chunk_size * factor` (~50 frames for the default
+`chunk_size=25`, factor 2), not `total_frames * factor`. The cross-chunk **carry-frame logic is
+unchanged**: the previous chunk's last frame is still prepended (`extended = [carry_frame,
+*chunk]`) so a real interpolated frame is generated across chunk boundaries instead of a hard
+stutter every `chunk_size` source frames, and `chunk_interp[0]` (the re-emitted carried frame) is
+still dropped before writing when a carry was prepended — this logic is interpolation-specific
+(the other three AI stages have no equivalent) and is covered by
+`tests/unit/test_interpolate_streaming.py`'s `TestStreamingNoAccumulation` (exact total-frame-count
+assertions across multi-chunk boundaries, plus a peak-single-batch-size regression guard).
+
+`interpolate`'s AI-path temp file is also now **Matroska (`.mkv`, H.264)**, not `.mp4` — the ONLY
+one of the four AI stages using MKV for its internal temp (`upscale`/`deblock`/`denoise_video`
+still use `.mp4`, since their fast N-in-N-out completion time makes a truncated temp far less
+costly to just re-run). Matroska is written incrementally (clusters flushed as they go), so a
+partial file stays playable/recoverable if the process is killed mid-write (OOM, host shutdown,
+power loss) — default MP4 only writes its `moov` index at clean finalize, so a truncated MP4 is
+unplayable. H.264-in-MKV remains stream-copyable (`-c:v copy`) into the stage's final MP4 output,
+so this costs nothing at finalize time — the existing audio-mux finalize pass IS the MKV→MP4
+remux, unchanged. Partial-output handling on failure:
+- **Hard kill** (SIGKILL/OOM/power loss): the `finally`-based temp cleanup simply never runs, so
+  the partial `.mkv` survives in place at its last flushed cluster — this is the primary benefit
+  and falls out for free; nothing preemptively deletes it.
+- **Graceful in-stage failure** (mux returns nonzero, a write failure, an inference exception):
+  instead of silently unlinking the partial, `InterpolateStage._preserve_or_discard_partial_temp()`
+  renames it to a visible sibling of the intended output, `<output_stem>_interp_partial.mkv`, and
+  logs its path at WARNING ("partial interpolated output preserved for inspection: ...") so the
+  user can inspect how far it got — falling back to leaving the temp in place if the rename itself
+  fails. Covered by `tests/unit/test_interpolate_streaming.py`'s `TestPartialOutputPreservation`.
+- **Success**: the temp is deleted in `finally` once the muxed output supersedes it (unchanged
+  behavior).
+
+`extract_frames()`/`frames_to_video()` themselves are untouched in `ai/frame_processor.py` — they
+remain the fallback implementation for anything not using `ai/frame_pipe.py`'s transport
+selection.
 
 ### Pinned staging pool (torch backend, CUDA only)
 
@@ -782,8 +825,11 @@ end (`StageTimer.summary()`). Independently, periodic throughput (`frames_done`,
 `current_fps`) logs at INFO every ~10s or 10 chunks (whichever first) — this exists specifically
 so a run killed early by an external timeout (e.g. a truncating `timeout` wrapper) still yields a
 valid frames/sec curve instead of nothing; see `docs/REQUIREMENTS.md`'s R5.3 note on the 4K
-benchmark this was retroactively needed for. `interpolate`'s RIFE path is NOT instrumented (it
-doesn't share this loop shape — see "Kill the ≤1000-frame full-buffering path" below).
+benchmark this was retroactively needed for. `interpolate`'s RIFE path streams through the same
+`ai/frame_pipe.py` transport now (see "AI stage temp-encode quality and the chunked streaming
+path" above) but is still NOT wired up to `StageTimer` — its per-chunk loop shape differs (carry-
+frame prepend/drop, `factor`x output growth per chunk) enough that reusing the shared instrumentation
+wasn't in scope for the streaming fix; a future pass could add it.
 
 ## Upscaling & Aspect Ratio
 

@@ -441,7 +441,6 @@ class InterpolateStage(BaseStage):
             factor = 2
 
         try:
-            from autovideofixer.ai.frame_processor import FrameProcessor
             from autovideofixer.ai.torch_utils import is_torch_available
             from autovideofixer.ai.wrappers.interpolate import RIFEInterpolator
         except ImportError:
@@ -551,27 +550,75 @@ class InterpolateStage(BaseStage):
             )
 
         try:
-            proc = FrameProcessor()
-            # Stream frames in chunks to avoid loading entire video into memory.
-            use_chunked = probe_info.frame_count and probe_info.frame_count > 1000
+            from autovideofixer.ai.frame_pipe import get_frame_reader, get_frame_writer
 
-            if use_chunked:
-                chunk_size = 25
-                all_interpolated: list[Any] = []
-                total_original_frames = probe_info.frame_count
-                processed = 0
-                carry_frame: Any = None
+            # Stream every chunk straight to a frame writer instead of
+            # accumulating the whole interpolated output in RAM. Interpolation
+            # produces `factor`x MORE frames than it reads, so the old
+            # `all_interpolated.extend(...)`-per-chunk (chunked path) / full
+            # `extract_frames()` (non-chunked, <=1000-frame path) both held
+            # every OUTPUT frame for the entire clip -- for a 61s 4K 30->60fps
+            # scene that's ~3667 frames * ~24.9MB = ~91GB resident, enough to
+            # OOM/swap-thrash the host. ALL videos now go through this single
+            # streaming path regardless of frame count (the old `use_chunked`
+            # / `frame_count > 1000` threshold is gone entirely) -- mirrors
+            # UpscaleStage._execute_ai (upscale.py), the last other AI stage
+            # to carry this same full-buffer pattern before it was fixed.
+            chunk_size = 25
+            read_ahead = self._stage_config.get("read_ahead", 2)
+            write_queue_depth = self._stage_config.get("write_queue_depth", 4)
+            in_width, in_height = probe_info.resolution
+            total_original_frames = probe_info.frame_count or 0
 
-                def cb(current, total, msg):
-                    self._report_progress(
-                        0.1 + (processed / total_original_frames) * 0.9,
-                        msg,
-                        progress_callback,
-                    )
+            reader = get_frame_reader(
+                input_path,
+                in_width,
+                in_height,
+                chunk_size=chunk_size,
+                read_ahead=read_ahead,
+            )
 
-                for chunk in proc.stream_frames(
-                    input_path, chunk_size=chunk_size, max_frames=total_original_frames
-                ):
+            source_fps = current_fps if current_fps else self._get_input_fps(input_path)
+            fps = source_fps * factor
+
+            # The temp file is DELIBERATELY Matroska (.mkv, H.264), not .mp4:
+            # Matroska is written incrementally with clusters flushed as they
+            # go, so a partial file stays playable/recoverable even if the
+            # process is killed mid-write (OOM, host shutdown, power loss).
+            # Default MP4 only writes its moov index at clean finalize, so a
+            # truncated MP4 (the old behavior here) is unplayable if the
+            # process dies mid-stream. H.264-in-MKV remains stream-copyable
+            # (`-c:v copy`) into the final MP4 below, so this costs nothing
+            # at finalize time. (The extension is still deliberately NOT
+            # derived from the input's own extension -- get_frame_writer
+            # always muxes with codec="libx264", which not every input
+            # container can hold; ".mkv" always matches the actual codec
+            # being written.)
+            temp_path = os.path.join(
+                os.path.dirname(input_path) or ".",
+                f".avf_interp_{os.path.splitext(os.path.basename(input_path))[0]}.mkv",
+            )
+
+            writer: Any = None
+            frames_written = 0
+            processed = 0
+            carry_frame: Any = None
+            temp_crf = self._stage_config.get("temp_crf", 16)
+
+            def cb(current, total, msg):
+                denom = total_original_frames or 1
+                self._report_progress(
+                    0.1 + (processed / denom) * 0.9,
+                    msg,
+                    progress_callback,
+                )
+
+            try:
+                while True:
+                    chunk = reader.next_batch()
+                    if chunk is None:
+                        break
+
                     # Carry the previous chunk's last frame into this chunk
                     # so a real interpolated frame is generated across the
                     # chunk boundary instead of a hard stutter every
@@ -586,76 +633,63 @@ class InterpolateStage(BaseStage):
                         # previous chunk's final output element -- drop the
                         # duplicate.
                         chunk_interp = chunk_interp[1:]
-                    all_interpolated.extend(chunk_interp)
+
+                    if writer is None and chunk_interp:
+                        out_h, out_w = chunk_interp[0].shape[:2]
+                        writer = get_frame_writer(
+                            temp_path,
+                            out_w,
+                            out_h,
+                            fps,
+                            crf=temp_crf,
+                            preset="medium",
+                            write_queue=write_queue_depth,
+                        )
+                    # Write straight to the ffmpeg pipe and discard --
+                    # `chunk_interp` is never appended to a running list, so
+                    # peak memory stays ~chunk_size*factor frames, not
+                    # total_frames*factor.
+                    if writer is not None:
+                        writer.write_batch(chunk_interp)
+                        frames_written += len(chunk_interp)
+
                     carry_frame = chunk[-1]
                     processed += len(chunk)
 
                     self._report_progress(
-                        0.1 + (processed / total_original_frames) * 0.9,
+                        0.1 + (processed / (total_original_frames or 1)) * 0.9,
                         "Interpolating chunk...",
                         progress_callback,
                     )
-                proc.close()
-                interpolated = all_interpolated
-            else:
-                frames = proc.extract_frames(input_path)
-                proc.close()
+                reader.close()
+                write_ok = writer.close() if writer is not None else False
+            except Exception:
+                reader.close()
+                if writer is not None:
+                    writer.close()
+                # A genuine in-loop failure (e.g. inference exception) is a
+                # graceful in-stage failure, not a hard kill -- preserve
+                # whatever was flushed so far instead of leaking/discarding
+                # it, then re-raise so the outer except still routes through
+                # _ai_fallback_or_fail.
+                self._preserve_or_discard_partial_temp(temp_path, output_path)
+                raise
 
-                if not frames:
-                    return StageResult(
-                        status=StageStatus.FAILED,
-                        error="No frames extracted from input video",
-                        duration_sec=time.time() - start,
-                    )
-
-                def cb(current, total, msg):
-                    self._report_progress(0.1 + (current / total) * 0.9, msg, progress_callback)
-
-                interpolated = interpolator.interpolate_video(
-                    frames, factor=factor, progress_callback=cb
-                )
-
-            if not interpolated:
+            if frames_written == 0:
                 return StageResult(
                     status=StageStatus.FAILED,
                     error="No frames produced by interpolator",
                     duration_sec=time.time() - start,
                 )
+            if not write_ok:
+                self._preserve_or_discard_partial_temp(temp_path, output_path)
+                return StageResult(
+                    status=StageStatus.FAILED,
+                    error="Failed to write interpolated frames to temp file",
+                    duration_sec=time.time() - start,
+                )
 
-            # Write interpolated frames to temp file, then use FFmpeg to finalize.
-            # Interpolation adds `factor`x more frames covering the SAME time
-            # span as the original clip, so the output must be written at
-            # `factor`x the original fps (i.e. the actual achieved framerate)
-            # to preserve duration. Using the original input's fps here (a
-            # pre-existing bug) kept the frame rate unchanged and instead
-            # stretched the clip's duration by `factor`x.
-            #
-            # The temp file's extension must NOT be derived from the input's
-            # extension: frames_to_video() always muxes with codec="libx264"
-            # (H.264), which webm/mkv/etc. containers can't hold -- so e.g. a
-            # .webm input produced a ".avf_interp_test.webm" temp target that
-            # ffmpeg then failed to write into. ".mp4" always matches the
-            # actual codec being written, regardless of input container.
-            temp_path = os.path.join(
-                os.path.dirname(input_path) or ".",
-                f".avf_interp_{os.path.splitext(os.path.basename(input_path))[0]}.mp4",
-            )
             try:
-                source_fps = current_fps if current_fps else self._get_input_fps(input_path)
-                fps = source_fps * factor
-                proc2 = FrameProcessor()
-                temp_crf = self._stage_config.get("temp_crf", 16)
-                if not proc2.frames_to_video(
-                    interpolated, temp_path, fps=fps, crf=temp_crf, preset="medium"
-                ):
-                    proc2.close()
-                    return StageResult(
-                        status=StageStatus.FAILED,
-                        error="Failed to write interpolated frames to temp file",
-                        duration_sec=time.time() - start,
-                    )
-                proc2.close()
-
                 # Mux the interpolated video back with the original audio (if
                 # any). Hardcoding "-map 0:a:0" on an audio-less input makes
                 # ffmpeg fail with no output file written; the return code was
@@ -669,7 +703,10 @@ class InterpolateStage(BaseStage):
                 # lossy generation plus a wasted full x264 pass over the
                 # whole video. Stream-copying the already-encoded video track
                 # makes this mux bit-identical to the temp file's video
-                # stream.
+                # stream -- and works unchanged with an MKV/H.264 temp, since
+                # `-c:v copy` only cares about the codec, not the container.
+                # This mux IS the "MKV -> MP4 remux" -- no separate step
+                # needed.
                 has_audio = probe_info.has_audio
                 mux_args = ["-i", input_path, "-i", temp_path]
                 if has_audio:
@@ -681,6 +718,10 @@ class InterpolateStage(BaseStage):
                 mux_result = run_ffmpeg(mux_args, timeout=self.stage_timeout())
 
                 if mux_result.returncode != 0 or not os.path.exists(output_path):
+                    # Graceful in-stage failure (not a hard kill): preserve the
+                    # partial MKV for inspection instead of silently unlinking
+                    # it in the `finally` below.
+                    self._preserve_or_discard_partial_temp(temp_path, output_path)
                     return StageResult(
                         status=StageStatus.FAILED,
                         error=f"Failed to mux interpolated output: {mux_result.stderr[:300]}",
@@ -697,17 +738,22 @@ class InterpolateStage(BaseStage):
                         "model": self._ai_model,
                         "factor": factor,
                         "frames_in": orig_count,
-                        "frames_out": len(interpolated),
+                        "frames_out": frames_written,
                     },
                     duration_sec=time.time() - start,
                 )
             finally:
-                # Always remove the internal temp file, on both the success
-                # and failure paths -- previously this only ran after a
-                # successful frames_to_video() + before the mux-result check,
-                # so any failure before that point (e.g. a codec/container
-                # mismatch) orphaned a partial temp file next to the user's
-                # source video.
+                # SUCCESS-path cleanup only: remove the internal temp file
+                # once the final muxed output supersedes it. On a HARD kill
+                # (SIGKILL/OOM/power loss) this `finally` never runs at all,
+                # so the partial .mkv simply survives on disk, playable up to
+                # its last flushed cluster -- that's the primary benefit of
+                # the MKV temp and is intentional; do NOT add code here that
+                # would preemptively delete it on some other path. Graceful
+                # in-stage failures are handled above via
+                # `_preserve_or_discard_partial_temp()` (rename, not delete)
+                # before this block ever runs, and both of those return
+                # early -- so if this line executes at all, mux succeeded.
                 if os.path.exists(temp_path):
                     os.unlink(temp_path)
 
@@ -727,6 +773,31 @@ class InterpolateStage(BaseStage):
             )
         finally:
             interpolator.unload()
+
+    def _preserve_or_discard_partial_temp(self, temp_path: str, output_path: str) -> None:
+        """On a graceful in-stage failure, rename the partial MKV temp aside.
+
+        A HARD kill (SIGKILL/OOM/power loss) never reaches this method at
+        all -- the process just dies and the partial `.mkv` survives at
+        `temp_path` untouched, playable up to its last flushed cluster. This
+        method only runs on a graceful failure the stage itself detected
+        (mux returned nonzero, an inference exception, a write failure) --
+        renaming to a visible sibling of the intended output lets the user
+        inspect how far interpolation got and judge whether a rerun is
+        worthwhile. Falls back to leaving the temp file in place if the
+        rename itself fails (e.g. cross-device, permissions).
+        """
+        if not os.path.exists(temp_path):
+            return
+        stem = os.path.splitext(output_path)[0]
+        partial_path = f"{stem}_interp_partial.mkv"
+        try:
+            os.replace(temp_path, partial_path)
+            self.logger.warning(
+                f"partial interpolated output preserved for inspection: {partial_path}"
+            )
+        except OSError as e:
+            self.logger.warning(f"could not preserve partial interpolated output: {e}")
 
     def _get_input_fps(self, path: str) -> float:
         """Get input video framerate."""
