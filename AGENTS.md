@@ -220,17 +220,26 @@ FFmpeg must be in PATH. Verify with `avf gpu-info`.
   gone -- `DEFAULTS["pipeline"]["default_order"]` (and a matching `DEFAULT_STAGE_ORDER` constant
   in `core/pipeline.py`, used only as a fallback when the config key is missing/empty) now
   **is** the actual execution order. Default order:
-  `detect, deblock, stabilize, crop, denoise_video, upscale, interpolate, normalize_volume,
-  normalize_audio, speed, hdr, encode`. Two changes from the previous hardcoded order:
-  - `deblock` now runs **before** `stabilize` (previously the reverse): blocking artifacts come
-    from the source video, so deblocking before stabilization's perspective warping keeps the
-    deblock model's input accurate (no warped block edges), and gives the stabilizer cleaner
-    detail to track motion against.
-  - `crop` sits right after `stabilize` and before every other enhancement stage: stabilize's
-    zoom-out correction can itself add a black border, so cropping after it removes both the
-    original letterboxing/pillarboxing AND any residual stabilization border in one pass; running
-    it before denoise/upscale/interpolate/encode means none of those (especially the AI-capable
+  `detect, crop, downscale, deblock, stabilize, denoise_video, upscale, interpolate,
+  normalize_volume, normalize_audio, speed, hdr, encode`.
+  - `crop` now runs **first**, right after `detect` (previously it ran after `stabilize`):
+    `stabilize`'s zoom is now a real percentile-based "borderless" zoom (not the old motion-guess
+    zoom), so it no longer leaves a black border for a later crop to clean up -- there's nothing
+    left for a post-stabilize crop to do. Running crop first also means `downscale` (which sits
+    right after `crop`, opt-in, off by default) and every other downstream stage size off the
+    already-cropped content instead of the full frame, so none of them (especially the AI-capable
     ones) spend compute on pixels about to be cropped away.
+  - `deblock` still runs **before** `stabilize`: blocking artifacts come from the source video, so
+    deblocking before stabilization's perspective warping keeps the deblock model's input accurate
+    (no warped block edges), and gives the stabilizer cleaner detail to track motion against.
+    `deblock` now also defaults to the compact, denoise-optimized `realesr-general-wdn-x4v3`
+    checkpoint (previously `RealESRGAN_x4plus`) -- it was trained on real-world degradation
+    including both compression/blocking AND noise, so this one early AI pass now covers both
+    artifact classes. As a result, `denoise_video` now defaults to **disabled**
+    (`stages.denoise_video.enabled: false`) -- it stays in `default_order` at its slot (after
+    `stabilize`, before `upscale`; omission != disable) for users who want a separate denoise pass
+    or set deblock back to an RRDB model. `max_quality` preset restores the old RRDB defaults
+    (`RealESRGAN_x4plus` for `deblock`/`upscale`) and keeps `denoise_video` enabled.
 
   Each `default_order` entry is either a plain stage name string (behaves exactly as before:
   this occurrence runs iff the stage is in the requested/auto-determined stage set) or a mapping
@@ -646,13 +655,16 @@ registry — stage pre-flight model checks must not gate an ncnn run on the torc
 `RealESRGANUpscaler.load_model()` (`ai/wrappers/upscale.py`) off each entry's `arch` field
 (default `"rrdb"` when absent, so every pre-existing entry is unaffected):
 
-- **RRDB (`RRDBNet`, default)** — `RealESRGAN_x4plus`, `RealESRGAN_x2plus`,
-  `RealESRGAN_x4plus_anime_6B`. ~16.7M params, the highest-quality restoration, and the default
-  for all three AI-capable stages. `deblock`/`denoise_video` (both run Real-ESRGAN at scale<=2)
-  and `upscale` (for scale<=2 requests) transparently substitute `RealESRGAN_x2plus` whenever the
-  configured model is literally `"RealESRGAN_x4plus"` (a strict `==` string check, e.g.
-  `core/stages/deblock.py`, `core/stages/denoise_video.py`) — this swap is model-name-string-based
-  and does NOT trigger for any other model name, compact or RRDB.
+- **RRDB (`RRDBNet`)** — `RealESRGAN_x4plus`, `RealESRGAN_x2plus`, `RealESRGAN_x4plus_anime_6B`.
+  ~16.7M params, the highest-quality restoration. Still the default for `upscale` and
+  `denoise_video`; `deblock` now defaults to the compact `realesr-general-wdn-x4v3` instead (see
+  below) since it doubles as a denoise pass — set `stages.deblock.ai_model:
+  RealESRGAN_x4plus` (the `max_quality` preset already does this) to restore the old RRDB
+  behavior. `deblock`/`denoise_video` (both run Real-ESRGAN at scale<=2) and `upscale` (for
+  scale<=2 requests) transparently substitute `RealESRGAN_x2plus` whenever the configured model is
+  literally `"RealESRGAN_x4plus"` (a strict `==` string check, e.g. `core/stages/deblock.py`,
+  `core/stages/denoise_video.py`) — this swap is model-name-string-based and does NOT trigger for
+  any other model name, compact or RRDB (so it does not fire for deblock's new compact default).
 - **Compact (`SRVGGNetCompact`)** — `realesr-general-x4v3` (`num_conv=32`), `realesr-general-wdn-x4v3`
   (`num_conv=32`, denoise-strength companion — official usage blends the two checkpoints' state
   dicts for a tunable `denoise_strength`; that blending is **not implemented**, this checkpoint is
@@ -1392,8 +1404,8 @@ Opt-in, off by default (`stages.crop.enabled: false`). See `core/stages/crop.py`
   unconditionally) when the resolved detector isn't `"cropdetect"` -- see the "Mixed Python/Rust"
   section's `avf_borders` writeup above for why (a luma-only prefilter would wrongly skip
   white/colored-bordered videos the rust pass could actually crop).
-- **Stage order**: right after `stabilize`, before every other enhancement/AI stage -- see the
-  "Pipeline Behavior" note above for why.
+- **Stage order**: right after `detect`, first in `default_order` -- see the "Pipeline Behavior"
+  note above for why (stabilize's zoom is now borderless, so crop no longer needs to run after it).
 - **Config** (`stages.crop`): `limit` (cropdetect luma threshold, default 24), `round` (even-
   dimension rounding, default 2), `min_crop_px` (skip entirely if the detected crop would save
   fewer than this many pixels in BOTH width and height, default 8 -- avoids a pointless 2px crop

@@ -353,20 +353,28 @@ pipeline:
   #   isn't in the configured order list. `encode` always stays last regardless.
   #
   # DEFAULTS itself stays plain strings (as below) so out-of-box behavior is unaffected by
-  # this feature -- the mapping form is opt-in. Note deblock now runs BEFORE stabilize
-  # (previously the reverse): blocking artifacts come from the source video, so deblocking
-  # before stabilization's perspective warping keeps the deblock model's input accurate and
-  # gives the stabilizer cleaner detail to track motion against. downscale sits right after
-  # crop: it's opt-in and off by default (stages.downscale.enabled), and shrinks an oversized
-  # input down to the target resolution box BEFORE the heavier deblock/denoise_video/upscale/
-  # interpolate stages run, so they never spend compute on pixels that would just be discarded
-  # downstream anyway. See core/stages/downscale.py.
+  # this feature -- the mapping form is opt-in. Note crop now runs FIRST, right after detect
+  # (previously it ran after stabilize): stabilize's zoom is now a real percentile-based
+  # "borderless" zoom (not the old motion-guess zoom), so it no longer leaves a black border
+  # for a later crop to clean up -- there's nothing left for a post-stabilize crop to do.
+  # downscale sits right after crop: it's opt-in and off by default
+  # (stages.downscale.enabled), and shrinks an oversized input down to the target resolution
+  # box BEFORE the heavier deblock/denoise_video/upscale/interpolate stages run, so they never
+  # spend compute on pixels that would just be discarded downstream anyway (and, since crop now
+  # runs first, downscale and every downstream stage size off the already-cropped content). See
+  # core/stages/downscale.py. deblock still runs before stabilize: blocking artifacts come from
+  # the source video, so deblocking before stabilization's perspective warping keeps the
+  # deblock model's input accurate and gives the stabilizer cleaner detail to track motion
+  # against. deblock also now defaults to the compact, denoise-optimized
+  # realesr-general-wdn-x4v3 model (see stages.deblock.ai_model below) instead of RRDB
+  # RealESRGAN_x4plus -- it doubles as a denoise pass, which is why denoise_video now defaults
+  # to disabled (stages.denoise_video.enabled: false below).
   default_order:
     - detect
-    - deblock
-    - stabilize
     - crop
     - downscale
+    - deblock
+    - stabilize
     - denoise_video
     - upscale
     - interpolate
@@ -380,9 +388,10 @@ pipeline:
   # time near the end at a different strength, regardless of stages.deblock.enabled:
   #   default_order:
   #     - detect
+  #     - crop
+  #     - downscale
   #     - deblock
   #     - stabilize
-  #     - crop
   #     - denoise_video
   #     - upscale
   #     - interpolate
@@ -403,9 +412,10 @@ pipeline:
   # resolves it exactly like any other stages.<name>.timeout value):
   #   default_order:
   #     - detect
+  #     - crop
+  #     - downscale
   #     - deblock
   #     - stabilize
-  #     - crop
   #     - denoise_video
   #     - upscale
   #     - interpolate
@@ -574,7 +584,13 @@ stages:
     write_queue_depth: 4  # see stages.upscale.write_queue_depth above; AI/RIFE path only
 
   denoise_video:
-    enabled: true
+    # Off by default: deblock's default ai_model (realesr-general-wdn-x4v3, see stages.deblock
+    # below) is trained on real-world degradation including noise, not just blocking, so its
+    # one early AI pass now covers denoising too and the other default stages don't introduce
+    # new noise. Stays in pipeline.default_order (omission != disable) so users who want a
+    # separate denoise pass -- or who set a different, denoise-focused deblock model -- can
+    # just flip this back on (or use the max_quality preset, which already does).
+    enabled: false
     # Reuses the Real-ESRGAN registry (denoise runs the model at scale=1, i.e. no spatial
     # upscaling -- artifact/noise removal as a side effect of super-resolution training).
     ai_model: RealESRGAN_x4plus
@@ -606,6 +622,11 @@ stages:
     # low, medium, high -- controls both filter amount and kernel size for the traditional
     # (unsharp-based) method.
     strength: medium
+    # Compact SRVGG general-v3 checkpoint trained on real-world degradation including
+    # compression/blocking artifacts AND noise -- ~3x faster than the RRDB RealESRGAN_x4plus
+    # model and doubles as a denoise pass (see stages.denoise_video.enabled above). Set back to
+    # RealESRGAN_x4plus for the old higher-fidelity RRDB behavior (max_quality preset does this).
+    ai_model: realesr-general-wdn-x4v3
     tile_size: 0        # see stages.upscale.tile_size above
     batch_size: 1       # see stages.upscale.batch_size above
     tile_batch_size: 1  # see stages.upscale.tile_batch_size above

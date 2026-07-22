@@ -27,7 +27,7 @@ class DeblockStage(BaseStage):
     def __init__(self, config, overrides: dict[str, Any] | None = None):
         super().__init__(config, overrides)
         self._strength = self._stage_config.get("strength", "medium")
-        self._ai_model = self._stage_config.get("ai_model", "RealESRGAN_x4plus")
+        self._ai_model = self._stage_config.get("ai_model", "realesr-general-wdn-x4v3")
 
     def should_run(self, input_info: dict[str, Any]) -> tuple[bool, str | None]:
         if not self.is_enabled():
@@ -169,16 +169,22 @@ class DeblockStage(BaseStage):
 
             # Deblocking runs Real-ESRGAN at scale=1 (no spatial upscaling): the
             # output is downscaled back from whatever the checkpoint's native
-            # scale is. x4plus's RRDB body runs at FULL input resolution (its
-            # native scale=4 means no pixel-unshuffle pre-shrink -- see
-            # RRDBNet docstring in ai/wrappers/upscale.py), and its upsample
-            # tail then produces activations at 4x width/height (16x the pixel
-            # count) before being thrown away by the scale=1 downscale. That
-            # tail is exactly what OOMs on 1080p+ input. x2plus pre-shrinks the
-            # body to half resolution AND caps the tail at 2x/4x pixel count
-            # instead of 4x/16x, so prefer it here whenever the user hasn't
-            # explicitly configured a different model -- same optimization
-            # UpscaleStage already applies for its own scale<=2 passes.
+            # scale is. The default ai_model is now the compact SRVGG
+            # realesr-general-wdn-x4v3 (see DEFAULTS["stages"]["deblock"] in
+            # config.py) -- an order of magnitude fewer params than the RRDB
+            # models, so this swap does NOT fire for the default. It only
+            # matters when a user explicitly sets ai_model back to
+            # "RealESRGAN_x4plus" (e.g. the max_quality preset): x4plus's RRDB
+            # body runs at FULL input resolution (its native scale=4 means no
+            # pixel-unshuffle pre-shrink -- see RRDBNet docstring in
+            # ai/wrappers/upscale.py), and its upsample tail then produces
+            # activations at 4x width/height (16x the pixel count) before
+            # being thrown away by the scale=1 downscale. That tail is
+            # exactly what OOMs on 1080p+ input. x2plus pre-shrinks the body
+            # to half resolution AND caps the tail at 2x/4x pixel count
+            # instead of 4x/16x, so prefer it whenever the user has
+            # explicitly opted into x4plus -- same optimization UpscaleStage
+            # already applies for its own scale<=2 passes.
             deblock_model = self._ai_model
             if deblock_model == "RealESRGAN_x4plus":
                 deblock_model = "RealESRGAN_x2plus"

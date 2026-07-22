@@ -31,6 +31,22 @@ class TestConfig:
         assert config.get("stages", "upscale", "enabled") is True
         assert config.get("stages", "interpolate", "ai_model") == "rife_v4.6"
 
+    def test_deblock_defaults_to_compact_denoise_optimized_model(self, tmp_path):
+        """deblock's default ai_model is the compact, denoise-optimized
+        realesr-general-wdn-x4v3 (not the RRDB RealESRGAN_x4plus) -- it
+        doubles as both deblock and denoise, which is why denoise_video
+        defaults to disabled (see the next test)."""
+        config = Config(tmp_path / "nonexistent.yaml")
+        assert config.get("stages", "deblock", "ai_model") == "realesr-general-wdn-x4v3"
+
+    def test_denoise_video_disabled_by_default(self, tmp_path):
+        """denoise_video defaults to disabled -- deblock's default ai_model
+        already covers denoising. It stays in pipeline.default_order at its
+        slot (omission != disable)."""
+        config = Config(tmp_path / "nonexistent.yaml")
+        assert config.get("stages", "denoise_video", "enabled") is False
+        assert "denoise_video" in config.get("pipeline", "default_order")
+
     def test_get_with_default(self, tmp_path):
         """Test getting values with defaults."""
         config = Config(tmp_path / "nonexistent.yaml")

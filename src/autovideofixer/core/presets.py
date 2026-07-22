@@ -112,8 +112,14 @@ PRESETS: dict[str, Preset] = {
             "encode": True,
         },
         stage_overrides={
-            "upscale": {"method": "ai", "scale_factor": 2.0},
+            # Pin the highest-quality RRDB models -- this preset is the
+            # explicit "maximum quality, slowest" option, so it should not
+            # inherit the faster/lower-fidelity compact realesr-general-
+            # wdn-x4v3 default (see DEFAULTS["stages"]["deblock"] in
+            # config.py).
+            "upscale": {"method": "ai", "scale_factor": 2.0, "ai_model": "RealESRGAN_x4plus"},
             "interpolate": {"method": "ai"},
+            "deblock": {"ai_model": "RealESRGAN_x4plus"},
             "denoise_video": {"method": "ai"},
         },
     ),
@@ -131,7 +137,9 @@ PRESETS: dict[str, Preset] = {
             "detect": True,
             "stabilize": True,
             "deblock": True,
-            "denoise_video": True,
+            # deblock's default ai_model (realesr-general-wdn-x4v3) already
+            # doubles as a denoise pass -- see DEFAULTS["stages"].
+            "denoise_video": False,
             "upscale": True,
             "interpolate": True,
             "normalize_volume": True,
@@ -153,7 +161,9 @@ PRESETS: dict[str, Preset] = {
             "detect": True,
             "stabilize": True,
             "deblock": True,
-            "denoise_video": True,
+            # deblock's default ai_model (realesr-general-wdn-x4v3) already
+            # doubles as a denoise pass -- see DEFAULTS["stages"].
+            "denoise_video": False,
             "upscale": True,
             "normalize_volume": True,
             "normalize_audio": False,  # duplicate of normalize_volume, see that stage's docstring
@@ -174,7 +184,9 @@ PRESETS: dict[str, Preset] = {
             "detect": True,
             "stabilize": True,
             "deblock": True,
-            "denoise_video": True,
+            # deblock's default ai_model (realesr-general-wdn-x4v3) already
+            # doubles as a denoise pass -- see DEFAULTS["stages"].
+            "denoise_video": False,
             "upscale": True,
             "interpolate": True,
             "normalize_volume": True,

@@ -62,6 +62,34 @@ class TestPresets:
         assert preset.enable_stages["interpolate"] is True
         assert preset.enable_stages["denoise_video"] is True
 
+    def test_max_quality_pins_rrdb_models(self):
+        """max_quality is the explicit "maximum quality, slowest" preset --
+        it must not inherit deblock's faster/lower-fidelity compact
+        realesr-general-wdn-x4v3 default, so it pins the RRDB models."""
+        preset = get_preset("max_quality")
+
+        assert preset.stage_overrides["deblock"]["ai_model"] == "RealESRGAN_x4plus"
+        assert preset.stage_overrides["upscale"]["ai_model"] == "RealESRGAN_x4plus"
+        # Existing upscale overrides are preserved, not clobbered.
+        assert preset.stage_overrides["upscale"]["method"] == "ai"
+        assert preset.stage_overrides["upscale"]["scale_factor"] == 2.0
+
+    def test_1080p60_4k60_4k30_denoise_video_disabled(self):
+        """1080p60/4k60/4k30 previously enabled denoise_video; they now leave
+        it disabled and inherit deblock's default denoise-optimized model
+        (realesr-general-wdn-x4v3) instead."""
+        for name in ("1080p60", "4k60", "4k30"):
+            preset = get_preset(name)
+            assert preset.enable_stages["denoise_video"] is False, name
+            assert preset.enable_stages["deblock"] is True, name
+
+    def test_hdr_enhance_denoise_video_still_enabled(self):
+        """hdr_enhance doesn't enable deblock -- denoise_video is its only
+        artifact-removal stage, so it stays on there deliberately."""
+        preset = get_preset("hdr_enhance")
+        assert preset.enable_stages["denoise_video"] is True
+        assert "deblock" not in preset.enable_stages
+
     def test_preset_size_reduction(self):
         """Test size reduction preset configuration."""
         preset = get_preset("size_reduction")

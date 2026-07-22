@@ -509,10 +509,25 @@ class Config:
             # for semantics. DEFAULTS itself stays plain strings so
             # out-of-box behavior is unaffected by this feature.
             #
-            # deblock now runs BEFORE stabilize (previously the reverse):
-            # blocking artifacts come from the source video, so deblocking
-            # before stabilization's perspective warping keeps the deblock
-            # model's input accurate (no warped block edges) and gives the
+            # crop now runs FIRST (right after detect), before stabilize:
+            # stabilize's zoom is now a real percentile-based "borderless"
+            # zoom (not the old motion-guess zoom), so it no longer leaves a
+            # black border for a later crop to clean up -- there's nothing
+            # left for a post-stabilize crop to do. Running crop first also
+            # means downscale (see below) and every downstream stage size
+            # off the already-cropped content instead of the full frame.
+            #
+            # deblock now defaults to the compact, denoise-optimized
+            # realesr-general-wdn-x4v3 model (see stages.deblock.ai_model
+            # below) instead of the RRDB RealESRGAN_x4plus checkpoint. That
+            # model was trained on real-world degradation including both
+            # compression/blocking AND noise, so one early AI pass now
+            # handles both artifact classes -- which is why
+            # stages.denoise_video.enabled defaults to False (see that key's
+            # own comment). deblock still runs before stabilize: blocking
+            # artifacts come from the source video, so deblocking before
+            # stabilization's perspective warping keeps the deblock model's
+            # input accurate (no warped block edges) and gives the
             # stabilizer cleaner detail to track motion against.
             #
             # downscale sits right after crop: it's opt-in and off by
@@ -523,10 +538,10 @@ class Config:
             # anyway. See core/stages/downscale.py.
             "default_order": [
                 "detect",
-                "deblock",
-                "stabilize",
                 "crop",
                 "downscale",
+                "deblock",
+                "stabilize",
                 "denoise_video",
                 "upscale",
                 "interpolate",
@@ -683,7 +698,16 @@ class Config:
                 "write_queue_depth": 4,  # see "upscale".write_queue_depth above; AI/RIFE path only
             },
             "denoise_video": {
-                "enabled": True,
+                # Off by default: deblock's default ai_model
+                # (realesr-general-wdn-x4v3) is trained on real-world
+                # degradation including noise, not just blocking, so its
+                # one early AI pass now covers denoising too and the other
+                # default stages don't introduce new noise. Stays in
+                # pipeline.default_order (omission != disable) so users who
+                # want a separate denoise pass -- or who set a different,
+                # denoise-focused deblock model -- can just flip this back
+                # on (or use a preset like max_quality that already does).
+                "enabled": False,
                 "ai_model": "RealESRGAN_x4plus",
                 "traditional_method": "hqdn3d",
                 "tile_size": 0,  # see "upscale".tile_size above
@@ -708,6 +732,14 @@ class Config:
             "deblock": {
                 "enabled": True,
                 "strength": "medium",  # low, medium, high
+                # Compact SRVGG general-v3 checkpoint trained on real-world
+                # degradation including compression/blocking artifacts AND
+                # noise -- ~3x faster than the RRDB RealESRGAN_x4plus model
+                # and doubles as a denoise pass (see stages.denoise_video's
+                # "enabled": False comment). Set back to "RealESRGAN_x4plus"
+                # for the old higher-fidelity RRDB behavior (max_quality
+                # preset does this).
+                "ai_model": "realesr-general-wdn-x4v3",
                 "tile_size": 0,  # see "upscale".tile_size above
                 "batch_size": 1,  # see "upscale".batch_size above
                 "tile_batch_size": 1,  # see "upscale".tile_batch_size above

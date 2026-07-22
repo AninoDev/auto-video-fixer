@@ -37,13 +37,14 @@ from autovideofixer.core.stages.base import (
 
 # Fallback when config `pipeline.default_order` is missing/empty -- mirrors
 # Config.DEFAULTS["pipeline"]["default_order"] exactly (see config.py for the
-# deblock-before-stabilize rationale). Kept as a plain list[str] since
-# DEFAULTS itself never uses mapping entries.
+# crop-first / deblock-before-stabilize rationale). Kept as a plain
+# list[str] since DEFAULTS itself never uses mapping entries.
 DEFAULT_STAGE_ORDER: list[str] = [
     "detect",
+    "crop",
+    "downscale",
     "deblock",
     "stabilize",
-    "crop",
     "denoise_video",
     "upscale",
     "interpolate",
@@ -659,21 +660,24 @@ class Pipeline:
         Rules (informational -- ``pipeline.default_order``, which
         ``resolve_stage_order()`` reads, is the actual source of truth):
         1. Analysis/detection first
-        2. Deblocking before stabilization (compression artifacts come from
+        2. Auto-crop right after detection, before every other enhancement
+           stage: stabilize's zoom is now a real percentile-based
+           "borderless" zoom, so it no longer leaves a black border for a
+           later crop to clean up -- cropping first instead means every
+           downstream stage (especially the AI-capable ones) sizes off the
+           already-cropped content and never wastes compute on pixels that
+           would just be cropped away.
+        3. Downscale right after crop, before the heavier deblock/denoise/
+           upscale/interpolate stages, for the same reason.
+        4. Deblocking before stabilization (compression artifacts come from
            the source video; deblocking a not-yet-warped frame keeps the
            deblock model's input accurate, and gives the stabilizer cleaner
-           detail to track)
-        3. Auto-crop right after stabilization: stabilize's zoom-out correction
-           can itself add a black border, so cropping after it removes both
-           the original letterboxing/pillarboxing AND any residual
-           stabilization border in a single pass -- and running it before
-           denoise/upscale/interpolate/encode means none of those
-           (especially the AI-capable ones) waste compute on pixels that are
-           about to be cropped away.
-        4. Denoising before upscaling (don't upscale noise)
-        5. Upscaling before interpolation (higher res frames interpolate better)
-        6. Normalization near the end
-        7. Encoding last
+           detail to track) -- deblock's default model now also doubles as
+           a denoise pass, which is why denoise_video defaults to disabled.
+        5. Denoising (if enabled) before upscaling (don't upscale noise)
+        6. Upscaling before interpolation (higher res frames interpolate better)
+        7. Normalization near the end
+        8. Encoding last
         """
         return [entry.label for entry in self.resolve_stage_order(stages)]
 

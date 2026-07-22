@@ -940,3 +940,48 @@ CLI: `--downscale`/`--no-downscale` (`stages.downscale.enabled`), `--resolution-
 {preserve_aspect,snap_limiting}` (`quality.quality_target.resolution_fit_mode`),
 `--dimension-multiple INT` (`quality.quality_target.dimension_multiple`), `--snap-tolerance
 FLOAT` (`quality.quality_target.snap_tolerance`).
+
+## 8. Pipeline default tuning (crop-first, deblock via denoise-optimized model, denoise off by default) [IMPLEMENTED 2026-07-22]
+
+Two independent default-behavior changes, both motivated by feature 7's `downscale` stage and
+by `stabilize`'s now-borderless zoom (percentile-based, not the old motion-guess zoom):
+
+**Change 1 — `crop` moves to the front of `pipeline.default_order`**: previously `crop` ran
+after `stabilize` because stabilize's zoom-out correction could itself add a black border that
+only a subsequent crop would clean up. That's no longer true — the percentile-based zoom is
+borderless by construction, so there's nothing left for a post-stabilize crop to remove. `crop`
+now runs immediately after `detect`, with `downscale` right behind it (unchanged from feature
+7). New default order: `detect, crop, downscale, deblock, stabilize, denoise_video, upscale,
+interpolate, normalize_volume, normalize_audio, speed, hdr, encode`. Running crop first means
+every downstream stage — not just `downscale` — sizes off the already-cropped frame instead of
+the original, so `deblock`/`stabilize`/`denoise_video`/`upscale`/`interpolate` never spend
+compute on pixels that would just be cropped away. `deblock` still runs before `stabilize` for
+the pre-existing reason (deblocking before stabilization's perspective warping keeps the
+deblock model's input accurate, and gives the stabilizer cleaner detail to track motion
+against).
+
+**Change 2 — `deblock` defaults to the compact `realesr-general-wdn-x4v3` model;
+`denoise_video` defaults to disabled**: `realesr-general-wdn-x4v3` is a denoise-optimized
+Real-ESRGAN general-v3 SRVGG checkpoint (already present in `ai/model_cache.py`'s
+`MODEL_REGISTRY`) trained on real-world degradation that includes both compression/blocking
+artifacts and general noise. It's ~3x faster than the RRDB `RealESRGAN_x4plus` checkpoint
+`deblock` previously defaulted to, and — because of what it was trained on — doubles as both a
+deblock and a denoise pass. Making it the default `stages.deblock.ai_model` means one early AI
+pass now handles both artifact classes that used to need two separate stages, so
+`stages.denoise_video.enabled` now defaults to `false`: the other default-enabled stages don't
+introduce new noise, so a dedicated second denoise pass is redundant in the common case.
+`denoise_video` stays in `pipeline.default_order` at its existing slot (after `stabilize`,
+before `upscale`) — disabling via `enabled: false` is what actually drops it from a run, per the
+pipeline's "omission from `default_order` != disabled" semantics; a user who wants a separate
+denoise pass, or who sets `stages.deblock.ai_model` to something that doesn't cover denoising,
+can flip it back on. The `RealESRGAN_x4plus`→`RealESRGAN_x2plus` OOM-avoidance swap in
+`deblock.py` (a strict `== "RealESRGAN_x4plus"` string check) does not fire for the new compact
+default — it only matters when a user explicitly configures `RealESRGAN_x4plus`.
+
+**`max_quality` preset is the deliberate exception**: it keeps `denoise_video` enabled and pins
+`stages.deblock.ai_model` / `stages.upscale.ai_model` to `RealESRGAN_x4plus`, preserving the old
+RRDB-everywhere, denoise-as-a-separate-pass behavior for users who explicitly asked for maximum
+quality over speed. `1080p60`/`4k60`/`4k30` (which previously enabled `denoise_video` in their
+`enable_stages`) now leave it disabled, inheriting the new default. `size_reduction`/
+`remux_only` (denoise already off/not applicable) and `hdr_enhance` (enables `denoise_video` but
+not `deblock` — denoise is its only artifact-removal stage) are unchanged.

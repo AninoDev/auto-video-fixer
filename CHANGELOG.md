@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **2026-07-22: BREAKING (default behavior) -- pipeline default order and default deblock model
+  changed for ALL users; `denoise_video` is now OFF by default.** No config change is required
+  to notice a difference -- these are `Config.DEFAULTS` changes, so any run without explicit
+  overrides for these keys will look/behave differently than before:
+  - **`pipeline.default_order`** (and the matching `DEFAULT_STAGE_ORDER` fallback in
+    `core/pipeline.py`): `crop` now runs FIRST, right after `detect`, instead of after
+    `stabilize`. New order: `detect, crop, downscale, deblock, stabilize, denoise_video, upscale,
+    interpolate, normalize_volume, normalize_audio, speed, hdr, encode`. Rationale: `stabilize`'s
+    zoom is now a real percentile-based "borderless" zoom (not the old motion-guess zoom), so it
+    no longer leaves a black border for a later crop to clean up -- there's nothing left for a
+    post-stabilize crop to do, and running crop first means every downstream stage sizes off the
+    already-cropped content instead of the full frame.
+  - **`stages.deblock.ai_model`** default changed from `RealESRGAN_x4plus` (RRDB) to
+    `realesr-general-wdn-x4v3` (compact SRVGG). This CHANGES default deblock output: the new
+    model is ~3x faster but trades some restoration quality vs. the RRDB checkpoint. It was
+    trained on real-world degradation including both compression/blocking artifacts and general
+    noise, so it doubles as a denoise pass.
+  - **`stages.denoise_video.enabled`** default changed from `true` to `false`, since the new
+    deblock default already covers denoising. `denoise_video` stays in `pipeline.default_order`
+    (omission != disable) -- set `stages.denoise_video.enabled: true` (or use the `max_quality`
+    preset) to restore a separate denoise pass.
+  - **Presets**: `1080p60`/`4k60`/`4k30` now leave `denoise_video` disabled (previously enabled
+    in their `enable_stages`) -- they inherit deblock's new default model. `max_quality` is the
+    deliberate exception: it keeps `denoise_video` enabled and now explicitly pins
+    `stages.deblock.ai_model`/`stages.upscale.ai_model` to `RealESRGAN_x4plus`, preserving the
+    old RRDB-everywhere behavior for users who explicitly want maximum quality over speed.
+    `size_reduction`/`remux_only`/`hdr_enhance` are unchanged.
+  - See `docs/REQUIREMENTS.md` § 8 for the full rationale.
+
 ### Fixed
 - **2026-07-20: RIFE AI-interpolation RAM blow-up (streamed output, crash-resilient MKV temp)**:
   `InterpolateStage._execute_ai` used to accumulate the ENTIRE interpolated output in RAM before
