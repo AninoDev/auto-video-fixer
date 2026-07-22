@@ -20,6 +20,7 @@ from rich.table import Table
 
 from autovideofixer import __version__
 from autovideofixer.cli import config_tools
+from autovideofixer.cli.progress import ProgressReporter, resolve_show_progress
 from autovideofixer.config import (
     VALID_LOG_TYPES,
     Config,
@@ -942,6 +943,22 @@ def _log_effective_settings(
     "duration, skip reason/error). No aggregates -- those are derivable from the per-job "
     "stage records.",
 )
+@click.option(
+    "--progress-batch/--no-progress-batch",
+    "progress_batch",
+    default=None,
+    help="Show a live batch progress bar (jobs completed, fractionally including the current "
+    "job's own progress) while processing (overrides reporting.progress_batch; on by default, "
+    "but only actually rendered when stdout is a real terminal).",
+)
+@click.option(
+    "--progress-file/--no-progress-file",
+    "progress_file",
+    default=None,
+    help="Show a live per-file progress bar tracking the current job's own 0..1 progress "
+    "(overrides reporting.progress_file; on by default, but only actually rendered when "
+    "stdout is a real terminal).",
+)
 @click.pass_context
 def process(
     ctx: click.Context,
@@ -988,6 +1005,8 @@ def process(
     stage_timing_totals: bool | None,
     stage_timing_averages: bool | None,
     report_json: str | None,
+    progress_batch: bool | None,
+    progress_file: bool | None,
 ) -> None:
     """Process video files with the specified settings."""
     if list_presets_flag:
@@ -1181,6 +1200,22 @@ def process(
         )
     if report_json is not None:
         cli_candidates.append((("--report-json",), ["reporting", "report_json"], report_json))
+    if progress_batch is not None:
+        cli_candidates.append(
+            (
+                ("--progress-batch", "--no-progress-batch"),
+                ["reporting", "progress_batch"],
+                progress_batch,
+            )
+        )
+    if progress_file is not None:
+        cli_candidates.append(
+            (
+                ("--progress-file", "--no-progress-file"),
+                ["reporting", "progress_file"],
+                progress_file,
+            )
+        )
     for stage_name in enable_stages:
         cli_candidates.append((("--enable-stage",), ["stages", stage_name, "enabled"], True))
     for stage_name in disable_stages:
@@ -1381,9 +1416,34 @@ def process(
 
     console.print(f"\nProcessing {len(jobs)} job(s)...")
 
+    # Feature 6: live nested progress bars. Each of the two bars is shown
+    # only when its own config/CLI flag is truthy AND the console is
+    # attached to a real terminal -- piped/redirected/non-TTY output gets no
+    # bars, and the run behaves exactly as it did before this feature.
+    batch_enabled = config.get("reporting", "progress_batch", default=True)
+    file_enabled = config.get("reporting", "progress_file", default=True)
+    # console.is_terminal alone can be True even when stdout isn't a real
+    # POSIX terminal (e.g. some redirected/piped setups still report as a
+    # terminal to Rich) -- also require the real fd-level isatty() signal so
+    # a redirected/piped run never leaks bar-redraw control codes into the
+    # captured output.
+    show_batch, show_file = resolve_show_progress(
+        bool(batch_enabled), bool(file_enabled), console.is_terminal and sys.stdout.isatty()
+    )
+    show_progress = show_batch or show_file
+    reporter = (
+        ProgressReporter(console, len(jobs), show_batch, show_file) if show_progress else None
+    )
+
     def _job_complete_cb(job: Job, result: JobResult) -> None:
         _on_job_complete(job, result)
         _print_job_report(logger, result, config)
+        if reporter is not None:
+            reporter.on_complete(job, result)
+
+    def _progress_cb(job: Job, progress: float, message: str) -> None:
+        if reporter is not None:
+            reporter.on_progress(job, progress, message)
 
     # REQUIREMENTS.md § 6.6: the JSON report is written once at the end of
     # the run, including on partial failure -- whatever jobs finished by the
@@ -1391,11 +1451,21 @@ def process(
     # reporting tail (per-job/aggregate console+log output, JSON write) runs
     # in `finally` so an unexpected exception escaping execute_all() (per-job
     # exceptions are already caught inside it) still gets a report for
-    # whatever's in `results` so far.
+    # whatever's in `results` so far. The live-progress region (if any) must
+    # be stopped BEFORE that reporting tail prints, so the end-of-run summary
+    # never gets overwritten/corrupted by the bars -- `with reporter:` (a
+    # no-op contextlib stand-in when disabled) wraps only the execute_all()
+    # call, not the finally block.
     results: list[JobResult] = []
     run_started_at = datetime.now(timezone.utc)
     try:
-        results = pipeline.execute_all(callback=_job_complete_cb)
+        if reporter is not None:
+            with reporter:
+                results = pipeline.execute_all(
+                    callback=_job_complete_cb, progress_callback=_progress_cb
+                )
+        else:
+            results = pipeline.execute_all(callback=_job_complete_cb)
     finally:
         run_finished_at = datetime.now(timezone.utc)
         _print_summary(results)

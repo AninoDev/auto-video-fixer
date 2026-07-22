@@ -604,6 +604,24 @@ functions) plus new `JobResult` fields and `cli.py` display/write wiring:
   once at the end of `process` (in a `finally` block around `execute_all()`, so partial-failure
   runs still get a report for whatever finished) — deliberately contains NO aggregates (derivable
   from per-job stage records; storing both invites picking the wrong one during analysis).
+- **Feature 6 — live progress bars** (`cli/progress.py::ProgressReporter`, ON by default): two
+  independent `rich.progress` bars in one live region sharing the module-level `console` — a BATCH
+  bar (total = job count, completed = `jobs_done + current_job_progress` so it moves smoothly
+  within a video, not just per-video) and a PER-FILE bar (total = 1.0, reset per job, tracking that
+  job's own 0..1 progress). Each is independently gated by `reporting.progress_batch` /
+  `reporting.progress_file` (`--progress-batch/--no-...`, `--progress-file/--no-...`, same
+  bool-pair pattern as the stage-timing flags above) AND `console.is_terminal` — on-when-TTY:
+  piped/redirected/non-TTY output silently gets no bars regardless of config, same as today's
+  behavior. `Pipeline.execute_job`'s `progress_callback` fires on every per-stage progress update
+  (not just once per stage), so the file bar moves at whatever granularity the currently-running
+  stage itself reports. Per-job Rich report tables print via the same `console` DURING the live
+  region (`rich.progress` renders `console.print` calls above the bars); the end-of-run summary/
+  stage-timing/JSON-report tail prints AFTER the region stops (`with reporter:` wraps only the
+  `execute_all()` call, not the `finally` reporting tail) so bars never overwrite it. Concurrency
+  caveat: with `general.max_concurrent_jobs` > 1, `progress_callback` calls from multiple jobs
+  interleave — there's one file bar, not one per job, so it just reflects whichever job most
+  recently reported (switching jobs resets it to that job's own progress); the batch bar is
+  unaffected since it always reflects the true completed-job count.
 
 ## AI/Traditional Method Selection
 
@@ -1655,6 +1673,10 @@ Global (before the subcommand):
   "Reporting" above
 - `--report-json PATH`: write the § 6.6 structured JSON run report once at the end of the run
   (`reporting.report_json`) — see "Reporting" above
+- `--progress-batch/--no-progress-batch` / `--progress-file/--no-progress-file`: independent,
+  ON-by-default (but only rendered when `console.is_terminal`) live progress bars
+  (`reporting.progress_batch` / `reporting.progress_file`) — see "Feature 6 — live progress bars"
+  above
 
 `avf analyze PATHS...`: like `process`, accepts multiple files and/or directories (directories
 scanned via `scan_directory`, hidden files skipped) and analyzes each in sequence; a per-file

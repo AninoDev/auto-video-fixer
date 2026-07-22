@@ -1050,3 +1050,25 @@ per-entry `recursive` override for directory entries — everything else falls t
 both sources, and errors if combined with any per-file output (ambiguous). See AGENTS.md's "Input
 file lists & pluggable parsers" section for the full CLI-side mechanics (argv-order recovery,
 inline-override disambiguation, fallback behavior).
+
+## 11. Live progress bars [IMPLEMENTED 2026-07-22]
+
+**Problem**: a long `avf process` batch gave no live sense of how far along the current video or
+the whole batch was — only start/finish lines and the per-job report table printed after each
+job completed.
+
+**Fix**: `process` gets two independent live `rich.progress` bars in one shared console region
+(`cli/progress.py::ProgressReporter`): a BATCH bar (total = job count; completed =
+fully-finished jobs + the current job's own 0..1 progress, so it advances smoothly within a
+video, not just once per video) and a PER-FILE bar (total = 1.0, reset at the start of each job,
+tracking that job's own progress as reported by `Pipeline.execute_job`'s `progress_callback` on
+every per-stage progress update). Each bar is independently controlled by
+`reporting.progress_batch` / `reporting.progress_file` (`--progress-batch/--no-progress-batch`,
+`--progress-file/--no-progress-file`) — both `True` by default — but a bar only actually renders
+when `console.is_terminal` is true; piped/redirected/non-TTY runs get no bars regardless of
+config, identical to pre-feature behavior. Per-job Rich report tables print via the same console
+during the live region (`rich.progress` supports interleaved `console.print`); the end-of-run
+summary/stage-timing/JSON-report tail is printed only after the region stops, so it's never
+overwritten by the bars. v1 limitation: with `general.max_concurrent_jobs` > 1 there is still
+only one file bar, which reflects whichever job most recently reported progress — no per-job
+bars yet. See AGENTS.md's "Feature 6 — live progress bars" section for implementation details.

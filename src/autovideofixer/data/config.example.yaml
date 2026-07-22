@@ -1116,6 +1116,15 @@ reporting:
   # (totals/averages) -- those are derivable from the per-job stage records, and storing both
   # invites picking the wrong one during offline analysis. null (default) = don't write one.
   report_json: null
+  # Feature 6: live nested progress bars (rich.progress) during `avf process` -- a BATCH bar
+  # (jobs completed + current job's fraction) and a PER-FILE bar (current job's own 0..1
+  # progress). Independently enabled here (also `--progress-batch/--no-progress-batch` and
+  # `--progress-file/--no-progress-file`), but a bar only ever actually renders when the
+  # console is attached to a real terminal -- piped/redirected/non-TTY output silently gets no
+  # bars regardless of these settings. With general.max_concurrent_jobs > 1, the single file
+  # bar just reflects whichever job most recently reported progress (no per-job bars in v1).
+  progress_batch: true
+  progress_file: true
 
 # --- Not part of Config.DEFAULTS, but read elsewhere and worth knowing about ---
 #

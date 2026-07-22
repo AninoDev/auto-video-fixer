@@ -1105,6 +1105,17 @@ class Config:
             # (one document per run, written once at the end -- also on partial
             # failure). null (default) = don't write one. See --report-json.
             "report_json": None,
+            # Feature 6: live nested progress bars (rich.progress) during `avf
+            # process` -- a BATCH bar (jobs completed + current job's fraction)
+            # and a PER-FILE bar (current job's own 0..1 progress). Each is
+            # independently enabled here but only ever actually shown when the
+            # console is attached to a real terminal (see
+            # cli/progress.py:resolve_show_progress) -- piped/redirected/non-TTY
+            # output silently gets no bars, same as before this feature existed.
+            # See --progress-batch/--no-progress-batch and
+            # --progress-file/--no-progress-file.
+            "progress_batch": True,
+            "progress_file": True,
         },
     }
 

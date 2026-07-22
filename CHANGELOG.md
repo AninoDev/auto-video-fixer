@@ -93,6 +93,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     on graceful failure, and empty-interpolator-output FAILED handling.
 
 ### Added
+- **2026-07-22: Live progress bars (REQUIREMENTS.md § 11)**: `process` now shows two independent
+  live `rich.progress` bars (new `cli/progress.py::ProgressReporter`) -- a batch bar (jobs
+  completed, fractionally including the current job's own progress) and a per-file bar (current
+  job's own 0..1 progress, reset per job). Both default to on but only render when stdout is a
+  real terminal (`console.is_terminal`); piped/redirected output gets no bars, unchanged from
+  before. New `reporting.progress_batch` / `reporting.progress_file` config keys and matching
+  `--progress-batch/--no-progress-batch` / `--progress-file/--no-progress-file` CLI flags. Per-job
+  report tables still print live during the run (above the bars); the end-of-run summary prints
+  only after the live region stops. v1 limitation: with `general.max_concurrent_jobs` > 1 there's
+  still one file bar reflecting whichever job most recently reported progress.
 - **2026-07-22: Input file lists & pluggable parsers (REQUIREMENTS.md § 10)**: `process
   --from-file PATH` (repeatable) reads input paths from a list file, parsed by a pluggable,
   user-extensible parser (new `core/input_parsers/` package, registered the same way

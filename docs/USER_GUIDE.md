@@ -228,6 +228,20 @@ avf process video.mp4 --stage detect --stage encode
 avf process video.mp4 -p 4k60 --threads 4
 ```
 
+### Live Progress Bars
+
+When run in a real terminal, `process` shows two live progress bars: a batch bar (how many
+videos are done, including the current one's partial progress) and a per-file bar (the current
+video's own progress). Both are on by default and disappear automatically when output is piped
+or redirected. Turn either off explicitly with `--no-progress-batch` / `--no-progress-file` (or
+their `--progress-batch` / `--progress-file` counterparts to force them on), or persist the
+choice via `reporting.progress_batch` / `reporting.progress_file` in your config file.
+
+```bash
+# Suppress both bars, e.g. for a cleaner log when redirecting to a file by hand
+avf process video.mp4 -p 4k60 --no-progress-batch --no-progress-file
+```
+
 ### Reading Inputs From a List File
 
 Besides typing paths directly, `process` can read them from one or more `--from-file` list
