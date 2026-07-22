@@ -661,6 +661,22 @@ def _log_effective_settings(
     help="Target output framerate (overrides quality.quality_target.target_framerate)",
 )
 @click.option(
+    "--sharpen/--no-sharpen",
+    "sharpen",
+    default=None,
+    help="Enable/disable post-stabilization sharpening (overrides "
+    "stages.stabilize.sharpen_enabled). Only applies when stabilization actually runs.",
+)
+@click.option(
+    "--sharpen-amount",
+    type=float,
+    default=None,
+    help="Post-stabilization unsharp luma amount -- stronger = sharper (overrides "
+    "stages.stabilize.sharpen_amount; ffmpeg's unsharp range is roughly -2.0..5.0). "
+    "Finer knobs (matrix sizes, chroma amount) are available via "
+    "--set stages.stabilize.sharpen_*.",
+)
+@click.option(
     "--resolution",
     default=None,
     help="Target output resolution as WIDTHxHEIGHT, e.g. 3840x2160 "
@@ -815,6 +831,8 @@ def process(
     overwrite: bool | None,
     ai_fallback: bool | None,
     fps: float | None,
+    sharpen: bool | None,
+    sharpen_amount: float | None,
     resolution: str | None,
     codec: str | None,
     audio_codec: str | None,
@@ -894,6 +912,14 @@ def process(
         )
     if fps is not None:
         cli_candidates.append((("--fps",), ["quality", "quality_target", "target_framerate"], fps))
+    if sharpen is not None:
+        cli_candidates.append(
+            (("--sharpen", "--no-sharpen"), ["stages", "stabilize", "sharpen_enabled"], sharpen)
+        )
+    if sharpen_amount is not None:
+        cli_candidates.append(
+            (("--sharpen-amount",), ["stages", "stabilize", "sharpen_amount"], sharpen_amount)
+        )
     if resolution is not None:
         try:
             w_str, h_str = resolution.lower().split("x")

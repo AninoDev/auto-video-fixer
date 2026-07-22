@@ -43,6 +43,10 @@ class StabilizeStage(BaseStage):
             0.0, min(1.0, float(self._stage_config.get("zoom_coverage", 1.0)))
         )
         self._sharpen_enabled = self._stage_config.get("sharpen_enabled", True)
+        self._sharpen_amount = self._stage_config.get("sharpen_amount", 1.0)
+        self._sharpen_luma_size = self._stage_config.get("sharpen_luma_size", 3)
+        self._sharpen_chroma_amount = self._stage_config.get("sharpen_chroma_amount", 0.0)
+        self._sharpen_chroma_size = self._stage_config.get("sharpen_chroma_size", 3)
         self._optalgo = self._stage_config.get("optalgo", "gauss")
         self._shakiness = self._stage_config.get("shakiness", 10)
         # pipe_timeout guards the decode/transform pipe's whole-video wait
@@ -72,6 +76,43 @@ class StabilizeStage(BaseStage):
         if not self.is_enabled():
             return False, "Stage disabled"
         return True, None
+
+    def _build_sharpen_suffix(self) -> str:
+        """Build the ",unsharp=..." filter suffix from config, or "" if disabled.
+
+        Validates against ffmpeg's unsharp constraints: matrix sizes must be
+        odd integers in [3, 63]; amounts must be floats in [-2.0, 5.0]. Floats
+        are formatted with :g so they are not truncated/rounded to ints (e.g.
+        2.5 stays "2.5", 1.0 becomes "1").
+        """
+        if not self._sharpen_enabled:
+            return ""
+
+        def _check_size(value: Any, key: str) -> int:
+            size = int(value)
+            if size % 2 == 0 or size < 3 or size > 63:
+                raise ValueError(
+                    f"stages.stabilize.{key} must be an odd integer in [3, 63], got {value!r}"
+                )
+            return size
+
+        def _check_amount(value: Any, key: str) -> float:
+            amount = float(value)
+            if amount < -2.0 or amount > 5.0:
+                raise ValueError(
+                    f"stages.stabilize.{key} must be a float in [-2.0, 5.0], got {value!r}"
+                )
+            return amount
+
+        luma_size = _check_size(self._sharpen_luma_size, "sharpen_luma_size")
+        chroma_size = _check_size(self._sharpen_chroma_size, "sharpen_chroma_size")
+        luma_amount = _check_amount(self._sharpen_amount, "sharpen_amount")
+        chroma_amount = _check_amount(self._sharpen_chroma_amount, "sharpen_chroma_amount")
+
+        return (
+            f",unsharp={luma_size}:{luma_size}:{luma_amount:g}:"
+            f"{chroma_size}:{chroma_size}:{chroma_amount:g}"
+        )
 
     def _analyze_trf_file(self, trf_path: str, threshold: float) -> tuple[bool, float]:
         """Parse vidstabdetect output to determine shake intensity.
@@ -718,7 +759,7 @@ class StabilizeStage(BaseStage):
             # Add sharpening if stabilization was auto-triggered (not user-disabled)
             auto_triggered = needs_stab and self._sharpen_enabled
             if auto_triggered:
-                stab_filter = f"{stab_filter},unsharp=3:3:0.5:3:3:0.0"
+                stab_filter = f"{stab_filter}{self._build_sharpen_suffix()}"
 
             self._report_progress(0.6, "Stabilizing (pipe decode→transform)...", progress_callback)
             self.logger.info(

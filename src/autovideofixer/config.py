@@ -681,6 +681,13 @@ class Config:
                 "zoom_threshold": 50.0,  # min movement (px) to trigger zoom
                 "zoom_mode": "black",  # black or keep
                 "sharpen_enabled": True,  # auto sharpen after stabilization
+                # Post-stabilize unsharp filter tuning (only applied when
+                # sharpen_enabled and stabilization actually triggered). See
+                # StabilizeStage._build_sharpen_suffix() for validation.
+                "sharpen_amount": 1.0,  # unsharp luma_amount, float in [-2.0, 5.0]
+                "sharpen_luma_size": 3,  # unsharp luma_msize_x/y, odd int in [3, 63]
+                "sharpen_chroma_amount": 0.0,  # unsharp chroma_amount, float in [-2.0, 5.0]
+                "sharpen_chroma_size": 3,  # unsharp chroma_msize_x/y, odd int in [3, 63]
                 # How much of the clip should end up border-free once zoom_enabled's
                 # gate decides zoom applies at all (0.0-1.0). 1.0 (default) = today's
                 # behavior: vidstabtransform's own optzoom=1 ("optimal static zoom"),

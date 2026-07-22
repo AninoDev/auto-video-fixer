@@ -1276,6 +1276,20 @@ requirement was too small to show a visible difference in cropdetect output at 0
 CLI: `--zoom-coverage FLOAT` (`stages.stabilize.zoom_coverage`), following the `--crop-limit`
 precedent of a single per-stage override flag.
 
+### Post-stabilize sharpening is configurable
+
+The `unsharp` pass applied after stabilization (when it actually triggered and
+`sharpen_enabled` is true) is no longer a hardcoded filter string. It's built by
+`StabilizeStage._build_sharpen_suffix()` from four config keys: `stages.stabilize.sharpen_amount`
+(unsharp `luma_amount`, float in [-2.0, 5.0], default **1.0** -- raised from the old hardcoded
+`0.5`), `sharpen_luma_size` (`luma_msize_x`/`luma_msize_y`, odd int in [3, 63], default 3),
+`sharpen_chroma_amount` (`chroma_amount`, float in [-2.0, 5.0], default 0.0), and
+`sharpen_chroma_size` (`chroma_msize_x`/`chroma_msize_y`, odd int in [3, 63], default 3).
+Out-of-range values raise a clear `ValueError` naming the offending key instead of failing
+inside ffmpeg. CLI: `--sharpen`/`--no-sharpen` (`stages.stabilize.sharpen_enabled`) and
+`--sharpen-amount FLOAT` (`stages.stabilize.sharpen_amount`); the matrix-size/chroma knobs are
+`--set`-only.
+
 ## Auto-crop
 
 Opt-in, off by default (`stages.crop.enabled: false`). See `core/stages/crop.py`,

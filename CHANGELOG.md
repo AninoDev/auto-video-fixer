@@ -46,6 +46,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     on graceful failure, and empty-interpolator-output FAILED handling.
 
 ### Added
+- **2026-07-22: Configurable post-stabilization sharpening (Feature 7)**: the `unsharp` filter
+  applied after stabilization was previously a hardcoded `unsharp=3:3:0.5:3:3:0.0` string. It's
+  now built from four new config keys -- `stages.stabilize.sharpen_amount` (luma amount, default
+  raised **0.5 -> 1.0**), `sharpen_luma_size`, `sharpen_chroma_amount`, `sharpen_chroma_size` --
+  via `StabilizeStage._build_sharpen_suffix()`, which validates against ffmpeg's `unsharp`
+  constraints (odd matrix sizes in [3, 63], amounts in [-2.0, 5.0]) and raises a clear
+  `ValueError` naming the offending key on invalid input instead of failing inside ffmpeg. New
+  CLI flags `--sharpen`/`--no-sharpen` and `--sharpen-amount FLOAT`; matrix-size/chroma knobs are
+  `--set`-only.
 - **2026-07-20: Config tooling `avf config clean | dump | upgrade` (REQUIREMENTS.md § 6.8,
   commit 4/4 — final commit of the output-handling/reporting work)**: new `avf config` command
   group backed by pure helpers in `cli/config_tools.py`. `clean` normalizes a config to bare
