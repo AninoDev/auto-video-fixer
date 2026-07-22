@@ -211,6 +211,61 @@ FFmpeg must be in PATH. Verify with `avf gpu-info`.
 6. **Register** in `src/autovideofixer/core/stages/__init__.py`: import and call `register_stage(MyStage)` at module level.
 7. Add config to `DEFAULTS["stages"][<name>]` in `src/autovideofixer/config.py`.
 
+## Input file lists & pluggable parsers (`process --from-file`, REQUIREMENTS.md § 10)
+
+`process` accepts input paths from either (or both) of two sources: the positional `PATHS`
+argument, and `--from-file PATH` (repeatable) -- a list file whose *contents* are parsed into more
+input paths (and, optionally, per-file output paths / recursive overrides). At least one input
+must come from one of the two sources or `process` errors with "No video files found." At most
+one of `--output-name`/a per-file `--from-file` output may apply -- combining them is an error
+(ambiguous which output name wins).
+
+- **Parser selection is stateful, mirroring `--preset`/`--config` interleaving**: `--from-file-parser
+  NAME` (default `shlex`) sets the parser used for every `--from-file` that follows it on the
+  command line, until the next `--from-file-parser`. True left-to-right argv order is recovered the
+  same way as the `--preset`/`--config` cascade (see "Config cascade" below) -- via
+  `_scan_process_argv()`/`_repeatable_matches()` -- with the same fallback when argv can't be
+  trusted (e.g. a programmatic `CliRunner.invoke()` call): apply the *last* `--from-file-parser`
+  value (or `shlex` if none given) to every `--from-file`, in `from_files`' own tuple order.
+- **Inline override**: a `--from-file` value of the form `NAME:PATH` (e.g. `csv:manifest.csv`) uses
+  parser `NAME` for just that file, regardless of the current stateful parser -- but only when
+  `NAME` is an actually-registered parser name, so a real path/URL containing a colon (or a file
+  literally named `x:y`) isn't misparsed; otherwise the whole string is the path. See
+  `_split_inline_parser()` in `cli/cli.py`.
+- An unknown parser name (stateful or inline) is a hard error (`sys.exit(1)`) before any file I/O
+  or job creation.
+- **Built-in parsers** (`core/input_parsers/`), each turning list-file text into a list of
+  `InputSpec(input_path, output_path=None, recursive=None)`:
+  - `shlex` (**the default**) -- `shlex.split(text, posix=True)`: whitespace- and newline-separated
+    tokens, quotes and backslash escapes honored, `#` NOT treated as a comment (paths may contain
+    it). This is deliberately the default because it's exactly what a file manager's
+    drag-and-drop-onto-a-terminal paste produces (e.g. Dolphin onto Konsole): a run of
+    whitespace/newline-separated, individually-quoted paths.
+  - `lines` -- one path per line; blank lines and lines starting with `#` (after stripping) are
+    skipped; one matched pair of surrounding quotes is stripped if present. The classic manifest
+    style.
+  - `csv` -- stdlib `csv` module. Positional columns `input[,output][,recursive]`; if the first
+    row's first cell is exactly `input` (case-insensitive), it's treated as a header and columns
+    are looked up by name in whatever order. `recursive` cell: `true/1/yes/y` → True,
+    `false/0/no/n`/empty → False.
+  - `json` -- accepts a JSON array of path strings, a JSON array of `{input, output?, recursive?}`
+    objects, or an object `{"inputs": [...either form...]}`. A missing `input` key on an object
+    entry is a hard error.
+- **Relative-path resolution is the caller's job, not the parser's**: parsers return paths exactly
+  as written and are otherwise I/O-free; `process` resolves a relative `input_path`/`output_path`
+  against the list file's own directory (`base_dir`), and a relative per-entry `output_path`
+  further against the configured output dir (`-o`/`general.output_dir`) if set, else the resolved
+  input file's own directory.
+- **Directory entries expand** the same as a positional directory path does: `scan_directory()`,
+  recursive-ness given by the entry's own `recursive` (csv/json only) if set, else the run's
+  `--recursive` flag.
+- **How to add a new parser**: create `src/autovideofixer/core/input_parsers/<name>.py`, subclass
+  `InputParser` (`core/input_parsers/base.py`), set a unique class-level `name`, implement
+  `parse(self, text: str, base_dir: str) -> list[InputSpec]`, decorate the class with
+  `@register_parser`. Then import the module in `core/input_parsers/__init__.py` so registration
+  runs at package-import time -- the exact same self-registration pattern as
+  `core/stages/__init__.py`'s `register_stage()`.
+
 ## Pipeline Behavior
 
 - **Stage ordering, omission, and repetition are driven by config**:

@@ -1023,3 +1023,30 @@ temp (same rationale as the RIFE temp — see feature notes on the streaming AI-
 AGENTS.md), muxed with the original audio in place of the RIFE temp; both temps are cleaned up
 on every success/failure path. Returned stage metadata gains `rife_factor`,
 `minterpolate_finish: bool`, and `fps_out`.
+
+## 10. Input file lists & pluggable parsers [IMPLEMENTED 2026-07-22]
+
+**Problem**: `process`'s positional `PATHS` argument only accepts filenames/directories typed (or
+shell-globbed) directly on the command line — there was no way to hand it a prepared list of
+files, e.g. a batch selected in a file manager and pasted into a terminal, or a manifest
+pairing specific inputs with specific output names.
+
+**Fix**: `process --from-file PATH` (repeatable) reads `PATH`'s contents and parses it into more
+input paths via a pluggable parser (`core/input_parsers/`, registered the same way `core/stages/`
+registers stages). `--from-file-parser NAME` selects the parser statefully (applies to every
+`--from-file` that follows it, until the next `--from-file-parser`); an inline `NAME:PATH` value
+on `--from-file` overrides the parser for just that one file. Default parser: `shlex` —
+deliberately chosen because `shlex.split()`'s whitespace/newline-splitting-with-quote-honoring is
+exactly what a Dolphin (or most file managers') drag-and-drop-onto-a-terminal paste produces.
+Three more built-ins ship (`lines` — one path per line, `#`-comments; `csv` — positional or
+headered `input[,output][,recursive]`; `json` — array of strings/objects or `{"inputs": [...]}`),
+and parsers are user-extensible exactly like stages: subclass `InputParser`, set a `name`, register
+it, import the module in `core/input_parsers/__init__.py`.
+
+`--from-file` entries combine with positional `PATHS` (both contribute to the same job list); a
+list-file entry may carry its own output path (csv `output` column / json `output` key) and/or a
+per-entry `recursive` override for directory entries — everything else falls through to the normal
+`-o`/`general.output_dir` resolution. `--output-name` still requires exactly one input total across
+both sources, and errors if combined with any per-file output (ambiguous). See AGENTS.md's "Input
+file lists & pluggable parsers" section for the full CLI-side mechanics (argv-order recovery,
+inline-override disambiguation, fallback behavior).

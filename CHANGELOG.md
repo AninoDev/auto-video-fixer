@@ -93,6 +93,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     on graceful failure, and empty-interpolator-output FAILED handling.
 
 ### Added
+- **2026-07-22: Input file lists & pluggable parsers (REQUIREMENTS.md § 10)**: `process
+  --from-file PATH` (repeatable) reads input paths from a list file, parsed by a pluggable,
+  user-extensible parser (new `core/input_parsers/` package, registered the same way
+  `core/stages/` registers stages). `--from-file-parser NAME` selects the parser statefully
+  (applies to every `--from-file` that follows it on the command line, argv-order recovered the
+  same way as `--preset`/`--config`); an inline `NAME:PATH` value on `--from-file` overrides the
+  parser for just that one file. Four built-in parsers: `shlex` (**the default** -- handles the
+  Dolphin/Konsole drag-and-drop paste case: quoted, whitespace/newline-separated paths), `lines`
+  (one path per line, `#`-comments, blank-line skipping), `csv` (positional or headered
+  `input[,output][,recursive]`), `json` (array of strings/objects, or `{"inputs": [...]}`).
+  `--from-file` entries combine with positional `PATHS`; a list-file entry may carry its own
+  output path and/or a per-entry `recursive` override for directory entries. `--output-name`
+  still requires exactly one input total and errors if combined with any per-file output
+  (ambiguous). New `tests/unit/test_input_parsers.py` (pure parser tests) and
+  `tests/unit/test_from_file_cli.py` (argv-order/inline-override/fallback resolution +
+  `--dry-run` integration tests). Documented in AGENTS.md's new "Input file lists & pluggable
+  parsers" section and docs/USER_GUIDE.md's new "Reading Inputs From a List File" subsection.
+
 - **2026-07-22: `downscale` stage + resolution fit modes (REQUIREMENTS.md § 7, Features 1/2/4)**:
   new opt-in `downscale` stage (`core/stages/downscale.py`, `stages.downscale.enabled`, default
   `false`) shrinks an oversized input down to the target resolution box before the heavier

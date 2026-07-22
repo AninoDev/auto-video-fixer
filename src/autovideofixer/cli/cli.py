@@ -32,6 +32,7 @@ from autovideofixer.config import (
     sanitize_console_text,
 )
 from autovideofixer.core.analysis import is_video_file, scan_directory
+from autovideofixer.core.input_parsers import get_parser, list_parsers
 from autovideofixer.core.pipeline import Job, JobResult, Pipeline
 from autovideofixer.core.presets import get_preset, list_presets, load_preset
 from autovideofixer.core.reporting import (
@@ -127,6 +128,8 @@ _VALUE_FLAGS = {
     "--resolution-fit-mode",
     "--dimension-multiple",
     "--snap-tolerance",
+    "--from-file",
+    "--from-file-parser",
 }
 
 # Boolean/flag-value options that map to a config key -- recorded with a
@@ -240,6 +243,61 @@ def _repeatable_matches(
     """True iff the argv-scanned values for `flag_names` exactly match `expected`."""
     scanned = [val for flag, val, _idx in occurrences if flag in flag_names]
     return scanned == list(expected)
+
+
+def _split_inline_parser(value: str, default: str) -> tuple[str, str]:
+    """Split a --from-file value on an inline `NAME:PATH` prefix.
+
+    Only treats the text before the first `:` as a parser-name override
+    when it's actually a registered parser name -- otherwise the whole
+    value is the path and `default` (the current stateful parser) is used.
+    This keeps real paths/URLs containing a colon (or a file literally
+    named e.g. "x:y") working via the normal stateful/default parser
+    instead of being misparsed as `x:` + path `y`.
+    """
+    prefix, sep, rest = value.partition(":")
+    if sep and prefix in list_parsers():
+        return prefix, rest
+    return default, value
+
+
+def _resolve_from_file_specs(
+    from_files: tuple[str, ...], from_file_parsers: tuple[str, ...]
+) -> list[tuple[str, str]]:
+    """Resolve each --from-file occurrence to (list_file_path, parser_name).
+
+    Prefers the true command-line order (recovered via `_scan_process_argv`)
+    so `--from-file-parser` is genuinely stateful across interleaved
+    `--from-file` occurrences. Falls back to applying the LAST
+    `--from-file-parser` value (or "shlex" if none given) to every file, in
+    `from_files`' own order, when argv can't be trusted (e.g. a
+    programmatic CliRunner.invoke() call whose sys.argv doesn't match) --
+    same fallback philosophy as the --preset/--config layering above.
+
+    An inline `NAME:PATH` value on a --from-file occurrence overrides the
+    current stateful parser for just that file (see `_split_inline_parser`),
+    in both the argv and fallback paths.
+    """
+    occurrences = _scan_process_argv()
+    argv_usable = _repeatable_matches(
+        occurrences, {"--from-file"}, from_files
+    ) and _repeatable_matches(occurrences, {"--from-file-parser"}, from_file_parsers)
+
+    resolved: list[tuple[str, str]] = []
+    if argv_usable and occurrences:
+        current_parser = "shlex"
+        for flag, val, _idx in occurrences:
+            if flag == "--from-file-parser" and val is not None:
+                current_parser = val
+            elif flag == "--from-file" and val is not None:
+                parser_name, path = _split_inline_parser(val, current_parser)
+                resolved.append((path, parser_name))
+    else:
+        fallback_parser = from_file_parsers[-1] if from_file_parsers else "shlex"
+        for val in from_files:
+            parser_name, path = _split_inline_parser(val, fallback_parser)
+            resolved.append((path, parser_name))
+    return resolved
 
 
 def _is_preset_path(value: str) -> bool:
@@ -575,7 +633,29 @@ def _log_effective_settings(
 
 
 @main.command()
-@click.argument("paths", nargs=-1, required=True)
+@click.argument("paths", nargs=-1, required=False)
+@click.option(
+    "--from-file",
+    "from_files",
+    multiple=True,
+    type=click.Path(),
+    help="Read additional input paths from a list file, parsed by the current "
+    "--from-file-parser (default: shlex). Repeatable -- may be combined with positional "
+    "PATHS and/or other --from-file occurrences. A value of the form NAME:PATH (e.g. "
+    "csv:manifest.csv) overrides the parser for just this one file, regardless of "
+    "--from-file-parser, as long as NAME is a registered parser. Available parsers: "
+    + ", ".join(sorted(list_parsers()))
+    + ".",
+)
+@click.option(
+    "--from-file-parser",
+    "from_file_parsers",
+    multiple=True,
+    help="Select the parser used for every --from-file that follows it on the command "
+    "line (stateful -- switches again at the next --from-file-parser). Default: shlex. "
+    "See --from-file's help for the inline NAME:PATH override and the list of available "
+    "parsers.",
+)
 @click.option(
     "--preset",
     "-p",
@@ -866,6 +946,8 @@ def _log_effective_settings(
 def process(
     ctx: click.Context,
     paths: tuple[str, ...],
+    from_files: tuple[str, ...],
+    from_file_parsers: tuple[str, ...],
     presets: tuple[str, ...],
     config_layers: tuple[str, ...],
     set_overrides: tuple[str, ...],
@@ -1166,19 +1248,84 @@ def process(
     # own layers.
     _log_effective_settings(logger, config, ctx.obj.get("config_path_source"))
 
-    # Collect input files
-    input_files = []
+    # --from-file resolution: (list_file_path, parser_name) pairs, in
+    # command-line order (see _resolve_from_file_specs -- same argv-order-
+    # recovery philosophy as the --preset/--config layering above). Validate
+    # every selected parser name up front, before any file I/O or job
+    # creation, so an unknown parser (stateful or inline) fails fast.
+    from_file_specs = _resolve_from_file_specs(from_files, from_file_parsers)
+    known_parsers = list_parsers()
+    for _list_file, _parser_name in from_file_specs:
+        if _parser_name not in known_parsers:
+            console.print(
+                f"[red]Unknown --from-file-parser {_parser_name!r}. Known parsers: "
+                f"{', '.join(sorted(known_parsers))}[/red]"
+            )
+            sys.exit(1)
+
+    # Collect input files: positional PATHS + every --from-file list file.
+    # Each resolved entry is (input_path, output_override | None) --
+    # output_override comes from a --from-file spec's per-entry output
+    # (csv 'output' column / json "output" key) and is None for everything
+    # else, falling through to the normal add_job()-computed output path.
+    resolved_inputs: list[tuple[str, str | None]] = []
     for path in paths:
         if os.path.isdir(path):
-            input_files.extend(scan_directory(path, recursive=recursive))
+            resolved_inputs.extend((f, None) for f in scan_directory(path, recursive=recursive))
         elif is_video_file(path):
-            input_files.append(path)
+            resolved_inputs.append((path, None))
         else:
             console.print(f"[yellow]Skipping non-video file: {_safe(path)}[/yellow]")
 
-    if not input_files:
+    configured_output_dir_for_specs = config.get("general", "output_dir", default=None)
+
+    for list_file, parser_name in from_file_specs:
+        try:
+            with open(list_file, encoding="utf-8") as fh:
+                list_text = fh.read()
+        except OSError as e:
+            console.print(
+                f"[red]Failed to read --from-file {_safe(list_file)}: {_safe(str(e))}[/red]"
+            )
+            sys.exit(1)
+
+        parser = get_parser(parser_name)
+        base_dir = os.path.dirname(os.path.abspath(list_file))
+        try:
+            specs = parser.parse(list_text, base_dir=base_dir)
+        except (ValueError, KeyError) as e:
+            console.print(
+                f"[red]Failed to parse --from-file {_safe(list_file)} with parser "
+                f"{parser_name!r}: {_safe(str(e))}[/red]"
+            )
+            sys.exit(1)
+
+        for spec in specs:
+            input_path = spec.input_path
+            if not os.path.isabs(input_path):
+                input_path = os.path.join(base_dir, input_path)
+
+            if os.path.isdir(input_path):
+                entry_recursive = spec.recursive if spec.recursive is not None else recursive
+                resolved_inputs.extend(
+                    (f, None) for f in scan_directory(input_path, recursive=entry_recursive)
+                )
+                continue
+            if not is_video_file(input_path):
+                console.print(f"[yellow]Skipping non-video file: {_safe(input_path)}[/yellow]")
+                continue
+
+            output_override = spec.output_path
+            if output_override and not os.path.isabs(output_override):
+                out_base = configured_output_dir_for_specs or os.path.dirname(input_path)
+                output_override = os.path.join(out_base, output_override)
+            resolved_inputs.append((input_path, output_override))
+
+    if not resolved_inputs:
         console.print("[red]No video files found.[/red]")
         sys.exit(1)
+
+    input_files = [f for f, _ in resolved_inputs]
 
     # REQUIREMENTS.md § 6.7: register each resolved input file + its parent
     # directory (role "input") now that they're known -- before dry-run/job
@@ -1190,13 +1337,21 @@ def process(
         cleaner.register_input(f)
         cleaner.register_directory(os.path.dirname(os.path.abspath(f)), "input")
 
-    if output_name and len(input_files) != 1:
+    total_inputs = len(resolved_inputs)
+    has_output_override = any(override is not None for _f, override in resolved_inputs)
+    if output_name and total_inputs != 1:
         console.print(
-            f"[red]--output-name requires exactly one input file, got {len(input_files)}[/red]"
+            f"[red]--output-name requires exactly one input file, got {total_inputs}[/red]"
+        )
+        sys.exit(1)
+    if output_name and has_output_override:
+        console.print(
+            "[red]--output-name cannot be combined with a per-file output from --from-file "
+            "(ambiguous)[/red]"
         )
         sys.exit(1)
 
-    console.print(f"Found {len(input_files)} video file(s)")
+    console.print(f"Found {total_inputs} video file(s)")
 
     if dry_run:
         console.print("\n[bold]DRY RUN - No files will be processed:[/bold]")
@@ -1212,7 +1367,12 @@ def process(
         )
         jobs = [pipeline.add_job(input_files[0], output_path=os.path.join(output_dir, output_name))]
     else:
-        jobs = pipeline.add_files(input_files)
+        jobs = [
+            pipeline.add_job(input_path, output_path=output_override)
+            if output_override
+            else pipeline.add_job(input_path)
+            for input_path, output_override in resolved_inputs
+        ]
 
     # Override stages if specified
     if stages:

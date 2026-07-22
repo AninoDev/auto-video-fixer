@@ -228,6 +228,65 @@ avf process video.mp4 --stage detect --stage encode
 avf process video.mp4 -p 4k60 --threads 4
 ```
 
+### Reading Inputs From a List File
+
+Besides typing paths directly, `process` can read them from one or more `--from-file` list
+files, parsed by a pluggable parser selected with `--from-file-parser` (default `shlex`). This
+is handy for batches you've already selected elsewhere, or manifests that pair specific inputs
+with specific output names.
+
+```bash
+# A file with one path per return -- works with either the default (shlex)
+# or the "lines" parser (lines also supports "#" comments and blank lines):
+cat > batch.txt <<EOF
+/videos/clip1.mp4
+/videos/clip2.mp4
+EOF
+avf process --from-file batch.txt -p 4k60
+
+# Drag-and-drop-style paste (e.g. selecting files in Dolphin and dropping them
+# onto a Konsole terminal produces a run of quoted, whitespace/newline-
+# separated paths) -- this is exactly what the default "shlex" parser handles:
+cat > dropped.txt <<'EOF'
+"/videos/My Trip.mp4" "/videos/Birthday Party.mp4"
+EOF
+avf process --from-file dropped.txt -p 1080p60
+
+# A manifest listing per-file comments and blanks (--from-file-parser lines):
+cat > manifest.txt <<'EOF'
+# Weekend footage
+/videos/clip1.mp4
+
+# Skip clip2, it's already processed
+/videos/clip3.mp4
+EOF
+avf process --from-file-parser lines --from-file manifest.txt -p size_reduction
+
+# A CSV manifest giving each input its own output path/name:
+cat > jobs.csv <<EOF
+input,output
+/videos/clip1.mp4,/enhanced/clip1_final.mp4
+/videos/clip2.mp4,/enhanced/clip2_final.mp4
+EOF
+avf process --from-file-parser csv --from-file jobs.csv
+
+# Inline override: pick the parser for just this one file without changing
+# the stateful --from-file-parser (useful when combining several list files
+# in different formats in one command):
+avf process --from-file "csv:jobs.csv" --from-file batch.txt
+
+# Switching parsers mid-command -- everything after each --from-file-parser
+# uses that parser until the next one:
+avf process \
+  --from-file-parser lines --from-file manifest.txt \
+  --from-file-parser json  --from-file jobs.json
+```
+
+Positional `PATHS` and `--from-file` inputs can be combined in the same command, and directory
+entries in a list file expand exactly like a directory typed on the command line does. See
+AGENTS.md's "Input file lists & pluggable parsers" section for the full parser reference and how
+to add a custom parser.
+
 ### Analyze Command
 
 ```bash
