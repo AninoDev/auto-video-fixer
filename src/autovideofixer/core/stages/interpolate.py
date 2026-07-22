@@ -4,10 +4,96 @@ from __future__ import annotations
 
 import os
 import time
+from dataclasses import dataclass
 from typing import Any
 
 from autovideofixer.core.ffmpeg_utils import probe, run_ffmpeg
 from autovideofixer.core.stages.base import BaseStage, StageResult, StageStatus
+
+# Epsilon for float fps comparisons throughout this module (target/intermediate
+# fps come from probes and preset math, never exact binary fractions).
+_FPS_EPS = 0.01
+
+
+@dataclass(frozen=True)
+class InterpPlan:
+    """Result of planning how the AI/RIFE path should reach ``target_fps``.
+
+    See ``_plan_ai_interpolation`` for the rules that produce this.
+    """
+
+    rife_factor: int
+    run_rife: bool
+    run_minterpolate_finish: bool
+    intermediate_fps: float
+
+
+def _plan_ai_interpolation(
+    current_fps: float, target_fps: float, hybrid_enabled: bool
+) -> InterpPlan:
+    """Plan the "RIFE under, then minterpolate up" strategy for the AI path.
+
+    RIFE (see ai/wrappers/interpolate.py's ``interpolate_video``) is
+    timestep-conditioned and supports arbitrary INTEGER factors, but never a
+    fractional one -- it can only exactly reach ``current_fps * N`` for an
+    integer N. minterpolate (``_minterpolate_filter``), by contrast, retimes
+    to ANY target fps exactly via its own ``fps=`` sub-option and true
+    motion-compensated interpolation (``mi_mode=mci``), so it's used here as
+    a "finish pass" for the fractional remainder RIFE can't reach on its own.
+
+    Rules (largest integer RIFE factor that stays AT OR BELOW target, i.e.
+    floor(target/current)):
+      - rife_factor = floor(target_fps / current_fps).
+      - If rife_factor >= 2: run RIFE at that factor. If the resulting
+        intermediate fps (current*rife_factor) is still short of target (by
+        more than _FPS_EPS), also run a minterpolate finish pass -- but only
+        when hybrid_enabled (the finish pass is itself a hybrid-only
+        behavior). If hybrid is disabled and a finish would otherwise be
+        needed, there is nothing else to do: RIFE's own integer-factor output
+        is the final answer (matches legacy: no finish, output landed at
+        current*rife_factor, not exactly target).
+      - If rife_factor <= 1: no integer RIFE factor helps without overshooting
+        (e.g. 50->60, 24->30, 60->75 all floor to 1). Two behaviors:
+          - hybrid_enabled: skip RIFE entirely, reach target via minterpolate
+            ALONE (the caller delegates to _execute_traditional).
+          - hybrid disabled: LEGACY back-compat -- force rife_factor=2 and run
+            RIFE anyway (the old overshoot behavior, e.g. 50->60 -> 100fps
+            output), no finish pass.
+    """
+    if current_fps <= 0 or target_fps <= current_fps:
+        # Shouldn't happen -- should_run() gates this -- but stay defined.
+        return InterpPlan(
+            rife_factor=2, run_rife=True, run_minterpolate_finish=False, intermediate_fps=0.0
+        )
+
+    rife_factor = int(target_fps / current_fps)  # floor
+
+    if rife_factor >= 2:
+        intermediate_fps = current_fps * rife_factor
+        needs_finish = intermediate_fps < target_fps - _FPS_EPS
+        run_finish = needs_finish and hybrid_enabled
+        return InterpPlan(
+            rife_factor=rife_factor,
+            run_rife=True,
+            run_minterpolate_finish=run_finish,
+            intermediate_fps=intermediate_fps,
+        )
+
+    # rife_factor <= 1
+    if hybrid_enabled:
+        return InterpPlan(
+            rife_factor=0,
+            run_rife=False,
+            run_minterpolate_finish=True,
+            intermediate_fps=current_fps,
+        )
+    # Legacy back-compat: force factor 2, overshoot, no finish.
+    return InterpPlan(
+        rife_factor=2,
+        run_rife=True,
+        run_minterpolate_finish=False,
+        intermediate_fps=current_fps * 2,
+    )
 
 
 class InterpolateStage(BaseStage):
@@ -27,6 +113,7 @@ class InterpolateStage(BaseStage):
     def __init__(self, config, overrides: dict[str, Any] | None = None):
         super().__init__(config, overrides)
         self._ai_model = self._stage_config.get("ai_model", "rife_v4.6")
+        self._hybrid = self._stage_config.get("hybrid_ai_minterpolate", True)
 
     def should_run(self, input_info: dict[str, Any]) -> tuple[bool, str | None]:
         if not self.is_enabled():
@@ -431,14 +518,50 @@ class InterpolateStage(BaseStage):
         Falls back to traditional FFmpeg method if PyTorch or model
         files are not available.
         """
-        # Calculate interpolation factor
+        # Plan the "RIFE under, then minterpolate up" strategy -- see
+        # _plan_ai_interpolation's docstring. Falls back to the legacy
+        # forced-factor-2 behavior if fps info is missing.
         if target_fps and current_fps and current_fps > 0:
-            factor = int(target_fps / current_fps)
+            plan = _plan_ai_interpolation(current_fps, target_fps, self._hybrid)
         else:
-            factor = 2
+            plan = InterpPlan(
+                rife_factor=2, run_rife=True, run_minterpolate_finish=False, intermediate_fps=0.0
+            )
 
-        if factor <= 1:
-            factor = 2
+        if not plan.run_rife:
+            # Target is reachable from current_fps via minterpolate ALONE (the
+            # largest integer RIFE factor is <= 1, so RIFE could only help by
+            # overshooting). This is a deliberate strategy choice, not an
+            # AI-unavailable fallback -- route straight to the traditional
+            # path (which already retimes to the exact target) rather than
+            # through _ai_fallback_or_fail, so the resulting metadata
+            # method="traditional" is accurate, not a logged "fallback".
+            self.logger.info(
+                f"interpolate: target {target_fps}fps is reachable from "
+                f"{current_fps}fps via minterpolate alone (integer RIFE factor "
+                f"{plan.rife_factor} <= 1) -- skipping RIFE, running minterpolate-only"
+            )
+            return self._execute_traditional(
+                input_path,
+                output_path,
+                progress_callback,
+                start,
+                target_fps=target_fps,
+                current_fps=current_fps,
+            )
+
+        factor = plan.rife_factor
+        if plan.run_minterpolate_finish:
+            self.logger.info(
+                f"interpolate: RIFE factor {factor} ({current_fps}fps -> "
+                f"{plan.intermediate_fps}fps) then a minterpolate finish pass to "
+                f"reach exact target {target_fps}fps"
+            )
+        else:
+            self.logger.info(
+                f"interpolate: RIFE factor {factor} ({current_fps}fps -> "
+                f"{plan.intermediate_fps}fps), no finish pass needed"
+            )
 
         try:
             from autovideofixer.ai.torch_utils import is_torch_available
@@ -689,6 +812,52 @@ class InterpolateStage(BaseStage):
                     duration_sec=time.time() - start,
                 )
 
+            # Hybrid finish pass: the RIFE temp above is at intermediate_fps
+            # (an exact integer multiple of current_fps), short of the exact
+            # target -- run ONE minterpolate pass over it (video only) to
+            # retime to exactly target_fps before the final audio mux. This
+            # is a SEPARATE temp file (also .mkv for the same crash-resilience
+            # reasons as the RIFE temp) so the RIFE output survives if this
+            # pass fails.
+            finish_temp_path: str | None = None
+            video_source_for_mux = temp_path
+            if plan.run_minterpolate_finish:
+                # plan.run_minterpolate_finish can only be True via
+                # _plan_ai_interpolation's real branches (both require a
+                # non-None target_fps/current_fps to compute) -- the
+                # target_fps-missing fallback plan above always has
+                # run_minterpolate_finish=False. assert (not just a comment)
+                # so mypy narrows float | None -> float here.
+                assert target_fps is not None
+                finish_temp_path = os.path.join(
+                    os.path.dirname(input_path) or ".",
+                    f".avf_interp_finish_{os.path.splitext(os.path.basename(input_path))[0]}.mkv",
+                )
+                finish_vf = self._minterpolate_filter(target_fps)
+                finish_args = [
+                    "-i",
+                    temp_path,
+                    "-vf",
+                    finish_vf,
+                    "-an",
+                    "-y",
+                    finish_temp_path,
+                ]
+                self._report_progress(
+                    0.92, "Minterpolate finish pass to exact target fps...", progress_callback
+                )
+                finish_result = run_ffmpeg(finish_args, timeout=self.stage_timeout())
+                if finish_result.returncode != 0 or not os.path.exists(finish_temp_path):
+                    self._preserve_or_discard_partial_temp(temp_path, output_path)
+                    if os.path.exists(finish_temp_path):
+                        os.unlink(finish_temp_path)
+                    return StageResult(
+                        status=StageStatus.FAILED,
+                        error=(f"Minterpolate finish pass failed: {finish_result.stderr[:300]}"),
+                        duration_sec=time.time() - start,
+                    )
+                video_source_for_mux = finish_temp_path
+
             try:
                 # Mux the interpolated video back with the original audio (if
                 # any). Hardcoding "-map 0:a:0" on an audio-less input makes
@@ -707,8 +876,12 @@ class InterpolateStage(BaseStage):
                 # `-c:v copy` only cares about the codec, not the container.
                 # This mux IS the "MKV -> MP4 remux" -- no separate step
                 # needed.
+                # video_source_for_mux is the RIFE temp directly (no finish
+                # pass needed) or the finish-pass temp (already at exactly
+                # target_fps) -- either way it's already fully encoded once,
+                # so this mux still stream-copies the video track.
                 has_audio = probe_info.has_audio
-                mux_args = ["-i", input_path, "-i", temp_path]
+                mux_args = ["-i", input_path, "-i", video_source_for_mux]
                 if has_audio:
                     mux_args += ["-map", "0:a:0", "-map", "1:v:0"]
                 else:
@@ -722,6 +895,8 @@ class InterpolateStage(BaseStage):
                     # partial MKV for inspection instead of silently unlinking
                     # it in the `finally` below.
                     self._preserve_or_discard_partial_temp(temp_path, output_path)
+                    if finish_temp_path and os.path.exists(finish_temp_path):
+                        os.unlink(finish_temp_path)
                     return StageResult(
                         status=StageStatus.FAILED,
                         error=f"Failed to mux interpolated output: {mux_result.stderr[:300]}",
@@ -737,6 +912,9 @@ class InterpolateStage(BaseStage):
                         "method": "ai",
                         "model": self._ai_model,
                         "factor": factor,
+                        "rife_factor": factor,
+                        "minterpolate_finish": plan.run_minterpolate_finish,
+                        "fps_out": target_fps,
                         "frames_in": orig_count,
                         "frames_out": frames_written,
                     },
@@ -756,6 +934,8 @@ class InterpolateStage(BaseStage):
                 # early -- so if this line executes at all, mux succeeded.
                 if os.path.exists(temp_path):
                     os.unlink(temp_path)
+                if finish_temp_path and os.path.exists(finish_temp_path):
+                    os.unlink(finish_temp_path)
 
         except Exception as e:
             self.logger.error(f"RIFE processing failed: {e}")

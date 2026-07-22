@@ -611,6 +611,45 @@ an inference exception, or CUDA OOM after tiling retries are exhausted:
   genuine post-AI failure (e.g. a mux error after AI frames were already produced) — those keep
   failing regardless of this policy.
 
+### Hybrid RIFE + minterpolate for non-integer AI interpolation targets
+
+RIFE (`ai/wrappers/interpolate.py`'s `interpolate_video(frames, factor, ...)`) is
+timestep-conditioned and supports arbitrary INTEGER factors (each inserted frame at timestep
+`j/factor`), but it can only exactly reach `current_fps * N` for integer `N` — it cannot hit a
+fractional target on its own. minterpolate (`InterpolateStage._minterpolate_filter()`), by
+contrast, retimes to ANY target fps exactly via its own `fps=` sub-option plus true
+motion-compensated interpolation (`mi_mode=mci`), so a minterpolate pass adds no jitter even when
+used purely to retime an already-smooth sequence to a nearby fractional rate.
+
+Before this feature, `InterpolateStage._execute_ai()` computed
+`factor = int(target_fps / current_fps)` and forced `factor = 2` whenever that floored to `<= 1`
+— so 50→60 always overshot to 100fps (never retimed down to the labeled 60), and 24→60 landed at
+48fps, never the requested target. The AI path now plans a "RIFE under, then minterpolate up"
+strategy via `InterpolateStage._plan_ai_interpolation(current_fps, target_fps, hybrid_enabled)`
+(pure function, unit-tested in `tests/unit/test_interpolate_streaming.py` /
+`test_ai_method_selection.py`), gated by `stages.interpolate.hybrid_ai_minterpolate` (default
+`True`) / CLI `--interpolate-hybrid` / `--no-interpolate-hybrid`:
+
+- `rife_factor = floor(target_fps / current_fps)`.
+- **`rife_factor >= 2`**: run RIFE at `rife_factor`. If `current_fps * rife_factor` still falls
+  short of `target_fps` (e.g. 24→60: RIFE factor 2 → 48fps, short of 60), run ONE minterpolate
+  finish pass over the RIFE output to retime the remainder to the exact target — only when hybrid
+  is enabled. If `current_fps * rife_factor` already lands on `target_fps` (e.g. 30→60, 30→120),
+  no finish pass runs.
+- **`rife_factor <= 1`** (e.g. 50→60, 24→30, 60→75 — no integer RIFE factor helps without
+  overshooting): with hybrid enabled, RIFE is skipped entirely and the AI path delegates straight
+  to `_execute_traditional()` (minterpolate alone reaches the exact target) — this is the
+  50→60 case. This is a deliberate strategy choice, not an AI-unavailable condition, so it does
+  **not** route through `_ai_fallback_or_fail()`; the returned `StageResult.metadata["method"]`
+  is accurately `"traditional"`. With hybrid disabled, the pre-hybrid legacy behavior is preserved
+  exactly: `rife_factor` forced to 2, RIFE runs, no finish pass (the old overshoot output).
+
+When RIFE does run, the finish pass (if any) is a second `.mkv` temp file (same crash-resilience
+rationale as the RIFE temp — see the streaming-writer section above), muxed with the original
+audio in place of the RIFE temp; both temps are cleaned up on every success/failure path. Returned
+metadata gains `rife_factor`, `minterpolate_finish: bool`, and `fps_out` (the actual final
+target) alongside the existing `method`/`model`/`factor`/`frames_in`/`frames_out`.
+
 ### Backend selection (torch vs ncnn)
 
 Independent of the AI/traditional choice, the `upscale` and `interpolate` stages also take

@@ -582,6 +582,14 @@ stages:
     temp_crf: 16
     read_ahead: 2         # see stages.upscale.read_ahead above; AI/RIFE path only
     write_queue_depth: 4  # see stages.upscale.write_queue_depth above; AI/RIFE path only
+    # When the AI/RIFE path is used and the target framerate isn't an exact integer multiple of
+    # the source, run RIFE at the largest integer factor <= target (never overshoot) then a
+    # minterpolate finish pass to reach the exact target -- instead of overshooting (e.g. 50->60
+    # forced to factor 2 -> 100fps) and relying on a downstream frame-drop to get back to 60.
+    # minterpolate's mi_mode=mci does true motion-compensated interpolation, so the finish pass
+    # adds no jitter. false restores the pre-hybrid overshoot behavior. See AGENTS.md's "Hybrid
+    # RIFE + minterpolate" section and InterpolateStage._plan_ai_interpolation().
+    hybrid_ai_minterpolate: true
 
   denoise_video:
     # Off by default: deblock's default ai_model (realesr-general-wdn-x4v3, see stages.deblock

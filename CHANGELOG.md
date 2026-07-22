@@ -38,6 +38,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - See `docs/REQUIREMENTS.md` § 8 for the full rationale.
 
 ### Fixed
+- **2026-07-22: AI/RIFE interpolation now reaches the exact target framerate for non-integer
+  factors (hybrid RIFE + minterpolate finish pass)**: `InterpolateStage._execute_ai()` used to
+  compute `factor = int(target_fps / current_fps)` and force `factor = 2` whenever that floored
+  to `<= 1` -- always overshooting instead of landing on the labeled target. 50fps->60fps forced
+  `factor=2` and produced 100fps output (never retimed to 60); 24fps->60fps produced 48fps, never
+  60. The AI path now plans a "RIFE under, then minterpolate up" strategy via the new
+  `InterpolateStage._plan_ai_interpolation()` (pure, unit-tested): run RIFE at the largest integer
+  factor that stays at or below the target, then -- only if that still falls short -- one
+  `minterpolate` finish pass (motion-compensated, `mi_mode=mci`, no added jitter) to reach the
+  exact target. When no integer RIFE factor helps at all without overshooting (e.g. 50->60,
+  24->30, 60->75), RIFE is skipped entirely and the AI path delegates straight to the
+  traditional/minterpolate-only path, which already reached the exact target -- this is a
+  deliberate strategy choice, not an `ai_fallback` condition, and the resulting metadata `method`
+  is accurately `"traditional"` in that case. New config key
+  `stages.interpolate.hybrid_ai_minterpolate` (default `true`) / CLI
+  `--interpolate-hybrid`/`--no-interpolate-hybrid`; disabling it restores the exact pre-hybrid
+  overshoot behavior. See `docs/REQUIREMENTS.md` § 9.
 - **2026-07-20: RIFE AI-interpolation RAM blow-up (streamed output, crash-resilient MKV temp)**:
   `InterpolateStage._execute_ai` used to accumulate the ENTIRE interpolated output in RAM before
   writing it out once -- the chunked path (`frame_count > 1000`) did

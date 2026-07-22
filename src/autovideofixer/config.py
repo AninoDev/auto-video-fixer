@@ -696,6 +696,16 @@ class Config:
                 "temp_crf": 16,  # see "upscale".temp_crf above; only used by the AI/RIFE path
                 "read_ahead": 2,  # see "upscale".read_ahead above; AI/RIFE path only
                 "write_queue_depth": 4,  # see "upscale".write_queue_depth above; AI/RIFE path only
+                # When the AI/RIFE path is used and the target framerate isn't
+                # an exact integer multiple of the source, run RIFE at the
+                # largest integer factor <= target (never overshoot) then a
+                # minterpolate finish pass to reach the exact target, instead
+                # of overshooting (e.g. 50->60 forced to factor 2 -> 100fps)
+                # and relying on a downstream frame-drop to get back to 60.
+                # False restores the pre-hybrid overshoot behavior. See
+                # InterpolateStage._plan_ai_interpolation() in
+                # core/stages/interpolate.py.
+                "hybrid_ai_minterpolate": True,
             },
             "denoise_video": {
                 # Off by default: deblock's default ai_model

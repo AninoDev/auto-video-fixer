@@ -985,3 +985,41 @@ quality over speed. `1080p60`/`4k60`/`4k30` (which previously enabled `denoise_v
 `enable_stages`) now leave it disabled, inheriting the new default. `size_reduction`/
 `remux_only` (denoise already off/not applicable) and `hdr_enhance` (enables `denoise_video` but
 not `deblock` — denoise is its only artifact-removal stage) are unchanged.
+
+## 9. AI interpolation to exact non-integer target framerates (RIFE + minterpolate hybrid) [IMPLEMENTED 2026-07-22]
+
+**Problem**: the traditional `interpolate` path (FFmpeg `minterpolate`, `mi_mode=mci`) already
+retimes to any target fps exactly, since `minterpolate`'s own `fps=` sub-option does true
+motion-compensated interpolation to an arbitrary rate. The AI/RIFE path did not: RIFE
+(`ai/wrappers/interpolate.py`) only supports integer factors (`current_fps * N`), but
+`InterpolateStage._execute_ai()` computed `factor = int(target_fps / current_fps)` and forced
+`factor = 2` whenever that floored to `<= 1` — always overshooting rather than ever landing on
+the labeled target. 50fps→60fps forced `factor=2` and produced 100fps output (never retimed
+down); 24fps→60fps produced 48fps, never 60.
+
+**Fix — "RIFE under, then minterpolate up"**: `InterpolateStage._plan_ai_interpolation(
+current_fps, target_fps, hybrid_enabled)` (pure, unit-tested helper in `core/stages/
+interpolate.py`) computes the largest integer RIFE factor that stays at or below the target
+(`floor(target_fps / current_fps)`), runs RIFE at that factor, then — only if the result still
+falls short of the exact target — runs one `minterpolate` finish pass over the RIFE output to
+reach it exactly. When no integer RIFE factor helps at all without overshooting (e.g. 50→60,
+24→30, 60→75 all floor to `factor <= 1`), RIFE is skipped entirely and the AI path delegates to
+the traditional/minterpolate-only path, which already reaches the exact target. This is a
+deliberate strategy choice, not an AI-unavailable condition — it does not go through the
+`ai_fallback` policy, and the resulting `StageResult.metadata["method"]` is accurately
+`"traditional"` in that case.
+
+Worked examples (hybrid enabled): 24→60 → RIFE factor 2 (→48fps) + minterpolate finish to 60;
+30→60 → RIFE factor 2 (→60fps exactly), no finish; 50→60 → RIFE skipped, minterpolate-only;
+30→120 → RIFE factor 4 (→120fps exactly), no finish; 24→30 → RIFE skipped, minterpolate-only;
+60→75 → RIFE skipped, minterpolate-only; 30→75 → RIFE factor 2 (→60fps) + minterpolate finish to
+75.
+
+**Config/CLI**: `stages.interpolate.hybrid_ai_minterpolate` (default `true`) / CLI
+`--interpolate-hybrid`/`--no-interpolate-hybrid`. Disabling it restores the exact pre-hybrid
+behavior: RIFE factor forced to 2 whenever the natural floor is `<= 1`, no finish pass, output
+overshoots the labeled target. When the finish pass runs, it's a second crash-resilient `.mkv`
+temp (same rationale as the RIFE temp — see feature notes on the streaming AI-frame pipeline in
+AGENTS.md), muxed with the original audio in place of the RIFE temp; both temps are cleaned up
+on every success/failure path. Returned stage metadata gains `rife_factor`,
+`minterpolate_finish: bool`, and `fps_out`.

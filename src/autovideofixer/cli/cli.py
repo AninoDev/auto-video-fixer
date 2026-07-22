@@ -751,6 +751,16 @@ def _log_effective_settings(
     "in config, since auto-crop is opt-in.",
 )
 @click.option(
+    "--interpolate-hybrid/--no-interpolate-hybrid",
+    "interpolate_hybrid",
+    default=None,
+    help="With AI/RIFE interpolation: when the target framerate isn't an exact integer "
+    "multiple of the source, run RIFE at the largest integer factor <= target then a "
+    "minterpolate finish pass to reach the exact target, instead of overshooting and relying "
+    "on a downstream frame-drop (overrides stages.interpolate.hybrid_ai_minterpolate; on by "
+    "default). --no-interpolate-hybrid restores the pre-hybrid overshoot behavior.",
+)
+@click.option(
     "--downscale/--no-downscale",
     "downscale",
     default=None,
@@ -884,6 +894,7 @@ def process(
     scene_mode: bool | None,
     drop_non_content: bool | None,
     crop_limit: int | None,
+    interpolate_hybrid: bool | None,
     downscale: bool | None,
     resolution_fit_mode: str | None,
     dimension_multiple: int | None,
@@ -1008,6 +1019,14 @@ def process(
         )
     if crop_limit is not None:
         cli_candidates.append((("--crop-limit",), ["stages", "crop", "limit"], crop_limit))
+    if interpolate_hybrid is not None:
+        cli_candidates.append(
+            (
+                ("--interpolate-hybrid", "--no-interpolate-hybrid"),
+                ["stages", "interpolate", "hybrid_ai_minterpolate"],
+                interpolate_hybrid,
+            )
+        )
     if downscale is not None:
         cli_candidates.append(
             (("--downscale", "--no-downscale"), ["stages", "downscale", "enabled"], downscale)
