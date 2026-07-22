@@ -895,3 +895,48 @@ consistency; user approved).
   use `--log-file` and grep the plain file (established practice).
 - Config keys should all be added to `DEFAULTS` in `config.py` AND documented in
   docs/config.example.yaml with rationale comments, per the standing docs-sync rule.
+
+## 7. Resolution downscaling & fit modes [IMPLEMENTED 2026-07-21]
+
+**Feature 1 — `downscale` stage**: a new pure-FFmpeg (no AI), opt-in stage
+(`stages.downscale.enabled`, default `false`) that shrinks an OVERSIZED input down to the
+configured target resolution box. Sits in `pipeline.default_order` immediately after `crop`
+and before the heavier `denoise_video`/`upscale`/`interpolate` stages, so they never spend
+compute on pixels a downscale would shrink away anyway. `should_run()` never fires on an input
+that needs upscaling instead (guarded by the same `SKIP_SCALE_THRESHOLD` tolerance the upscale
+stage uses) — `downscale` and `upscale` are complementary: an oversized input gets shrunk by
+`downscale` and then skipped by `upscale` ("already at target"); a small input is skipped by
+`downscale` and (if enabled) upscaled as usual.
+
+**Feature 2 — shared dimension-fitting helper + two fit modes**: `core/output_check.py:
+compute_fitted_dimensions()` is the one implementation of "fit an input into an
+orientation-aware target box" shared by `UpscaleStage` and `DownscaleStage`. Two
+`quality.quality_target.resolution_fit_mode` values:
+  - `preserve_aspect` (default): fits the input's exact aspect ratio within the target box,
+    rounds each dimension UP to `dimension_multiple`. Reproduces the pre-existing upscale
+    behavior exactly (byte-identical output dims) when `dimension_multiple == 2`.
+  - `snap_limiting` ("snap-to-box-when-close"): the LIMITING axis (the one binding the
+    preserve_aspect min-fit scale) always lands exactly onto its target bound. The OTHER
+    (derived) axis's exact aspect-preserving float value falls short of its own bound by some
+    gap fraction; if that gap is `<= snap_tolerance` (default 0.01 = 1%), the derived axis is
+    ALSO snapped exactly onto its bound -- both dimensions land on the full target box (e.g. a
+    1440x812 input against `[1920, 1080]` snaps to exactly 1920x1080 instead of ~1920x1078).
+    Beyond `snap_tolerance` (a genuinely different aspect ratio), the derived axis is left at
+    its aspect-preserving value, rounded to the NEAREST `dimension_multiple` (e.g. a 3840x2106
+    input -- a 2.5% gap -- stays 1920x1052, not snapped to 1920x1080).
+
+`quality.quality_target.dimension_multiple` (default 2, required by H.264/yuv420p) is the
+rounding granularity for both fit modes and both stages.
+`quality.quality_target.snap_tolerance` (default 0.01) only applies to `snap_limiting`.
+
+**Feature 4 — upscale routes through the shared helper**: `UpscaleStage._calculate_target_
+dimensions()` now delegates to `compute_fitted_dimensions()` instead of its own inline
+scale+round logic, picking up both fit modes, `dimension_multiple`, and `snap_tolerance` for
+free, and fixing the same rounding artifact in upscale's own output when
+`resolution_fit_mode: snap_limiting` is set. `should_run()`'s "already at target" skip logic is
+unchanged.
+
+CLI: `--downscale`/`--no-downscale` (`stages.downscale.enabled`), `--resolution-fit-mode
+{preserve_aspect,snap_limiting}` (`quality.quality_target.resolution_fit_mode`),
+`--dimension-multiple INT` (`quality.quality_target.dimension_multiple`), `--snap-tolerance
+FLOAT` (`quality.quality_target.snap_tolerance`).

@@ -5,6 +5,7 @@ from autovideofixer.core.stages.crop import CropStage
 from autovideofixer.core.stages.deblock import DeblockStage
 from autovideofixer.core.stages.denoise_video import DenoiseVideoStage
 from autovideofixer.core.stages.detect import DetectStage
+from autovideofixer.core.stages.downscale import DownscaleStage
 from autovideofixer.core.stages.encode import EncodeStage
 from autovideofixer.core.stages.hdr import HDRStage
 from autovideofixer.core.stages.interpolate import InterpolateStage
@@ -18,6 +19,7 @@ from autovideofixer.core.stages.upscale import UpscaleStage
 register_stage(DetectStage)
 register_stage(StabilizeStage)
 register_stage(CropStage)
+register_stage(DownscaleStage)
 register_stage(DeblockStage)
 register_stage(DenoiseVideoStage)
 register_stage(UpscaleStage)
@@ -36,6 +38,7 @@ __all__ = [
     "DetectStage",
     "StabilizeStage",
     "CropStage",
+    "DownscaleStage",
     "DeblockStage",
     "DenoiseVideoStage",
     "UpscaleStage",

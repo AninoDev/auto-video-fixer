@@ -7,7 +7,7 @@ import time
 from typing import Any
 
 from autovideofixer.core.ffmpeg_utils import probe, run_ffmpeg
-from autovideofixer.core.output_check import SKIP_SCALE_THRESHOLD
+from autovideofixer.core.output_check import SKIP_SCALE_THRESHOLD, compute_fitted_dimensions
 from autovideofixer.core.output_check import effective_target_bounds as _effective_target_bounds_fn
 from autovideofixer.core.stages.base import BaseStage, StageResult, StageStatus
 
@@ -46,6 +46,15 @@ class UpscaleStage(BaseStage):
         self._scale_factor = self._stage_config.get("scale_factor", 4)
         self._keep_aspect_ratio = self.config.get(
             "quality", "quality_target", "keep_aspect_ratio", default=True
+        )
+        self._fit_mode = self.config.get(
+            "quality", "quality_target", "resolution_fit_mode", default="preserve_aspect"
+        )
+        self._dimension_multiple = self.config.get(
+            "quality", "quality_target", "dimension_multiple", default=2
+        )
+        self._snap_tolerance = self.config.get(
+            "quality", "quality_target", "snap_tolerance", default=0.01
         )
 
     def should_run(self, input_info: dict[str, Any]) -> tuple[bool, str | None]:
@@ -831,22 +840,16 @@ class UpscaleStage(BaseStage):
         if target_width is None or target_height is None:
             return (input_width, input_height)
 
-        if not self._keep_aspect_ratio:
-            return self._round_to_even(target_width, target_height)
-
-        bound_w, bound_h = self._effective_target_bounds(
-            input_width, input_height, target_width, target_height
+        return compute_fitted_dimensions(
+            input_width,
+            input_height,
+            target_width,
+            target_height,
+            self._keep_aspect_ratio,
+            self._fit_mode,
+            self._dimension_multiple,
+            self._snap_tolerance,
         )
-
-        # Scale to fit within the (possibly rotated) bounding box
-        scale_w = bound_w / input_width if input_width > 0 else 1.0
-        scale_h = bound_h / input_height if input_height > 0 else 1.0
-        scale_factor = min(scale_w, scale_h)
-
-        new_width = int(input_width * scale_factor)
-        new_height = int(input_height * scale_factor)
-
-        return self._round_to_even(new_width, new_height)
 
     def _effective_target_bounds(
         self, input_width: int, input_height: int, target_width: int, target_height: int

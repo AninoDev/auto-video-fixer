@@ -5,6 +5,12 @@ callers hand in as plain dicts) so they're trivially unit-testable in isolation 
 importable from both ``core/pipeline.py`` (the § 6.1/6.2 decision path) and
 ``core/stages/upscale.py`` (which shares the orientation-aware resolution-bounds
 math with this module instead of duplicating it -- see ``effective_target_bounds()``).
+
+``compute_fitted_dimensions()`` (REQUIREMENTS.md § 7) is the shared dimension-fitting
+helper used by both ``core/stages/upscale.py``'s ``UpscaleStage`` and
+``core/stages/downscale.py``'s ``DownscaleStage`` -- the same "fit an input into an
+orientation-aware target box" math, in one place, so an upscale and a downscale
+targeting the same box always agree on the resulting dimensions.
 """
 
 from __future__ import annotations
@@ -102,6 +108,131 @@ def effective_target_bounds(
     else:  # Square input
         side = min(target_width, target_height)
         return side, side
+
+
+def _round_up_to_multiple(value: int, multiple: int) -> int:
+    """Round ``value`` UP to the nearest multiple of ``multiple``, clamped to
+    at least ``multiple`` (never 0)."""
+    rounded = ((value + multiple - 1) // multiple) * multiple
+    return max(rounded, multiple)
+
+
+def _round_nearest_to_multiple(value: float, multiple: int) -> int:
+    """Round ``value`` to the NEAREST multiple of ``multiple``, clamped to at
+    least ``multiple`` (never 0)."""
+    rounded = round(value / multiple) * multiple
+    return max(rounded, multiple)
+
+
+def compute_fitted_dimensions(
+    input_width: int,
+    input_height: int,
+    target_width: int,
+    target_height: int,
+    keep_aspect_ratio: bool = True,
+    fit_mode: str = "preserve_aspect",
+    multiple: int = 2,
+    snap_tolerance: float = 0.01,
+) -> tuple[int, int]:
+    """Fit ``(input_width, input_height)`` into the orientation-aware target
+    box, per ``fit_mode`` (REQUIREMENTS.md § 7).
+
+    Shared by ``UpscaleStage._calculate_target_dimensions()`` and
+    ``DownscaleStage._target_dimensions()`` -- both an upscale and a
+    downscale targeting the same box must agree on the resulting dimensions.
+
+    ``fit_mode="preserve_aspect"`` (default): scales the input to fit
+    entirely within the (possibly rotated) target box, preserving the
+    input's exact aspect ratio, then rounds each dimension UP to the next
+    multiple of ``multiple``. This reproduces
+    ``UpscaleStage._calculate_target_dimensions()``'s original behavior
+    exactly when ``multiple == 2`` (``_round_to_even``'s "round up if odd"
+    rule generalized to an arbitrary multiple).
+
+    ``fit_mode="snap_limiting"`` -- "snap-to-box-when-close": the LIMITING
+    axis (the one whose bound/input ratio is smaller -- i.e. the axis that
+    determines the preserve_aspect min-fit scale) always lands EXACTLY on
+    its bound value. The OTHER (derived) axis's exact float value
+    (``input_other * scale``) is at most its bound; how far short of that
+    bound it falls is the "gap" fraction
+    (``(bound_other - derived_float) / bound_other``). If that gap is
+    ``<= snap_tolerance`` (default 1%), the derived axis is ALSO snapped
+    exactly onto its bound -- both dimensions land on the full target box,
+    accepting a sub-percent aspect-ratio shift (e.g. a 1440x812 input
+    against a [1920, 1080] target snaps to a clean 1920x1080 instead of
+    preserve_aspect's 1920x1078-ish). If the gap exceeds ``snap_tolerance``
+    (a genuinely different aspect ratio, not just off-by-a-few-px), the
+    derived axis is left at its aspect-preserving value, rounded to the
+    NEAREST multiple -- no over-eager snapping for inputs that really don't
+    match the target's aspect ratio.
+
+    ``snap_tolerance`` is ignored by ``preserve_aspect`` and the
+    ``keep_aspect_ratio=False`` path.
+
+    ``keep_aspect_ratio=False``: an exact target was requested -- both fit
+    modes return the (unrotated) target box's dimensions, each rounded to
+    ``multiple`` (nearest).
+
+    Raises ``ValueError`` for an unrecognized ``fit_mode``, a non-positive
+    ``multiple``, or a ``snap_tolerance`` outside ``[0.0, 1.0]``.
+    """
+    if fit_mode not in ("preserve_aspect", "snap_limiting"):
+        raise ValueError(
+            f"Invalid fit_mode {fit_mode!r}; expected 'preserve_aspect' or 'snap_limiting'"
+        )
+    if not isinstance(multiple, int) or multiple < 1:
+        raise ValueError(f"Invalid multiple {multiple!r}; expected a positive int")
+    if not isinstance(snap_tolerance, (int, float)) or not (0.0 <= snap_tolerance <= 1.0):
+        raise ValueError(
+            f"Invalid snap_tolerance {snap_tolerance!r}; expected a float in [0.0, 1.0]"
+        )
+
+    bound_w, bound_h = effective_target_bounds(
+        input_width, input_height, target_width, target_height, keep_aspect_ratio
+    )
+
+    if not keep_aspect_ratio:
+        return (
+            _round_nearest_to_multiple(bound_w, multiple),
+            _round_nearest_to_multiple(bound_h, multiple),
+        )
+
+    scale_w = bound_w / input_width if input_width > 0 else 1.0
+    scale_h = bound_h / input_height if input_height > 0 else 1.0
+
+    if fit_mode == "preserve_aspect":
+        scale = min(scale_w, scale_h)
+        new_w = int(input_width * scale)
+        new_h = int(input_height * scale)
+        return (
+            _round_up_to_multiple(new_w, multiple),
+            _round_up_to_multiple(new_h, multiple),
+        )
+
+    # snap_limiting: the limiting axis is the one with the SMALLER
+    # bound/input ratio -- that's the axis that binds the preserve_aspect
+    # min-fit scale. Ties (square input) pick width as limiting.
+    scale = min(scale_w, scale_h)
+    if scale_w <= scale_h:
+        limiting_bound = bound_w
+        derived_bound = bound_h
+        derived_float = input_height * scale if input_height > 0 else bound_h
+    else:
+        limiting_bound = bound_h
+        derived_bound = bound_w
+        derived_float = input_width * scale if input_width > 0 else bound_w
+
+    gap = (derived_bound - derived_float) / derived_bound if derived_bound > 0 else 1.0
+    if gap <= snap_tolerance:
+        derived_final = _round_nearest_to_multiple(derived_bound, multiple)
+    else:
+        derived_final = _round_nearest_to_multiple(derived_float, multiple)
+    limiting_final = _round_nearest_to_multiple(limiting_bound, multiple)
+
+    if scale_w <= scale_h:
+        return (limiting_final, derived_final)
+    else:
+        return (derived_final, limiting_final)
 
 
 def resolution_satisfies(

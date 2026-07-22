@@ -872,6 +872,55 @@ always well above 1.05, e.g. 540×960 → 1080×1920 is 2.0x) — chosen to skip
 still running a (much smaller, non-power-of-2) AI pass, since Real-ESRGAN's minimum discrete scale
 is already 2x and a genuine sub-2x need this close to target isn't worth a full AI forward pass.
 
+## Resolution fit modes & the `downscale` stage (REQUIREMENTS.md § 7)
+
+`core/output_check.py:compute_fitted_dimensions()` is the shared dimension-fitting helper used
+by both `UpscaleStage._calculate_target_dimensions()` and `DownscaleStage._target_dimensions()`
+(`core/stages/downscale.py`) — one implementation of "fit an input into an orientation-aware
+target box" instead of two, so an upscale and a downscale targeting the same box always agree on
+the resulting dimensions. It builds on `effective_target_bounds()` (the same rotation-to-
+orientation helper `UpscaleStage._effective_target_bounds()` already wrapped) and supports two
+`quality.quality_target.resolution_fit_mode` values:
+
+- **`preserve_aspect`** (default): scales the input to fit entirely within the (possibly
+  rotated) target box at its exact aspect ratio, then rounds each dimension UP to
+  `dimension_multiple` (default 2, i.e. `_round_to_even`'s "round up if odd" rule generalized).
+  This is `UpscaleStage`'s original behavior, unchanged when `dimension_multiple == 2` — the
+  truncate-then-round-up can land a few px short of a clean target (e.g. a 1920×1080 target on
+  an off-aspect input coming out 1918×1080 or 1920×1078).
+- **`snap_limiting`** ("snap-to-box-when-close"): the LIMITING axis (the one whose bound/input
+  ratio is smaller — i.e. the axis that binds the preserve_aspect min-fit scale) always lands
+  EXACTLY on its target bound value. The OTHER (derived) axis's exact aspect-preserving float
+  value (`input_other * scale`) is at most its own bound; the gap between that value and the
+  bound, as a fraction of the bound, is compared against `snap_tolerance` (default 0.01 = 1%).
+  If the gap is `<= snap_tolerance`, the derived axis is ALSO snapped exactly onto its bound —
+  both dimensions land on the full target box, accepting a sub-percent aspect-ratio shift for a
+  clean standard resolution (e.g. a 1440×812 input against a `[1920, 1080]` target snaps to
+  exactly 1920×1080 instead of preserve_aspect's ~1920×1078). Beyond that tolerance (a genuinely
+  different aspect ratio, not just off-by-a-few-px), the derived axis is left at its
+  aspect-preserving value instead, rounded to the NEAREST `dimension_multiple` — no over-eager
+  snapping for inputs that really don't match the target's aspect ratio (e.g. a 3840×2106 input
+  against `[1920, 1080]` — a 2.5% gap — still comes out 1920×1052, not snapped to 1920×1080).
+
+`quality.quality_target.dimension_multiple` (default 2, required by H.264/yuv420p) controls the
+rounding granularity for both fit modes and both stages. `quality.quality_target.snap_tolerance`
+(default 0.01) only affects `snap_limiting`. All three are overridable per-run via
+`avf process --resolution-fit-mode {preserve_aspect,snap_limiting}` / `--dimension-multiple N` /
+`--snap-tolerance FLOAT`.
+
+The **`downscale`** stage (`core/stages/downscale.py`, `stages.downscale.enabled`, default
+`false` — strictly opt-in) is the mirror image of `upscale`: pure FFmpeg (lanczos), no AI path,
+shrinks an OVERSIZED input down to the target resolution box. It sits in `pipeline.default_order`
+immediately after `crop` and before `denoise_video`/`upscale`/etc. — running before the heavier
+stages means they never spend compute on pixels that would just be discarded downstream anyway.
+
+`downscale` and `upscale` are complementary, not redundant: for a given target box,
+- an OVERSIZED input: `downscale` shrinks it to target; `upscale` then sees an input already at
+  target and skips ("Already at target resolution").
+- a SMALL/at-target input: `downscale.should_run()` skips it (`binding_ratio >= 1.0` → "Input
+  already at or below target resolution", or within `SKIP_SCALE_THRESHOLD` tolerance → "Within
+  downscale tolerance") — `downscale` never upscales; `upscale` (if enabled) runs as usual.
+
 ## Configuration
 
 - Config file: `~/.config/auto-video-fixer/config.yaml` (Linux, `$XDG_CONFIG_HOME` if set),
@@ -932,7 +981,8 @@ layer that sets it, never merged element-by-element.
    name is an error.
 4. **Every other CLI option that maps to a config key** (`--threads`, `--ai`/`--no-ai`,
    `--fps`, `--resolution`, `--codec`/`--audio-codec`/`--crf`/`--encoder-preset`, `--hwaccel`,
-   `--gpu-device`, `--scene-mode`, `--drop-non-content`, `--crop-limit`, `--zoom-coverage`,
+   `--gpu-device`, `--scene-mode`, `--drop-non-content`, `--crop-limit`, `--downscale`,
+   `--resolution-fit-mode`, `--dimension-multiple`, `--snap-tolerance`, `--zoom-coverage`,
    `--batch-size`/`--tile-batch-size`, `--enable-stage`/`--disable-stage`, and `--set
    KEY=VALUE`), folded into **one** final layer applied **last** — this layer always wins over
    every `--preset`/`--config` layer, *even if the CLI flag was typed before them on the command
@@ -1477,6 +1527,18 @@ Global (before the subcommand):
 - `--crop-limit INT`: cropdetect luma threshold override for the auto-crop stage
   (`stages.crop.limit`) — auto-crop itself is still opt-in, enable it via `--enable-stage crop`
   or `stages.crop.enabled: true` in config; see "Auto-crop" above
+- `--downscale` / `--no-downscale`: enable/disable the `downscale` stage (`stages.downscale.
+  enabled`, off by default), which shrinks an oversized input to the target resolution box
+  before the heavier stages run — see "Resolution fit modes & the `downscale` stage" above
+- `--resolution-fit-mode {preserve_aspect,snap_limiting}`: how upscale/downscale fit an input
+  into the target resolution box (`quality.quality_target.resolution_fit_mode`) — see
+  "Resolution fit modes & the `downscale` stage" above
+- `--dimension-multiple INT`: rounding granularity for upscale/downscale output dimensions
+  (`quality.quality_target.dimension_multiple`, default 2)
+- `--snap-tolerance FLOAT`: with `--resolution-fit-mode snap_limiting`, how close (fractional,
+  default 0.01 = 1%) the non-limiting axis must be to the target box before it's snapped exactly
+  onto it (`quality.quality_target.snap_tolerance`) — see "Resolution fit modes & the
+  `downscale` stage" above
 - `--zoom-coverage FLOAT`: fraction of frames (0.0-1.0) that should end up border-free once the
   stabilize stage's zoom gate decides zoom applies at all (`stages.stabilize.zoom_coverage`) —
   see "Stabilization zoom coverage" above

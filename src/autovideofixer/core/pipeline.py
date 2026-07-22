@@ -439,6 +439,13 @@ class Pipeline:
         if crop_config.get("enabled", False):
             stages.append("crop")
 
+        # Downscale -- opt-in, off by default (see Config.DEFAULTS["stages"]["downscale"]
+        # and docs/REQUIREMENTS.md § 7). pipeline.default_order places it right after
+        # "crop" regardless of insertion order here.
+        downscale_config = self.config.get("stages", "downscale", default={})
+        if downscale_config.get("enabled", False):
+            stages.append("downscale")
+
         # Final encoding
         stages.append("encode")
 

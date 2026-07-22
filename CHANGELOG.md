@@ -46,6 +46,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     on graceful failure, and empty-interpolator-output FAILED handling.
 
 ### Added
+- **2026-07-22: `downscale` stage + resolution fit modes (REQUIREMENTS.md § 7, Features 1/2/4)**:
+  new opt-in `downscale` stage (`core/stages/downscale.py`, `stages.downscale.enabled`, default
+  `false`) shrinks an oversized input down to the target resolution box before the heavier
+  `denoise_video`/`upscale`/`interpolate` stages run -- sits in `pipeline.default_order`
+  immediately after `crop`, traditional/FFmpeg (lanczos) only, no AI path. Complementary to
+  `upscale`, not redundant: an oversized input gets shrunk by `downscale` then skipped by
+  `upscale` ("already at target"); a small input is skipped by `downscale` and (if enabled)
+  upscaled as usual. New shared helper `core/output_check.py:compute_fitted_dimensions()`
+  (used by both `UpscaleStage` and `DownscaleStage`) adds a second
+  `quality.quality_target.resolution_fit_mode`: `preserve_aspect` (default, byte-identical to
+  the previous upscale behavior) fits the input's exact aspect ratio within the target box and
+  rounds up to `dimension_multiple`; `snap_limiting` ("snap-to-box-when-close") always lands the
+  limiting axis exactly onto its target bound, and ALSO snaps the other (derived) axis exactly
+  onto its bound whenever it would otherwise fall short by no more than a configurable
+  `quality.quality_target.snap_tolerance` fraction (default `0.01` = 1%) -- e.g. a 1440x812
+  input against a `[1920, 1080]` target now snaps to exactly `1920x1080` (not just the limiting
+  axis) -- beyond that tolerance (a genuinely different aspect ratio) the derived axis is left
+  at its aspect-preserving value, rounded to the nearest `dimension_multiple` (e.g. 3840x2106 ->
+  1920x1052, not over-eagerly snapped). New `quality.quality_target.dimension_multiple` (default
+  `2`) and `quality.quality_target.snap_tolerance` (default `0.01`) config keys. `UpscaleStage.
+  _calculate_target_dimensions()` now delegates to the shared helper instead of its own inline
+  scale+round logic. New CLI flags `--downscale`/`--no-downscale`, `--resolution-fit-mode
+  {preserve_aspect,snap_limiting}`, `--dimension-multiple INT`, `--snap-tolerance FLOAT`.
 - **2026-07-22: Configurable post-stabilization sharpening (Feature 7)**: the `unsharp` filter
   applied after stabilization was previously a hardcoded `unsharp=3:3:0.5:3:3:0.0` string. It's
   now built from four new config keys -- `stages.stabilize.sharpen_amount` (luma amount, default

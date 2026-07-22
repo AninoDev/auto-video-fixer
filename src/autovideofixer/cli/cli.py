@@ -124,6 +124,9 @@ _VALUE_FLAGS = {
     "--zoom-coverage",
     "--batch-size",
     "--tile-batch-size",
+    "--resolution-fit-mode",
+    "--dimension-multiple",
+    "--snap-tolerance",
 }
 
 # Boolean/flag-value options that map to a config key -- recorded with a
@@ -139,6 +142,8 @@ _BOOL_FLAGS = {
     "--no-scene-mode",
     "--drop-non-content",
     "--no-drop-non-content",
+    "--downscale",
+    "--no-downscale",
 }
 
 
@@ -746,6 +751,42 @@ def _log_effective_settings(
     "in config, since auto-crop is opt-in.",
 )
 @click.option(
+    "--downscale/--no-downscale",
+    "downscale",
+    default=None,
+    help="Enable/disable the downscale stage, which shrinks an oversized input to the "
+    "target resolution box before the heavier stages run (overrides stages.downscale."
+    "enabled; off by default). Needs a target resolution (--resolution or "
+    "quality.quality_target.target_resolution) to have any effect.",
+)
+@click.option(
+    "--resolution-fit-mode",
+    default=None,
+    type=click.Choice(["preserve_aspect", "snap_limiting"]),
+    help="How upscale/downscale fit an input into the target resolution box (overrides "
+    "quality.quality_target.resolution_fit_mode). preserve_aspect (default) keeps the "
+    "input's exact aspect ratio; snap_limiting (snap-to-box-when-close) forces the limiting "
+    "axis exactly onto the target, and also snaps the other axis onto the target when it "
+    "would otherwise fall short by no more than --snap-tolerance (e.g. exactly 1920x1080 "
+    "instead of ~1920x1078).",
+)
+@click.option(
+    "--dimension-multiple",
+    type=int,
+    default=None,
+    help="Round upscale/downscale output dimensions to a multiple of this (overrides "
+    "quality.quality_target.dimension_multiple; default 2, required by H.264/yuv420p).",
+)
+@click.option(
+    "--snap-tolerance",
+    type=float,
+    default=None,
+    help="With --resolution-fit-mode snap_limiting: how close (as a fraction, e.g. 0.01 = 1%%) "
+    "the non-limiting axis must be to the target box before it's snapped exactly onto it "
+    "(overrides quality.quality_target.snap_tolerance; default 0.01). Ignored by "
+    "preserve_aspect.",
+)
+@click.option(
     "--zoom-coverage",
     type=float,
     default=None,
@@ -843,6 +884,10 @@ def process(
     scene_mode: bool | None,
     drop_non_content: bool | None,
     crop_limit: int | None,
+    downscale: bool | None,
+    resolution_fit_mode: str | None,
+    dimension_multiple: int | None,
+    snap_tolerance: float | None,
     zoom_coverage: float | None,
     batch_size: int | None,
     tile_batch_size: int | None,
@@ -963,6 +1008,34 @@ def process(
         )
     if crop_limit is not None:
         cli_candidates.append((("--crop-limit",), ["stages", "crop", "limit"], crop_limit))
+    if downscale is not None:
+        cli_candidates.append(
+            (("--downscale", "--no-downscale"), ["stages", "downscale", "enabled"], downscale)
+        )
+    if resolution_fit_mode is not None:
+        cli_candidates.append(
+            (
+                ("--resolution-fit-mode",),
+                ["quality", "quality_target", "resolution_fit_mode"],
+                resolution_fit_mode,
+            )
+        )
+    if dimension_multiple is not None:
+        cli_candidates.append(
+            (
+                ("--dimension-multiple",),
+                ["quality", "quality_target", "dimension_multiple"],
+                dimension_multiple,
+            )
+        )
+    if snap_tolerance is not None:
+        cli_candidates.append(
+            (
+                ("--snap-tolerance",),
+                ["quality", "quality_target", "snap_tolerance"],
+                snap_tolerance,
+            )
+        )
     if zoom_coverage is not None:
         cli_candidates.append(
             (("--zoom-coverage",), ["stages", "stabilize", "zoom_coverage"], zoom_coverage)

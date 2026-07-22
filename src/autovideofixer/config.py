@@ -461,6 +461,35 @@ class Config:
                 "target_resolution": None,  # (width, height) or None
                 "target_framerate": None,
                 "keep_aspect_ratio": True,  # preserve original video aspect ratio
+                # How UpscaleStage/DownscaleStage fit an input into
+                # target_resolution's (orientation-aware) box -- see
+                # core.output_check.compute_fitted_dimensions() and
+                # docs/REQUIREMENTS.md § 7. "preserve_aspect" (default) keeps
+                # the input's exact aspect ratio, fits it entirely within the
+                # target box, and rounds up to dimension_multiple.
+                # "snap_limiting" forces the LIMITING axis exactly onto the
+                # target and derives+rounds the other axis, allowing a
+                # sub-percent aspect shift in exchange for clean standard
+                # dimensions (e.g. exactly 1920x1080 instead of 1920x1078).
+                "resolution_fit_mode": "preserve_aspect",
+                # Output dimensions are rounded to a multiple of this. 2 is
+                # required by H.264/yuv420p (chroma subsampling needs even
+                # dimensions); raise for stricter codecs that need e.g. a
+                # multiple of 4/8/16.
+                "dimension_multiple": 2,
+                # Only used by resolution_fit_mode: "snap_limiting" --
+                # "snap-to-box-when-close". The limiting axis (the one that
+                # binds the aspect-preserving fit) always lands exactly on
+                # its target bound; the OTHER (derived) axis is snapped
+                # exactly onto ITS bound too -- both dimensions land on the
+                # full target box -- whenever it would otherwise fall short
+                # by no more than this fraction (e.g. 0.01 = 1%), accepting
+                # a sub-percent aspect-ratio shift for a clean standard
+                # resolution (e.g. 1440x812 -> exactly 1920x1080 instead of
+                # ~1920x1078). Beyond this tolerance (a genuinely different
+                # aspect ratio, not just off-by-a-few-px), the derived axis
+                # is left at its aspect-preserving value instead.
+                "snap_tolerance": 0.01,
             },
         },
         "pipeline": {
@@ -485,11 +514,19 @@ class Config:
             # before stabilization's perspective warping keeps the deblock
             # model's input accurate (no warped block edges) and gives the
             # stabilizer cleaner detail to track motion against.
+            #
+            # downscale sits right after crop: it's opt-in and off by
+            # default (stages.downscale.enabled), and shrinks an oversized
+            # input down to the target resolution box BEFORE the heavier
+            # deblock/denoise_video/upscale/interpolate stages run, so they
+            # never spend compute on pixels a downscale would shrink away
+            # anyway. See core/stages/downscale.py.
             "default_order": [
                 "detect",
                 "deblock",
                 "stabilize",
                 "crop",
+                "downscale",
                 "denoise_video",
                 "upscale",
                 "interpolate",
@@ -597,6 +634,20 @@ class Config:
                 # write_queue_depth: max encoded chunks buffered ahead of the
                 # ffmpeg encoder pipe.
                 "write_queue_depth": 4,
+            },
+            "downscale": {
+                # Shrinks an oversized input down to the target resolution
+                # box BEFORE the heavier deblock/denoise_video/upscale/
+                # interpolate stages run, so they never spend compute on
+                # pixels that would just be discarded downstream anyway.
+                # Off by default -- strictly opt-in (see
+                # docs/REQUIREMENTS.md § 7). Traditional/FFmpeg only, no AI
+                # path. Uses the same quality.quality_target.
+                # resolution_fit_mode/dimension_multiple as upscale (via the
+                # shared core.output_check.compute_fitted_dimensions()), so
+                # a downscale and a subsequent upscale on the same target
+                # box always agree on dimensions.
+                "enabled": False,
             },
             "interpolate": {
                 "enabled": True,

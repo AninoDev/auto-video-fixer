@@ -289,6 +289,30 @@ quality:
     # target_resolution. See AGENTS.md's "Upscaling & Aspect Ratio" section for the algorithm.
     keep_aspect_ratio: true
 
+    # How UpscaleStage/DownscaleStage fit an input into target_resolution's (orientation-aware)
+    # box -- see core.output_check.compute_fitted_dimensions() and docs/REQUIREMENTS.md § 7.
+    # "preserve_aspect" (default) keeps the input's exact aspect ratio, fits it entirely within
+    # the target box, and rounds up to dimension_multiple. "snap_limiting" ("snap-to-box-when-
+    # close") always lands the LIMITING axis (the one binding the aspect-preserving fit) exactly
+    # on the target; the OTHER (derived) axis is ALSO snapped exactly onto its target bound
+    # whenever it would otherwise fall short by no more than snap_tolerance (e.g. a 1440x812
+    # input against a [1920, 1080] target snaps to a clean 1920x1080 instead of ~1920x1078) --
+    # beyond that tolerance (a genuinely different aspect ratio) the derived axis is left at its
+    # aspect-preserving value instead, rounded to the nearest dimension_multiple. Overridden
+    # per-run by `avf process --resolution-fit-mode`.
+    resolution_fit_mode: preserve_aspect
+
+    # Output dimensions (upscale/downscale) are rounded to a multiple of this. 2 is required by
+    # H.264/yuv420p (chroma subsampling needs even dimensions); raise for stricter codecs that
+    # need e.g. a multiple of 4/8/16. Overridden per-run by `avf process --dimension-multiple`.
+    dimension_multiple: 2
+
+    # Only used by resolution_fit_mode: snap_limiting. Fractional tolerance (0.01 = 1%) for how
+    # close the derived (non-limiting) axis must be to the target box before it's snapped
+    # exactly onto it, accepting a sub-percent aspect-ratio shift for a clean standard
+    # resolution. Overridden per-run by `avf process --snap-tolerance`.
+    snap_tolerance: 0.01
+
 pipeline:
   # Drives actual stage order, omission, AND repetition -- Pipeline.resolve_stage_order()
   # (called by optimize_stage_order()/execute_job()) reads this list; a hardcoded
@@ -332,12 +356,17 @@ pipeline:
   # this feature -- the mapping form is opt-in. Note deblock now runs BEFORE stabilize
   # (previously the reverse): blocking artifacts come from the source video, so deblocking
   # before stabilization's perspective warping keeps the deblock model's input accurate and
-  # gives the stabilizer cleaner detail to track motion against.
+  # gives the stabilizer cleaner detail to track motion against. downscale sits right after
+  # crop: it's opt-in and off by default (stages.downscale.enabled), and shrinks an oversized
+  # input down to the target resolution box BEFORE the heavier deblock/denoise_video/upscale/
+  # interpolate stages run, so they never spend compute on pixels that would just be discarded
+  # downstream anyway. See core/stages/downscale.py.
   default_order:
     - detect
     - deblock
     - stabilize
     - crop
+    - downscale
     - denoise_video
     - upscale
     - interpolate
@@ -496,6 +525,17 @@ stages:
     # (see ai/frame_pipe.py's "fallback parity gaps" docstring note).
     read_ahead: 2         # max decoded chunks buffered ahead of GPU inference
     write_queue_depth: 4  # max encoded chunks buffered ahead of the ffmpeg encoder pipe
+
+  downscale:
+    # Shrinks an oversized input down to the target resolution box BEFORE the heavier
+    # deblock/denoise_video/upscale/interpolate stages run, so they never spend compute on
+    # pixels that would just be discarded downstream anyway. Off by default -- strictly
+    # opt-in (see docs/REQUIREMENTS.md § 7). Traditional/FFmpeg only, no AI path. Uses the
+    # same quality.quality_target.resolution_fit_mode/dimension_multiple as upscale (via the
+    # shared core.output_check.compute_fitted_dimensions()), so a downscale and a subsequent
+    # upscale on the same target box always agree on dimensions. Overridden per-run by
+    # `avf process --downscale`/`--no-downscale`.
+    enabled: false
 
   interpolate:
     enabled: true

@@ -224,3 +224,46 @@ class TestCalculateTargetDimensions:
     def test_already_at_target_is_noop(self, tmp_path):
         stage = _make_stage(tmp_path)
         assert stage._calculate_target_dimensions(1080, 1920, 1920, 1080) == (1080, 1920)
+
+
+class TestResolutionFitModeRefactor:
+    """_calculate_target_dimensions() now delegates to core.output_check.
+    compute_fitted_dimensions() (REQUIREMENTS.md § 7) -- these cover that the
+    default (preserve_aspect) behavior is unchanged, and that switching to
+    snap_limiting actually changes the result for an off-aspect input."""
+
+    def test_preserve_aspect_default_unchanged(self, tmp_path):
+        stage = _make_stage(tmp_path)
+        assert stage._fit_mode == "preserve_aspect"
+        assert stage._dimension_multiple == 2
+        # Exact repro of the AGENTS.md "Upscaling & Aspect Ratio" case: a
+        # 1072x1908 portrait input against a [1920, 1080] target rotates to a
+        # 1080x1920 bound, and preserve_aspect's truncate-then-round-up lands
+        # width a couple px short (1078 instead of a clean 1080).
+        assert stage._calculate_target_dimensions(1072, 1908, 1920, 1080) == (1078, 1920)
+
+    def test_snap_limiting_changes_output_for_off_aspect_input(self, tmp_path):
+        config = Config(tmp_path / "nonexistent.yaml")
+        config.set("snap_limiting", "quality", "quality_target", "resolution_fit_mode")
+        stage = UpscaleStage(config)
+        assert stage._fit_mode == "snap_limiting"
+
+        # WIDTH is the binding (smaller-ratio) axis here, so preserve_aspect's
+        # derived HEIGHT comes out short of a clean rounding under min-fit
+        # truncation, while snap_limiting's nearest-rounded derived height
+        # differs from it.
+        preserve_stage = _make_stage(tmp_path)
+        preserve_dims = preserve_stage._calculate_target_dimensions(3840, 2106, 1920, 1080)
+        snap_dims = stage._calculate_target_dimensions(3840, 2106, 1920, 1080)
+
+        assert snap_dims != preserve_dims
+        assert snap_dims[0] == 1920  # limiting axis lands exactly on target
+
+    def test_custom_dimension_multiple(self, tmp_path):
+        config = Config(tmp_path / "nonexistent.yaml")
+        config.set(4, "quality", "quality_target", "dimension_multiple")
+        stage = UpscaleStage(config)
+        assert stage._dimension_multiple == 4
+        w, h = stage._calculate_target_dimensions(3840, 2160, 1921, 1081)
+        assert w % 4 == 0
+        assert h % 4 == 0
