@@ -1,5 +1,23 @@
 # Auto Video Fixer - Agent Instructions
 
+## Standing rule: the agent never commits — prepare, the user signs
+
+The user signs every commit with an SSH key that requires a passphrase typed by
+hand, so **the agent must not run `git commit` (or `git push`)**. Instead, when
+work is ready to land:
+
+1. Stage the change with `git add -A` (or the specific paths).
+2. Write the full commit message to a NEW file at
+   `$CLAUDE_JOB_DIR/tmp/commit-msg-<short-slug>.txt` (one file per commit; see the
+   existing `commit-msg-*.txt` there for the house style — concise subject line,
+   blank line, wrapped body with bullet points, then the `Co-Authored-By:` and
+   `Claude-Session:` trailers).
+3. Give the user the path to that file. They review, commit with it, and push.
+
+This is the standing protocol for the whole project — it applies to every session
+regardless of what the task was. Do not assume a fresh session already knows it;
+this section is here so it doesn't get missed again.
+
 ## Standing rule: keep docs in sync
 
 Any change to behavior, config keys, CLI flags, or stage semantics MUST update

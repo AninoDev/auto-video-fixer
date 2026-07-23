@@ -19,7 +19,12 @@ def _plain(output: str) -> str:
 
 def _video(tmp_path, name="test.mp4"):
     f = tmp_path / name
-    f.write_text("fake video")
+    # Content includes the name so distinct fixture files never collide
+    # under `avf process`'s content-identity dedup planner (which collapses
+    # byte-identical inputs onto a single representative job) -- these tests
+    # exercise --from-file resolution, not dedup, and want every video
+    # treated as a genuinely distinct input.
+    f.write_text(f"fake video content for {name}")
     return f
 
 

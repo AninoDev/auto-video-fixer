@@ -261,6 +261,33 @@ class Pipeline:
     def running(self) -> bool:
         return self._running
 
+    def resolve_output_path(self, input_path: str, output_path: str | None = None) -> str:
+        """Resolve the output path a job for ``input_path`` will use.
+
+        If ``output_path`` is given, it's returned verbatim (this is what
+        ``add_job`` stores as ``job.output_path`` for override entries -- do
+        not normalize/realpath it here, callers that need an exact match to
+        a future ``job.output_path`` rely on the verbatim string).
+
+        Otherwise computes the pipeline's default output path:
+        ``{stem}_enhanced{ext}`` in ``general.output_dir`` if configured
+        (honoring ``general.output_container`` for the extension),
+        else alongside the input file.
+        """
+        if output_path is not None:
+            return output_path
+
+        output_dir = self.config.get("general", "output_dir", default=None)
+        base_name = os.path.basename(input_path)
+        stem, ext = os.path.splitext(base_name)
+        output_container = self.config.get("general", "output_container", default=None)
+        if output_container:
+            ext = output_container if output_container.startswith(".") else f".{output_container}"
+        output_filename = f"{stem}_enhanced{ext}"
+        if output_dir:
+            return os.path.join(output_dir, output_filename)
+        return os.path.join(os.path.dirname(input_path), output_filename)
+
     def add_job(
         self,
         input_path: str,
@@ -277,20 +304,7 @@ class Pipeline:
         if not os.path.exists(input_path):
             raise FileNotFoundError(f"Input file not found: {input_path}")
 
-        if output_path is None:
-            output_dir = self.config.get("general", "output_dir", default=None)
-            base_name = os.path.basename(input_path)
-            stem, ext = os.path.splitext(base_name)
-            output_container = self.config.get("general", "output_container", default=None)
-            if output_container:
-                ext = (
-                    output_container if output_container.startswith(".") else f".{output_container}"
-                )
-            output_filename = f"{stem}_enhanced{ext}"
-            if output_dir:
-                output_path = os.path.join(output_dir, output_filename)
-            else:
-                output_path = os.path.join(os.path.dirname(input_path), output_filename)
+        output_path = self.resolve_output_path(input_path, output_path)
 
         job = Job(
             input_path=input_path,

@@ -5,8 +5,10 @@ from __future__ import annotations
 import contextlib
 import copy
 import csv
+import hashlib
 import logging
 import os
+import shutil
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -299,6 +301,167 @@ def _resolve_from_file_specs(
             parser_name, path = _split_inline_parser(val, fallback_parser)
             resolved.append((path, parser_name))
     return resolved
+
+
+def _content_signature(path: str) -> str:
+    """Return a blake2b hex digest identifying a file's content.
+
+    Hashes the file size plus up to three sampled 1 MiB chunks (head, middle,
+    tail) for large files, or the whole file for small ones (<= ~3 MiB) --
+    cheap enough to distinguish content without reading entire large files.
+    """
+    chunk_size = 1024 * 1024
+    size = os.stat(path).st_size
+    digest = hashlib.blake2b()
+    digest.update(str(size).encode("utf-8"))
+    with open(path, "rb") as fh:
+        if size <= chunk_size * 3:
+            digest.update(fh.read())
+        else:
+            fh.seek(0)
+            digest.update(fh.read(chunk_size))
+            fh.seek(size // 2)
+            digest.update(fh.read(chunk_size))
+            fh.seek(max(0, size - chunk_size))
+            digest.update(fh.read(chunk_size))
+    return digest.hexdigest()
+
+
+def _build_content_groups(realpaths: list[str]) -> dict[str, object]:
+    """Assign each realpath a content-identity group key.
+
+    Two different realpaths land in the same group iff they share both file
+    size (cheap prefilter) and a `_content_signature` (blake2b over size +
+    sampled chunks). Realpaths whose size is unique (or whose stat/read
+    fails) get their own singleton group -- distinct size already proves
+    distinct content, and I/O errors fail safe to "not a duplicate" rather
+    than silently merging unrelated files.
+    """
+    sizes: dict[str, int] = {}
+    for rp in realpaths:
+        try:
+            sizes[rp] = os.stat(rp).st_size
+        except OSError:
+            continue
+
+    size_buckets: dict[int, list[str]] = {}
+    for rp, size in sizes.items():
+        size_buckets.setdefault(size, []).append(rp)
+    hashable = {rp for bucket in size_buckets.values() if len(bucket) > 1 for rp in bucket}
+
+    group_key: dict[str, object] = {}
+    for rp in realpaths:
+        if rp in hashable:
+            try:
+                group_key[rp] = (sizes[rp], _content_signature(rp))
+                continue
+            except OSError:
+                pass
+        group_key[rp] = ("__path__", rp)
+    return group_key
+
+
+def _plan_resolved_inputs(
+    resolved_inputs: list[tuple[str, str | None]],
+    pipeline: Pipeline,
+    console: Console,
+) -> tuple[list[tuple[str, str | None]], dict[str, list[str]]]:
+    """Collapse content-duplicate inputs into one representative job each,
+    with the rest recorded as fan-out copy destinations.
+
+    Two entries are the same CONTENT (see `_build_content_groups`: realpath
+    identity plus size+hash for distinct realpaths sharing content). Within
+    a content group, walked in original order:
+    - the first distinct resolved output becomes the REPRESENTATIVE -- it's
+      kept in the returned to-process list and actually gets processed;
+    - a later entry resolving to a different output is an EXTRA destination
+      -- recorded in the returned fan-out dict (representative's resolved
+      output -> list of extra resolved outputs) so the completion callback
+      can copy the finished file there instead of reprocessing;
+    - a later entry resolving to an output already seen in this group (same
+      source, same destination) is a true no-op duplicate and is dropped.
+
+    Outputs are resolved via `pipeline.resolve_output_path` up front so the
+    fan-out dict key is the exact string `add_job`/`Job.output_path` will
+    carry for the representative (override outputs are kept verbatim --
+    only the in-group distinctness comparison uses realpath).
+    """
+    realpaths = list(dict.fromkeys(os.path.realpath(p) for p, _ in resolved_inputs))
+    group_key_by_realpath = _build_content_groups(realpaths)
+
+    # Per content group, the (output_key, resolved_output, input_path) tuples
+    # seen so far, in first-seen order -- index 0 is the representative.
+    group_seen: dict[object, list[tuple[str, str, str]]] = {}
+
+    to_process: list[tuple[str, str | None]] = []
+    fanout: dict[str, list[str]] = {}
+
+    for entry in resolved_inputs:
+        input_path, output_override = entry
+        real = os.path.realpath(input_path)
+        group_key = group_key_by_realpath[real]
+        resolved_output = pipeline.resolve_output_path(input_path, output_override)
+        output_key = os.path.realpath(resolved_output)
+
+        seen_list = group_seen.setdefault(group_key, [])
+        match = next((s for s in seen_list if s[0] == output_key), None)
+        if match is not None:
+            console.print(
+                f"[yellow]Skipping duplicate input (same output as {_safe(match[2])}): "
+                f"{_safe(input_path)}[/yellow]"
+            )
+            continue
+
+        if not seen_list:
+            seen_list.append((output_key, resolved_output, input_path))
+            to_process.append(entry)
+        else:
+            rep_output = seen_list[0][1]
+            rep_input = seen_list[0][2]
+            seen_list.append((output_key, resolved_output, input_path))
+            fanout.setdefault(rep_output, []).append(resolved_output)
+            console.print(
+                f"[yellow]Will copy result of {_safe(rep_input)} to additional destination: "
+                f"{_safe(resolved_output)}[/yellow]"
+            )
+
+    return to_process, fanout
+
+
+def _fanout_copy(
+    job: Job, result: JobResult, extras: list[str], config: Config, console: Console
+) -> None:
+    """Copy a representative job's finished output to its extra destinations.
+
+    Invoked from the job-completion callback for representatives that had
+    other content-identical inputs collapsed onto them by
+    `_plan_resolved_inputs` -- rather than reprocessing to produce a
+    byte-identical file, the already-finished output is copied.
+    """
+    output_path = job.output_path
+    overwrite = bool(config.get("general", "overwrite", default=False))
+    source_ok = (
+        result.outcome != "failed" and output_path is not None and os.path.exists(output_path)
+    )
+
+    for extra in extras:
+        if not source_ok or not output_path:
+            console.print(
+                f"[yellow]Cannot copy to {_safe(extra)}: source output not produced[/yellow]"
+            )
+            continue
+        try:
+            if os.path.exists(extra) and not overwrite:
+                console.print(
+                    "[yellow]Output already exists, not overwriting "
+                    f"(general.overwrite=false): {_safe(extra)}[/yellow]"
+                )
+                continue
+            os.makedirs(os.path.dirname(extra) or ".", exist_ok=True)
+            shutil.copy2(output_path, extra)
+            console.print(f"[green]Copied output to {_safe(extra)}[/green]")
+        except OSError as e:
+            console.print(f"[red]Failed to copy output to {_safe(extra)}: {_safe(str(e))}[/red]")
 
 
 def _is_preset_path(value: str) -> bool:
@@ -1356,6 +1519,14 @@ def process(
                 output_override = os.path.join(out_base, output_override)
             resolved_inputs.append((input_path, output_override))
 
+    # Create the pipeline before planning -- the planner needs
+    # `pipeline.resolve_output_path` to resolve each entry's actual output
+    # up front (both to detect fan-out/duplicate destinations and so the
+    # fan-out dict key matches the exact string `add_job` will later store
+    # as the representative job's `output_path`).
+    pipeline = Pipeline(config)
+    resolved_inputs, fanout = _plan_resolved_inputs(resolved_inputs, pipeline, console)
+
     if not resolved_inputs:
         console.print("[red]No video files found.[/red]")
         sys.exit(1)
@@ -1367,10 +1538,16 @@ def process(
     # creation, so even a --dry-run run's logging is covered. `Pipeline.
     # add_job()` also registers each job's input/output path (idempotent
     # no-op here for inputs already registered by this loop); this is what
-    # actually numbers/registers each job's OUTPUT path.
+    # actually numbers/registers each job's OUTPUT path. Fan-out extra
+    # destinations are never passed to add_job (they're copy targets, not
+    # jobs), so they're registered here explicitly to keep clean logs from
+    # leaking them.
     for f in input_files:
         cleaner.register_input(f)
         cleaner.register_directory(os.path.dirname(os.path.abspath(f)), "input")
+    for extras in fanout.values():
+        for extra in extras:
+            cleaner.register_output(extra)
 
     total_inputs = len(resolved_inputs)
     has_output_override = any(override is not None for _f, override in resolved_inputs)
@@ -1394,8 +1571,7 @@ def process(
             console.print(f"  - {_safe(f)}")
         return
 
-    # Create pipeline and process
-    pipeline = Pipeline(config)
+    # Process (pipeline was already constructed above, before planning).
     if output_name:
         output_dir = config.get("general", "output_dir", default=None) or os.path.dirname(
             input_files[0]
@@ -1438,6 +1614,9 @@ def process(
     def _job_complete_cb(job: Job, result: JobResult) -> None:
         _on_job_complete(job, result)
         _print_job_report(logger, result, config)
+        extras = fanout.get(job.output_path) if job.output_path else None
+        if extras:
+            _fanout_copy(job, result, extras, config, console)
         if reporter is not None:
             reporter.on_complete(job, result)
 
