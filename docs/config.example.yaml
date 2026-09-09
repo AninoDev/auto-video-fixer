@@ -661,15 +661,33 @@ stages:
     # never fails) on a probe failure or a timestamp count that disagrees with the frames the
     # reader actually produces. false always uses the uniform-factor path.
     adaptive_cadence: true
-    # § 16.3 guard: a gap needing more synthesized frames than this is treated as a stall or a
-    # hard cut, not motion -- RIFE quality degrades badly at large motion/extreme timesteps, so
-    # past this cap gap_fallback decides instead of asking RIFE to invent an unreasonable
-    # number of intermediates for one gap.
-    max_intermediates_per_gap: 8
-    # What to do instead of synthesizing, once max_intermediates_per_gap is exceeded for a
-    # gap: "hold" (default -- repeat the frame before the gap, exactly what the source did) or
-    # "blend" (linear crossfade across the gap instead of a hard repeat).
-    gap_fallback: hold
+    # § 16.7 -- up to this many intermediates in one gap are generated directly from the gap's
+    # two real bracketing frames, one RIFE call each at the exact needed timestep. More than
+    # this RECURSIVELY SUBDIVIDES instead of a single long-range RIFE call (bad quality at
+    # extreme timesteps) or holding (reproduces the very defect this feature exists to fix --
+    # see gap_fallback below): the midpoint is synthesized from the two real frames, then
+    # reused as a new reference frame for two half-gap recursive passes, and so on, so every
+    # actual RIFE call stays short-range. Depth is ceil(log2(n / direct_synthesis_max)).
+    direct_synthesis_max: 3
+    # § 16.3 SAFETY VALVES for pathological input (e.g. a corrupt timestamp implying an
+    # hours-long "gap"), NOT the normal path -- 0 / 0.0 (both default) mean unlimited, so an
+    # ordinary long gap always subdivides instead of degrading to gap_fallback.
+    # max_intermediates_per_gap caps the intermediate COUNT a single gap may need before
+    # gap_fallback applies instead of subdividing; max_gap_sec (seconds) caps the gap's real
+    # DURATION the same way. Either firing always overrides subdivision, regardless of
+    # gap_fallback's value (see gap_fallback below) -- pair one of these with an explicit
+    # gap_fallback: hold to restore the pre-§16.7 default behavior for extreme gaps only.
+    max_intermediates_per_gap: 0
+    max_gap_sec: 0.0
+    # What to do instead of synthesizing/subdividing, once a safety valve above actually
+    # fires for a gap: "subdivide" (default) recursively bisects per § 16.7 -- since a firing
+    # valve always overrides subdivision (see above), this default effectively DEGRADES TO
+    # "hold" only when a valve fires (subdividing is not a meaningful response to a gap just
+    # flagged as pathological); set explicitly to "hold" (repeat the frame before the gap,
+    # exactly what the source did) or "blend" (linear crossfade across the gap) to choose
+    # which. NOTE: with both safety valves left at their unlimited defaults, gap_fallback is
+    # never consulted at all -- every gap subdivides regardless of this value.
+    gap_fallback: subdivide
     # Governs the UNIFORM-FACTOR AI path only (REQUIREMENTS.md § 16.4) -- irrelevant when
     # adaptive_cadence reaches the target exactly, and only consulted with
     # hybrid_ai_minterpolate: true (hybrid disabled keeps the pre-existing forced-factor-2
@@ -781,15 +799,24 @@ stages:
     sharpen_chroma_amount: 0.0
     # unsharp chroma_msize_x/chroma_msize_y (same value used for both). Odd integer in [3, 63].
     sharpen_chroma_size: 3
-    # How much of the clip should end up border-free once zoom_enabled/zoom_threshold's gate
-    # decides zoom applies at all (0.0-1.0) -- does NOT change that gate, only what zoom is used.
-    # 1.0 (default) = optzoom=1, sized to the single worst frame, guaranteed no border on any
-    # frame. 0.0 = no zoom at all (every border stays visible). In between = optzoom=0 plus a
-    # static zoom computed from the zoom_coverage-quantile of per-frame required-zoom estimates
-    # (StabilizeStage._compute_static_zoom_pct) -- trades the "no border, ever" guarantee for a
-    # less aggressive crop with occasional brief borders on the most extreme motion (e.g. a
-    # violent-motion ending). This is an APPROXIMATION of vidstabtransform's own smoothed camera
-    # path (built from the raw TRF local-motion data, with a local moving-average matching
+    # SIGNED zoom dial (0.0-1.0) once zoom_enabled/zoom_threshold's gate decides zoom applies
+    # at all -- does NOT change that gate, only what zoom is used. BREAKING as of 2026-09 (see
+    # CHANGELOG.md): 0.0 used to mean "no zoom" and now means "zoom out to preserve everything";
+    # the old 0.0 behaviour moved to 0.5. Let B_i be the per-frame required-zoom-IN percentage
+    # that would just eliminate frame i's border (always >= 0); -B_i is the mirror-image zoom-OUT
+    # needed to keep that frame's content fully intact.
+    #   0.00 -> zoom=-max(B)  : every frame's content fully preserved, borders everywhere,
+    #                           nothing ever cropped
+    #   0.25 -> zoom=-p50(B)  : ~50% of frames fully preserved
+    #   0.50 -> zoom=0        : no zoom at all (vidstabtransform's own default -- this is the OLD
+    #                           0.0 behaviour; anyone who set 0.0 to mean "leave it alone" must
+    #                           change it to 0.5)
+    #   0.75 -> zoom=+p50(B)  : ~50% of frames border-free
+    #   1.00 (default) -> zoom=+max(B) : every frame border-free, delegated to vidstabtransform's
+    #                           own optzoom=1 exactly as before -- bit-for-bit unchanged, exact,
+    #                           no approximation
+    # Everywhere except 1.0, B is an APPROXIMATION of vidstabtransform's own smoothed camera path
+    # (built from the raw TRF local-motion data, with a local moving-average matching
     # `smoothness`), not an exact read of it -- see AGENTS.md's "Stabilization zoom coverage"
     # section for the accuracy caveat and verification methodology.
     zoom_coverage: 1.0

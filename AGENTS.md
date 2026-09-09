@@ -809,35 +809,67 @@ one place synthesized motion is most needed gets no extra frames.
 
 **Fix**: resample the recovered timeline directly onto the target-fps grid instead of multiplying
 frame count by a constant factor. `ai/wrappers/interpolate.py`'s `resample_plan(in_timestamps,
-target_fps, *, eps, max_intermediates_per_gap, gap_fallback) -> list[PlanEntry]` is a PURE,
-side-effect-free function (no torch/GPU/video file needed to test it — see
-`tests/unit/test_adaptive_interpolation.py`): it builds the output grid `o[j] = t[0] + j/f` for
+target_fps, *, eps, direct_synthesis_max, max_intermediates_per_gap, max_gap_sec, gap_fallback) ->
+list[PlanEntry]` is a PURE, side-effect-free function (no torch/GPU/video file needed to test it —
+see `tests/unit/test_adaptive_interpolation.py`): it builds the output grid `o[j] = t[0] + j/f` for
 `j = 0..floor((t[-1]-t[0])*f)`, brackets each `o[j]` between real input frames `t[k] <= o[j] <=
 t[k+1]`, computes `local = (o[j]-t[k])/(t[k+1]-t[k])`, and emits a `PlanEntry`: `op="emit"` (a real
-frame, `local <= eps` or `>= 1-eps` — no inference) or `op="synthesize"` (RIFE at
-`timestep=local`). This is the grid formulation, not per-gap counting (`n_k = round(gap_k*f)`) —
-the grid is **drift-free by construction**: every output timestamp derives from the global grid,
-never accumulated gap-by-gap, so rounding cannot walk a long video's duration off over time. It
-also hits the target framerate EXACTLY (no minterpolate finish pass needed on this path — the
-output IS defined as the target grid) and produces genuinely CFR output, so neither PyAV nor
-mkvtoolnix is needed here even though § 12.4b documents them as rejected write-side options for
-arbitrary-PTS muxing elsewhere. `max_intermediates_per_gap` (default 8) caps synthesis per gap — a
-gap needing more is a stall or a hard cut, not motion, and RIFE quality degrades badly at extreme
-timesteps; past the cap every `"synthesize"` entry in that bracket becomes `gap_fallback` (`"hold"`
-default — repeat the frame before the gap, exactly what the source did; or `"blend"` — linear
-crossfade, `ai/wrappers/interpolate.py`'s `_linear_blend()`). `plan_stats(plan)` derives
-`frames_synthesized`/`frames_passed_through`/`gaps_capped` counters straight from the plan's op
-tags (a gap is "capped" if it produced any `"hold"`/`"blend"` entry — `"synthesize"` and the other
-two ops are mutually exclusive per bracket).
+frame, `local <= eps` or `>= 1-eps` — no inference) or `op="synthesize"` (RIFE — see below for what
+it actually references). This is the grid formulation, not per-gap counting (`n_k =
+round(gap_k*f)`) — the grid is **drift-free by construction**: every output timestamp derives from
+the global grid, never accumulated gap-by-gap, so rounding cannot walk a long video's duration off
+over time. It also hits the target framerate EXACTLY (no minterpolate finish pass needed on this
+path — the output IS defined as the target grid) and produces genuinely CFR output, so neither
+PyAV nor mkvtoolnix is needed here even though § 12.4b documents them as rejected write-side
+options for arbitrary-PTS muxing elsewhere.
+
+**Recursive subdivision for long gaps (REQUIREMENTS.md § 16.7, revised 2026-09-09).** The original
+design capped a gap at `max_intermediates_per_gap` (default 8) and repeated the source frame past
+it (`gap_fallback="hold"`) — but that made the *worst* inputs (heavily duplicated/VFR footage, the
+whole reason this feature exists) look worst, since the longest holds are exactly where synthesized
+motion is needed most. Holding reproduces the defect instead of repairing it. Now: a gap needing
+more than `direct_synthesis_max` (default 3) intermediates is **recursively bisected** instead —
+synthesize the midpoint from the gap's two real frames, then recurse into `[a, mid]`/`[mid, b]`
+with each needed timestep's position renormalized into whichever half it falls in, treating `mid`
+as a real reference frame for that half. This keeps every actual RIFE call short-range (its quality
+degrades badly at large motion/extreme timesteps), at a depth of
+`ceil(log2(n / direct_synthesis_max))` — a handful of levels even for a very long gap.
+
+This lives in the plan, not the executor: `PlanEntry` gained `ref_a`/`ref_b`/`ref_local` (what a
+`"synthesize"` call actually interpolates between/at — `ref_a`/`ref_b` are a real frame index
+(>= 0) or a generated node id (< 0), defaulting to `(k, k+1, local)` via `__post_init__` so a
+hand-built `PlanEntry` without them behaves exactly as before subdivision existed), `node_id` (a
+`"synth_node"` entry's cache key), and `depth`. `_subdivide_bracket()` is the pure recursive
+planner (own docstring in `ai/wrappers/interpolate.py`) — kept separate from `resample_plan()`'s
+main loop and independently testable, since the property "`resample_plan()` stays a pure function
+exhaustively testable without a GPU" had to survive this change. A `"synth_node"` entry is never
+itself an output frame — only a later entry's `ref_a`/`ref_b` reference (see the executor below).
+`k`/`local` on every entry still describe the ORIGINAL, unsubdivided bracket — reporting/tests never
+need to know about subdivision to read those two fields.
+
+`max_intermediates_per_gap` (default **0 = unlimited**, changed from the old default of 8) and
+`max_gap_sec` (default **0.0 = unlimited**, new) are SAFETY VALVES for pathological input (a
+corrupt timestamp implying an hours-long "gap"), not the normal path — left unlimited by default so
+an ordinary long gap always subdivides. When either fires, `gap_fallback` (default **`"subdivide"`**,
+changed from `"hold"`) decides the same as before: `"hold"` repeats the frame, `"blend"` crossfades
+(`ai/wrappers/interpolate.py`'s `_linear_blend()`) — a firing valve always overrides subdivision
+regardless of `gap_fallback`'s value, and degrades to `"hold"` if `gap_fallback` is still
+`"subdivide"` (i.e. the valve wasn't paired with an explicit fallback choice), since "keep
+subdividing" isn't a meaningful response to a gap just flagged as pathological. `plan_stats(plan)`
+derives `frames_synthesized`/`frames_passed_through`/`gaps_capped` (now genuine safety-valve hits
+only) plus two new counters: `gaps_subdivided` (distinct gaps that used subdivision) and
+`max_subdivision_depth` (deepest recursion level used anywhere in the plan, 0 if none).
 
 `execute_resample_plan(frame_source, plan, interpolate_fn) -> Iterator[frame]` is the streaming
-executor: a two-pointer sliding window (`cur_frame`/`next_frame`) that advances forward-only as
-plan entries reference increasing frame indices, holding AT MOST those two frames at any time —
-reintroducing an accumulated output list here would recreate the RIFE RAM blowup the chunked
-streaming path (`ai/frame_pipe.py`) was built to fix in the first place. It degrades to repeating
-the last available frame (never raises) if the frame source runs out early — should not happen
-when the timeline probe matched the reader's actual output, but a streaming executor must not
-crash a job over a stale/mismatched timeline.
+executor: a two-pointer sliding window (`cur_frame`/`next_frame`) over the REAL frame source that
+advances forward-only as plan entries reference increasing frame indices, holding AT MOST those two
+real frames at any time, PLUS a small per-gap `node_cache` (cleared whenever `entry.k` changes) for
+`"synth_node"` outputs a later entry's `ref_a`/`ref_b` needs — bounded by subdivision's shallow
+depth, so this still holds only a handful of frames total. Reintroducing an accumulated output list
+here would recreate the RIFE RAM blowup the chunked streaming path (`ai/frame_pipe.py`) was built
+to fix in the first place. It degrades to repeating the last available frame (never raises) if the
+frame source runs out early — should not happen when the timeline probe matched the reader's actual
+output, but a streaming executor must not crash a job over a stale/mismatched timeline.
 
 The timeline itself comes from `core/cadence.py`'s `probe_frame_timestamps(path, config)` — a
 decode-only `ffmpeg -i IN -map 0:v:0 -an -sn -vf showinfo -f null -` pass (no `mpdecimate`; every
@@ -863,8 +895,8 @@ uniform path's early "skip RIFE, minterpolate alone reaches target" branch doesn
 then streams via `execute_resample_plan()` instead of `RIFEInterpolator.interpolate_video()`'s
 uniform `timestep = j/factor` loop, writing directly to `get_frame_writer()` at a carrier rate of
 `target_fps` (exact, since the output is already CFR at that rate). Reported metadata:
-`adaptive: true`, `frames_synthesized`, `frames_passed_through`, `gaps_capped`, `fps_out`, and
-`timeline_linearized: false` (timing is honoured exactly on this path, never linearized — contrast
+`adaptive: true`, `frames_synthesized`, `frames_passed_through`, `gaps_capped`, `gaps_subdivided`,
+`max_subdivision_depth`, `fps_out`, and `timeline_linearized: false` (timing is honoured exactly on this path, never linearized — contrast
 with the uniform-factor raw-pipe writer's `nominal_fps` carrier rate, § 12.4b, which DOES linearize
 a genuinely irregular cadence). A probe failure/mismatch falls through to the exact same
 uniform-factor `_plan_ai_interpolation()` path documented above, unchanged.
@@ -1555,57 +1587,76 @@ after `current_path = job.input_path`, before the main stage loop).
 
 ## Stabilization zoom coverage
 
-`stages.stabilize.zoom_coverage` (float, default `1.0`) tunes how aggressively the stabilize
-stage's zoom compensates for borders introduced by stabilization, once `zoom_enabled` /
-`zoom_threshold`'s movement-extent gate (`apply_zoom` in `StabilizeStage.execute()`) has already
-decided zoom applies at all -- `zoom_coverage` does NOT change that gate, only what zoom is used
-once it fires:
+`stages.stabilize.zoom_coverage` (float, default `1.0`) is a **SIGNED dial** (REQUIREMENTS.md
+§ 17) that tunes how the stabilize stage's zoom compensates for borders introduced by
+stabilization, once `zoom_enabled` / `zoom_threshold`'s movement-extent gate (`apply_zoom` in
+`StabilizeStage.execute()`) has already decided zoom applies at all -- `zoom_coverage` does NOT
+change that gate, only what zoom is used once it fires (§ 17.1: `zoom_enabled: false` still means
+no zoom of any kind, never redirected to zoom-out behaviour).
 
-- `1.0` (default, unchanged behavior): `vidstabtransform`'s own `optzoom=1` ("optimal static
-  zoom"), sized to the single worst frame in the clip -- guaranteed no visible border on any
-  frame, at the cost of being the least tight/most-cropped option.
-- `0.0`: no zoom at all (`optzoom=0`, `zoom=0`) -- every border from camera motion stays visible,
-  equivalent to `zoom_enabled=False`'s zoom behavior but without disabling the rest of the gate
-  logic (movement is still analyzed, `apply_zoom` is still computed and reported in metadata).
-- In between: `optzoom=0` plus a static `zoom=<pct>` computed by
-  `StabilizeStage._compute_static_zoom_pct()` from the TRF vidstabdetect already parses
-  (`_analyze_trf_file`/`_movement_extent`'s TRF-reading lineage) -- the `zoom_coverage`-th
-  quantile of PER-FRAME required-zoom estimates, not the max. This lets a user trade "guaranteed
-  no border, ever" for "less aggressive crop, with occasional brief borders on the most extreme
-  motion" -- e.g. a violent-motion ending gets a border for a second or two while the rest of the
-  clip stays zoomed less than the `1.0` case would force.
+**BREAKING (2026-09)**: this used to mean "fraction of frames that end up border-free", with
+`0.0` short-circuiting to "no zoom at all" (`optzoom=0, zoom=0`). That was a bug: no zoom is not
+no cropping -- with `zoom=0` a stabilized frame is still translated/rotated by the smoothing path,
+so it loses content off one edge while showing a border on the other. Every shaky frame ended up
+both bordered *and* cropped, which is not what a user setting `0.0` (expecting "nothing is ever
+cropped") wanted. `zoom_coverage` is now signed, spanning zoom-OUT as well as zoom-IN. The OLD
+`0.0` behaviour (no zoom at all) now lives at `0.5`; anyone who set `0.0` expecting "leave it
+alone" must change it to `0.5` -- `avf config upgrade` does NOT rewrite this for you, since it
+cannot infer old intent (it also does not silently touch any existing `zoom_coverage: 0.0`).
 
-**Accuracy limitation (state honestly, this is not exact)**: what actually determines a frame's
-visible border is `vidstabtransform`'s own internally-computed SMOOTHED camera path (a function of
-`smoothing`/`maxshift`/`optalgo`/`interpol`), which this code has no access to -- it only sees the
-raw per-block local-motion (LM) values in the TRF. `_compute_static_zoom_pct()` integrates those
-into an approximate raw cumulative camera-path position, then applies a local moving-average
-smoothing window (matching `stages.stabilize.smoothness`, the same window vidstabtransform itself
-uses) to approximate the smoothed path, and measures each frame's deviation from that local
-average as its "required zoom" (`zoom_pct = 200 * shift_px / dimension_px`, derived from
-`vidstabtransform`'s `zoom=Z%` scaling the frame by `1+Z/100` around center). This is
-**directionally correct and tunable** (verified: monotonically increasing with `coverage`,
-verified via a synthetic shaky clip) but not an exact match to vidstabtransform's internal
-computation -- empirically, on one synthetic test clip, this method's own `coverage=1.0` quantile
-(the theoretical max) came out ~3x higher than vidstabtransform's own logged `optzoom=1` "Final
-zoom" value, i.e. the approximation is conservative/over-corrects rather than under-corrects for
-that clip. Individual frames' actual post-smoothing border requirements can come out higher or
-lower than this estimate. This also does NOT account for rotation's contribution to border size
-(same limitation as `_movement_extent()` -- no new rotation math was added).
+Let `B_i` be the existing per-frame required-zoom-IN percentage that would just eliminate frame
+`i`'s border (always `>= 0`; see `StabilizeStage._compute_required_zoom_percentages()`). The same
+magnitude negated, `-B_i`, is the zoom-OUT needed to keep frame `i`'s content fully intact. The
+dial (`StabilizeStage._signed_zoom_from_coverage()`):
 
-**Verification methodology** (ffmpeg/CPU only, no GPU needed): a synthetic clip was generated with
-`ffmpeg -f lavfi -i testsrc2=...` piped through a time-varying `crop=` filter simulating handheld
-shake (sinusoidal jitter) plus one abrupt high-velocity displacement late in the clip (the
-"violent-motion ending" scenario). Verified via whole-video-union `cropdetect=limit:round:reset=0`
-(same methodology as the auto-crop stage) and per-frame `cropdetect=limit:round:reset=1` box
-sampling: `zoom_coverage=1.0` produced zero border on any of 178 sampled frames (matches
-`optzoom=1`'s guarantee); `zoom_coverage=0.0` reproduced the same borders as the fully-unzoomed
-baseline (~43% of frames showing a small border, matching `crop_mode: black`'s border-fill
-behavior); `zoom_coverage=0.6`'s computed static zoom quantile was measurably smaller than the
-`coverage=1.0` quantile computed by the same function (10.4% vs. 25.5% on the test clip) while
-still fully covering that particular clip's (small, ~2-4px) actual borders -- demonstrating the
-dial responds correctly to `coverage` even though this specific synthetic clip's real border
-requirement was too small to show a visible difference in cropdetect output at 0.6 vs. 1.0.
+| `zoom_coverage` | `zoom=`   | Meaning                                                          |
+|------------------|-----------|-------------------------------------------------------------------|
+| `0.00`           | `-max(B)` | 100% of frames keep ALL content; borders everywhere, nothing cropped |
+| `0.25`           | `-p50(B)` | ~50% of frames fully preserved                                    |
+| `0.50`           | `0`       | no zoom -- `vidstabtransform`'s own default, and the OLD `0.0` behaviour |
+| `0.75`           | `+p50(B)` | ~50% of frames border-free                                        |
+| `1.00`           | `+max(B)` | 100% border-free, delegated to `optzoom=1` exactly as before -- bit-for-bit unchanged, exact |
+
+Formally: for `q >= 0.5`, `zoom = quantile(B, 2(q - 0.5))`; for `q < 0.5`,
+`zoom = -quantile(B, 1 - 2q)`; `q == 0.5` is a hard `0.0` rather than the data-dependent quantile,
+so the dial is continuous through zero and matches `vidstabtransform`'s own no-zoom default
+exactly at the midpoint. `q = 1.0` keeps delegating to `optzoom=1` exactly as today (no
+approximation involved, unlike every other point on the dial), so the default is unchanged. The
+emitted percentage is clamped to `vidstabtransform`'s valid `zoom=` range, `[-100, 100]`.
+
+The `q -> signed-zoom` mapping (`_signed_zoom_from_coverage()`/`_zoom_quantile()`) is pure and
+exactly unit-testable given a synthetic list of B values -- see
+`tests/unit/test_stabilize_zoom.py`. Producing the B values themselves from a TRF
+(`_compute_required_zoom_percentages()`) is not exact; see the caveat below.
+
+**Accuracy limitation (state honestly, this is not exact) -- applies to BOTH halves of the dial**:
+what actually determines a frame's visible border is `vidstabtransform`'s own
+internally-computed SMOOTHED camera path (a function of `smoothing`/`maxshift`/`optalgo`/
+`interpol`), which this code has no access to -- it only sees the raw per-block local-motion (LM)
+values in the TRF. `_compute_required_zoom_percentages()` integrates those into an approximate raw
+cumulative camera-path position, then applies a local moving-average smoothing window (matching
+`stages.stabilize.smoothness`, the same window vidstabtransform itself uses) to approximate the
+smoothed path, and measures each frame's deviation from that local average as its "required zoom"
+(`zoom_pct = 200 * shift_px / dimension_px`, derived from `vidstabtransform`'s `zoom=Z%` scaling
+the frame by `1+Z/100` around center). This is **directionally correct and tunable** but not an
+exact match to vidstabtransform's internal computation -- individual frames' actual post-smoothing
+border requirements (and, by the same token, their actual post-smoothing content-preservation
+needs on the zoom-out half) can come out higher or lower than this estimate. This also does NOT
+account for rotation's contribution to border size (same limitation as `_movement_extent()` -- no
+new rotation math was added). `1.0` remains exact because it delegates to `optzoom=1` rather than
+to the estimate; every other point on the dial, including `0.0`, is "our best estimate", not a
+mathematical guarantee -- `0.0` is "zoom out by our best estimate of the worst displacement", not
+a guarantee that no pixel is ever lost.
+
+**Verification methodology** (ffmpeg n9.0.1, CPU only, no GPU needed): measured the non-black
+content box of a stabilized 560x400 frame via `cropdetect`. `optzoom=1` (the `1.0` endpoint)
+produced a 560x400 content box, 100% non-black (zoomed in, no border, content cropped) --
+confirms the `1.0` endpoint is unaffected by this change. `optzoom=0:zoom=0` (the `0.5` midpoint,
+and the OLD, buggy `0.0` behaviour) produced 98.1% non-black -- confirming the bug this section
+describes: already bordered *and* cropped simultaneously. `optzoom=0:zoom=-20` (a negative,
+zoom-OUT value like the new `0.0` endpoint would compute) produced a 528x370 content box, 83.6%
+non-black -- genuinely zoomed out, full frame content preserved with a border, demonstrating the
+zoom-out half of the dial behaves as intended.
 
 CLI: `--zoom-coverage FLOAT` (`stages.stabilize.zoom_coverage`), following the `--crop-limit`
 precedent of a single per-stage override flag.

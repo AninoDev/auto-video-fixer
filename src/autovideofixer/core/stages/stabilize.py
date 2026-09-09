@@ -36,9 +36,13 @@ class StabilizeStage(BaseStage):
         self._zoom_enabled = self._stage_config.get("zoom_enabled", True)
         self._zoom_mode = self._stage_config.get("zoom_mode", "black")
         self._zoom_threshold = self._stage_config.get("zoom_threshold", 50.0)  # pixels
-        # 1.0 = today's optzoom=1 behavior (fill frame for every frame); 0.0 = no
-        # zoom; in between = a static zoom sized to the zoom_coverage-quantile of
-        # per-frame required-zoom estimates. See _compute_static_zoom_pct().
+        # SIGNED dial (REQUIREMENTS.md § 17): 1.0 = today's optzoom=1 behavior
+        # (every frame border-free, content cropped -- exact, no approximation).
+        # 0.5 = no zoom at all (vidstabtransform's own default). 0.0 = zoom OUT
+        # far enough that every frame's full content survives (borders on all
+        # frames, nothing ever cropped). 0.0-0.5 and 0.5-1.0 each interpolate via
+        # a quantile of per-frame required-zoom estimates -- see
+        # _signed_zoom_from_coverage() and _compute_required_zoom_percentages().
         self._zoom_coverage = max(
             0.0, min(1.0, float(self._stage_config.get("zoom_coverage", 1.0)))
         )
@@ -417,11 +421,67 @@ class StabilizeStage(BaseStage):
             self.logger.warning(f"Movement extent calculation failed: {e}")
             return 0.0
 
-    def _compute_static_zoom_pct(
-        self, trf_path: str, video_width: int, video_height: int, coverage: float
-    ) -> float:
-        """Approximate the static vidstabtransform ``zoom=<pct>`` needed so that
-        ``coverage`` fraction of frames end up border-free.
+    @staticmethod
+    def _zoom_quantile(values: list[float], p: float) -> float:
+        """Nearest-rank quantile of ``values`` at fraction ``p`` (0.0-1.0).
+
+        Pure and independent of TRF parsing, so it is exactly unit-testable
+        given a synthetic list of B values. ``values`` need not be sorted.
+        ``p`` is clamped to [0, 1]; an empty ``values`` returns 0.0.
+        """
+        if not values:
+            return 0.0
+        p = max(0.0, min(1.0, p))
+        sorted_values = sorted(values)
+        n = len(sorted_values)
+        idx = min(n - 1, int(round(p * (n - 1))))
+        return sorted_values[idx]
+
+    @classmethod
+    def _signed_zoom_from_coverage(cls, b_values: list[float], coverage: float) -> float:
+        """Map a ``zoom_coverage`` dial value in [0, 1] to a SIGNED
+        vidstabtransform ``zoom=`` percentage, per REQUIREMENTS.md § 17.
+
+        ``b_values`` is the per-frame required-zoom-IN estimate B_i (always
+        >= 0; see ``_compute_required_zoom_percentages``). The dial:
+
+        | coverage | zoom=      | meaning                                    |
+        |----------|------------|---------------------------------------------|
+        | 0.00     | -max(B)    | every frame's content fully preserved       |
+        | 0.25     | -p50(B)    | ~50% of frames fully preserved              |
+        | 0.50     | 0          | no zoom (vidstabtransform's own default)    |
+        | 0.75     | +p50(B)    | ~50% of frames border-free                  |
+        | 1.00     | +max(B)    | every frame border-free (delegated to       |
+        |          |            | optzoom=1 by the caller, not this method)   |
+
+        Formally: for coverage > 0.5, zoom = +quantile(B, 2*(coverage-0.5));
+        for coverage < 0.5, zoom = -quantile(B, 1-2*coverage); coverage ==
+        0.5 is a hard 0.0, matching vidstabtransform's own no-zoom default
+        exactly rather than an approximation. This makes the mapping
+        continuous through zero at coverage=0.5 and both true endpoints
+        (0.0, 1.0) exact once combined with the B values (or, for 1.0, the
+        exact optzoom=1 delegation in ``execute()`` instead of this method).
+
+        Returns a percentage clamped to vidstabtransform's valid
+        ``zoom=`` range, [-100, 100]. Never raises: degenerate ``b_values``
+        (empty, all zeros, a single value) simply yield 0.0 or a clamped
+        magnitude, never a division by zero.
+        """
+        coverage = max(0.0, min(1.0, coverage))
+        if coverage == 0.5:
+            signed = 0.0
+        elif coverage > 0.5:
+            signed = cls._zoom_quantile(b_values, 2.0 * (coverage - 0.5))
+        else:
+            signed = -cls._zoom_quantile(b_values, 1.0 - 2.0 * coverage)
+        return max(-100.0, min(100.0, signed))
+
+    def _compute_required_zoom_percentages(
+        self, trf_path: str, video_width: int, video_height: int
+    ) -> list[float]:
+        """Estimate the per-frame required-zoom-IN percentage B_i (always
+        >= 0) for every frame in ``trf_path``, i.e. the zoom that would just
+        eliminate that frame's border.
 
         LIMITATION (state this honestly, do not treat this as exact): what
         actually determines each frame's visible border is
@@ -430,21 +490,25 @@ class StabilizeStage(BaseStage):
         has no access to. All it can see is the raw per-block local-motion
         (LM) values in the TRF file -- frame-to-frame motion estimates, not
         the smoothed path -- which are integrated here into an approximate
-        cumulative camera-path position. The quantile of these raw,
+        cumulative camera-path position. A quantile of these raw,
         un-smoothed excursions is a DIRECTIONALLY CORRECT approximation of
         the quantile of the true smoothed-path excursions, not an exact
         match: individual frames' actual post-smoothing border requirements
-        can come out higher or lower than this estimate. This is exactly
-        why zoom_coverage is a tunable dial and not a guarantee once
-        coverage < 1.0 -- at coverage=1.0 the exact optzoom=1 delegation is
-        used instead (no approximation involved). This also does NOT
-        account for rotation's contribution to border size -- the TRF's
-        rotation component, if present, is ignored here, same limitation as
-        _movement_extent().
+        can come out higher or lower than this estimate. This applies
+        symmetrically to the negative (zoom-OUT) half of the zoom_coverage
+        dial too: ``-B_i`` (the zoom-out needed to keep frame i's content
+        fully intact) inherits the same approximation, since it is just the
+        negation of the same estimate. This is exactly why zoom_coverage is
+        a tunable dial and not a guarantee anywhere except its exact
+        coverage=1.0 endpoint, which delegates to vidstabtransform's own
+        optzoom=1 instead of this estimate (no approximation involved
+        there). This also does NOT account for rotation's contribution to
+        border size -- the TRF's rotation component, if present, is ignored
+        here, same limitation as _movement_extent().
 
-        Returns a zoom percentage suitable for vidstabtransform's
-        ``zoom=`` option (>0 = zoom in), or 0.0 if the TRF can't be parsed
-        or has no LM data.
+        Returns a list of non-negative percentages (one per frame, in frame
+        order) suitable for ``_zoom_quantile``/``_signed_zoom_from_coverage``,
+        or an empty list if the TRF can't be parsed or has no LM data.
         """
         try:
             with open(trf_path, "r") as f:
@@ -469,7 +533,7 @@ class StabilizeStage(BaseStage):
                         frames_data[current_frame].append((float(dx), float(dy)))
 
             if not frames_data:
-                return 0.0
+                return []
 
             ordered_frames = sorted(frames_data)
             avg_dx = []
@@ -484,7 +548,7 @@ class StabilizeStage(BaseStage):
                     avg_dy.append(0.0)
 
             if not avg_dx:
-                return 0.0
+                return []
 
             # Integrate frame-to-frame local motion into an approximate raw
             # cumulative camera-path position -- see the LIMITATION note
@@ -538,17 +602,13 @@ class StabilizeStage(BaseStage):
                 shift_y = abs(y - sy)
                 pct_x = (200.0 * shift_x / video_width) if video_width else 0.0
                 pct_y = (200.0 * shift_y / video_height) if video_height else 0.0
-                required_pct.append(max(pct_x, pct_y))
+                required_pct.append(max(0.0, max(pct_x, pct_y)))
 
-            required_pct.sort()
-            n = len(required_pct)
-            coverage = max(0.0, min(1.0, coverage))
-            idx = min(n - 1, int(round(coverage * (n - 1))))
-            return max(0.0, required_pct[idx])
+            return required_pct
 
         except Exception as e:
-            self.logger.warning(f"Static zoom computation failed: {e}")
-            return 0.0
+            self.logger.warning(f"Required-zoom computation failed: {e}")
+            return []
 
     def _detect_scenes(self, input_path: str, scene_threshold: float = 0.98) -> list[float]:
         """Detect scene changes by comparing consecutive frames.
@@ -775,15 +835,22 @@ class StabilizeStage(BaseStage):
             # zoom_enabled=False (vidstabtransform's own default is
             # optzoom=1, so it must be explicitly zeroed here).
             #
-            # zoom_coverage (0.0-1.0) shapes WHAT zoom is applied once
-            # apply_zoom (the movement-extent gate above) has already
-            # decided zoom applies at all -- it does not change the gate
-            # itself. 1.0 (default) = today's exact optzoom=1 behavior
-            # (guaranteed no border on any frame). 0.0 = no zoom (all
-            # borders visible, same as apply_zoom=False). In between: a
-            # static zoom= percentage computed from the zoom_coverage-th
-            # quantile of per-frame required-zoom estimates (see
-            # _compute_static_zoom_pct's docstring for the accuracy
+            # zoom_coverage (0.0-1.0, SIGNED dial -- REQUIREMENTS.md § 17)
+            # shapes WHAT zoom is applied once apply_zoom (the
+            # movement-extent gate above) has already decided zoom applies
+            # at all -- it does not change the gate itself (§ 17.1:
+            # zoom_enabled=False still means no zoom of any kind, never
+            # redirected to zoom-out). 1.0 (default) = today's exact
+            # optzoom=1 behavior (guaranteed no border on any frame,
+            # content cropped) -- bit-for-bit unchanged, delegated to
+            # vidstabtransform rather than estimated. 0.5 = no zoom at all
+            # (vidstabtransform's own default -- today's old 0.0
+            # behavior). 0.0 = zoom OUT far enough that every frame's full
+            # content survives (borders on all frames, nothing ever
+            # cropped). Everywhere except 1.0, the signed zoom= percentage
+            # is a quantile of per-frame required-zoom estimates (see
+            # _compute_required_zoom_percentages's and
+            # _signed_zoom_from_coverage's docstrings for the accuracy
             # limitation -- it approximates vidstabtransform's own smoothed
             # camera path from the raw TRF, it does not read it directly).
             static_zoom_pct = None
@@ -791,15 +858,14 @@ class StabilizeStage(BaseStage):
                 zoom_param = ":zoom=0:optzoom=0"
             elif self._zoom_coverage >= 1.0:
                 zoom_param = ":zoom=0:optzoom=1"
-            elif self._zoom_coverage <= 0.0:
-                zoom_param = ":zoom=0:optzoom=0"
             else:
-                static_zoom_pct = self._compute_static_zoom_pct(
-                    clean_trf_path, video_width, video_height, self._zoom_coverage
+                b_values = self._compute_required_zoom_percentages(
+                    clean_trf_path, video_width, video_height
                 )
+                static_zoom_pct = self._signed_zoom_from_coverage(b_values, self._zoom_coverage)
                 zoom_param = f":zoom={static_zoom_pct:.4f}:optzoom=0"
                 self.logger.debug(
-                    f"zoom_coverage={self._zoom_coverage} -> static zoom={static_zoom_pct:.4f}%"
+                    f"zoom_coverage={self._zoom_coverage} -> signed zoom={static_zoom_pct:.4f}%"
                 )
 
             # Build filter chain with optional sharpening

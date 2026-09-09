@@ -1551,10 +1551,16 @@ short.
 
 ### 16.3 Guards
 
-- **`max_intermediates_per_gap`** (default 8). A gap needing more synthesized frames than this is
-  a stall or a hard cut, not motion — RIFE quality degrades badly at large motion and extreme
-  timesteps. Past the cap, `gap_fallback` decides: `hold` (default — repeat frame `k`, exactly
-  what the source did) or `blend` (linear crossfade). Never silently ask RIFE for 30 intermediates.
+- **Long gaps are SUBDIVIDED, not held** (revised 2026-09-09 — the original draft of this section
+  got this backwards; see 16.7).  A gap needing many synthesized frames is exactly where generated
+  motion matters most, so it must never degrade to repeating a frame. `gap_fallback` defaults to
+  `subdivide`; `hold` and `blend` remain available but are no longer the default.
+- **`direct_synthesis_max`** (default 3). Up to this many intermediates in one gap are generated
+  directly from the two real bracketing frames at their exact timesteps — a single RIFE pass each.
+- **`max_intermediates_per_gap`** (default 0 = unlimited) and **`max_gap_sec`** (default 0.0 =
+  unlimited) are safety valves for pathological input, not the normal path. When either is
+  exceeded, `gap_fallback` applies (`hold` repeats frame `k`, `blend` crossfades). Left unlimited
+  by default so the badly-upsampled inputs this feature exists for are always improved.
 - **Scene cuts.** The adaptive path inherits the existing rule that interpolation never crosses a
   cut: in scene mode `interpolate` already runs per-scene. In whole-video mode a hard cut is
   usually a *normal-length* gap and is therefore indistinguishable here — the cap above only
@@ -1564,6 +1570,40 @@ short.
   goes. `o[j]` is monotonic so `k` advances monotonically — a sliding window, never an
   accumulated output list. This preserves the fix for the RIFE RAM blow-up (unbounded
   `all_interpolated` accumulation), which must not be reintroduced.
+
+### 16.7 Recursive subdivision for long gaps
+
+**Why this replaces `hold`.** The original 16.3 capped a gap at 8 intermediates and repeated the
+source frame beyond that. That made the *worst* inputs — heavily upsampled or badly variable
+footage, the ones this whole feature exists to fix — come out looking the worst, because the
+longest holds are precisely the frames most in need of synthesized motion. Holding reproduces the
+defect instead of repairing it.
+
+**The method.** RIFE quality degrades as the temporal distance between its two reference frames
+grows, so filling a long gap with one pass at extreme timesteps is genuinely bad. The fix is not
+to give up but to shorten the distance: generate a small number of intermediates, then treat those
+generated frames as new reference frames and interpolate again between them. Each successive pass
+spans half the temporal distance of the last, so every RIFE call stays in the short-range regime
+it handles well.
+
+For a gap requiring `n` intermediates:
+
+- `n <= direct_synthesis_max` (default 3): generate each directly from the two real frames at its
+  exact timestep. One pass, no recursion — this is the common case.
+- `n > direct_synthesis_max`: recursively bisect. Synthesize the midpoint (`t = 0.5`) from the
+  interval's two endpoints, then recurse into `[a, mid]` and `[mid, b]`, carrying the needed
+  timesteps down into whichever half contains them, until each sub-interval holds no more than
+  `direct_synthesis_max` of them. Endpoints of a sub-interval may themselves be generated frames.
+  A needed timestep's position is renormalized into its sub-interval at each level.
+
+Depth is `ceil(log2(n / direct_synthesis_max))`, so even a 30-frame gap is ~4 levels. Memory stays
+bounded: a recursion holds at most two frames per level, and levels are shallow — the § 16.3
+streaming discipline is unaffected.
+
+**Quality note.** Subdivision is strictly better than a single long-range pass, but it is not
+free: a frame produced at depth 3 is an interpolation of interpolations, and error compounds. It
+is nonetheless far better than repeating a frame, which contributes no motion at all. Users who
+prefer the old behaviour for extreme gaps can set `max_gap_sec` with `gap_fallback: hold`.
 
 ### 16.4 Target approach policy (the uniform-factor path)
 
@@ -1582,8 +1622,10 @@ adaptive interpolation. Default stays `under` so existing behaviour is bit-for-b
 stages:
   interpolate:
     adaptive_cadence: true          # 16.1; false = always the uniform-factor path
-    max_intermediates_per_gap: 8    # 16.3 cap
-    gap_fallback: hold              # hold | blend, past the cap
+    direct_synthesis_max: 3         # 16.7; intermediates generated in one pass per gap
+    gap_fallback: subdivide         # subdivide (default) | hold | blend
+    max_intermediates_per_gap: 0    # 16.3 safety valve; 0 = unlimited
+    max_gap_sec: 0.0                # 16.3 safety valve; 0.0 = unlimited
     target_approach: under          # under | nearest | over (uniform path only)
 ```
 
@@ -1595,3 +1637,71 @@ Stage metadata gains `adaptive: bool`, `frames_synthesized`, `frames_passed_thro
 landings that reused a real frame), `gaps_capped` (how often `max_intermediates_per_gap` was hit),
 and keeps `fps_out`. `timeline_linearized` (§ 12.4b) must report **false** whenever the adaptive
 path ran, since the timing is honoured rather than flattened.
+
+## 17. Signed stabilization zoom: `zoom_coverage` spans zoom-OUT as well as zoom-in (PLANNED 2026-09-09, user-approved)
+
+**Problem**: `stages.stabilize.zoom_coverage=0.0` does not do what its name and documentation
+imply. Today `0.0` means "no zoom" (`optzoom=0, zoom=0`) — but *no zoom is not no cropping*. With
+zoom at 0 a stabilized frame is still translated/rotated by the smoothing path, so it loses
+content off one edge while showing a border on the opposite edge. Every shaky frame ends up both
+bordered **and** cropped. Setting `zoom_enabled: false` behaves similarly, because `vidstab`
+never zooms *out* on its own.
+
+What the user wants at `0.0` is the mirror image of `optzoom=1`: zoom **out** far enough that
+every frame's full content survives the transform, accepting borders on all of them. That requires
+a **negative** `zoom=` value, which `vidstabtransform` supports (`>0` zooms in, `<0` zooms out) and
+which the current implementation can never produce — `_compute_static_zoom_pct()` returns
+percentages in `[0, ...]` and `0.0` short-circuits to no zoom at all.
+
+**Fix — make `zoom_coverage` a SIGNED dial.** Let `B_i` be the zoom-in percentage that would just
+eliminate frame `i`'s border (the existing per-frame required-zoom estimate, always `>= 0`). Note
+the same magnitude negated, `-B_i`, is the zoom-out needed to keep frame `i`'s content fully intact.
+The dial maps:
+
+| `zoom_coverage` | `zoom=` | Meaning |
+|---|---|---|
+| `0.00` | `-max(B)` | 100% of frames keep ALL content; borders everywhere. Nothing is ever cropped. |
+| `0.25` | `-p50(B)` | ~50% of frames fully preserved |
+| `0.50` | `0` | No zoom — `vidstabtransform`'s default, and today's `0.0` behaviour |
+| `0.75` | `+p50(B)` | ~50% of frames border-free |
+| `1.00` | `+max(B)` | 100% border-free (today's `1.0`, `optzoom=1`) |
+
+Formally: for `q >= 0.5`, `zoom = quantile(B, 2(q - 0.5))`; for `q < 0.5`,
+`zoom = -quantile(B, 1 - 2q)`. Continuous through `zoom = 0` at `q = 0.5`, and both endpoints are
+exact. The upper half raises the fraction of frames that are border-free; the lower half raises
+the fraction whose content is fully preserved. `q = 1.0` keeps delegating to `optzoom=1` exactly
+as today, so the default is bit-for-bit unchanged.
+
+**Why the dial can't mean "fraction of frames clipped" throughout** (the user's initial phrasing):
+that metric saturates at 100% as soon as `zoom` reaches 0 — at any `zoom >= 0` every displaced
+frame loses some content — so it cannot distinguish the entire zoom-in half of the range, where
+the meaningful variable is instead how many frames are border-free. The two halves necessarily
+measure different things; the table above is the coherent reading, chosen by the user.
+
+### 17.1 Interaction with the movement gate
+
+`zoom_enabled` / `zoom_threshold`'s `apply_zoom` gate is unchanged and still decides whether any
+zoom is applied. No special case is needed for the zoom-out half: on stable footage `max(B)` is
+near zero, so the computed zoom-out is a near-no-op regardless of the gate.
+
+`zoom_enabled: false` continues to mean "no zoom of any kind" — it is not redirected to the
+zoom-out behaviour, since a user disabling a feature should get vidstab's own default, not a new
+transform. Zoom-out is requested via `zoom_coverage`, not by disabling zoom.
+
+### 17.2 Migration (breaking)
+
+**This changes the meaning of an existing key.** `zoom_coverage: 0.0` previously meant "no zoom"
+and now means "zoom out to preserve everything"; the old `0.0` behaviour moves to `0.5`. Anyone
+who set `0.0` to mean "leave it alone" must change it to `0.5`. This is deliberate — the old
+`0.0` was widely misread as "no cropping", which is the bug being fixed — but it must be called
+out in CHANGELOG.md and the config comments, and `avf config upgrade` cannot infer the intent, so
+it must not silently rewrite the value.
+
+### 17.3 Accuracy caveat (carried over)
+
+The existing limitation in AGENTS.md's "Stabilization zoom coverage" section still applies and
+must be restated for the negative range: `B_i` is estimated from the TRF's raw per-block local
+motion, not from `vidstabtransform`'s internally-computed smoothed camera path, which this code
+cannot see. So `0.0` is "zoom out by our best estimate of the worst displacement", not a
+mathematical guarantee that no pixel is ever lost. `1.0` remains exact because it delegates to
+`optzoom=1` rather than to the estimate.

@@ -213,53 +213,54 @@ def _write_frames_trf(tmp_path, name, per_frame_dx):
     return str(trf)
 
 
-class TestComputeStaticZoomPct:
-    """Static zoom is the zoom_coverage-quantile of per-frame required-zoom
-    estimates, not the max (which is what optzoom=1 effectively guarantees)."""
+class TestComputeRequiredZoomPercentages:
+    """B_i (per-frame required-zoom-IN estimate) parsing from the TRF --
+    see REQUIREMENTS.md § 17. The signed q -> zoom mapping itself is tested
+    in TestSignedZoomFromCoverage / tests/unit/test_stabilize_zoom.py."""
 
-    def test_no_lm_entries_returns_zero(self, tmp_path):
+    def test_no_frame_headers_returns_empty(self, tmp_path):
         stage = _make_stage(tmp_path)
         trf = tmp_path / "empty.trf"
+        trf.write_text("VidStab 1\n")
+        assert stage._compute_required_zoom_percentages(str(trf), 1920, 1080) == []
+
+    def test_frame_with_no_lm_entries_yields_zero(self, tmp_path):
+        """A frame header with an empty LM list still produces one B_i entry
+        (0.0 -- no measured motion for that frame), not an empty result."""
+        stage = _make_stage(tmp_path)
+        trf = tmp_path / "no_lm.trf"
         trf.write_text("VidStab 1\nFrame 0 (List 0 [])\n")
-        assert stage._compute_static_zoom_pct(str(trf), 1920, 1080, 0.5) == 0.0
+        assert stage._compute_required_zoom_percentages(str(trf), 1920, 1080) == [0.0]
 
-    def test_missing_file_returns_zero(self, tmp_path):
+    def test_missing_file_returns_empty(self, tmp_path):
         stage = _make_stage(tmp_path)
-        assert stage._compute_static_zoom_pct(str(tmp_path / "nope.trf"), 1920, 1080, 0.5) == 0.0
+        assert (
+            stage._compute_required_zoom_percentages(str(tmp_path / "nope.trf"), 1920, 1080) == []
+        )
 
-    def test_full_coverage_uses_worst_frame(self, tmp_path):
-        """coverage=1.0 (quantile at the max) should require at least as
-        much zoom as any lower coverage on the same clip."""
-        stage = _make_stage(tmp_path)
-        # One violent-motion frame among many calm ones.
-        dx = [0.0] * 20 + [200.0]
-        trf = _write_frames_trf(tmp_path, "mixed.trf", dx)
-        pct_full = stage._compute_static_zoom_pct(trf, 1920, 1080, 1.0)
-        pct_half = stage._compute_static_zoom_pct(trf, 1920, 1080, 0.5)
-        assert pct_full >= pct_half
-        assert pct_full > 0.0
-
-    def test_zero_coverage_uses_smallest_frame(self, tmp_path):
+    def test_has_an_outlier_frame(self, tmp_path):
+        """A clip with one violent-motion frame among many calm ones should
+        produce at least one large B value and several near-zero ones."""
         stage = _make_stage(tmp_path)
         dx = [0.0] * 20 + [200.0]
         trf = _write_frames_trf(tmp_path, "mixed.trf", dx)
-        pct_zero = stage._compute_static_zoom_pct(trf, 1920, 1080, 0.0)
-        pct_full = stage._compute_static_zoom_pct(trf, 1920, 1080, 1.0)
-        assert pct_zero <= pct_full
+        b_values = stage._compute_required_zoom_percentages(trf, 1920, 1080)
+        assert len(b_values) == len(dx)
+        assert all(b >= 0.0 for b in b_values)
+        assert max(b_values) > 0.0
 
-    def test_uniform_motion_all_quantiles_equal(self, tmp_path):
+    def test_uniform_motion_all_frames_equal(self, tmp_path):
         """A single initial jump followed by a steady position (constant
         cumulative path, no further outlier frames) should give the same
-        required zoom regardless of coverage, since every frame's excursion
-        from the median path is identical."""
+        required zoom for every frame, since each frame's excursion from
+        the local-average path is identical."""
         stage = _make_stage(tmp_path)
         # cumulative path (integral of these per-frame deltas) is a constant
         # 5px offset for every frame after the first.
         dx = [5.0] + [0.0] * 29
         trf = _write_frames_trf(tmp_path, "steady.trf", dx)
-        pct_low = stage._compute_static_zoom_pct(trf, 1920, 1080, 0.1)
-        pct_high = stage._compute_static_zoom_pct(trf, 1920, 1080, 0.9)
-        assert pct_low == pytest.approx(pct_high, abs=1e-6)
+        b_values = stage._compute_required_zoom_percentages(trf, 1920, 1080)
+        assert b_values[-1] == pytest.approx(b_values[-2], abs=1e-6)
 
 
 class TestZoomCoverageExecuteWiring:
@@ -274,10 +275,9 @@ class TestZoomCoverageExecuteWiring:
             zoom_param = ":zoom=0:optzoom=0"
         elif stage._zoom_coverage >= 1.0:
             zoom_param = ":zoom=0:optzoom=1"
-        elif stage._zoom_coverage <= 0.0:
-            zoom_param = ":zoom=0:optzoom=0"
         else:
-            static_zoom_pct = stage._compute_static_zoom_pct(trf_path, 1920, 1080, 0.6)
+            b_values = stage._compute_required_zoom_percentages(trf_path, 1920, 1080)
+            static_zoom_pct = stage._signed_zoom_from_coverage(b_values, stage._zoom_coverage)
             zoom_param = f":zoom={static_zoom_pct:.4f}:optzoom=0"
         return zoom_param, static_zoom_pct
 
@@ -288,16 +288,30 @@ class TestZoomCoverageExecuteWiring:
         assert zoom_param == ":zoom=0:optzoom=1"
         assert static_pct is None
 
-    def test_coverage_zero_disables_zoom(self, tmp_path):
+    def test_coverage_zero_zooms_out(self, tmp_path):
+        """coverage=0.0 now means zoom OUT (negative zoom=) to preserve
+        every frame's content, not "no zoom" -- REQUIREMENTS.md § 17."""
         stage = _make_stage(tmp_path)
         stage._zoom_coverage = 0.0
-        zoom_param, static_pct = self._run_zoom_param_decision(stage, apply_zoom=True)
-        assert zoom_param == ":zoom=0:optzoom=0"
-        assert static_pct is None
+        trf = _write_frames_trf(tmp_path, "shaky.trf", [0.0] * 20 + [200.0])
+        zoom_param, static_pct = self._run_zoom_param_decision(stage, apply_zoom=True, trf_path=trf)
+        assert ":optzoom=0" in zoom_param
+        assert static_pct is not None
+        assert static_pct < 0.0
 
     def test_gate_false_disables_zoom_regardless_of_coverage(self, tmp_path):
         stage = _make_stage(tmp_path)
         stage._zoom_coverage = 0.8
+        zoom_param, static_pct = self._run_zoom_param_decision(stage, apply_zoom=False)
+        assert zoom_param == ":zoom=0:optzoom=0"
+        assert static_pct is None
+
+    def test_coverage_zero_gate_false_still_disables_zoom(self, tmp_path):
+        """§ 17.1: zoom_enabled=False (apply_zoom=False) means no zoom of
+        any kind, even at zoom_coverage=0.0 -- never redirected to
+        zoom-out."""
+        stage = _make_stage(tmp_path)
+        stage._zoom_coverage = 0.0
         zoom_param, static_pct = self._run_zoom_param_decision(stage, apply_zoom=False)
         assert zoom_param == ":zoom=0:optzoom=0"
         assert static_pct is None

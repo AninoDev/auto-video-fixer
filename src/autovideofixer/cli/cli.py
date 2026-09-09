@@ -168,6 +168,10 @@ _VALUE_FLAGS = {
     "--retime-min-duplicate-ratio",
     "--output-timing",
     "--interpolate-target-approach",
+    "--interpolate-direct-synthesis-max",
+    "--interpolate-gap-fallback",
+    "--interpolate-max-intermediates-per-gap",
+    "--interpolate-max-gap-sec",
 }
 
 # Boolean/flag-value options that map to a config key -- recorded with a
@@ -1082,6 +1086,46 @@ def _log_effective_settings(
     "exact rate (overrides stages.interpolate.target_approach).",
 )
 @click.option(
+    "--interpolate-direct-synthesis-max",
+    type=int,
+    default=None,
+    help="With adaptive AI/RIFE interpolation: up to this many intermediates in one gap are "
+    "generated directly from the gap's two real frames; more than this recursively "
+    "subdivides (synthesize the midpoint, then reuse it as a new reference frame for two "
+    "half-gap passes, and so on) so every RIFE call stays short-range (overrides "
+    "stages.interpolate.direct_synthesis_max; default 3). See docs/REQUIREMENTS.md § 16.7.",
+)
+@click.option(
+    "--interpolate-gap-fallback",
+    default=None,
+    type=click.Choice(["subdivide", "hold", "blend"]),
+    help="With adaptive AI/RIFE interpolation: what a gap does once it exceeds "
+    "--interpolate-direct-synthesis-max -- 'subdivide' (default) recursively bisects per "
+    "§ 16.7; 'hold'/'blend' restore the pre-§16.7 behavior but ONLY take effect for a gap "
+    "that also exceeds --interpolate-max-intermediates-per-gap or "
+    "--interpolate-max-gap-sec (both unlimited by default, so this flag alone does "
+    "nothing unless paired with one) (overrides stages.interpolate.gap_fallback).",
+)
+@click.option(
+    "--interpolate-max-intermediates-per-gap",
+    type=int,
+    default=None,
+    help="With adaptive AI/RIFE interpolation: a SAFETY VALVE for pathological input, not "
+    "the normal path -- a gap needing more synthesized frames than this forces "
+    "--interpolate-gap-fallback's hold/blend behavior instead of subdividing (overrides "
+    "stages.interpolate.max_intermediates_per_gap; default 0 = unlimited, so an ordinary "
+    "long gap always subdivides). See docs/REQUIREMENTS.md § 16.3.",
+)
+@click.option(
+    "--interpolate-max-gap-sec",
+    type=float,
+    default=None,
+    help="With adaptive AI/RIFE interpolation: a SAFETY VALVE, same idea as "
+    "--interpolate-max-intermediates-per-gap but capping the gap's real DURATION in "
+    "seconds instead of its intermediate count (overrides stages.interpolate.max_gap_sec; "
+    "default 0.0 = unlimited).",
+)
+@click.option(
     "--downscale/--no-downscale",
     "downscale",
     default=None,
@@ -1149,12 +1193,13 @@ def _log_effective_settings(
     "--zoom-coverage",
     type=float,
     default=None,
-    help="Fraction (0.0-1.0) of frames that should end up border-free once the stabilize "
-    "stage's zoom gate decides zoom applies at all (overrides stages.stabilize.zoom_coverage). "
-    "1.0 (default) = vidstabtransform's optzoom=1, guaranteed no border on any frame. 0.0 = no "
-    "zoom (all borders visible). In between trades that guarantee for a less aggressive crop, "
-    "with occasional brief borders on the most extreme motion -- see AGENTS.md's stabilize zoom "
-    "section.",
+    help="SIGNED zoom dial (0.0-1.0) once the stabilize stage's zoom gate decides zoom applies "
+    "at all (overrides stages.stabilize.zoom_coverage; BREAKING as of 2026-09, see "
+    "CHANGELOG.md). 1.0 (default) = vidstabtransform's optzoom=1, guaranteed no border on any "
+    "frame (content cropped). 0.5 = no zoom at all (vidstabtransform's own default -- this is "
+    "the OLD 0.0 behavior). 0.0 = zoom OUT far enough that every frame's full content survives "
+    "(borders on all frames, nothing ever cropped). 0.25/0.75 = the zoom-out/zoom-in midpoints. "
+    "See AGENTS.md's stabilize zoom section.",
 )
 @click.option(
     "--batch-size",
@@ -1277,6 +1322,10 @@ def process(
     interpolate_hybrid: bool | None,
     interpolate_adaptive: bool | None,
     interpolate_target_approach: str | None,
+    interpolate_direct_synthesis_max: int | None,
+    interpolate_gap_fallback: str | None,
+    interpolate_max_intermediates_per_gap: int | None,
+    interpolate_max_gap_sec: float | None,
     downscale: bool | None,
     retime: bool | None,
     retime_min_duplicate_ratio: float | None,
@@ -1429,6 +1478,38 @@ def process(
                 ("--interpolate-target-approach",),
                 ["stages", "interpolate", "target_approach"],
                 interpolate_target_approach,
+            )
+        )
+    if interpolate_direct_synthesis_max is not None:
+        cli_candidates.append(
+            (
+                ("--interpolate-direct-synthesis-max",),
+                ["stages", "interpolate", "direct_synthesis_max"],
+                interpolate_direct_synthesis_max,
+            )
+        )
+    if interpolate_gap_fallback is not None:
+        cli_candidates.append(
+            (
+                ("--interpolate-gap-fallback",),
+                ["stages", "interpolate", "gap_fallback"],
+                interpolate_gap_fallback,
+            )
+        )
+    if interpolate_max_intermediates_per_gap is not None:
+        cli_candidates.append(
+            (
+                ("--interpolate-max-intermediates-per-gap",),
+                ["stages", "interpolate", "max_intermediates_per_gap"],
+                interpolate_max_intermediates_per_gap,
+            )
+        )
+    if interpolate_max_gap_sec is not None:
+        cli_candidates.append(
+            (
+                ("--interpolate-max-gap-sec",),
+                ["stages", "interpolate", "max_gap_sec"],
+                interpolate_max_gap_sec,
             )
         )
     if downscale is not None:
@@ -2241,6 +2322,9 @@ def config_upgrade(
         err_console.print(
             f"[yellow]Warning: dropping unknown key not present in template: {key}[/yellow]"
         )
+    zoom_note = config_tools.zoom_coverage_migration_note(input_text)
+    if zoom_note:
+        err_console.print(f"[yellow]Note: {zoom_note}[/yellow]")
     _write_config_output(upgraded, output, force=force, backup=backup)
 
 

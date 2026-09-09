@@ -63,31 +63,72 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   of applying one global factor: `ai/wrappers/interpolate.py`'s new `resample_plan()` (pure,
   side-effect-free -- builds the output grid `o[j] = t[0] + j/f`, brackets each point between two
   real input frames, and either emits the original frame verbatim, RIFE-interpolates at the exact
-  fractional timestep, or -- past `max_intermediates_per_gap` -- falls back to `hold`/`blend` for
-  that gap) and `execute_resample_plan()` (a streaming executor holding at most two input frames
-  at a time, mirroring the existing chunked-streaming discipline so this doesn't reintroduce the
-  RIFE RAM blowup fixed earlier). This is drift-free by construction (every output timestamp comes
-  from the global grid, never accumulated per-gap) and reaches the target framerate EXACTLY, so no
-  minterpolate finish pass or timestamp-graft mechanism is needed on this path -- the output is
-  genuinely CFR at the target rate. The timeline itself comes from a new decode-only probe,
-  `core/cadence.py`'s `probe_frame_timestamps()` (a bare `showinfo` pass over the interpolate
-  stage's OWN input file -- correct whether or not `retime` ran, and reflects retiming from
-  intermediate stages like `speed`); it fails open to the existing uniform-factor path (logged at
-  INFO, job never fails) on a probe failure or a timestamp count that disagrees with the frame
-  count the stage's own reader is expected to produce. `InterpolateStage._plan_ai_interpolation()`
-  (the uniform-factor path, used as the fallback and when adaptive is disabled) also gains a
-  `target_approach` option: `under` (default, bit-for-bit unchanged) uses the largest integer RIFE
-  factor at or below target then a minterpolate finish pass; `over` uses the smallest factor at or
-  above target then minterpolate finishes DOWN to the exact rate; `nearest` picks whichever factor
-  lands closer. New config: `stages.interpolate.adaptive_cadence` (default `true`),
-  `max_intermediates_per_gap` (default `8`), `gap_fallback` (`hold`/`blend`, default `hold`),
-  `target_approach` (`under`/`nearest`/`over`, default `under`). New CLI flags:
-  `--interpolate-adaptive`/`--no-interpolate-adaptive`, `--interpolate-target-approach`. Stage
-  metadata gains `adaptive: bool`, `frames_synthesized`, `frames_passed_through`, `gaps_capped`,
-  and reports `timeline_linearized: false` whenever the adaptive path ran (timing is honoured, not
-  flattened, on this path). See `docs/REQUIREMENTS.md` § 16 for the full spec.
+  fractional timestep, or -- once a gap needs more intermediates than `direct_synthesis_max` --
+  recursively SUBDIVIDES it (§ 16.7, see below) rather than falling back) and
+  `execute_resample_plan()` (a streaming executor holding at most two real input frames plus a
+  small per-gap cache of generated frames at a time, mirroring the existing chunked-streaming
+  discipline so this doesn't reintroduce the RIFE RAM blowup fixed earlier). This is drift-free by
+  construction (every output timestamp comes from the global grid, never accumulated per-gap) and
+  reaches the target framerate EXACTLY, so no minterpolate finish pass or timestamp-graft mechanism
+  is needed on this path -- the output is genuinely CFR at the target rate. The timeline itself
+  comes from a new decode-only probe, `core/cadence.py`'s `probe_frame_timestamps()` (a bare
+  `showinfo` pass over the interpolate stage's OWN input file -- correct whether or not `retime`
+  ran, and reflects retiming from intermediate stages like `speed`); it fails open to the existing
+  uniform-factor path (logged at INFO, job never fails) on a probe failure or a timestamp count
+  that disagrees with the frame count the stage's own reader is expected to produce.
+  `InterpolateStage._plan_ai_interpolation()` (the uniform-factor path, used as the fallback and
+  when adaptive is disabled) also gains a `target_approach` option: `under` (default, bit-for-bit
+  unchanged) uses the largest integer RIFE factor at or below target then a minterpolate finish
+  pass; `over` uses the smallest factor at or above target then minterpolate finishes DOWN to the
+  exact rate; `nearest` picks whichever factor lands closer.
+  - **Recursive subdivision for long gaps (§ 16.7, revised before release -- landed together with
+    the feature above, so this replaces rather than changes released behavior).** The first cut of
+    this feature capped a gap at `max_intermediates_per_gap` (default 8) and repeated the source
+    frame past it (`gap_fallback: hold`) -- but that made the worst inputs (heavily
+    duplicated/VFR footage, the whole reason this feature exists) look worst, since the longest
+    holds are exactly where synthesized motion is needed most. Now a gap needing more than the new
+    `direct_synthesis_max` (default `3`) intermediates is recursively bisected instead --
+    synthesize the midpoint from the gap's two real frames, then reuse it as a reference frame for
+    two half-gap recursive passes, and so on, so every RIFE call stays short-range
+    (`ceil(log2(n / direct_synthesis_max))` levels deep). `max_intermediates_per_gap`'s default
+    changed `8` -> `0` (unlimited) and `gap_fallback`'s default changed `hold` -> `subdivide`; both
+    (plus the new `max_gap_sec`, default `0.0` = unlimited) are now SAFETY VALVES for pathological
+    input only, not the normal path -- an ordinary long gap always subdivides. New config:
+    `stages.interpolate.direct_synthesis_max` (default `3`), `max_gap_sec` (default `0.0`). New
+    CLI flags: `--interpolate-direct-synthesis-max`, `--interpolate-gap-fallback`,
+    `--interpolate-max-intermediates-per-gap`, `--interpolate-max-gap-sec`. Stage metadata gains
+    `gaps_subdivided`, `max_subdivision_depth`; `gaps_capped` now counts genuine safety-valve hits
+    only.
+  New config: `stages.interpolate.adaptive_cadence` (default `true`), `max_intermediates_per_gap`
+  (default `0` = unlimited), `max_gap_sec` (default `0.0` = unlimited), `gap_fallback`
+  (`subdivide`/`hold`/`blend`, default `subdivide`), `target_approach` (`under`/`nearest`/`over`,
+  default `under`). New CLI flags: `--interpolate-adaptive`/`--no-interpolate-adaptive`,
+  `--interpolate-target-approach`. Stage metadata gains `adaptive: bool`, `frames_synthesized`,
+  `frames_passed_through`, `gaps_capped`, `gaps_subdivided`, `max_subdivision_depth`, and reports
+  `timeline_linearized: false` whenever the adaptive path ran (timing is honoured, not flattened,
+  on this path). See `docs/REQUIREMENTS.md` § 16 (§ 16.7 for subdivision) for the full spec.
 
 ### Changed
+- **2026-09-09: BREAKING -- `stages.stabilize.zoom_coverage` is now a SIGNED dial spanning
+  zoom-OUT as well as zoom-IN; `0.0`'s meaning changed (REQUIREMENTS.md § 17).** Previously
+  `zoom_coverage=0.0` meant "no zoom at all" (`optzoom=0, zoom=0`) -- but no zoom is not no
+  cropping: with `zoom=0` a stabilized frame is still translated/rotated by the smoothing path, so
+  it loses content off one edge while showing a border on the other. Every shaky frame ended up
+  both bordered AND cropped, which is not what a user setting `0.0` (expecting "nothing is ever
+  cropped") wanted. `zoom_coverage` is now a signed dial: `0.00` -> `zoom=-max(B)` (zoom OUT far
+  enough that every frame's full content survives; borders everywhere, nothing ever cropped);
+  `0.25` -> `zoom=-p50(B)`; `0.50` -> `zoom=0` (no zoom at all -- **this is the OLD `0.0`
+  behaviour**); `0.75` -> `zoom=+p50(B)`; `1.00` -> `zoom=+max(B)` (every frame border-free,
+  still delegated to `vidstabtransform`'s own `optzoom=1` exactly as before -- bit-for-bit
+  unchanged, the default). `B_i` is the existing per-frame required-zoom-IN estimate.
+  **Anyone who set `zoom_coverage: 0.0` expecting "leave it alone" must change it to `0.5`.**
+  `avf config upgrade` does NOT infer this for you -- it carries an existing `zoom_coverage` value
+  through unchanged (as it does for every key) and now prints an explicit note when it does, since
+  a silent passthrough of a now-differently-meaning value is easy to miss. `zoom_enabled: false`
+  is unaffected -- it continues to mean "no zoom of any kind" and is never redirected to the
+  zoom-out behaviour (§ 17.1). See `AGENTS.md`'s "Stabilization zoom coverage" section for the
+  full mapping, the accuracy caveat (both halves of the dial approximate vidstabtransform's own
+  smoothed camera path from raw TRF data; only `1.0` is exact), and empirical verification.
 - **2026-07-22: BREAKING (default behavior) -- pipeline default order and default deblock model
   changed for ALL users; `denoise_video` is now OFF by default.** No config change is required
   to notice a difference -- these are `Config.DEFAULTS` changes, so any run without explicit

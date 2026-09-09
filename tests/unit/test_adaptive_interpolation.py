@@ -49,8 +49,10 @@ class TestResamplePlanUniform:
         assert len(plan) == expected_count
 
     def test_uniform_input_never_needs_gap_fallback(self):
-        """A perfectly uniform 24fps timeline never exceeds the default cap
-        (8) -- there should be zero "hold"/"blend" entries."""
+        """A perfectly uniform 24fps timeline never needs more than 2
+        intermediates per gap -- well under direct_synthesis_max (3), so
+        no subdivision and no safety valve either: every entry stays
+        "emit"/"synthesize", never "hold"/"blend"/"synth_node"."""
         timestamps = [i / 24.0 for i in range(240)]
         plan = resample_plan(timestamps, 60.0)
         assert all(e.op in ("emit", "synthesize") for e in plan)
@@ -92,7 +94,13 @@ class TestResamplePlanIrregular:
 
     def test_irregular_cadence_reaches_grid_count_exactly(self):
         """Mixed short/long gaps still hit the grid count exactly (no
-        special-casing breaks the drift-free guarantee)."""
+        special-casing breaks the drift-free guarantee). The 0.2s gaps
+        here need 12 intermediates at 60fps -- past direct_synthesis_max
+        (3) -- so this also exercises subdivision: len(plan) itself is no
+        longer the output count once "synth_node"/"node_free" internal
+        bookkeeping entries are in the mix (neither is ever yielded -- see
+        execute_resample_plan()), so count OUTPUT-producing entries
+        instead."""
         gaps = [0.05, 0.033, 0.05, 0.2, 0.033, 0.05] * 50
         timestamps = [0.0]
         for g in gaps:
@@ -100,7 +108,8 @@ class TestResamplePlanIrregular:
         plan = resample_plan(timestamps, 60.0, max_intermediates_per_gap=100)
         duration = timestamps[-1] - timestamps[0]
         expected_count = int(math.floor(duration * 60.0)) + 1
-        assert len(plan) == expected_count
+        output_count = sum(1 for e in plan if e.op not in ("synth_node", "node_free"))
+        assert output_count == expected_count
 
 
 class TestResamplePlanSnapping:
@@ -123,9 +132,16 @@ class TestResamplePlanSnapping:
 
 
 class TestMaxIntermediatesPerGapCap:
+    """max_intermediates_per_gap is now a SAFETY VALVE (REQUIREMENTS.md §
+    16.3/16.7), not the normal path -- it defaults to 0 (unlimited) and
+    must be set explicitly (as every test below does) to trigger
+    hold/blend at all. A long gap under the DEFAULT config subdivides
+    instead -- see TestRecursiveSubdivision."""
+
     def test_cap_triggers_hold_fallback(self):
-        # One huge gap (1 second) targeting 60fps needs ~59 intermediates,
-        # way past the default cap of 8.
+        # One huge gap (1 second) targeting 60fps needs ~59 intermediates --
+        # an explicit cap of 8, paired with gap_fallback="hold", is a
+        # safety valve firing: no synthesis, hold instead.
         timestamps = [0.0, 1.0]
         plan = resample_plan(timestamps, 60.0, max_intermediates_per_gap=8, gap_fallback="hold")
         assert not any(e.op == "synthesize" for e in plan)
@@ -137,13 +153,26 @@ class TestMaxIntermediatesPerGapCap:
         assert not any(e.op == "synthesize" for e in plan)
         assert any(e.op == "blend" for e in plan)
 
+    def test_cap_without_explicit_fallback_degrades_to_hold(self):
+        """A safety valve fires even if gap_fallback is left at its
+        "subdivide" default -- "keep subdividing" isn't a meaningful
+        response to a gap flagged as pathological, so it degrades to
+        "hold" (REQUIREMENTS.md § 16.7's design note)."""
+        timestamps = [0.0, 1.0]
+        plan = resample_plan(timestamps, 60.0, max_intermediates_per_gap=8)
+        assert not any(e.op == "synthesize" for e in plan)
+        assert not any(e.op == "synth_node" for e in plan)
+        assert any(e.op == "hold" for e in plan)
+
     def test_below_cap_still_synthesizes(self):
-        # A short gap needing only ~3 intermediates stays under the
-        # default cap of 8 and must synthesize normally.
+        # A short gap needing only 3 intermediates -- exactly
+        # direct_synthesis_max -- stays under an explicit cap of 8 AND
+        # under the direct-synthesis threshold, so it synthesizes directly
+        # (no subdivision, no fallback).
         timestamps = [0.0, 4 / 60]
         plan = resample_plan(timestamps, 60.0, max_intermediates_per_gap=8)
         assert any(e.op == "synthesize" for e in plan)
-        assert not any(e.op in ("hold", "blend") for e in plan)
+        assert not any(e.op in ("hold", "blend", "synth_node") for e in plan)
 
     def test_invalid_gap_fallback_raises(self):
         with pytest.raises(ValueError):
@@ -153,9 +182,170 @@ class TestMaxIntermediatesPerGapCap:
         # Two independent stalled gaps -- gaps_capped must count DISTINCT
         # brackets, not total capped entries.
         timestamps = [0.0, 1.0, 1.0 + 1 / 24, 2.0 + 1 / 24]
-        plan = resample_plan(timestamps, 60.0, max_intermediates_per_gap=8)
+        plan = resample_plan(timestamps, 60.0, max_intermediates_per_gap=8, gap_fallback="hold")
         stats = plan_stats(plan)
         assert stats["gaps_capped"] == 2
+
+
+class TestRecursiveSubdivision:
+    """REQUIREMENTS.md § 16.7. Replaces the old default-hold-past-a-cap
+    behaviour: a long gap now subdivides instead, because holding a frame
+    reproduces the exact defect (a duplicated/stalled frame) this feature
+    exists to repair -- see § 16.7's "Why this replaces hold"."""
+
+    def test_long_gap_subdivides_not_holds_by_default(self):
+        # A 1-second gap at 60fps needs ~59 intermediates -- default
+        # config (unlimited safety valves, gap_fallback="subdivide") must
+        # subdivide, never hold/blend, and every needed timestep must
+        # still end up as a "synthesize" leaf.
+        timestamps = [0.0, 1.0]
+        plan = resample_plan(timestamps, 60.0)
+        assert not any(e.op == "hold" for e in plan)
+        assert not any(e.op == "blend" for e in plan)
+        assert any(e.op == "synth_node" for e in plan)
+        synth_count = sum(1 for e in plan if e.op == "synthesize")
+        assert synth_count == 59
+
+    def test_reference_pairs_shorten_with_depth(self):
+        """The entire point of § 16.7: NOT every synthesized frame in a
+        subdivided gap comes from the two original (far-apart) endpoints
+        -- deeper leaves reference progressively closer, generated
+        frames instead."""
+        timestamps = [0.0, 1.0]
+        plan = resample_plan(timestamps, 60.0)  # ~59 intermediates -> subdivides
+        synth = [e for e in plan if e.op == "synthesize"]
+        assert synth
+        # If nothing were subdivided, every leaf would reference (0, 1)
+        # directly -- prove that's not the case for at least some of them.
+        assert any(e.ref_a != 0 or e.ref_b != 1 for e in synth)
+        # And nodes themselves chain: with ~59 items and
+        # direct_synthesis_max=3 the tree is several levels deep, so at
+        # least one node must be built from TWO other nodes (both refs
+        # negative), not from the two real frames.
+        nodes = [e for e in plan if e.op == "synth_node"]
+        assert any(e.ref_a < 0 and e.ref_b < 0 for e in nodes)
+
+    def test_timestep_positions_correct_after_renormalization(self):
+        """End-to-end check of the bisection arithmetic: feed a fake
+        interpolate_fn that does TRUE linear interpolation between its two
+        inputs (frames are just the real timestamps themselves) -- since
+        linear interpolation composes exactly under repeated bisection,
+        every output frame must land EXACTLY on its target-grid timestamp
+        even after several levels of subdivision."""
+        timestamps = [0.0, 1.0]
+        target_fps = 60.0
+        plan = resample_plan(timestamps, target_fps)
+
+        def linear_interp(a, b, t):
+            return a + (b - a) * t
+
+        out = list(execute_resample_plan(timestamps, plan, linear_interp))
+        j_max = int(math.floor((timestamps[-1] - timestamps[0]) * target_fps + 1e-9))
+        expected = [timestamps[0] + j / target_fps for j in range(j_max + 1)]
+        assert len(out) == len(expected)
+        for got, want in zip(out, expected):
+            assert got == pytest.approx(want, abs=1e-9)
+
+    def test_direct_synthesis_max_boundary(self):
+        """Exactly direct_synthesis_max intermediates -> direct synthesis
+        (no "synth_node" at all); one more -> subdivides."""
+        max_n = 3
+        timestamps_at_max = [0.0, (max_n + 1) / 60.0]
+        plan_at_max = resample_plan(timestamps_at_max, 60.0, direct_synthesis_max=max_n)
+        assert sum(1 for e in plan_at_max if e.op == "synthesize") == max_n
+        assert not any(e.op == "synth_node" for e in plan_at_max)
+
+        timestamps_over = [0.0, (max_n + 2) / 60.0]
+        plan_over = resample_plan(timestamps_over, 60.0, direct_synthesis_max=max_n)
+        assert sum(1 for e in plan_over if e.op == "synthesize") == max_n + 1
+        assert any(e.op == "synth_node" for e in plan_over)
+
+    def test_max_intermediates_per_gap_safety_valve_still_holds(self):
+        """Safety valve (REQUIREMENTS.md § 16.3): set explicitly, it still
+        forces hold/blend instead of subdividing, exactly like before."""
+        timestamps = [0.0, 1.0]
+        plan = resample_plan(timestamps, 60.0, max_intermediates_per_gap=8, gap_fallback="hold")
+        assert not any(e.op in ("synthesize", "synth_node") for e in plan)
+        assert any(e.op == "hold" for e in plan)
+
+    def test_max_gap_sec_safety_valve_still_holds(self):
+        timestamps = [0.0, 2.0]  # a 2-second gap
+        plan = resample_plan(timestamps, 60.0, max_gap_sec=1.0, gap_fallback="hold")
+        assert not any(e.op in ("synthesize", "synth_node") for e in plan)
+        assert any(e.op == "hold" for e in plan)
+
+    def test_max_gap_sec_safety_valve_blend(self):
+        timestamps = [0.0, 2.0]
+        plan = resample_plan(timestamps, 60.0, max_gap_sec=1.0, gap_fallback="blend")
+        assert not any(e.op in ("synthesize", "synth_node") for e in plan)
+        assert any(e.op == "blend" for e in plan)
+
+    def test_default_unlimited_valves_long_gap_still_subdivides(self):
+        # A 10-second gap at 60fps needs ~599 intermediates -- far past
+        # the OLD default cap (8) -- under the NEW defaults (both safety
+        # valves unlimited) it must still subdivide, never hold/blend.
+        timestamps = [0.0, 10.0]
+        plan = resample_plan(timestamps, 60.0)
+        assert not any(e.op == "hold" for e in plan)
+        assert not any(e.op == "blend" for e in plan)
+        stats = plan_stats(plan)
+        assert stats["gaps_capped"] == 0
+        assert stats["gaps_subdivided"] == 1
+        assert stats["max_subdivision_depth"] >= 1
+
+    def test_non_monotonic_timeline_with_subdivision_no_crash(self):
+        """Degenerate (non-monotonic) input must not raise even when the
+        resulting "gap" is long enough to subdivide."""
+        timestamps = [0.0, 5.0, 2.0, 9.0]
+        plan = resample_plan(timestamps, 60.0)
+        assert len(plan) > 0
+
+    def test_zero_and_single_frame_timelines_unaffected_by_new_defaults(self):
+        """Degenerate inputs still degrade to "emit every frame once"
+        under the new defaults (subdivide/unlimited), exactly as before."""
+        assert resample_plan([], 60.0) == []
+        assert resample_plan([1.23], 60.0) == [PlanEntry(op="emit", k=0)]
+        assert resample_plan([1.0, 1.0, 1.0], 60.0) == [PlanEntry(op="emit", k=i) for i in range(3)]
+
+    def test_node_lifetime_is_bounded_by_depth_not_total_node_count(self):
+        """The bounded-memory property (REQUIREMENTS.md § 16.3/16.7): a
+        node must never be "alive" (created but not yet freed) at the
+        same time as every OTHER node in a large gap -- only ones on the
+        current recursion path. Replays the plan's "synth_node"/
+        "node_free" entries the same way the streaming executor's
+        node_cache would, and asserts peak concurrent occupancy tracks
+        max_subdivision_depth, not the (much larger) total node count."""
+        timestamps = [0.0, 100.0]  # ~5987 intermediates -> deep subdivision
+        plan = resample_plan(timestamps, 60.0)
+        stats = plan_stats(plan)
+        total_nodes = sum(1 for e in plan if e.op == "synth_node")
+        assert total_nodes > 100  # sanity: this really is a big tree
+
+        live: set[int] = set()
+        peak = 0
+        for e in plan:
+            if e.op == "synth_node":
+                live.add(e.node_id)
+                peak = max(peak, len(live))
+            elif e.op == "node_free":
+                live.discard(e.node_id)
+
+        assert live == set(), "every node must be freed by the end of its gap"
+        assert peak <= stats["max_subdivision_depth"]
+        assert peak < total_nodes  # the bug this guards against: peak == total_nodes
+
+    def test_node_free_entries_never_counted_as_capped_or_output(self):
+        """ "node_free" is pure bookkeeping -- plan_stats() must not treat
+        it as a capped gap, and it must never appear in execute_resample_
+        plan()'s output stream."""
+        timestamps = [0.0, 100.0]
+        plan = resample_plan(timestamps, 60.0)
+        stats = plan_stats(plan)
+        assert stats["gaps_capped"] == 0
+
+        out = list(execute_resample_plan(timestamps, plan, lambda a, b, t: object()))
+        output_entries = sum(1 for e in plan if e.op not in ("synth_node", "node_free"))
+        assert len(out) == output_entries
 
 
 class TestTargetFpsEdgeCasesAndDegenerateInputs:

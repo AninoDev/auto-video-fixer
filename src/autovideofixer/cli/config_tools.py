@@ -92,6 +92,37 @@ def _walk_leaves(
     return out
 
 
+def zoom_coverage_migration_note(input_text: str) -> str | None:
+    """Return a migration note if `input_text` sets `stages.stabilize.zoom_coverage`,
+    or None otherwise.
+
+    REQUIREMENTS.md § 17.2: `zoom_coverage` changed meaning in a BREAKING way
+    (old `0.0` = "no zoom" now means "zoom out to preserve everything"; the
+    old `0.0` behaviour moved to `0.5`) and `upgrade_config_text()` cannot
+    infer intent, so it passes the value through UNCHANGED rather than
+    rewriting it -- this note exists purely to surface that fact to the user
+    at `avf config upgrade` time, since a silent passthrough of a
+    now-differently-meaning value is easy to miss.
+    """
+    try:
+        data = yaml.safe_load(input_text) or {}
+    except yaml.YAMLError:
+        return None
+    if not isinstance(data, dict):
+        return None
+    stages = data.get("stages")
+    stabilize = stages.get("stabilize") if isinstance(stages, dict) else None
+    if not isinstance(stabilize, dict) or "zoom_coverage" not in stabilize:
+        return None
+    value = stabilize["zoom_coverage"]
+    return (
+        f"stages.stabilize.zoom_coverage={value!r} carried over UNCHANGED. Its meaning changed "
+        'in a breaking way (REQUIREMENTS.md § 17): 0.0 used to mean "no zoom" and now means '
+        '"zoom out to preserve everything" -- the old 0.0 behaviour is now 0.5. If this value '
+        "was set under the old meaning, update it by hand; upgrade cannot infer your intent."
+    )
+
+
 def upgrade_config_text(
     input_text: str, template_text: str, *, drop_unknown: bool = False
 ) -> tuple[str, list[str]]:

@@ -184,8 +184,20 @@ class InterpolateStage(BaseStage):
         self._target_approach = self._stage_config.get("target_approach", "under")
         # REQUIREMENTS.md § 16 -- per-gap adaptive AI interpolation.
         self._adaptive_cadence = self._stage_config.get("adaptive_cadence", True)
-        self._max_intermediates_per_gap = self._stage_config.get("max_intermediates_per_gap", 8)
-        self._gap_fallback = self._stage_config.get("gap_fallback", "hold")
+        # § 16.7 -- up to this many intermediates in one gap are generated
+        # directly from the gap's two real frames; more than this
+        # recursively subdivides instead of holding. See resample_plan()'s
+        # docstring (ai/wrappers/interpolate.py) for the full contract.
+        self._direct_synthesis_max = self._stage_config.get("direct_synthesis_max", 3)
+        # § 16.3 safety valves, NOT the normal path -- 0/0.0 (default) is
+        # unlimited, so an ordinary long gap always subdivides instead of
+        # holding. See resample_plan()'s docstring for when these actually
+        # fire (only together with an explicit gap_fallback of "hold"/
+        # "blend" is the fallback guaranteed rather than degrading to
+        # "hold").
+        self._max_intermediates_per_gap = self._stage_config.get("max_intermediates_per_gap", 0)
+        self._max_gap_sec = self._stage_config.get("max_gap_sec", 0.0)
+        self._gap_fallback = self._stage_config.get("gap_fallback", "subdivide")
 
     def should_run(self, input_info: dict[str, Any]) -> tuple[bool, str | None]:
         if not self.is_enabled():
@@ -1311,7 +1323,9 @@ class InterpolateStage(BaseStage):
             plan = resample_plan(
                 timeline,
                 target_fps,
+                direct_synthesis_max=self._direct_synthesis_max,
                 max_intermediates_per_gap=self._max_intermediates_per_gap,
+                max_gap_sec=self._max_gap_sec,
                 gap_fallback=self._gap_fallback,
             )
             stats = plan_stats(plan)
@@ -1443,6 +1457,12 @@ class InterpolateStage(BaseStage):
                         "frames_synthesized": stats["frames_synthesized"],
                         "frames_passed_through": stats["frames_passed_through"],
                         "gaps_capped": stats["gaps_capped"],
+                        # § 16.7 -- how many gaps needed recursive
+                        # subdivision (more than direct_synthesis_max
+                        # intermediates) and the deepest recursion level
+                        # used anywhere in this run (0 if none did).
+                        "gaps_subdivided": stats["gaps_subdivided"],
+                        "max_subdivision_depth": stats["max_subdivision_depth"],
                         # § 16.1.2/16.6: the adaptive output lands on the
                         # target grid exactly -- timing is honoured, never
                         # linearized, on this path.
