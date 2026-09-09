@@ -387,4 +387,104 @@ def analyze_cadence(path: str, config: Config, sample_sec: float | None = None) 
     )
 
 
-__all__ = ["CadenceAnalysis", "analyze_cadence"]
+def probe_frame_timestamps(
+    path: str, config: Config, *, timeout: float | None = None
+) -> list[float] | None:
+    """Read the ascending presentation timestamps of ``path``'s video stream
+    (REQUIREMENTS.md § 16.2 -- the per-gap adaptive AI interpolation
+    timeline probe).
+
+    Lives here (rather than ``core/ffmpeg_utils.py``) because it reuses this
+    module's ``showinfo``-parsing machinery (``_parse_pts_times()``) and
+    fail-open conventions almost verbatim -- the only difference from
+    ``analyze_cadence()`` is that this probe wants EVERY decoded frame's
+    timestamp, not just mpdecimate's survivors, so the filter chain is a
+    bare ``showinfo`` with no ``mpdecimate`` ahead of it:
+
+        ffmpeg -i IN -map 0:v:0 -an -sn -vf showinfo -f null -
+
+    Returns ``None`` on ANY failure -- ffmpeg/ffprobe missing, no video
+    stream, a malformed/truncated run, a timeout, or zero timestamps
+    parsed -- and NEVER raises. Callers (``InterpolateStage``) must fall
+    back to the existing uniform-factor interpolation path on ``None``,
+    logged at INFO: a timeline miss must never fail a job, same fail-open
+    contract as ``analyze_cadence()``.
+
+    This does not itself validate the returned count against any expected
+    frame count -- REQUIREMENTS.md § 16.2 asks callers to validate that
+    against the frame count the reader actually produces (or, cheaply, the
+    same probe's ``frame_count``), since only the caller knows what to
+    compare against and how strict to be about it.
+    """
+    try:
+        probe_result = probe(path, config)
+    except Exception as e:
+        logger.info("timeline probe: probe failed for %s: %s", path, e)
+        return None
+    if not probe_result.has_video:
+        return None
+
+    try:
+        ffmpeg = get_ffmpeg_path(config)
+    except FileNotFoundError as e:
+        logger.info("timeline probe: %s", e)
+        return None
+
+    args = [
+        ffmpeg,
+        "-hide_banner",
+        "-nostdin",
+        "-i",
+        path,
+        "-map",
+        "0:v:0",
+        "-an",
+        "-sn",
+        "-vf",
+        "showinfo",
+        "-f",
+        "null",
+        "-",
+    ]
+
+    resolved_timeout = resolve_timeout(
+        timeout or config.get("pipeline", "stage_timeout", default=None),
+        "stages.interpolate.timeline_probe_timeout",
+    )
+
+    try:
+        result = subprocess.run(
+            args,
+            capture_output=True,
+            text=True,
+            timeout=resolved_timeout,
+            stdin=subprocess.DEVNULL,
+        )
+    except Exception as e:
+        logger.info("timeline probe: ffmpeg run failed for %s: %s", path, e)
+        return None
+
+    if result.returncode != 0:
+        logger.info(
+            "timeline probe: ffmpeg exited %s for %s -- falling back to uniform-factor "
+            "interpolation",
+            result.returncode,
+            path,
+        )
+        return None
+
+    # showinfo logs to stderr at the default "info" loglevel -- only one
+    # filter instance in this chain, so any-instance parsing is unambiguous.
+    timestamps = _parse_pts_times(result.stderr)
+    if not timestamps:
+        logger.info(
+            "timeline probe: no frame timestamps parsed for %s -- falling back to "
+            "uniform-factor interpolation",
+            path,
+        )
+        return None
+
+    return timestamps
+
+
+__all__ = ["CadenceAnalysis", "analyze_cadence", "probe_frame_timestamps"]

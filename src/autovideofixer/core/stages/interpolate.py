@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
+import math
 import os
 import time
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Iterator
 
 from autovideofixer.core.ffmpeg_utils import probe, run_ffmpeg
 from autovideofixer.core.stages.base import BaseStage, StageResult, StageStatus
@@ -29,9 +30,16 @@ class InterpPlan:
 
 
 def _plan_ai_interpolation(
-    current_fps: float, target_fps: float, hybrid_enabled: bool
+    current_fps: float,
+    target_fps: float,
+    hybrid_enabled: bool,
+    target_approach: str = "under",
 ) -> InterpPlan:
-    """Plan the "RIFE under, then minterpolate up" strategy for the AI path.
+    """Plan the "RIFE + minterpolate finish" strategy for the uniform-factor
+    AI path (REQUIREMENTS.md § 16.4's ``target_approach`` governs THIS
+    function only -- the adaptive path of § 16.1 reaches the target exactly
+    via ``resample_plan()``/``execute_resample_plan()`` and never calls
+    this).
 
     RIFE (see ai/wrappers/interpolate.py's ``interpolate_video``) is
     timestep-conditioned and supports arbitrary INTEGER factors, but never a
@@ -41,24 +49,31 @@ def _plan_ai_interpolation(
     motion-compensated interpolation (``mi_mode=mci``), so it's used here as
     a "finish pass" for the fractional remainder RIFE can't reach on its own.
 
-    Rules (largest integer RIFE factor that stays AT OR BELOW target, i.e.
-    floor(target/current)):
-      - rife_factor = floor(target_fps / current_fps).
-      - If rife_factor >= 2: run RIFE at that factor. If the resulting
-        intermediate fps (current*rife_factor) is still short of target (by
-        more than _FPS_EPS), also run a minterpolate finish pass -- but only
-        when hybrid_enabled (the finish pass is itself a hybrid-only
-        behavior). If hybrid is disabled and a finish would otherwise be
-        needed, there is nothing else to do: RIFE's own integer-factor output
-        is the final answer (matches legacy: no finish, output landed at
-        current*rife_factor, not exactly target).
-      - If rife_factor <= 1: no integer RIFE factor helps without overshooting
-        (e.g. 50->60, 24->30, 60->75 all floor to 1). Two behaviors:
-          - hybrid_enabled: skip RIFE entirely, reach target via minterpolate
-            ALONE (the caller delegates to _execute_traditional).
-          - hybrid disabled: LEGACY back-compat -- force rife_factor=2 and run
-            RIFE anyway (the old overshoot behavior, e.g. 50->60 -> 100fps
-            output), no finish pass.
+    ``target_approach`` (only consulted when ``hybrid_enabled`` -- with
+    hybrid disabled, behavior is the LEGACY forced-factor-2 overshoot,
+    unaffected by this parameter, exactly as before this option existed):
+
+    - ``"under"`` (default -- bit-for-bit identical to the pre-§16.4
+      behavior): largest integer RIFE factor that stays AT OR BELOW target,
+      i.e. ``floor(target/current)``.
+      - If ``rife_factor >= 2``: run RIFE at that factor. If the resulting
+        intermediate fps (``current*rife_factor``) is still short of target
+        (by more than ``_FPS_EPS``), also run a minterpolate finish pass. If
+        ``current*rife_factor`` already lands on target, no finish pass.
+      - If ``rife_factor <= 1`` (e.g. 50->60, 24->30, 60->75 -- no integer
+        factor helps without overshooting): skip RIFE entirely, reach target
+        via minterpolate ALONE (the caller delegates to
+        ``_execute_traditional``).
+    - ``"over"``: smallest integer factor AT OR ABOVE target, i.e.
+      ``ceil(target/current)`` -- since ``target > current`` is guaranteed
+      by the ``should_run()`` gate, this ratio is always > 1, so ``ceil``
+      is always >= 2 and RIFE always runs (no "skip RIFE" branch here).
+      minterpolate then finishes DOWN to the exact target whenever
+      ``current*rife_factor`` overshoots it.
+    - ``"nearest"``: whichever of ``floor``/``ceil`` lands its
+      ``current*rife_factor`` closer to target (ties favor ``floor``, i.e.
+      "under", for determinism). If that's the same ``floor_factor <= 1``
+      case as "under", it likewise skips RIFE and uses minterpolate alone.
     """
     if current_fps <= 0 or target_fps <= current_fps:
         # Shouldn't happen -- should_run() gates this -- but stay defined.
@@ -66,7 +81,64 @@ def _plan_ai_interpolation(
             rife_factor=2, run_rife=True, run_minterpolate_finish=False, intermediate_fps=0.0
         )
 
-    rife_factor = int(target_fps / current_fps)  # floor
+    if not hybrid_enabled:
+        # Legacy path -- target_approach does not apply, preserved exactly.
+        rife_factor = int(target_fps / current_fps)  # floor
+        if rife_factor >= 2:
+            intermediate_fps = current_fps * rife_factor
+            return InterpPlan(
+                rife_factor=rife_factor,
+                run_rife=True,
+                run_minterpolate_finish=False,
+                intermediate_fps=intermediate_fps,
+            )
+        return InterpPlan(
+            rife_factor=2,
+            run_rife=True,
+            run_minterpolate_finish=False,
+            intermediate_fps=current_fps * 2,
+        )
+
+    ratio = target_fps / current_fps
+
+    if target_approach == "over":
+        rife_factor = math.ceil(ratio)  # always >= 2 since ratio > 1
+        intermediate_fps = current_fps * rife_factor
+        needs_finish = abs(intermediate_fps - target_fps) > _FPS_EPS
+        return InterpPlan(
+            rife_factor=rife_factor,
+            run_rife=True,
+            run_minterpolate_finish=needs_finish,
+            intermediate_fps=intermediate_fps,
+        )
+
+    if target_approach == "nearest":
+        floor_factor = max(1, int(ratio))
+        ceil_factor = math.ceil(ratio)
+        if floor_factor == ceil_factor:
+            rife_factor = floor_factor
+        else:
+            under_err = abs(current_fps * floor_factor - target_fps)
+            over_err = abs(current_fps * ceil_factor - target_fps)
+            rife_factor = floor_factor if under_err <= over_err else ceil_factor
+        if rife_factor >= 2:
+            intermediate_fps = current_fps * rife_factor
+            needs_finish = abs(intermediate_fps - target_fps) > _FPS_EPS
+            return InterpPlan(
+                rife_factor=rife_factor,
+                run_rife=True,
+                run_minterpolate_finish=needs_finish,
+                intermediate_fps=intermediate_fps,
+            )
+        return InterpPlan(
+            rife_factor=0,
+            run_rife=False,
+            run_minterpolate_finish=True,
+            intermediate_fps=current_fps,
+        )
+
+    # target_approach == "under" (default) -- exact pre-§16.4 logic.
+    rife_factor = int(ratio)  # floor
 
     if rife_factor >= 2:
         intermediate_fps = current_fps * rife_factor
@@ -80,19 +152,11 @@ def _plan_ai_interpolation(
         )
 
     # rife_factor <= 1
-    if hybrid_enabled:
-        return InterpPlan(
-            rife_factor=0,
-            run_rife=False,
-            run_minterpolate_finish=True,
-            intermediate_fps=current_fps,
-        )
-    # Legacy back-compat: force factor 2, overshoot, no finish.
     return InterpPlan(
-        rife_factor=2,
-        run_rife=True,
-        run_minterpolate_finish=False,
-        intermediate_fps=current_fps * 2,
+        rife_factor=0,
+        run_rife=False,
+        run_minterpolate_finish=True,
+        intermediate_fps=current_fps,
     )
 
 
@@ -114,6 +178,14 @@ class InterpolateStage(BaseStage):
         super().__init__(config, overrides)
         self._ai_model = self._stage_config.get("ai_model", "rife_v4.6")
         self._hybrid = self._stage_config.get("hybrid_ai_minterpolate", True)
+        # REQUIREMENTS.md § 16.4 -- governs the uniform-factor AI path only
+        # (_plan_ai_interpolation); the adaptive path of § 16.1 always hits
+        # the target exactly and never consults this.
+        self._target_approach = self._stage_config.get("target_approach", "under")
+        # REQUIREMENTS.md § 16 -- per-gap adaptive AI interpolation.
+        self._adaptive_cadence = self._stage_config.get("adaptive_cadence", True)
+        self._max_intermediates_per_gap = self._stage_config.get("max_intermediates_per_gap", 8)
+        self._gap_fallback = self._stage_config.get("gap_fallback", "hold")
 
     def should_run(self, input_info: dict[str, Any]) -> tuple[bool, str | None]:
         if not self.is_enabled():
@@ -553,11 +625,36 @@ class InterpolateStage(BaseStage):
         Falls back to traditional FFmpeg method if PyTorch or model
         files are not available.
         """
+        # REQUIREMENTS.md § 16 -- per-gap adaptive AI interpolation. Tried
+        # FIRST, ahead of the uniform-factor plan below: it reaches
+        # target_fps exactly regardless of how irregular the recovered
+        # cadence is (the whole point of § 16 -- a uniform factor buys
+        # nothing on an irregular timeline, see § 16(a)/(b)). Fails open to
+        # the uniform-factor path on any probe failure/mismatch, logged at
+        # INFO by _get_adaptive_timeline -- never fails the job over it.
+        if self._adaptive_cadence and target_fps:
+            adaptive = self._get_adaptive_timeline(input_path)
+            if adaptive is not None:
+                timeline, probe_info_adaptive = adaptive
+                return self._execute_ai_adaptive(
+                    input_path,
+                    output_path,
+                    progress_callback,
+                    start,
+                    target_fps=target_fps,
+                    current_fps=current_fps,
+                    timeline=timeline,
+                    probe_info=probe_info_adaptive,
+                    input_info=input_info,
+                )
+
         # Plan the "RIFE under, then minterpolate up" strategy -- see
         # _plan_ai_interpolation's docstring. Falls back to the legacy
         # forced-factor-2 behavior if fps info is missing.
         if target_fps and current_fps and current_fps > 0:
-            plan = _plan_ai_interpolation(current_fps, target_fps, self._hybrid)
+            plan = _plan_ai_interpolation(
+                current_fps, target_fps, self._hybrid, self._target_approach
+            )
         else:
             plan = InterpPlan(
                 rife_factor=2, run_rife=True, run_minterpolate_finish=False, intermediate_fps=0.0
@@ -983,6 +1080,382 @@ class InterpolateStage(BaseStage):
 
         except Exception as e:
             self.logger.error(f"RIFE processing failed: {e}")
+            return self._ai_fallback_or_fail(
+                f"inference exception: {e}",
+                start,
+                lambda: self._execute_traditional(
+                    input_path,
+                    output_path,
+                    progress_callback,
+                    start,
+                    target_fps=target_fps,
+                    current_fps=current_fps,
+                ),
+            )
+        finally:
+            interpolator.unload()
+
+    def _get_adaptive_timeline(self, input_path: str) -> tuple[list[float], Any] | None:
+        """Resolve the § 16.1 resample timeline for ``input_path``, the
+        interpolate stage's OWN input file (§ 16.2: correct whether or not
+        ``retime`` ran, and reflects any retiming applied by intermediate
+        stages like ``speed``, which a timestamp list captured earlier
+        would not).
+
+        Fails open -- returns ``None`` (never raises) on a probe failure, a
+        missing/empty timeline, or a timeline that fails the structural
+        checks below (non-monotonic, zero span, or spanning far less than
+        the container duration) -- logged at INFO. Callers must
+        treat ``None`` as "use the uniform-factor path instead", exactly
+        like ``core/cadence.py``'s ``analyze_cadence()`` fail-open
+        convention.
+        """
+        try:
+            probe_info = probe(input_path)
+        except Exception as e:
+            self.logger.info(f"interpolate: adaptive timeline probe failed for {input_path}: {e}")
+            return None
+        if not probe_info.has_video:
+            return None
+
+        from autovideofixer.core.cadence import probe_frame_timestamps
+
+        timestamps = probe_frame_timestamps(input_path, self.config)
+        if timestamps is None:
+            self.logger.info(
+                f"interpolate: adaptive timeline unavailable for {input_path} -- "
+                "falling back to uniform-factor interpolation"
+            )
+            return None
+
+        if len(timestamps) < 2:
+            # Nothing to resample between -- not an error, just not useful.
+            return None
+
+        # Validate the timeline's own STRUCTURE, not its length against
+        # probe_info.frame_count. That count is derived from avg_frame_rate,
+        # which § 12.3 documents as unreliable for VFR -- and a VFR
+        # intermediate is the ONLY input this path exists to serve. Measured:
+        # a 48-frame retimed file reports frame_count=119, and a 123-frame
+        # native VFR capture reports 180. An equality check against it
+        # therefore fails 100% of the time on exactly the inputs adaptive
+        # interpolation is for, silently disabling the whole feature while
+        # appearing to work. `timestamps` comes from a real decode and IS the
+        # ground truth here -- there is no more reliable count to compare it
+        # against.
+        if any(b < a for a, b in zip(timestamps, timestamps[1:])):
+            self.logger.info(
+                f"interpolate: adaptive timeline for {input_path} is not monotonic -- "
+                "falling back to uniform-factor interpolation"
+            )
+            return None
+        span = timestamps[-1] - timestamps[0]
+        if span <= 0:
+            self.logger.info(
+                f"interpolate: adaptive timeline for {input_path} has zero span -- "
+                "falling back to uniform-factor interpolation"
+            )
+            return None
+        # Sanity-check the span against the container duration (a coarse
+        # bound, not a frame count): a timeline covering wildly less than the
+        # file suggests a truncated/partial probe rather than real cadence.
+        # Defensive: this is a fail-open path, so a probe object with a
+        # missing/non-numeric duration must degrade to "skip the check",
+        # never raise.
+        try:
+            duration = float(getattr(probe_info, "duration", 0.0) or 0.0)
+        except TypeError, ValueError:
+            duration = 0.0
+        if duration > 0 and span < duration * 0.5:
+            self.logger.info(
+                f"interpolate: adaptive timeline for {input_path} spans {span:.3f}s of a "
+                f"{duration:.3f}s file (likely a truncated probe) -- "
+                "falling back to uniform-factor interpolation"
+            )
+            return None
+
+        return timestamps, probe_info
+
+    def _execute_ai_adaptive(
+        self,
+        input_path: str,
+        output_path: str,
+        progress_callback: Any,
+        start: float,
+        target_fps: float,
+        current_fps: float | None,
+        timeline: list[float],
+        probe_info: Any,
+        input_info: dict[str, Any] | None,
+    ) -> StageResult:
+        """Per-gap adaptive AI interpolation (REQUIREMENTS.md § 16).
+
+        Resamples the recovered input timeline onto the target-fps grid
+        (``resample_plan()``) and executes it with a bounded two-frame
+        sliding window (``execute_resample_plan()``) instead of a uniform
+        RIFE factor -- long gaps (camera stalls, irregular-cadence
+        downloads) get MORE synthesized frames, short gaps get fewer, and
+        the output lands on the exact target framerate by construction
+        (§ 16.1), so no minterpolate finish pass is needed and the output
+        is genuinely CFR at ``target_fps``.
+        """
+        try:
+            from autovideofixer.ai.torch_utils import is_torch_available
+            from autovideofixer.ai.wrappers.interpolate import RIFEInterpolator
+        except ImportError:
+            return self._ai_fallback_or_fail(
+                "PyTorch not available",
+                start,
+                lambda: self._execute_traditional(
+                    input_path,
+                    output_path,
+                    progress_callback,
+                    start,
+                    target_fps=target_fps,
+                    current_fps=current_fps,
+                ),
+            )
+
+        if not is_torch_available():
+            return self._ai_fallback_or_fail(
+                "PyTorch not installed",
+                start,
+                lambda: self._execute_traditional(
+                    input_path,
+                    output_path,
+                    progress_callback,
+                    start,
+                    target_fps=target_fps,
+                    current_fps=current_fps,
+                ),
+            )
+
+        backend = self._stage_config.get("backend", "torch")
+
+        try:
+            from autovideofixer.ai.model_cache import ensure_model_available
+
+            success, msg = (
+                (True, "") if backend == "ncnn" else ensure_model_available(self._ai_model)
+            )
+            if not success:
+                return self._ai_fallback_or_fail(
+                    f"model not available: {msg}",
+                    start,
+                    lambda: self._execute_traditional(
+                        input_path,
+                        output_path,
+                        progress_callback,
+                        start,
+                        target_fps=target_fps,
+                        current_fps=current_fps,
+                    ),
+                )
+        except Exception as e:
+            return self._ai_fallback_or_fail(
+                f"model check failed: {e}",
+                start,
+                lambda: self._execute_traditional(
+                    input_path,
+                    output_path,
+                    progress_callback,
+                    start,
+                    target_fps=target_fps,
+                    current_fps=current_fps,
+                ),
+            )
+
+        input_w, input_h = probe_info.resolution
+        if input_w < 64 or input_h < 64:
+            self.logger.warning(
+                f"Input resolution {input_w}x{input_h} too small for AI interpolation "
+                "(RIFE expects >= 64px)"
+            )
+            return self._execute_traditional(
+                input_path,
+                output_path,
+                progress_callback,
+                start,
+                target_fps=target_fps,
+                current_fps=current_fps,
+            )
+
+        interpolator = RIFEInterpolator(
+            model_name=self._ai_model,
+            device_preference=self.config.get("gpu", "preferred_device", default="auto"),
+            backend=backend,
+            vulkan_device=self.config.get("gpu", "vulkan_device", default=0),
+        )
+        if not interpolator.load_model():
+            return self._ai_fallback_or_fail(
+                "failed to load RIFE model",
+                start,
+                lambda: self._execute_traditional(
+                    input_path,
+                    output_path,
+                    progress_callback,
+                    start,
+                    target_fps=target_fps,
+                    current_fps=current_fps,
+                ),
+            )
+
+        try:
+            from autovideofixer.ai.frame_pipe import get_frame_reader, get_frame_writer
+            from autovideofixer.ai.wrappers.interpolate import (
+                execute_resample_plan,
+                plan_stats,
+                resample_plan,
+            )
+
+            plan = resample_plan(
+                timeline,
+                target_fps,
+                max_intermediates_per_gap=self._max_intermediates_per_gap,
+                gap_fallback=self._gap_fallback,
+            )
+            stats = plan_stats(plan)
+
+            chunk_size = 25
+            read_ahead = self._stage_config.get("read_ahead", 2)
+            write_queue_depth = self._stage_config.get("write_queue_depth", 4)
+            in_width, in_height = probe_info.resolution
+            total_original_frames = probe_info.frame_count or len(timeline)
+
+            reader = get_frame_reader(
+                input_path,
+                in_width,
+                in_height,
+                chunk_size=chunk_size,
+                read_ahead=read_ahead,
+            )
+
+            def _iter_reader_frames() -> Iterator[Any]:
+                while True:
+                    batch = reader.next_batch()
+                    if not batch:
+                        return
+                    yield from batch
+
+            # Same MKV-temp crash-resilience rationale as the uniform-factor
+            # AI path above (see that path's comment): incremental-cluster
+            # Matroska survives a hard kill mid-write; the container is
+            # remuxed to the final format below via a stream-copy mux.
+            temp_path = os.path.join(
+                os.path.dirname(input_path) or ".",
+                f".avf_interp_adaptive_{os.path.splitext(os.path.basename(input_path))[0]}.mkv",
+            )
+            temp_crf = self._stage_config.get("temp_crf", 16)
+
+            writer: Any = None
+            frames_written = 0
+            processed = 0
+            write_batch: list[Any] = []
+            write_batch_size = chunk_size
+
+            def _interp_fn(frame_a: Any, frame_b: Any, timestep: float) -> Any:
+                return interpolator.interpolate(frame_a, frame_b, timestep=timestep)
+
+            try:
+                for frame in execute_resample_plan(_iter_reader_frames(), plan, _interp_fn):
+                    if writer is None:
+                        out_h, out_w = frame.shape[:2]
+                        # The output IS the target grid (§ 16.1.2): genuinely
+                        # CFR at target_fps, no finish pass, no linearization.
+                        writer = get_frame_writer(
+                            temp_path,
+                            out_w,
+                            out_h,
+                            target_fps,
+                            crf=temp_crf,
+                            preset="medium",
+                            write_queue=write_queue_depth,
+                        )
+                    write_batch.append(frame)
+                    processed += 1
+                    if len(write_batch) >= write_batch_size:
+                        writer.write_batch(write_batch)
+                        frames_written += len(write_batch)
+                        write_batch = []
+                        self._report_progress(
+                            0.1 + (processed / (len(plan) or 1)) * 0.8,
+                            "Adaptive interpolation...",
+                            progress_callback,
+                        )
+                if writer is not None and write_batch:
+                    writer.write_batch(write_batch)
+                    frames_written += len(write_batch)
+                reader.close()
+                write_ok = writer.close() if writer is not None else False
+            except Exception:
+                reader.close()
+                if writer is not None:
+                    writer.close()
+                self._preserve_or_discard_partial_temp(temp_path, output_path)
+                raise
+
+            if frames_written == 0:
+                return StageResult(
+                    status=StageStatus.FAILED,
+                    error="No frames produced by adaptive interpolator",
+                    duration_sec=time.time() - start,
+                )
+            if not write_ok:
+                self._preserve_or_discard_partial_temp(temp_path, output_path)
+                return StageResult(
+                    status=StageStatus.FAILED,
+                    error="Failed to write adaptively interpolated frames to temp file",
+                    duration_sec=time.time() - start,
+                )
+
+            try:
+                has_audio = probe_info.has_audio
+                mux_args = ["-i", input_path, "-i", temp_path]
+                if has_audio:
+                    mux_args += ["-map", "0:a:0", "-map", "1:v:0"]
+                else:
+                    mux_args += ["-map", "1:v:0"]
+                mux_args += ["-c:v", "copy", "-c:a", "copy", "-y", output_path]
+
+                mux_result = run_ffmpeg(mux_args, timeout=self.stage_timeout())
+                if mux_result.returncode != 0 or not os.path.exists(output_path):
+                    self._preserve_or_discard_partial_temp(temp_path, output_path)
+                    return StageResult(
+                        status=StageStatus.FAILED,
+                        error=f"Failed to mux adaptively interpolated output: "
+                        f"{mux_result.stderr[:300]}",
+                        duration_sec=time.time() - start,
+                    )
+
+                self._report_progress(
+                    1.0, "Adaptive AI frame interpolation complete", progress_callback
+                )
+                return StageResult(
+                    status=StageStatus.COMPLETED,
+                    output_path=output_path,
+                    metadata={
+                        "method": "ai",
+                        "model": self._ai_model,
+                        "adaptive": True,
+                        "fps_out": target_fps,
+                        "frames_in": total_original_frames,
+                        "frames_out": frames_written,
+                        "frames_synthesized": stats["frames_synthesized"],
+                        "frames_passed_through": stats["frames_passed_through"],
+                        "gaps_capped": stats["gaps_capped"],
+                        # § 16.1.2/16.6: the adaptive output lands on the
+                        # target grid exactly -- timing is honoured, never
+                        # linearized, on this path.
+                        "timeline_linearized": False,
+                    },
+                    duration_sec=time.time() - start,
+                )
+            finally:
+                if os.path.exists(temp_path):
+                    os.unlink(temp_path)
+
+        except Exception as e:
+            self.logger.error(f"Adaptive RIFE processing failed: {e}")
             return self._ai_fallback_or_fail(
                 f"inference exception: {e}",
                 start,

@@ -53,6 +53,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   spec, including the empirically-validated ffmpeg behavior (§ 12.6) and non-goals (§ 12.8:
   irregular cadence through the raw-pipe AI stages is linearized, not timestamp-aware; RIFE
   itself isn't made timestamp-aware; interlaced/telecined sources are out of scope).
+- **Per-gap adaptive AI interpolation / timestamp-aware RIFE (REQUIREMENTS.md § 16).** § 12's
+  cadence recovery was previously thrown away by AI interpolation: a uniform RIFE factor
+  (`floor(target/current)`) collapses to `run_rife=False` on an irregular recovered cadence
+  (`nominal_fps` is a mean on those inputs -- e.g. `floor(60/41) = 1` on a phone-recorded clip
+  published to YouTube), and even on a regular cadence, a uniform factor generates the same
+  number of intermediates for a long camera-stall gap as for a normal one. `InterpolateStage`'s
+  AI path now resamples the RECOVERED INPUT TIMELINE directly onto the target-fps grid instead
+  of applying one global factor: `ai/wrappers/interpolate.py`'s new `resample_plan()` (pure,
+  side-effect-free -- builds the output grid `o[j] = t[0] + j/f`, brackets each point between two
+  real input frames, and either emits the original frame verbatim, RIFE-interpolates at the exact
+  fractional timestep, or -- past `max_intermediates_per_gap` -- falls back to `hold`/`blend` for
+  that gap) and `execute_resample_plan()` (a streaming executor holding at most two input frames
+  at a time, mirroring the existing chunked-streaming discipline so this doesn't reintroduce the
+  RIFE RAM blowup fixed earlier). This is drift-free by construction (every output timestamp comes
+  from the global grid, never accumulated per-gap) and reaches the target framerate EXACTLY, so no
+  minterpolate finish pass or timestamp-graft mechanism is needed on this path -- the output is
+  genuinely CFR at the target rate. The timeline itself comes from a new decode-only probe,
+  `core/cadence.py`'s `probe_frame_timestamps()` (a bare `showinfo` pass over the interpolate
+  stage's OWN input file -- correct whether or not `retime` ran, and reflects retiming from
+  intermediate stages like `speed`); it fails open to the existing uniform-factor path (logged at
+  INFO, job never fails) on a probe failure or a timestamp count that disagrees with the frame
+  count the stage's own reader is expected to produce. `InterpolateStage._plan_ai_interpolation()`
+  (the uniform-factor path, used as the fallback and when adaptive is disabled) also gains a
+  `target_approach` option: `under` (default, bit-for-bit unchanged) uses the largest integer RIFE
+  factor at or below target then a minterpolate finish pass; `over` uses the smallest factor at or
+  above target then minterpolate finishes DOWN to the exact rate; `nearest` picks whichever factor
+  lands closer. New config: `stages.interpolate.adaptive_cadence` (default `true`),
+  `max_intermediates_per_gap` (default `8`), `gap_fallback` (`hold`/`blend`, default `hold`),
+  `target_approach` (`under`/`nearest`/`over`, default `under`). New CLI flags:
+  `--interpolate-adaptive`/`--no-interpolate-adaptive`, `--interpolate-target-approach`. Stage
+  metadata gains `adaptive: bool`, `frames_synthesized`, `frames_passed_through`, `gaps_capped`,
+  and reports `timeline_linearized: false` whenever the adaptive path ran (timing is honoured, not
+  flattened, on this path). See `docs/REQUIREMENTS.md` § 16 for the full spec.
 
 ### Changed
 - **2026-07-22: BREAKING (default behavior) -- pipeline default order and default deblock model

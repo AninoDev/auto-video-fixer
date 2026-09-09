@@ -786,6 +786,89 @@ audio in place of the RIFE temp; both temps are cleaned up on every success/fail
 metadata gains `rife_factor`, `minterpolate_finish: bool`, and `fps_out` (the actual final
 target) alongside the existing `method`/`model`/`factor`/`frames_in`/`frames_out`.
 
+`target_approach` (`stages.interpolate.target_approach`, default `"under"`; CLI
+`--interpolate-target-approach`) governs ONLY this uniform-factor strategy, via a fourth parameter
+on `_plan_ai_interpolation(current_fps, target_fps, hybrid_enabled, target_approach)`: `"under"` is
+the exact pre-existing logic above (bit-for-bit unchanged); `"over"` picks the smallest integer
+factor at or above target (`ceil(target/current)` — always ≥ 2 since `target > current` is
+guaranteed by `should_run()`, so unlike `"under"` it never delegates to minterpolate-alone) and
+lets the finish pass retime DOWN to the exact target instead of up; `"nearest"` picks whichever of
+`floor`/`ceil` lands closer (ties favor `floor`, matching `"under"`). Irrelevant whenever the
+adaptive path below actually runs (it always reaches the target exactly and never calls this
+function at all).
+
+### Per-gap adaptive AI interpolation (timestamp-aware RIFE)
+
+The hybrid strategy above still applies ONE global RIFE factor to the whole clip. That defeats two
+things `retime` (§ 12) was built to fix, together documented as REQUIREMENTS.md § 16: (a) on an
+irregular recovered cadence, `nominal_fps` is a mean, so `floor(target/nominal_fps)` routinely
+floors to ≤ 1 and RIFE never runs at all — the phone-recorded-at-60fps-published-to-YouTube case
+gets ZERO benefit from enabling AI interpolation; (b) even on a regular cadence, a uniform factor
+generates the same number of intermediates for a long camera-stall gap as for a short one, so the
+one place synthesized motion is most needed gets no extra frames.
+
+**Fix**: resample the recovered timeline directly onto the target-fps grid instead of multiplying
+frame count by a constant factor. `ai/wrappers/interpolate.py`'s `resample_plan(in_timestamps,
+target_fps, *, eps, max_intermediates_per_gap, gap_fallback) -> list[PlanEntry]` is a PURE,
+side-effect-free function (no torch/GPU/video file needed to test it — see
+`tests/unit/test_adaptive_interpolation.py`): it builds the output grid `o[j] = t[0] + j/f` for
+`j = 0..floor((t[-1]-t[0])*f)`, brackets each `o[j]` between real input frames `t[k] <= o[j] <=
+t[k+1]`, computes `local = (o[j]-t[k])/(t[k+1]-t[k])`, and emits a `PlanEntry`: `op="emit"` (a real
+frame, `local <= eps` or `>= 1-eps` — no inference) or `op="synthesize"` (RIFE at
+`timestep=local`). This is the grid formulation, not per-gap counting (`n_k = round(gap_k*f)`) —
+the grid is **drift-free by construction**: every output timestamp derives from the global grid,
+never accumulated gap-by-gap, so rounding cannot walk a long video's duration off over time. It
+also hits the target framerate EXACTLY (no minterpolate finish pass needed on this path — the
+output IS defined as the target grid) and produces genuinely CFR output, so neither PyAV nor
+mkvtoolnix is needed here even though § 12.4b documents them as rejected write-side options for
+arbitrary-PTS muxing elsewhere. `max_intermediates_per_gap` (default 8) caps synthesis per gap — a
+gap needing more is a stall or a hard cut, not motion, and RIFE quality degrades badly at extreme
+timesteps; past the cap every `"synthesize"` entry in that bracket becomes `gap_fallback` (`"hold"`
+default — repeat the frame before the gap, exactly what the source did; or `"blend"` — linear
+crossfade, `ai/wrappers/interpolate.py`'s `_linear_blend()`). `plan_stats(plan)` derives
+`frames_synthesized`/`frames_passed_through`/`gaps_capped` counters straight from the plan's op
+tags (a gap is "capped" if it produced any `"hold"`/`"blend"` entry — `"synthesize"` and the other
+two ops are mutually exclusive per bracket).
+
+`execute_resample_plan(frame_source, plan, interpolate_fn) -> Iterator[frame]` is the streaming
+executor: a two-pointer sliding window (`cur_frame`/`next_frame`) that advances forward-only as
+plan entries reference increasing frame indices, holding AT MOST those two frames at any time —
+reintroducing an accumulated output list here would recreate the RIFE RAM blowup the chunked
+streaming path (`ai/frame_pipe.py`) was built to fix in the first place. It degrades to repeating
+the last available frame (never raises) if the frame source runs out early — should not happen
+when the timeline probe matched the reader's actual output, but a streaming executor must not
+crash a job over a stale/mismatched timeline.
+
+The timeline itself comes from `core/cadence.py`'s `probe_frame_timestamps(path, config)` — a
+decode-only `ffmpeg -i IN -map 0:v:0 -an -sn -vf showinfo -f null -` pass (no `mpdecimate`; every
+frame's timestamp is wanted here, not just mpdecimate's survivors), parsed with the same
+`_parse_pts_times()` machinery `analyze_cadence()` (§ 12.1) already uses. Lives in `cadence.py`
+(not `ffmpeg_utils.py`) purely to reuse that parsing/fail-open machinery. It probes the interpolate
+stage's OWN input file (`InterpolateStage._get_adaptive_timeline()`, called with the same
+`input_path` `_execute_ai`/`_execute_ai_adaptive` already operate on) rather than a timestamp list
+plumbed through `input_info` — correct whether or not `retime` ran (native VFR input, which
+`retime` deliberately SKIPs, still gets adaptive interpolation) and reflects retiming applied by
+intermediate stages like `speed` (which scales PTS) that a list captured earlier wouldn't see.
+Fails open exactly like `analyze_cadence()`: any probe failure, a missing/empty timeline, or (the
+one check `probe_frame_timestamps()` itself does NOT do — its caller does) a timestamp count that
+disagrees with the frame count `probe()` reports for the same file falls back to the existing
+uniform-factor path, logged at INFO — a timeline miss must never fail a job.
+
+`InterpolateStage._execute_ai()` tries the adaptive path FIRST (`stages.interpolate.
+adaptive_cadence`, default `true`; CLI `--interpolate-adaptive`/`--no-interpolate-adaptive`),
+before even computing the uniform-factor plan — a probe success routes straight to
+`_execute_ai_adaptive()`, which duplicates the torch-availability/model-load/resolution-validation
+preamble from `_execute_ai()` (it can't reuse that method's control flow directly since the
+uniform path's early "skip RIFE, minterpolate alone reaches target" branch doesn't apply here) and
+then streams via `execute_resample_plan()` instead of `RIFEInterpolator.interpolate_video()`'s
+uniform `timestep = j/factor` loop, writing directly to `get_frame_writer()` at a carrier rate of
+`target_fps` (exact, since the output is already CFR at that rate). Reported metadata:
+`adaptive: true`, `frames_synthesized`, `frames_passed_through`, `gaps_capped`, `fps_out`, and
+`timeline_linearized: false` (timing is honoured exactly on this path, never linearized — contrast
+with the uniform-factor raw-pipe writer's `nominal_fps` carrier rate, § 12.4b, which DOES linearize
+a genuinely irregular cadence). A probe failure/mismatch falls through to the exact same
+uniform-factor `_plan_ai_interpolation()` path documented above, unchanged.
+
 ### Backend selection (torch vs ncnn)
 
 Independent of the AI/traditional choice, the `upscale` and `interpolate` stages also take

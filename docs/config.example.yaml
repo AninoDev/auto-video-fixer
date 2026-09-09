@@ -647,6 +647,38 @@ stages:
     # adds no jitter. false restores the pre-hybrid overshoot behavior. See AGENTS.md's "Hybrid
     # RIFE + minterpolate" section and InterpolateStage._plan_ai_interpolation().
     hybrid_ai_minterpolate: true
+    # REQUIREMENTS.md § 16 -- per-gap adaptive AI interpolation (timestamp-aware RIFE).
+    # Resamples the recovered INPUT timeline (a probe of the interpolate stage's own input
+    # file, see core/cadence.py's probe_frame_timestamps()) directly onto the target-fps grid
+    # instead of applying one global RIFE factor -- long gaps (camera stalls, an
+    # irregular-cadence download) get MORE synthesized frames, short gaps get fewer, and grid
+    # landings that coincide with a real input frame are emitted verbatim (no inference). This
+    # is what makes AI interpolation actually DO something useful on an irregular recovered
+    # cadence (a uniform factor collapses to run_rife=False for those inputs -- see § 16's
+    # problem statement) and reaches target_fps EXACTLY, so no minterpolate finish pass is
+    # needed on this path. Tried FIRST, ahead of the uniform-factor hybrid_ai_minterpolate
+    # strategy above; fails open (falls back to the uniform-factor path, logged at INFO, job
+    # never fails) on a probe failure or a timestamp count that disagrees with the frames the
+    # reader actually produces. false always uses the uniform-factor path.
+    adaptive_cadence: true
+    # § 16.3 guard: a gap needing more synthesized frames than this is treated as a stall or a
+    # hard cut, not motion -- RIFE quality degrades badly at large motion/extreme timesteps, so
+    # past this cap gap_fallback decides instead of asking RIFE to invent an unreasonable
+    # number of intermediates for one gap.
+    max_intermediates_per_gap: 8
+    # What to do instead of synthesizing, once max_intermediates_per_gap is exceeded for a
+    # gap: "hold" (default -- repeat the frame before the gap, exactly what the source did) or
+    # "blend" (linear crossfade across the gap instead of a hard repeat).
+    gap_fallback: hold
+    # Governs the UNIFORM-FACTOR AI path only (REQUIREMENTS.md § 16.4) -- irrelevant when
+    # adaptive_cadence reaches the target exactly, and only consulted with
+    # hybrid_ai_minterpolate: true (hybrid disabled keeps the pre-existing forced-factor-2
+    # overshoot regardless of this key). "under" (default -- bit-for-bit unchanged existing
+    # behavior): largest integer RIFE factor at or below target, then a minterpolate finish
+    # pass for the fractional remainder. "nearest": whichever integer factor (over or under)
+    # lands closest to target. "over": smallest integer factor at or above target, then
+    # minterpolate finishes DOWN to the exact rate.
+    target_approach: under
 
   denoise_video:
     # Off by default: deblock's default ai_model (realesr-general-wdn-x4v3, see stages.deblock

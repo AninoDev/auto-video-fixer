@@ -167,6 +167,7 @@ _VALUE_FLAGS = {
     "--from-file-parser",
     "--retime-min-duplicate-ratio",
     "--output-timing",
+    "--interpolate-target-approach",
 }
 
 # Boolean/flag-value options that map to a config key -- recorded with a
@@ -1059,6 +1060,28 @@ def _log_effective_settings(
     "default). --no-interpolate-hybrid restores the pre-hybrid overshoot behavior.",
 )
 @click.option(
+    "--interpolate-adaptive/--no-interpolate-adaptive",
+    "interpolate_adaptive",
+    default=None,
+    help="With AI/RIFE interpolation: resample the recovered input timeline directly onto "
+    "the target-fps grid (per-gap adaptive interpolation) instead of one uniform RIFE "
+    "factor, so long gaps (camera stalls, an irregular-cadence download) get more "
+    "synthesized frames and short gaps get fewer, reaching the target framerate exactly "
+    "(overrides stages.interpolate.adaptive_cadence; on by default). Fails open to the "
+    "uniform-factor path on a timeline probe failure. See docs/REQUIREMENTS.md § 16.",
+)
+@click.option(
+    "--interpolate-target-approach",
+    default=None,
+    type=click.Choice(["under", "nearest", "over"]),
+    help="Governs the UNIFORM-FACTOR AI interpolation path only (irrelevant when "
+    "--interpolate-adaptive reaches the target exactly): 'under' (default) uses the "
+    "largest integer RIFE factor at or below target then a minterpolate finish pass; "
+    "'nearest' uses whichever integer factor lands closest to target; 'over' uses the "
+    "smallest integer factor at or above target, then minterpolate finishes DOWN to the "
+    "exact rate (overrides stages.interpolate.target_approach).",
+)
+@click.option(
     "--downscale/--no-downscale",
     "downscale",
     default=None,
@@ -1252,6 +1275,8 @@ def process(
     drop_non_content: bool | None,
     crop_limit: int | None,
     interpolate_hybrid: bool | None,
+    interpolate_adaptive: bool | None,
+    interpolate_target_approach: str | None,
     downscale: bool | None,
     retime: bool | None,
     retime_min_duplicate_ratio: float | None,
@@ -1388,6 +1413,22 @@ def process(
                 ("--interpolate-hybrid", "--no-interpolate-hybrid"),
                 ["stages", "interpolate", "hybrid_ai_minterpolate"],
                 interpolate_hybrid,
+            )
+        )
+    if interpolate_adaptive is not None:
+        cli_candidates.append(
+            (
+                ("--interpolate-adaptive", "--no-interpolate-adaptive"),
+                ["stages", "interpolate", "adaptive_cadence"],
+                interpolate_adaptive,
+            )
+        )
+    if interpolate_target_approach is not None:
+        cli_candidates.append(
+            (
+                ("--interpolate-target-approach",),
+                ["stages", "interpolate", "target_approach"],
+                interpolate_target_approach,
             )
         )
     if downscale is not None:

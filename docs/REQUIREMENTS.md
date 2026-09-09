@@ -1444,3 +1444,154 @@ to a tool and get one contiguous video.
   `_concat_demuxer()` and `concat_video_clips()` to build on.
 - Audio must be handled explicitly: clips with and without audio tracks cannot be concat-copied
   together; detect and report rather than producing a silent or truncated result.
+
+## 16. Per-gap adaptive AI interpolation (timestamp-aware RIFE) (PLANNED 2026-09-08, user-approved)
+
+**Problem**: § 12 recovers a video's true frame timing, but the AI interpolation path then throws
+it away. Two distinct failures, both hitting the case the feature exists to serve.
+
+**(a) RIFE never runs on irregular cadence.** `_plan_ai_interpolation` picks the largest integer
+factor at or below the target (`floor(target / current)`), where `current` is `nominal_fps` — a
+single scalar. For a phone-recorded-at-60fps clip published to YouTube, the recovered cadence is
+irregular, so `nominal_fps` collapses to a *mean* (41.0 on the reference clip). `floor(60/41) = 1`,
+so the planner returns `run_rife=False` and delegates the whole job to minterpolate:
+
+```
+_plan_ai_interpolation(41.0, 60.0, True) -> InterpPlan(rife_factor=0, run_rife=False, ...)
+_plan_ai_interpolation(24.0, 60.0, True) -> InterpPlan(rife_factor=2, run_rife=True,  ...)
+```
+
+Enabling AI therefore buys *nothing* for exactly the inputs § 12 was built for; only a uniform
+padded cadence (24-in-60) reaches RIFE at all.
+
+**(b) A uniform factor ignores how long each frame was actually held.** Where the publisher
+duplicated a frame four times (a camera stall) and elsewhere held it once, a global factor
+generates the same number of intermediates for both. The long stall — precisely where synthesized
+motion is most needed — gets no extra frames.
+
+**Fix — resample the recovered timeline onto the target grid.** Instead of "multiply the frame
+count by N", ask, for every output frame the target framerate requires, *where does it fall
+between two real input frames*, and synthesize exactly that frame. RIFE is already
+timestep-conditioned and already varies its timestep per inserted frame:
+
+```python
+def interpolate(self, frame0, frame1, timestep: float = 0.5)   # arbitrary t in [0, 1]
+...
+timestep = j / factor    # interpolate_video, today: uniform spacing only
+```
+
+Only the *count and spacing* are hardcoded to a global factor. Making them per-pair is a change to
+the driving loop, not to the model.
+
+### 16.1 The resampling formulation
+
+Given real input frames at timestamps `t[0..n-1]` and target framerate `f`, the output grid is
+`o[j] = t[0] + j/f` for `j = 0 .. floor((t[n-1] - t[0]) * f)`. For each `o[j]`, find the bracketing
+pair `t[k] <= o[j] <= t[k+1]` and the normalized position within it:
+
+```
+local = (o[j] - t[k]) / (t[k+1] - t[k])
+```
+
+- `local <= eps`      -> emit the ORIGINAL frame `k` (no inference at all)
+- `local >= 1 - eps`  -> emit the ORIGINAL frame `k+1`
+- otherwise           -> `interpolate(frame[k], frame[k+1], timestep=local)`
+
+This is preferred over per-gap counting (`n_k = round(gap_k * f)`, emit `n_k - 1` intermediates)
+because it is **inherently drift-free**: every output timestamp is computed from the global grid
+rather than accumulated per gap, so rounding cannot walk the duration off over a long video. It
+also emits real frames wherever the grid lands on one, avoiding both needless inference cost and
+the quality loss of re-synthesizing a frame that already exists.
+
+Three consequences worth stating explicitly:
+
+1. **It hits the target framerate exactly, by construction.** Output frames are *defined* as the
+   target grid, so no minterpolate finish pass is needed on this path.
+2. **The output is CFR at the target rate**, so there are no arbitrary per-frame timestamps to
+   mux. This is what makes § 12.4b's write-side limitation disappear for the interpolate stage —
+   **neither PyAV nor mkvtoolnix is required**. (Evaluated and rejected on those grounds:
+   mkvtoolnix is not on PyPI at all and would be a second external binary; PyAV installs cleanly
+   as an `abi3` wheel and was verified to write exact arbitrary PTS, but is unnecessary if the
+   output lands on a uniform grid anyway.)
+3. It is **agnostic to how the input got its timing** — it works identically for a retimed
+   YouTube download, a native VFR capture, and an honest CFR file, at any target framerate.
+
+### 16.2 Where the timeline comes from
+
+Source of truth is a **probe of the interpolate stage's own input file**, not a timestamp list
+plumbed through `input_info`. Rationale:
+
+- It is correct whether or not `retime` ran — a native VFR input (which `retime` deliberately
+  SKIPs, § 12.1) still gets adaptive interpolation.
+- It reflects retiming applied by *intermediate* stages (notably `speed`, which scales PTS), which
+  a list captured at retime time would not.
+- It avoids carrying a potentially very large float list (a 10-minute 60fps clip is ~36k entries)
+  through `input_info` and into the JSON run report.
+
+Read presentation timestamps for the video stream, ascending. **On missing timestamps or a probe
+failure, fall back to the existing uniform-factor path** and log at INFO. This must never fail a
+job — same fail-open convention as `analyze_cadence`.
+
+**Do NOT validate the timeline's length against `probe().frame_count`.** An earlier draft of this
+section said to check it "matches the frame count the reader actually produces", and implementing
+that against `probe().frame_count` broke the feature completely: that count is derived from
+`avg_frame_rate`, which § 12.3 documents as unreliable for VFR — and a VFR intermediate is the
+*only* input this path exists to serve. Measured: a 48-frame retimed intermediate reports
+`frame_count=119`; a 123-frame native VFR capture reports `180`. The equality check therefore
+failed 100% of the time on exactly the right inputs, silently routing every job to the uniform
+path while all gates passed and the stage still reported COMPLETED (`adaptive` metadata absent was
+the only symptom).
+
+The probed timestamps come from a real decode and ARE the ground truth here; there is no more
+reliable count to compare them against. Validate the timeline's own **structure** instead:
+non-empty and at least 2 entries, monotonically non-decreasing, non-zero span, and a span that is
+not a small fraction of the container duration (which would indicate a truncated probe).
+`execute_resample_plan()` additionally degrades gracefully at runtime if the reader still falls
+short.
+
+### 16.3 Guards
+
+- **`max_intermediates_per_gap`** (default 8). A gap needing more synthesized frames than this is
+  a stall or a hard cut, not motion — RIFE quality degrades badly at large motion and extreme
+  timesteps. Past the cap, `gap_fallback` decides: `hold` (default — repeat frame `k`, exactly
+  what the source did) or `blend` (linear crossfade). Never silently ask RIFE for 30 intermediates.
+- **Scene cuts.** The adaptive path inherits the existing rule that interpolation never crosses a
+  cut: in scene mode `interpolate` already runs per-scene. In whole-video mode a hard cut is
+  usually a *normal-length* gap and is therefore indistinguishable here — the cap above only
+  catches long ones. No new cut detection is introduced; this is a known limit, unchanged from the
+  uniform path.
+- **Streaming discipline.** The loop must hold at most two input frames and emit outputs as it
+  goes. `o[j]` is monotonic so `k` advances monotonically — a sliding window, never an
+  accumulated output list. This preserves the fix for the RIFE RAM blow-up (unbounded
+  `all_interpolated` accumulation), which must not be reintroduced.
+
+### 16.4 Target approach policy (the uniform-factor path)
+
+New `stages.interpolate.target_approach`: `under` (default, current behaviour — largest integer
+factor at or below target, then a minterpolate finish) | `nearest` (whichever integer factor lands
+closest, over or under) | `over` (smallest factor at or above target, then minterpolate *down* to
+the exact rate).
+
+This governs the **uniform-factor path only**. The adaptive path of 16.1 reaches the target
+exactly and never needs it. It exists for the fallback cases in 16.2 and for users who disable
+adaptive interpolation. Default stays `under` so existing behaviour is bit-for-bit unchanged.
+
+### 16.5 Config surface
+
+```yaml
+stages:
+  interpolate:
+    adaptive_cadence: true          # 16.1; false = always the uniform-factor path
+    max_intermediates_per_gap: 8    # 16.3 cap
+    gap_fallback: hold              # hold | blend, past the cap
+    target_approach: under          # under | nearest | over (uniform path only)
+```
+
+CLI: `--interpolate-adaptive/--no-interpolate-adaptive`, `--interpolate-target-approach`.
+
+### 16.6 Reporting
+
+Stage metadata gains `adaptive: bool`, `frames_synthesized`, `frames_passed_through` (grid
+landings that reused a real frame), `gaps_capped` (how often `max_intermediates_per_gap` was hit),
+and keeps `fps_out`. `timeline_linearized` (§ 12.4b) must report **false** whenever the adaptive
+path ran, since the timing is honoured rather than flattened.

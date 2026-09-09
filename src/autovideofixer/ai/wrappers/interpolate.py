@@ -14,9 +14,11 @@ timestep conditioning works, unlike a fixed-midpoint interpolator).
 from __future__ import annotations
 
 import logging
+import math
 import zipfile
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable, Iterable, Iterator
 
 import torch
 import torch.nn.functional as F
@@ -33,6 +35,256 @@ def _get_logger() -> logging.Logger:
     if _logger is None:
         _logger = logging.getLogger("autovideofixer.ai.interpolate")
     return _logger
+
+
+@dataclass(frozen=True)
+class PlanEntry:
+    """One output frame's origin, as produced by ``resample_plan()``
+    (REQUIREMENTS.md § 16.1 -- per-gap adaptive AI interpolation).
+
+    ``op``:
+      - ``"emit"``: output the ORIGINAL input frame at index ``k`` verbatim
+        (no inference at all) -- the output grid landed on, or within
+        ``eps`` of, a real frame.
+      - ``"synthesize"``: RIFE-interpolate between input frames ``k`` and
+        ``k + 1`` at ``timestep=local``.
+      - ``"hold"``: ``max_intermediates_per_gap`` was exceeded for this gap
+        and ``gap_fallback="hold"`` -- repeat input frame ``k`` verbatim
+        (no inference), exactly what the source did.
+      - ``"blend"``: same cap, ``gap_fallback="blend"`` -- a linear
+        crossfade of frames ``k``/``k + 1`` at weight ``local`` (no RIFE
+        inference).
+
+    ``k`` means different things depending on ``op``: for ``"emit"`` it is
+    the EXACT input frame index to output; for the other three ops it is
+    the bracket's LOWER index -- the pair referenced is always
+    ``(k, k + 1)``.
+    """
+
+    op: str
+    k: int
+    local: float = 0.0
+
+
+def resample_plan(
+    in_timestamps: list[float],
+    target_fps: float,
+    *,
+    eps: float = 1e-3,
+    max_intermediates_per_gap: int = 8,
+    gap_fallback: str = "hold",
+) -> list[PlanEntry]:
+    """Pure, side-effect-free timeline-resampling core (REQUIREMENTS.md § 16.1).
+
+    Given real input frame timestamps ``in_timestamps`` (ascending, seconds)
+    and a target framerate ``target_fps``, builds the output grid
+    ``o[j] = t[0] + j / target_fps`` for ``j = 0 .. floor((t[-1] - t[0]) *
+    target_fps)``, brackets each ``o[j]`` between consecutive input frames
+    ``t[k] <= o[j] <= t[k + 1]``, and computes the normalized position
+    ``local = (o[j] - t[k]) / (t[k + 1] - t[k])`` within that bracket:
+
+    - ``local <= eps``      -> emit the ORIGINAL frame ``k`` (no inference).
+    - ``local >= 1 - eps``  -> emit the ORIGINAL frame ``k + 1``.
+    - otherwise             -> synthesize at ``timestep=local``.
+
+    This is the grid formulation (not per-gap counting) because it is
+    **inherently drift-free**: every ``o[j]`` is computed from the GLOBAL
+    grid, never accumulated gap-by-gap, so rounding cannot walk the output
+    duration off over a long video -- see REQUIREMENTS.md § 16.1 for the
+    full rationale (also: real frames are reused wherever the grid lands on
+    one, avoiding both needless inference cost and re-synthesizing a frame
+    that already exists).
+
+    ``max_intermediates_per_gap``: when a single bracket needs MORE
+    synthesized frames than this (a stall or a hard cut, not motion -- RIFE
+    quality degrades badly at large motion / extreme timesteps), every
+    "synthesize" entry in that bracket is replaced by ``gap_fallback``
+    (``"hold"`` -- repeat frame ``k``, default; or ``"blend"`` -- linear
+    crossfade) instead of asking RIFE to invent motion across an
+    unreasonably large gap.
+
+    Degenerate inputs never raise and never divide by zero: an empty
+    timeline returns ``[]``; a single-frame timeline or a non-positive
+    ``target_fps`` returns one "emit" entry per input frame; a
+    zero-or-negative overall duration (duplicate timestamps, or a
+    non-monotonic timeline whose endpoints collapse) likewise degrades to
+    "emit every original frame once, in order" rather than resampling.
+    Non-monotonic timestamps and zero-length individual gaps are handled by
+    clamping ``local`` to ``[0, 1]`` and treating a zero-or-negative
+    individual gap as an immediate snap to frame ``k`` -- never a
+    ZeroDivisionError.
+    """
+    if gap_fallback not in ("hold", "blend"):
+        raise ValueError(f"gap_fallback must be 'hold' or 'blend', got {gap_fallback!r}")
+
+    n = len(in_timestamps)
+    if n == 0:
+        return []
+    if n == 1 or target_fps <= 0:
+        return [PlanEntry(op="emit", k=i) for i in range(n)]
+
+    t = in_timestamps
+    t0 = t[0]
+    duration = t[-1] - t0
+    if duration <= 0:
+        return [PlanEntry(op="emit", k=i) for i in range(n)]
+
+    # Small epsilon guards the floor() against a value that's mathematically
+    # exactly an integer but lands a hair under it due to float error.
+    j_max = int(math.floor(duration * target_fps + 1e-9))
+
+    entries: list[PlanEntry] = []
+    bracket: list[PlanEntry] = []
+    k = 0
+
+    def flush() -> None:
+        nonlocal bracket
+        if not bracket:
+            return
+        synth_idx = [i for i, e in enumerate(bracket) if e.op == "synthesize"]
+        if len(synth_idx) > max_intermediates_per_gap:
+            for i in synth_idx:
+                e = bracket[i]
+                bracket[i] = PlanEntry(op=gap_fallback, k=e.k, local=e.local)
+        entries.extend(bracket)
+        bracket = []
+
+    for j in range(j_max + 1):
+        o = t0 + j / target_fps
+        # Two-pointer advance: o[j] is monotonic non-decreasing, so k only
+        # ever moves forward -- never re-scans from the start.
+        while k < n - 2 and o > t[k + 1]:
+            flush()
+            k += 1
+
+        gap = t[k + 1] - t[k] if k + 1 < n else 0.0
+        if gap <= 0:
+            local = 0.0
+        else:
+            local = (o - t[k]) / gap
+            local = 0.0 if local < 0.0 else (1.0 if local > 1.0 else local)
+
+        if local <= eps:
+            bracket.append(PlanEntry(op="emit", k=k))
+        elif local >= 1.0 - eps:
+            bracket.append(PlanEntry(op="emit", k=k + 1))
+        else:
+            bracket.append(PlanEntry(op="synthesize", k=k, local=local))
+
+    flush()
+    return entries
+
+
+def plan_stats(plan: list[PlanEntry]) -> dict[str, int]:
+    """Summary counters for a ``resample_plan()`` result (REQUIREMENTS.md
+    § 16.6 stage metadata): frames synthesized via RIFE inference, frames
+    passed through unchanged (a real input frame, reused verbatim), and how
+    many DISTINCT gaps hit ``max_intermediates_per_gap`` and fell back to
+    "hold"/"blend" instead of synthesis.
+    """
+    frames_synthesized = 0
+    frames_passed_through = 0
+    capped_gaps: set[int] = set()
+    for e in plan:
+        if e.op == "synthesize":
+            frames_synthesized += 1
+        elif e.op == "emit":
+            frames_passed_through += 1
+        else:  # "hold" / "blend"
+            capped_gaps.add(e.k)
+    return {
+        "frames_synthesized": frames_synthesized,
+        "frames_passed_through": frames_passed_through,
+        "gaps_capped": len(capped_gaps),
+    }
+
+
+def _linear_blend(frame_a: Any, frame_b: Any, weight: float) -> Any:
+    """Linear crossfade between two frames at ``weight`` (0.0 -> a, 1.0 ->
+    b) -- ``resample_plan()``'s "blend" ``gap_fallback`` (§ 16.3). Frames
+    are numpy arrays (H, W, 3) uint8; blending is done in float32 and
+    rounded back to the input dtype."""
+    import numpy as np
+
+    a = frame_a.astype(np.float32)
+    b = frame_b.astype(np.float32)
+    blended = a * (1.0 - weight) + b * weight
+    return blended.round().astype(frame_a.dtype)
+
+
+def execute_resample_plan(
+    frame_source: Iterable[Any],
+    plan: list[PlanEntry],
+    interpolate_fn: Callable[[Any, Any, float], Any],
+) -> Iterator[Any]:
+    """Streaming executor for a ``resample_plan()`` result (§ 16.3
+    "streaming discipline").
+
+    ``frame_source`` yields decoded input frames, in ascending index order
+    (frame 0, 1, 2, ...) -- e.g. a flat unroll of a chunked frame reader's
+    batches. ``plan`` entries must reference non-decreasing frame indices
+    (exactly what ``resample_plan()`` produces). ``interpolate_fn(frame_k,
+    frame_k1, timestep)`` computes one synthesized frame, typically
+    ``RIFEInterpolator.interpolate``.
+
+    Yields one output frame per plan entry, in order, holding AT MOST the
+    current bracket's two frames (``cur_frame``, ``next_frame``) at any
+    time -- never an accumulated output list. Reintroducing full
+    accumulation here would recreate the RIFE RAM blowup the AI stages'
+    streaming path (``ai/frame_pipe.py``) was built to fix (see
+    ``core/stages/interpolate.py``'s ``_execute_ai`` docstring).
+
+    Fails open on a source that runs out of frames early (fewer frames than
+    the plan expects, e.g. a stale/mismatched timeline): repeats the last
+    available frame rather than raising -- this should not happen when the
+    timeline probe's frame count matched the reader's actual output (see
+    ``core/cadence.py``'s ``probe_frame_timestamps``), but a streaming
+    executor must never crash a job over it.
+    """
+    it = iter(frame_source)
+
+    def _next() -> Any:
+        try:
+            return next(it)
+        except StopIteration:
+            return None
+
+    cur_idx = -1
+    cur_frame: Any = None
+    next_idx = -1
+    next_frame: Any = _next()
+    if next_frame is None:
+        return
+    cur_idx, cur_frame = 0, next_frame
+    next_idx = 1
+    next_frame = _next()
+
+    def advance_to(target: int) -> None:
+        nonlocal cur_idx, cur_frame, next_idx, next_frame
+        while cur_idx < target and next_frame is not None:
+            cur_idx, cur_frame = next_idx, next_frame
+            next_idx = cur_idx + 1
+            next_frame = _next()
+
+    for entry in plan:
+        if entry.op == "emit":
+            advance_to(entry.k)
+            yield cur_frame
+            continue
+
+        advance_to(entry.k)
+        if next_frame is None:
+            yield cur_frame
+            continue
+
+        if entry.op == "synthesize":
+            yield interpolate_fn(cur_frame, next_frame, entry.local)
+        elif entry.op == "hold":
+            yield cur_frame
+        elif entry.op == "blend":
+            yield _linear_blend(cur_frame, next_frame, entry.local)
+        else:  # pragma: no cover - resample_plan() never emits any other op
+            yield cur_frame
 
 
 def warp(tensor_input: torch.Tensor, tensor_flow: torch.Tensor) -> torch.Tensor:
