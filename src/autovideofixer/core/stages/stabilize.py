@@ -9,7 +9,7 @@ import time
 from typing import Any
 
 from autovideofixer.config import resolve_timeout
-from autovideofixer.core.ffmpeg_utils import run_ffmpeg
+from autovideofixer.core.ffmpeg_utils import run_ffmpeg, timing_output_args
 from autovideofixer.core.stages.base import BaseStage, StageResult, StageStatus
 
 
@@ -186,6 +186,50 @@ class StabilizeStage(BaseStage):
         except Exception:
             pass
         return 1920, 1080
+
+    @staticmethod
+    def _build_decode_args(
+        ffmpeg_bin: str,
+        input_path: str,
+        pixel_format: str,
+        video_width: int,
+        video_height: int,
+    ) -> list[str]:
+        """Build the raw-pipe decode process's ffmpeg argv (REQUIREMENTS.md
+        § 12.4b). Extracted from ``execute()`` so the mandatory
+        ``-fps_mode passthrough`` fix (see ``timing_output_args()``) is
+        directly unit-testable without driving the full decode/transform
+        subprocess pipe.
+
+        ``-s`` explicitly sets output size to match the transform side's own
+        ``-s`` input -- prevents corruption when ffprobe returns incorrect
+        dimensions.
+        """
+        return [
+            ffmpeg_bin,
+            "-hide_banner",
+            "-nostdin",
+            "-i",
+            input_path,
+            "-vf",
+            f"format={pixel_format}",
+            # REQUIREMENTS.md § 12.4b mandatory fix: without this, ffmpeg
+            # silently re-expands a VFR input back to CFR by duplicating
+            # frames on the way into the rawvideo pipe (verified: 48 real
+            # frames -> 120 output frames) -- negating retime's whole-
+            # pipeline saving at full decode+transform cost. This restores
+            # the correct (reduced) frame count.
+            *timing_output_args(),
+            "-c:v",
+            "rawvideo",
+            "-f",
+            "rawvideo",
+            "-s",
+            f"{video_width}x{video_height}",
+            "-bufsize",
+            "10M",
+            "-",
+        ]
 
     def _get_video_framerate(self, input_path: str) -> float:
         """Get video framerate from ffprobe.
@@ -702,7 +746,16 @@ class StabilizeStage(BaseStage):
             # from corrupting decoder reference frames (B-frame issue)
             # vidstab only supports yuv420p, so we convert regardless of source format
             pixel_format = "yuv420p"
-            framerate = self._get_video_framerate(input_path)
+            # REQUIREMENTS.md § 12.4b: rawvideo carries no timestamps, so
+            # this pipe's assumed frame rate (used on BOTH the decode and
+            # transform sides below) is the writer's carrier rate -- prefer
+            # the recovered true content cadence (nominal_fps, via
+            # input_info["true_framerate"]) over a fresh probe, which is
+            # unreliable on a VFR intermediate downstream of retime
+            # (avg_frame_rate lies -- see AGENTS.md's gotcha).
+            framerate = (input_info or {}).get("true_framerate") or self._get_video_framerate(
+                input_path
+            )
 
             crop_mode = "black" if self._zoom_mode == "black" else "keep"
             # Delegate the actual zoom amount to vidstabtransform's built-in
@@ -784,24 +837,9 @@ class StabilizeStage(BaseStage):
             # NOTE: -s explicitly sets output size to match transform's -s input
             # This prevents corruption when ffprobe returns incorrect dimensions
             decode_proc = sp.Popen(
-                [
-                    ffmpeg_bin,
-                    "-hide_banner",
-                    "-nostdin",
-                    "-i",
-                    input_path,
-                    "-vf",
-                    f"format={pixel_format}",
-                    "-c:v",
-                    "rawvideo",
-                    "-f",
-                    "rawvideo",
-                    "-s",
-                    f"{video_width}x{video_height}",
-                    "-bufsize",
-                    "10M",
-                    "-",
-                ],
+                self._build_decode_args(
+                    ffmpeg_bin, input_path, pixel_format, video_width, video_height
+                ),
                 # No stdin data is ever piped into decode_proc (only its
                 # stdout feeds transform_proc) -- without stdin=DEVNULL it
                 # would otherwise inherit the parent's stdin, i.e. the
@@ -983,23 +1021,32 @@ class StabilizeStage(BaseStage):
 
             self._report_progress(1.0, "Stabilization complete", progress_callback)
 
+            stab_metadata: dict[str, Any] = {
+                # REQUIREMENTS.md § 6.4: stabilize is traditional-only
+                # (FFmpeg vidstab, no AI path) -- uniform provenance.
+                "method": "traditional",
+                "smoothness": smooth,
+                "threshold": thresh,
+                "avg_shake": avg_value,
+                "scene_changes": scene_changes,
+                "num_scenes": len(scene_changes) + 1 if scene_changes else 1,
+                "pixel_format": pixel_format,
+                "apply_zoom": apply_zoom,
+                "zoom_coverage": self._zoom_coverage,
+                "static_zoom_pct": static_zoom_pct,
+            }
+            cadence = (input_info or {}).get("cadence")
+            if cadence and not cadence.get("is_regular", True):
+                # REQUIREMENTS.md § 12.4b: the raw pipe's fixed carrier rate
+                # (framerate, computed above) linearizes a genuinely
+                # irregular recovered cadence to a constant rate -- a real,
+                # bounded limitation that must be surfaced, never silent.
+                stab_metadata["timeline_linearized"] = True
+
             return StageResult(
                 status=StageStatus.COMPLETED,
                 output_path=output_path,
-                metadata={
-                    # REQUIREMENTS.md § 6.4: stabilize is traditional-only
-                    # (FFmpeg vidstab, no AI path) -- uniform provenance.
-                    "method": "traditional",
-                    "smoothness": smooth,
-                    "threshold": thresh,
-                    "avg_shake": avg_value,
-                    "scene_changes": scene_changes,
-                    "num_scenes": len(scene_changes) + 1 if scene_changes else 1,
-                    "pixel_format": pixel_format,
-                    "apply_zoom": apply_zoom,
-                    "zoom_coverage": self._zoom_coverage,
-                    "static_zoom_pct": static_zoom_pct,
-                },
+                metadata=stab_metadata,
                 duration_sec=time.time() - start,
             )
 

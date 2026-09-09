@@ -254,6 +254,11 @@ _VALID_EXISTING_MISMATCHED = ("rename", "overwrite")
 # from, and this tuple is otherwise a plain data constant with no logging-
 # specific behavior attached.
 VALID_LOG_TYPES = ("raw", "clean", "both", "none")
+# Canonical set for reporting.color / --color/--no-color (see the DEFAULTS
+# comment above for the tri-state's meaning). Kept here for the same reason
+# as VALID_LOG_TYPES: config.py is the layer both cli.py and logger.py
+# already import from.
+VALID_COLOR_MODES = ("auto", "always", "never")
 
 
 def validate_output_handling_config(config: "Config") -> None:
@@ -411,6 +416,18 @@ class Config:
             # non-zero exit) -- never a silent overwrite of one file by the
             # other.
             "log_suffix_clean": "-clean",
+            # REQUIREMENTS.md § 12.5: governs ONLY the final `encode` stage's
+            # ffmpeg `-fps_mode`. "cfr" (default) keeps the deliverable
+            # constant-framerate at the target rate -- the same posture as
+            # before this feature, now explicit rather than relying on
+            # ffmpeg's own muxer-dependent implicit default. "vfr" carries
+            # the recovered/genuine variable-framerate timeline all the way
+            # out to the final file. "passthrough" is the same idea without
+            # ffmpeg's timestamp-monotonicity normalization. Intermediates
+            # produced by every stage BEFORE encode are always VFR-safe
+            # (``-fps_mode passthrough``) regardless of this key -- it only
+            # affects the last encode.
+            "output_timing": "cfr",
         },
         "gpu": {
             "auto_detect": True,
@@ -536,8 +553,18 @@ class Config:
             # deblock/denoise_video/upscale/interpolate stages run, so they
             # never spend compute on pixels a downscale would shrink away
             # anyway. See core/stages/downscale.py.
+            #
+            # retime runs immediately after detect, before every other
+            # stage (REQUIREMENTS.md § 12): it recovers the input's TRUE
+            # content cadence (as opposed to the encoded/container
+            # framerate) and drops padding/duplicate frames, so the reduced,
+            # honest frame set -- and the compute saving -- carries through
+            # every later stage. Enabled by default; SKIPs (never fails)
+            # cheaply on an already-honest input. See core/stages/retime.py
+            # and core/cadence.py.
             "default_order": [
                 "detect",
+                "retime",
                 "crop",
                 "downscale",
                 "deblock",
@@ -551,12 +578,12 @@ class Config:
                 "hdr",
                 "encode",
             ],
-            # Must stay >= len(default_order) above (12) since a full default run
+            # Must stay >= len(default_order) above (14) since a full default run
             # legitimately uses every stage; this only guards against pathological
             # --stage/default_order repetition, not normal preset/auto-determined
             # pipelines. Counts resolved OCCURRENCES, not unique stage names -- a
             # stage repeated via default_order counts once per repetition.
-            "max_stages": 15,
+            "max_stages": 16,
             "skip_stage_on_error": True,
             # Default timeout (seconds) for a stage's MAIN ffmpeg processing/mux
             # pass(es) -- see BaseStage.stage_timeout() in core/stages/base.py.
@@ -649,6 +676,62 @@ class Config:
                 # write_queue_depth: max encoded chunks buffered ahead of the
                 # ffmpeg encoder pipe.
                 "write_queue_depth": 4,
+            },
+            "retime": {
+                # REQUIREMENTS.md § 12: recovers the input's TRUE content
+                # cadence (as opposed to the encoded/container framerate)
+                # via a single decode-only mpdecimate + metadata=print pass
+                # (core/cadence.py's analyze_cadence()), and -- when the
+                # input is actually padded -- drops the duplicate/padding
+                # frames while preserving genuine VFR timing
+                # (`-fps_mode vfr`). On by default: the analysis pass is
+                # cheap (decode-only, no encode) relative to any real
+                # processing stage, and SKIPs (never fails, never re-encodes)
+                # on an input that's already honest. See core/stages/
+                # retime.py.
+                "enabled": True,
+                # mpdecimate hi/lo/frac thresholds (encoder-noise tolerance
+                # for "these two frames are near-duplicates"). hi/lo are
+                # 8x8-pixel-block noise-metric thresholds (mpdecimate's own
+                # units); frac is the fraction of blocks that must be below
+                # `lo` OR the fraction below `hi` overall, whichever
+                # `mpdecimate` triggers on. See ffmpeg's mpdecimate filter
+                # docs for the precise semantics; these defaults (768=64*12,
+                # 320=64*5, 0.33) are ffmpeg's own filter defaults, chosen
+                # for its documented (and empirically validated -- see
+                # REQUIREMENTS.md § 12.6) real-world padding-detection
+                # behavior.
+                "hi": 768,
+                "lo": 320,
+                "frac": 0.33,
+                # Below this duplicate_ratio (= 1 - unique_frames/total_frames,
+                # from the analysis pass), the input is treated as already
+                # honest and the stage SKIPs without ever running the real
+                # mpdecimate re-encode pass. 0.05 = at least 5% of frames
+                # must be near-duplicates before retime bothers.
+                "min_duplicate_ratio": 0.05,
+                # Analysis pass is limited to the first N seconds of content
+                # (cheaper decision -- the actual retime re-encode pass, once
+                # triggered, always runs mpdecimate over the WHOLE input
+                # regardless of this). 0 = analyse the whole file.
+                "analysis_sample_sec": 120,
+                # nominal_fps snapping window: detected_fps snaps to the
+                # nearest standard rate (23.976/24/25/29.97/30/48/50/59.94/
+                # 60/100/120) when within this RELATIVE tolerance (e.g.
+                # 0.02 = 2%), else stays at the raw detected value.
+                "snap_tolerance": 0.02,
+                # is_regular classification: the coefficient of variation
+                # (std/mean) of the recovered timeline's inter-frame gaps
+                # must be under this to count as a uniform (not genuinely
+                # variable-framerate) cadence. Also reused as the tolerance
+                # for grid_rate's "does every gap divide evenly onto the
+                # encoded grid" check (see core/cadence.py).
+                "regularity_tolerance": 0.15,
+                # CRF for the retime stage's own internal re-encode pass
+                # (NOT the final output -- this is an intermediate .mkv temp
+                # every later stage reads from). Default 16 (near-visually-
+                # lossless), matching the AI stages' own temp_crf default.
+                "temp_crf": 16,
             },
             "downscale": {
                 # Shrinks an oversized input down to the target resolution
@@ -1116,6 +1199,30 @@ class Config:
             # --progress-file/--no-progress-file.
             "progress_batch": True,
             "progress_file": True,
+            # Tri-state override for Rich console colour on the CLI's stdout/
+            # stderr consoles AND the logging RichHandler's console (see
+            # logger.py:build_console/set_console_color). "auto" (default)
+            # keeps today's behavior -- Rich autodetects a real terminal and
+            # enables colour only then. The motivating case for the other two
+            # is `avf process ... | tee run.log`: piping stdout through `tee`
+            # makes it a pipe, not a TTY, so Rich silently drops to plain text
+            # even though the user is still watching a real terminal (just
+            # downstream of `tee`) -- "always" forces colour back on
+            # (force_terminal=True) for that case. "never" is the inverse,
+            # forcing colour off (no_color=True) even when attached to a real
+            # terminal (e.g. a terminal that mishandles ANSI, or scripting
+            # `avf` interactively but wanting clean output to eyeball). See
+            # --color/--no-color on `avf process` (CLI flag wins over this
+            # config value; absent flag leaves this value in effect).
+            # Deliberately independent of the progress bars above: those stay
+            # gated on the real fd-level `sys.stdout.isatty()` check
+            # regardless of this setting (see cli.py's `process` command) --
+            # forcing colour on for a `tee`d run must NOT re-enable bars,
+            # since their redraw control codes would still corrupt the piped
+            # file. Also never affects file logs (auto_log_file/--log-file),
+            # which stay plain-text always -- only the two Rich consoles are
+            # ever touched. Must be one of VALID_COLOR_MODES below.
+            "color": "auto",
         },
     }
 

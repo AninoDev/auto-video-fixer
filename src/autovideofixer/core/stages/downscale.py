@@ -27,7 +27,7 @@ import time
 from typing import Any, Callable
 
 from autovideofixer.config import Config
-from autovideofixer.core.ffmpeg_utils import probe, run_ffmpeg
+from autovideofixer.core.ffmpeg_utils import probe, run_ffmpeg, timing_output_args
 from autovideofixer.core.output_check import SKIP_SCALE_THRESHOLD, compute_fitted_dimensions
 from autovideofixer.core.output_check import effective_target_bounds as _effective_target_bounds_fn
 from autovideofixer.core.stages.base import BaseStage, StageResult, StageStatus
@@ -140,7 +140,17 @@ class DownscaleStage(BaseStage):
         final_w, final_h = self._target_dimensions(input_w, input_h, target_width, target_height)
         scale_expr = f"scale={final_w}:{final_h}:flags=lanczos"
         vf_filter = f"{scale_expr},format=yuv420p"
-        args = ["-i", input_path, "-vf", vf_filter, "-c:a", "copy", "-y", output_path]
+        args = [
+            "-i",
+            input_path,
+            "-vf",
+            vf_filter,
+            *timing_output_args(),
+            "-c:a",
+            "copy",
+            "-y",
+            output_path,
+        ]
 
         def cb(p: float, m: str) -> None:
             self._report_progress(0.2 + p * 0.8, m, progress_callback)

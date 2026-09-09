@@ -5,7 +5,7 @@ from __future__ import annotations
 import time
 from typing import Any
 
-from autovideofixer.core.ffmpeg_utils import probe, run_ffmpeg
+from autovideofixer.core.ffmpeg_utils import probe, run_ffmpeg, timing_output_args
 from autovideofixer.core.stages.base import BaseStage, StageResult, StageStatus
 
 
@@ -96,7 +96,17 @@ class DenoiseVideoStage(BaseStage):
             "high": "10:6:12:12",
         }.get(str(strength), "6:4:8:8")
 
-        args = ["-i", input_path, "-vf", f"hqdn3d={params}", "-c:a", "copy", "-y", output_path]
+        args = [
+            "-i",
+            input_path,
+            "-vf",
+            f"hqdn3d={params}",
+            *timing_output_args(),
+            "-c:a",
+            "copy",
+            "-y",
+            output_path,
+        ]
 
         def cb(p, m):
             self._report_progress(0.3 + p * 0.7, m, progress_callback)

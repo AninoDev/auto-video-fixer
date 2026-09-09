@@ -208,6 +208,7 @@ avf process [PATHS...] [OPTIONS]
 - `--dry-run`: Show what would be processed without processing
 - `--stage TEXT`: Specific stage to run (can repeat)
 - `--threads INT`: Number of concurrent processing threads
+- `--color / --no-color`: Force console colour on/off (see [Console Colour](#console-colour))
 
 **Examples:**
 
@@ -241,6 +242,26 @@ choice via `reporting.progress_batch` / `reporting.progress_file` in your config
 # Suppress both bars, e.g. for a cleaner log when redirecting to a file by hand
 avf process video.mp4 -p 4k60 --no-progress-batch --no-progress-file
 ```
+
+### Console Colour
+
+By default (`auto`) Rich only colours `process`'s console output when stdout/stderr is a real
+terminal -- the common case where this bites is `avf process ... | tee run.log`: piping stdout
+through `tee` makes it a pipe rather than a TTY, so Rich silently drops to plain text even though
+you're still watching a real terminal on the other end of `tee`. Pass `--color` to force colour
+back on for that case, or `--no-color` to force it off (e.g. a terminal that mishandles ANSI, or
+you just want clean output to eyeball). Persist the choice via `reporting.color` (`auto` |
+`always` | `never`) in your config file; the CLI flag wins when both are given.
+
+```bash
+# Keep colour even though tee makes stdout a pipe
+avf process video.mp4 -p 4k60 --color | tee run.log
+```
+
+Colour and the live progress bars above are independent controls: `--color`/`reporting.color:
+always` does **not** re-enable the progress bars for piped/redirected output -- those stay gated
+on stdout actually being a real terminal, since their redraw control codes would otherwise
+corrupt the piped file. Forcing colour on only affects what the console text itself looks like.
 
 ### Reading Inputs From a List File
 

@@ -73,6 +73,22 @@ gates (no Rust unit tests exist yet for this crate — correctness is verified v
 differential test `TestRustPythonParity` in `tests/unit/test_scene_detection.py`, which compares
 the Rust and Python implementations' output directly).
 
+**Gotcha — `uv run` can silently serve a STALE cached wheel of a Rust crate you just edited.**
+After changing Rust source, `maturin develop --release` installs the new build, but the next
+`uv run <anything>` re-syncs and reinstalls a *cached* wheel built from the pre-edit source,
+reverting your change with no warning. Observed concretely while landing the `retime` feature
+(REQUIREMENTS.md § 12.6): the `avf_framepipe` frame reader returned the correct 48 frames when
+invoked via `.venv/bin/python` straight after a rebuild, then 120 frames again through `uv run`.
+
+Force a genuine rebuild instead:
+
+```
+uv sync --all-extras --reinstall-package avf_framepipe   # or avf_scenes / avf_hashing / avf_borders
+```
+
+Always re-verify Rust-side behavior **through `uv run`**, not just a direct `.venv/bin/python`
+call — otherwise you can "confirm" a fix that the real entry points don't actually have.
+
 A second crate, `rust/avf_hashing/` (perceptual-hash duplicate detection, `docs/REQUIREMENTS.md`
 R5.2), followed the same workspace/build pattern (`[tool.uv.workspace]` member, `avf-hashing`
 dependency + `[tool.uv.sources]` editable-workspace entry, built automatically by `uv sync
@@ -293,9 +309,19 @@ one of `--output-name`/a per-file `--from-file` output may apply -- combining th
   gone -- `DEFAULTS["pipeline"]["default_order"]` (and a matching `DEFAULT_STAGE_ORDER` constant
   in `core/pipeline.py`, used only as a fallback when the config key is missing/empty) now
   **is** the actual execution order. Default order:
-  `detect, crop, downscale, deblock, stabilize, denoise_video, upscale, interpolate,
+  `detect, retime, crop, downscale, deblock, stabilize, denoise_video, upscale, interpolate,
   normalize_volume, normalize_audio, speed, hdr, encode`.
-  - `crop` now runs **first**, right after `detect` (previously it ran after `stabilize`):
+  - `retime` runs **immediately after `detect`** (REQUIREMENTS.md § 12): it recovers the input's
+    TRUE content cadence (as opposed to the encoded/container framerate) via a single decode-only
+    `mpdecimate`+`metadata=print` pass (`core/cadence.py`) and drops padding/duplicate frames
+    while preserving genuine VFR timing, so every later stage sees the reduced, honest frame set.
+    On by default; SKIPs (never fails) cheaply on an already-honest input. `InterpolateStage`
+    prefers `input_info["true_framerate"]` (published by this stage) over the probed `framerate`
+    -- this is the actual payoff: a 24-in-60 input targeting 60fps now correctly plans 24->60
+    interpolation instead of reading 60->60 and skipping. See "Timestamp safety across stages"
+    below for how the rest of the pipeline stays VFR-safe downstream of this stage.
+  - `crop` now runs **first** among the enhancement stages, right after `retime` (previously it
+    ran after `stabilize`):
     `stabilize`'s zoom is now a real percentile-based "borderless" zoom (not the old motion-guess
     zoom), so it no longer leaves a black border for a later crop to clean up -- there's nothing
     left for a post-stabilize crop to do. Running crop first also means `downscale` (which sits
@@ -640,6 +666,25 @@ functions) plus new `JobResult` fields and `cli.py` display/write wiring:
   interleave — there's one file bar, not one per job, so it just reflects whichever job most
   recently reported (switching jobs resets it to that job's own progress); the batch bar is
   unaffected since it always reflects the true completed-job count.
+- **`reporting.color` tri-state + `--color/--no-color`** (default `"auto"`): overrides Rich
+  colour on the CLI's module-level `console`/`err_console` (`cli.py`) and the logging
+  `RichHandler`'s console (`logger.py::setup_logging`) — motivated by `avf process ... | tee
+  run.log`, where piping stdout through `tee` makes it a non-TTY pipe and Rich silently drops
+  colour even though a real terminal is still watching downstream of `tee`. `"always"` forces
+  colour on (`Console(force_terminal=True)`) even off a TTY; `"never"` forces it off
+  (`Console(no_color=True)`) even on a real TTY; built via `logger.py::build_console()`, shared
+  by both the CLI globals and `setup_logging()` so all three consoles agree. Precedence: CLI flag
+  (`process` only) > config file > `"auto"`. Since `--color` only lives on `process` and
+  `setup_logging()` runs earlier in the group callback (before `process`'s own preset/config/CLI-
+  flag cascade resolves), `main()` applies the base config's value up front and `process`
+  retroactively re-applies the fully-resolved value via `logger.py::set_console_color()` (which
+  just reassigns `RichHandler.console`, a public attribute) once its own cascade is done — see
+  `cli.py::_apply_color_mode()`. **Independent of the live progress bars above**: forcing colour
+  on makes `console.is_terminal` True even for piped output, but the bars' gate is `console.
+  is_terminal AND sys.stdout.isatty()` — the `isatty()` half still catches it, so
+  `reporting.color=always` deliberately does NOT re-enable bars for redirected/piped output.
+  Never touches file handlers (`auto_log_file`/`--log-file` stay plain-text always, regardless of
+  this setting).
 
 ## AI/Traditional Method Selection
 
@@ -1124,6 +1169,7 @@ layer that sets it, never merged element-by-element.
 4. **Every other CLI option that maps to a config key** (`--threads`, `--ai`/`--no-ai`,
    `--fps`, `--resolution`, `--codec`/`--audio-codec`/`--crf`/`--encoder-preset`, `--hwaccel`,
    `--gpu-device`, `--scene-mode`, `--drop-non-content`, `--crop-limit`, `--downscale`,
+   `--retime`/`--no-retime`, `--retime-min-duplicate-ratio`, `--output-timing`,
    `--resolution-fit-mode`, `--dimension-multiple`, `--snap-tolerance`, `--zoom-coverage`,
    `--batch-size`/`--tile-batch-size`, `--enable-stage`/`--disable-stage`, and `--set
    KEY=VALUE`), folded into **one** final layer applied **last** — this layer always wins over
@@ -1226,6 +1272,19 @@ per-run number baked into this codebase.
 
 ## Gotchas
 
+- **Timestamp safety downstream of `retime` (REQUIREMENTS.md § 12.4)**: once an intermediate is
+  VFR, any stage that silently re-conforms it to CFR re-inserts the duplicate frames `retime`
+  just removed. Filter-only ffmpeg stages (`crop`/`downscale`/`denoise_video`/`deblock`
+  traditional/`hdr`/`speed`) carry an explicit `-fps_mode passthrough` via the shared
+  `ffmpeg_utils.timing_output_args()` helper. Raw-frame-pipe stages (`upscale`/`deblock` AI,
+  `interpolate` AI/RIFE, `stabilize`'s manual decode/transform pipe) are the dangerous class: the
+  **reader**'s ffmpeg args must also carry `-fps_mode passthrough` -- without it, ffmpeg silently
+  re-expands a VFR input back to CFR by duplicating frames on the way into the rawvideo pipe
+  (verified: 48 real frames -> 120 output frames), negating the whole feature at full AI-inference
+  cost. `-fps_mode` is an OUTPUT option -- it must be placed after `-i`, never before (corrupts
+  input parsing). Also do **not** re-probe for fps on a file downstream of `retime`:
+  `avg_frame_rate` is unreliable on a VFR intermediate (empirically a 48-frame 2s VFR MKV still
+  advertised `avg_frame_rate=60/1`) -- take the rate from `input_info["true_framerate"]` instead.
 - **stabilize.py `_get_video_dimensions` / `_get_video_framerate`**: Must use `stdout=subprocess.PIPE` (not `subprocess.DEVNULL`). Using DEVNULL discards output and forces fallback to 1920×1080 / 30fps, stretching portrait video to landscape.
 - **stabilize pipe sizing**: The decode subprocess **must** include `-s {width}x{height}` to match the transform's `-s` input. Without it, anamorphic or non-standard resolution videos produce corrupted output due to stride mismatch.
 - **vid.stab B-frame corruption**: Known bug (github.com/georgmartius/vid.stab#144). The pipeline pipes raw YUV420P between decode and transform to avoid it. Use accuracy=15 (higher causes FFmpeg return code 222).
@@ -1672,6 +1731,13 @@ Global (before the subcommand):
 - `--downscale` / `--no-downscale`: enable/disable the `downscale` stage (`stages.downscale.
   enabled`, off by default), which shrinks an oversized input to the target resolution box
   before the heavier stages run — see "Resolution fit modes & the `downscale` stage" above
+- `--retime` / `--no-retime`: enable/disable the `retime` stage (`stages.retime.enabled`, ON by
+  default), which recovers a video's TRUE source cadence and drops padding/duplicate frames —
+  see REQUIREMENTS.md § 12 and "Pipeline Behavior" above
+- `--retime-min-duplicate-ratio FLOAT`: minimum duplicate-frame fraction before `retime` actually
+  re-encodes (`stages.retime.min_duplicate_ratio`, default 0.05) — below it the stage SKIPs
+- `--output-timing {cfr,vfr,passthrough}`: timing mode for the FINAL `encode` stage only
+  (`general.output_timing`, default `cfr`) — see REQUIREMENTS.md § 12.5
 - `--resolution-fit-mode {preserve_aspect,snap_limiting}`: how upscale/downscale fit an input
   into the target resolution box (`quality.quality_target.resolution_fit_mode`) — see
   "Resolution fit modes & the `downscale` stage" above
@@ -1695,6 +1761,9 @@ Global (before the subcommand):
   ON-by-default (but only rendered when `console.is_terminal`) live progress bars
   (`reporting.progress_batch` / `reporting.progress_file`) — see "Feature 6 — live progress bars"
   above
+- `--color/--no-color`: force Rich console colour on/off, e.g. to keep colour through `| tee
+  run.log` (`reporting.color`, default `"auto"`) — independent of the progress bars above; see
+  the `reporting.color` tri-state bullet above
 
 `avf analyze PATHS...`: like `process`, accepts multiple files and/or directories (directories
 scanned via `scan_directory`, hidden files skipped) and analyzes each in sequence; a per-file

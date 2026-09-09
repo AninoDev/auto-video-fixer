@@ -88,6 +88,15 @@ class Preset:
 
 
 # ─── Built-in presets ──────────────────────────────────────────────
+#
+# Note (docs/REQUIREMENTS.md § 12): none of the presets below mention
+# "retime" in enable_stages/stage_overrides -- this is deliberate, not an
+# omission. Cadence recovery is universally beneficial (it only ever removes
+# duplicate/padding frames the source itself doesn't need, or SKIPs cheaply
+# on an already-honest input) and is on by default (stages.retime.enabled:
+# true in Config.DEFAULTS), so every preset -- including remux_only, where
+# it still pays off before a mere container change -- simply inherits the
+# global default rather than each preset re-asserting it.
 
 PRESETS: dict[str, Preset] = {
     "max_quality": Preset(

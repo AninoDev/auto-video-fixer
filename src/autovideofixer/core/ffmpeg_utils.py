@@ -372,6 +372,24 @@ def build_hwaccel_args(hwaccel: str) -> list[str]:
     return ["-hwaccel", hwaccel]
 
 
+def timing_output_args(mode: str = "passthrough") -> list[str]:
+    """Build the shared ``-fps_mode`` OUTPUT arguments (REQUIREMENTS.md § 12.4).
+
+    ``-fps_mode`` is an OUTPUT option -- callers must place these args
+    somewhere in the output section of the command (after ``-i``, before the
+    output path). Emitting them before ``-i`` corrupts input parsing
+    (observed as spurious ``Duplicate element``/EBML errors on Matroska).
+
+    ``"passthrough"`` (the only mode every timestamp-safe stage in this
+    codebase actually uses) tells ffmpeg to honor each frame's own PTS
+    exactly rather than silently re-conforming the stream to CFR -- required
+    on every stage downstream of ``retime`` so a VFR intermediate's dropped
+    duplicate frames stay dropped instead of being silently reinserted (see
+    ``core/stages/retime.py`` and AGENTS.md's timestamp-safety notes).
+    """
+    return ["-fps_mode", mode]
+
+
 def run_ffmpeg(
     args: list[str],
     progress_callback: callable | None = None,

@@ -24,6 +24,7 @@ from autovideofixer import __version__
 from autovideofixer.cli import config_tools
 from autovideofixer.cli.progress import ProgressReporter, resolve_show_progress
 from autovideofixer.config import (
+    VALID_COLOR_MODES,
     VALID_LOG_TYPES,
     Config,
     _looks_like_secret_key,
@@ -49,7 +50,7 @@ from autovideofixer.core.reporting import (
     write_json_report,
 )
 from autovideofixer.logclean import get_pii_cleaner
-from autovideofixer.logger import get_logger, setup_logging
+from autovideofixer.logger import build_console, get_logger, set_console_color, setup_logging
 
 if TYPE_CHECKING:
     from autovideofixer.core.analysis import VideoAnalysis
@@ -61,6 +62,37 @@ console = Console()
 # `avf config upgrade in.yaml --drop-unknown > out.yaml` would prepend
 # ANSI-coloured "Warning:" lines into the YAML file and corrupt it.
 err_console = Console(stderr=True)
+
+
+def _apply_color_mode(mode: str) -> None:
+    """Rebuild `console`/`err_console` (this module) and the logging
+    RichHandler's console (logger.py) for `mode`, so all three Rich
+    consoles the CLI touches agree on the resolved reporting.color value.
+
+    `console`/`err_console` are built at IMPORT time, before any config is
+    read (see the module-level assignments above), so they always start out
+    "auto" -- this is the retroactive fix-up, called once the effective
+    reporting.color (config file, then `main()`'s early read; then
+    `process`'s own --color/--no-color CLI-flag layer, which wins) is known.
+    Every `console.print(...)`/`err_console.print(...)` call site in this
+    module resolves the module global at call time, so reassigning these
+    globals here is picked up by every later call without threading a
+    `console` parameter through the whole file.
+
+    Reassigns rather than mutates (new `Console` objects) -- Rich has no
+    public API to flip an existing Console's colour mode in place, and
+    `ProgressReporter`/anything else constructed AFTER this runs is handed
+    the freshly rebuilt `console` global, never a stale pre-override one
+    (both `process` call sites below apply this before constructing
+    `ProgressReporter`). `set_console_color()` does the equivalent for
+    logger.py's own RichHandler console -- see its docstring for why that
+    one needs to be retargeted after the fact rather than just rebuilt here
+    (it isn't a module global in THIS file).
+    """
+    global console, err_console
+    console = build_console(stderr=False, color=mode)
+    err_console = build_console(stderr=True, color=mode)
+    set_console_color(mode)
 
 
 def _safe(value: object) -> str:
@@ -133,6 +165,8 @@ _VALUE_FLAGS = {
     "--snap-tolerance",
     "--from-file",
     "--from-file-parser",
+    "--retime-min-duplicate-ratio",
+    "--output-timing",
 }
 
 # Boolean/flag-value options that map to a config key -- recorded with a
@@ -150,6 +184,8 @@ _BOOL_FLAGS = {
     "--no-drop-non-content",
     "--downscale",
     "--no-downscale",
+    "--retime",
+    "--no-retime",
 }
 
 
@@ -713,6 +749,23 @@ def main(
     log_suffix_raw = config.get("general", "log_suffix_raw", default="")
     log_suffix_clean = config.get("general", "log_suffix_clean", default="-clean")
 
+    # reporting.color (§ "tri-state colour control"): no CLI flag at THIS
+    # (group) level -- --color/--no-color lives on `process` only, since
+    # that's the command people pipe through `tee` -- so this only ever
+    # reflects the base config file, same "read before setup_logging()"
+    # caveat as resolved_log_type above. `process` re-resolves and
+    # retroactively applies the fully-layered value (including its own CLI
+    # flag) later via `_apply_color_mode()`, once its preset/config/CLI-flag
+    # cascade has finished.
+    resolved_color = (config.get("reporting", "color", default="auto") or "auto").lower()
+    if resolved_color not in VALID_COLOR_MODES:
+        console.print(
+            f"[red]Invalid reporting.color: {resolved_color!r} "
+            f"(must be one of {VALID_COLOR_MODES!r})[/red]"
+        )
+        sys.exit(1)
+    _apply_color_mode(resolved_color)
+
     # An explicit --log-file replaces the automatic state-dir log rather than
     # adding a second file: the run's canonical log lives wherever the user
     # pointed it, and it gets the same always-DEBUG treatment.
@@ -733,6 +786,7 @@ def main(
             log_type=resolved_log_type,
             log_suffix_raw=log_suffix_raw,
             log_suffix_clean=log_suffix_clean,
+            color=resolved_color,
         )
     except ValueError as e:
         console.print(f"[red]{_safe(e)}[/red]")
@@ -1014,6 +1068,34 @@ def _log_effective_settings(
     "quality.quality_target.target_resolution) to have any effect.",
 )
 @click.option(
+    "--retime/--no-retime",
+    "retime",
+    default=None,
+    help="Enable/disable the retime stage, which recovers a video's TRUE source "
+    "cadence (as opposed to the encoded/container framerate) and drops padding/"
+    "duplicate frames while preserving genuine VFR timing (overrides "
+    "stages.retime.enabled; on by default). See docs/REQUIREMENTS.md § 12.",
+)
+@click.option(
+    "--retime-min-duplicate-ratio",
+    type=float,
+    default=None,
+    help="Minimum fraction of near-duplicate frames (1 - unique/total, from retime's "
+    "cadence analysis) before the retime stage actually re-encodes -- below this the "
+    "input is treated as already honest and the stage SKIPs (overrides "
+    "stages.retime.min_duplicate_ratio; default 0.05).",
+)
+@click.option(
+    "--output-timing",
+    default=None,
+    type=click.Choice(["cfr", "vfr", "passthrough"]),
+    help="Timing mode for the FINAL encode only (overrides general.output_timing; "
+    "default cfr). 'cfr' keeps the deliverable constant-framerate at the target rate; "
+    "'vfr' carries the recovered/genuine variable-framerate timeline all the way out; "
+    "'passthrough' is the same idea without ffmpeg's timestamp-monotonicity "
+    "normalization. Intermediates upstream of encode are always VFR-safe regardless.",
+)
+@click.option(
     "--resolution-fit-mode",
     default=None,
     type=click.Choice(["preserve_aspect", "snap_limiting"]),
@@ -1122,6 +1204,19 @@ def _log_effective_settings(
     "(overrides reporting.progress_file; on by default, but only actually rendered when "
     "stdout is a real terminal).",
 )
+@click.option(
+    "--color/--no-color",
+    "color",
+    default=None,
+    help="Force Rich console colour on/off (overrides reporting.color; default auto -- "
+    "colour only when stdout/stderr is a real terminal). Useful for `avf process ... | tee "
+    "run.log`: the pipe makes stdout non-interactive, so Rich normally drops colour even "
+    "though you're still watching a real terminal downstream of `tee` -- pass --color to "
+    "keep it. Independent of the progress bars: those stay gated on the real fd-level "
+    "sys.stdout.isatty() check regardless of this flag (see --progress-batch/"
+    "--progress-file) -- forcing colour on for a piped/redirected run does NOT re-enable "
+    "them, since their redraw control codes would still corrupt the captured output.",
+)
 @click.pass_context
 def process(
     ctx: click.Context,
@@ -1158,6 +1253,9 @@ def process(
     crop_limit: int | None,
     interpolate_hybrid: bool | None,
     downscale: bool | None,
+    retime: bool | None,
+    retime_min_duplicate_ratio: float | None,
+    output_timing: str | None,
     resolution_fit_mode: str | None,
     dimension_multiple: int | None,
     snap_tolerance: float | None,
@@ -1170,6 +1268,7 @@ def process(
     report_json: str | None,
     progress_batch: bool | None,
     progress_file: bool | None,
+    color: bool | None,
 ) -> None:
     """Process video files with the specified settings."""
     if list_presets_flag:
@@ -1295,6 +1394,20 @@ def process(
         cli_candidates.append(
             (("--downscale", "--no-downscale"), ["stages", "downscale", "enabled"], downscale)
         )
+    if retime is not None:
+        cli_candidates.append(
+            (("--retime", "--no-retime"), ["stages", "retime", "enabled"], retime)
+        )
+    if retime_min_duplicate_ratio is not None:
+        cli_candidates.append(
+            (
+                ("--retime-min-duplicate-ratio",),
+                ["stages", "retime", "min_duplicate_ratio"],
+                retime_min_duplicate_ratio,
+            )
+        )
+    if output_timing is not None:
+        cli_candidates.append((("--output-timing",), ["general", "output_timing"], output_timing))
     if resolution_fit_mode is not None:
         cli_candidates.append(
             (
@@ -1379,6 +1492,14 @@ def process(
                 progress_file,
             )
         )
+    if color is not None:
+        cli_candidates.append(
+            (
+                ("--color", "--no-color"),
+                ["reporting", "color"],
+                "always" if color else "never",
+            )
+        )
     for stage_name in enable_stages:
         cli_candidates.append((("--enable-stage",), ["stages", stage_name, "enabled"], True))
     for stage_name in disable_stages:
@@ -1423,6 +1544,22 @@ def process(
         _set_nested(final_layer, key_path, value)
     if final_layer:
         config.apply_layer(final_layer, "cli-flags")
+
+    # Re-resolve reporting.color now that the --color/--no-color CLI-flag
+    # layer (if any) is folded in, and apply it retroactively to `console`/
+    # `err_console` and the logging RichHandler console -- `main()` already
+    # applied the base config's value earlier, before this command's own
+    # cascade (preset/config/--set/CLI-flag layers) had been resolved, so
+    # this is the point where a `process`-specific --color/--no-color (or a
+    # preset/--set override of reporting.color) actually takes effect.
+    resolved_color = (config.get("reporting", "color", default="auto") or "auto").lower()
+    if resolved_color not in VALID_COLOR_MODES:
+        console.print(
+            f"[red]Invalid reporting.color: {resolved_color!r} "
+            f"(must be one of {VALID_COLOR_MODES!r})[/red]"
+        )
+        sys.exit(1)
+    _apply_color_mode(resolved_color)
 
     # REQUIREMENTS.md § 6.7: register what's known from the EFFECTIVE config
     # (VLM/LLM endpoints, this run's config layer files, the output dir if
@@ -1602,7 +1739,14 @@ def process(
     # POSIX terminal (e.g. some redirected/piped setups still report as a
     # terminal to Rich) -- also require the real fd-level isatty() signal so
     # a redirected/piped run never leaks bar-redraw control codes into the
-    # captured output.
+    # captured output. Crucially, `reporting.color=always`/--color (see
+    # `_apply_color_mode()` above) makes `console.is_terminal` True even for
+    # a piped/redirected `console` (that's the whole point of forcing
+    # colour) -- so `sys.stdout.isatty()` is the ONLY thing still preventing
+    # bars from corrupting a `tee`d file once colour is forced on. Colour and
+    # progress bars are deliberately independent controls: forcing colour on
+    # must never re-enable bars for non-TTY output, and this AND keeps it
+    # that way regardless of which reporting.color value was applied above.
     show_batch, show_file = resolve_show_progress(
         bool(batch_enabled), bool(file_enabled), console.is_terminal and sys.stdout.isatty()
     )
@@ -1612,6 +1756,17 @@ def process(
     )
 
     def _job_complete_cb(job: Job, result: JobResult) -> None:
+        # Accumulate here rather than relying on execute_all()'s return value:
+        # on Ctrl-C (KeyboardInterrupt propagating out of execute_all) the
+        # assignment below never runs, so a cancelled run used to report an
+        # EMPTY results list -- "Job outcomes aggregate: {}" and a zeroed
+        # summary -- even though every finished job had already been reported
+        # through this very callback. execute_all() invokes this for every
+        # job it completes (both the sequential and the thread-pool path), so
+        # appending here makes the `finally` reporting tail see exactly the
+        # jobs that actually finished, on cancel and on unexpected-exception
+        # paths alike.
+        results.append(result)
         _on_job_complete(job, result)
         _print_job_report(logger, result, config)
         extras = fanout.get(job.output_path) if job.output_path else None
@@ -1629,8 +1784,12 @@ def process(
     # time something goes wrong. `results` starts empty and the whole
     # reporting tail (per-job/aggregate console+log output, JSON write) runs
     # in `finally` so an unexpected exception escaping execute_all() (per-job
-    # exceptions are already caught inside it) still gets a report for
-    # whatever's in `results` so far. The live-progress region (if any) must
+    # exceptions are already caught inside it) -- or a KeyboardInterrupt from
+    # the user cancelling the run -- still gets a report for whatever's in
+    # `results` so far. `results` is populated incrementally by
+    # `_job_complete_cb` above, NOT from execute_all()'s return value, which
+    # is never assigned when the call is interrupted. The live-progress
+    # region (if any) must
     # be stopped BEFORE that reporting tail prints, so the end-of-run summary
     # never gets overwritten/corrupted by the bars -- `with reporter:` (a
     # no-op contextlib stand-in when disabled) wraps only the execute_all()
@@ -1640,11 +1799,9 @@ def process(
     try:
         if reporter is not None:
             with reporter:
-                results = pipeline.execute_all(
-                    callback=_job_complete_cb, progress_callback=_progress_cb
-                )
+                pipeline.execute_all(callback=_job_complete_cb, progress_callback=_progress_cb)
         else:
-            results = pipeline.execute_all(callback=_job_complete_cb)
+            pipeline.execute_all(callback=_job_complete_cb)
     finally:
         run_finished_at = datetime.now(timezone.utc)
         _print_summary(results)

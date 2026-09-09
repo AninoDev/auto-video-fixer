@@ -39,7 +39,12 @@ import time
 from dataclasses import dataclass, field
 from typing import Any
 
-from autovideofixer.core.ffmpeg_utils import get_ffmpeg_path, probe, run_ffmpeg
+from autovideofixer.core.ffmpeg_utils import (
+    get_ffmpeg_path,
+    probe,
+    run_ffmpeg,
+    timing_output_args,
+)
 from autovideofixer.core.stages.base import BaseStage, StageResult, StageStatus
 
 logger = logging.getLogger(__name__)
@@ -407,7 +412,7 @@ class CropStage(BaseStage):
             "18",
         ]
         args += ["-c:a", "copy"] if has_audio else []
-        args += ["-y", output_path]
+        args += [*timing_output_args(), "-y", output_path]
 
         def cb(p, m):
             self._report_progress(0.5 + p * 0.5, m, progress_callback)

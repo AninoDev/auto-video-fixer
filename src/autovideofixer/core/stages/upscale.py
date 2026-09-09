@@ -96,6 +96,7 @@ class UpscaleStage(BaseStage):
         target_height: int | None = None,
         method: str | None = None,
         scale_factor: float | None = None,
+        input_info: dict[str, Any] | None = None,
         **kwargs,
     ) -> StageResult:
         start = time.time()
@@ -135,6 +136,7 @@ class UpscaleStage(BaseStage):
                     scale_factor=scale_factor,
                     target_width=target_width,
                     target_height=target_height,
+                    input_info=input_info,
                 )
             return self._execute_traditional(
                 input_path,
@@ -223,6 +225,7 @@ class UpscaleStage(BaseStage):
         scale_factor: float | None = None,
         target_width: int | None = None,
         target_height: int | None = None,
+        input_info: dict[str, Any] | None = None,
         **kwargs,
     ) -> StageResult:
         """AI-based upscaling using Real-ESRGAN via PyTorch.
@@ -404,6 +407,11 @@ class UpscaleStage(BaseStage):
                         "target_width": final_target_w,
                         "target_height": final_target_h,
                     },
+                    override_fps=(
+                        (input_info or {}).get("true_framerate")
+                        if current_input == input_path
+                        else None
+                    ),
                 )
 
             if result.status != StageStatus.COMPLETED:
@@ -451,10 +459,19 @@ class UpscaleStage(BaseStage):
                 if fix_result.status != StageStatus.COMPLETED:
                     return fix_result
 
+        metadata: dict[str, Any] = {"method": "ai", "model": self._ai_model, "passes": num_passes}
+        cadence = (input_info or {}).get("cadence")
+        if cadence and not cadence.get("is_regular", True):
+            # REQUIREMENTS.md § 12.4b: the raw-pipe writer's carrier rate
+            # (nominal_fps, via override_fps above) reproduces the intended
+            # timeline exactly for a uniform cadence, but LINEARIZES a
+            # genuinely irregular one to a constant rate -- a real, bounded
+            # limitation that must be surfaced, never silent.
+            metadata["timeline_linearized"] = True
         return StageResult(
             status=StageStatus.COMPLETED,
             output_path=output_path,
-            metadata={"method": "ai", "model": self._ai_model, "passes": num_passes},
+            metadata=metadata,
             duration_sec=time.time() - start,
         )
 
@@ -518,6 +535,7 @@ class UpscaleStage(BaseStage):
         start: float,
         scale_factor: float,
         fallback_ctx: dict | None = None,
+        override_fps: float | None = None,
     ) -> StageResult:
         """Run a single AI upscaling pass.
 
@@ -528,6 +546,15 @@ class UpscaleStage(BaseStage):
         Without it (fallback_ctx=None), AI-unavailability always fails outright
         -- used by callers that don't have a well-defined traditional
         equivalent to fall back to.
+
+        `override_fps` (REQUIREMENTS.md § 12.3/12.4b): the writer's carrier
+        rate for this pass's raw-pipe temp/output, when known ahead of a
+        fresh probe -- used for the FIRST pass over the job's real input
+        (whose `input_info["true_framerate"]` may differ from a probe of a
+        VFR intermediate, which is unreliable -- see AGENTS.md's "do not
+        re-probe for fps downstream of retime" gotcha). `None` (later passes,
+        whose `input_path` is this stage's OWN already-CFR intermediate
+        temp) falls back to `_get_input_fps(input_path)` exactly as before.
         """
 
         def _traditional_fallback() -> StageResult:
@@ -641,7 +668,7 @@ class UpscaleStage(BaseStage):
             # count (see DeblockStage._execute_ai for why the old frame-
             # count-only `use_chunked` threshold and its full-buffer
             # extract_frames()/frames_to_video() route were removed).
-            fps = self._get_input_fps(input_path)
+            fps = override_fps or self._get_input_fps(input_path)
             probe_info = probe(input_path)
             total_est = int(probe_info.frame_count) if probe_info.frame_count else 0
             in_width, in_height = probe_info.resolution

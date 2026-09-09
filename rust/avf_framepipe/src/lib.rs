@@ -358,9 +358,27 @@ impl FrameReader {
         let read_ahead = read_ahead.max(1);
         let frame_size = width * height * 3;
 
+        // REQUIREMENTS.md § 12.4b mandatory fix: without `-fps_mode
+        // passthrough`, ffmpeg silently re-expands a VFR input back to CFR
+        // by duplicating frames on the way into the rawvideo pipe (verified
+        // in the Python-level equivalent: 48 real frames -> 120 output
+        // frames), negating retime's whole-pipeline saving at full
+        // decode+transform cost. `-fps_mode` is an OUTPUT option and must
+        // stay after `-i`.
         let mut child = Command::new(&ffmpeg_path)
             .args([
-                "-v", "error", "-nostdin", "-i", &path, "-f", "rawvideo", "-pix_fmt", "bgr24", "-",
+                "-v",
+                "error",
+                "-nostdin",
+                "-i",
+                &path,
+                "-fps_mode",
+                "passthrough",
+                "-f",
+                "rawvideo",
+                "-pix_fmt",
+                "bgr24",
+                "-",
             ])
             .stdin(Stdio::null())
             .stdout(Stdio::piped())

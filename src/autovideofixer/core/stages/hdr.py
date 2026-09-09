@@ -50,7 +50,7 @@ class HDRStage(BaseStage):
             )
 
         try:
-            from autovideofixer.core.ffmpeg_utils import run_ffmpeg
+            from autovideofixer.core.ffmpeg_utils import run_ffmpeg, timing_output_args
 
             # HDR (PQ/HLG, bt2020) -> SDR (bt709) requires converting to linear
             # light before tonemapping, then converting back to the target
@@ -77,6 +77,7 @@ class HDRStage(BaseStage):
                 "medium",
                 "-crf",
                 "18",
+                *timing_output_args(),
                 "-c:a",
                 "copy",
                 "-y",

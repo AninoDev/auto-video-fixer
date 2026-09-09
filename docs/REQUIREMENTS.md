@@ -1072,3 +1072,375 @@ summary/stage-timing/JSON-report tail is printed only after the region stops, so
 overwritten by the bars. v1 limitation: with `general.max_concurrent_jobs` > 1 there is still
 only one file bar, which reflects whichever job most recently reported progress — no per-job
 bars yet. See AGENTS.md's "Feature 6 — live progress bars" section for implementation details.
+
+## 12. True source cadence recovery & timestamp-safe pipeline (PLANNED 2026-09-08, user-approved)
+
+**Problem**: AVF treats the *encoded* framerate as the truth about a video's motion. Many real
+inputs lie about it. A 24fps recording published at 60fps CFR carries 60 frames per second of
+which only 24 are distinct — the other 36 are duplicates inserted by whoever transcoded it.
+Variable-framerate captures (phone video, screen recordings) that were converted to CFR for
+publishing are the same story with an irregular original cadence. Encoder noise means the
+duplicates are rarely bit-identical, so naive equality checks miss them.
+
+Two consequences, both bad:
+
+1. **Interpolation is defeated.** `InterpolateStage` reads `current_fps` from the probe
+   (`avg_frame_rate` = 60) and interpolates 60→120. But 36 of every 60 input frames carry no new
+   motion, so RIFE/minterpolate spend their effort synthesizing intermediate frames *between two
+   identical images* — producing nothing, at full GPU/CPU cost. The genuinely useful work
+   (24→60, real new motion) never happens because AVF never learns the content is 24fps.
+2. **Every stage overpays.** `upscale`, `deblock`, `denoise_video` and `stabilize` each process
+   the duplicate frames at full per-frame cost. On a 24-in-60 input that is **60% of all AI
+   inference wasted** on frames that are copies of their predecessor.
+
+**Fix**: recover the true content cadence up front, drop the duplicate frames, and carry the
+recovered timeline through the pipeline as genuine VFR (original presentation timestamps
+preserved) rather than re-flattening it to CFR.
+
+### 12.1 Cadence analysis (`core/cadence.py`, new module)
+
+`analyze_cadence(path, config, sample_sec=...) -> CadenceAnalysis` runs one **decode-only**
+ffmpeg pass (no encode, so it is cheap relative to any processing stage):
+
+```
+ffmpeg -i IN -map 0:v:0 -an -sn \
+       -vf mpdecimate=hi=<hi>:lo=<lo>:frac=<frac>,showinfo \
+       -f null -
+```
+
+`mpdecimate` drops near-duplicate frames; the `showinfo` filter immediately after it therefore
+logs one line per **surviving (unique)** frame to stderr, each carrying that frame's original
+`pts_time`. Parsing those `pts_time` values yields the recovered timeline directly — no pixel
+comparison code of our own, and `mpdecimate`'s `hi`/`lo`/`frac` thresholds are exactly the
+tunables needed to tolerate encoder noise between "identical" frames.
+
+**Do not use `metadata=print` here.** An earlier draft of this spec specified
+`mpdecimate,metadata=print:file=-`; it emits **nothing at all**. `metadata=print` only prints for
+frames that already carry an attached metadata key, and `mpdecimate` never attaches one.
+Verified on ffmpeg n9.0.1: the `metadata=print` form yields 0 `pts_time` records for a file whose
+`showinfo` form correctly yields 48. `showinfo` writes to **stderr at the default log level**, so
+the analysis pass must capture stderr rather than stdout.
+
+**Native VFR vs. a CFR encode of a VFR original — these are different inputs.** A direct phone or
+screen capture is genuinely VFR: irregular gaps, but **no duplicate frames**, so `retime` must
+SKIP. A YouTube-style download of that same content is CFR *padded with real duplicates*, so
+`retime` must run. Distinguishing them requires a MEASURED total frame count: deriving it as
+`duration * encoded_fps` uses `avg_frame_rate`, which § 12.3 documents as unreliable for VFR — a
+genuine 123-frame capture advertising 60fps over 3s "measured" 180 total frames and reported a
+0.317 duplicate ratio for a file with zero duplicates, triggering a needless full re-encode and
+pinning the CFR deliverable to a meaningless mean rate. The analysis chain is therefore
+`showinfo,mpdecimate,showinfo`: instance 0 counts every decoded frame, instance 2 counts the
+survivors, both from the same single decode pass, attributed via ffmpeg's `[Parsed_showinfo_<n>]`
+log prefix. Note a showinfo record can wrap across multiple log lines, so count `pts_time`
+occurrences, not prefix occurrences (123 frames produced 251 prefix lines). Verified:
+native VFR 123/123 (0.000, skips), VFR-transcoded-to-CFR 180/123 (0.317, runs), 24-in-60 120/48
+(0.600, runs).
+
+`CadenceAnalysis` (frozen dataclass) reports:
+
+- `encoded_fps` — what the container claims (today's `probe().framerate`).
+- `total_frames`, `unique_frames`, `duplicate_ratio` = `1 - unique/total`.
+- `unique_timestamps: list[float]` — the recovered timeline.
+- `detected_fps` — `unique_frames / analysed_duration`.
+- `nominal_fps` — `detected_fps` snapped to the nearest standard rate (23.976, 24, 25, 29.97,
+  30, 48, 50, 59.94, 60, 100, 120) when within `snap_tolerance`, else `detected_fps` unchanged.
+- `is_padded` — `duplicate_ratio >= min_duplicate_ratio`.
+- `is_regular` — coefficient of variation of the inter-frame gaps is under `regularity_tolerance`.
+  Note this is computed on the *raw* recovered gaps, so grid quantization (see 12.6) makes a
+  uniform-cadence source read as mildly irregular; `grid_rate` disambiguates.
+- `grid_rate` — the rate whose period divides all recovered gaps (i.e. the original encoded
+  grid). Present when the timeline is a subset of a uniform grid, which is true for any input
+  that was itself CFR-encoded.
+
+Analysis may be limited to the first `analysis_sample_sec` seconds (default 120; `0` = whole
+file) because its only job is the *decision*; the retime pass itself always runs `mpdecimate`
+over the whole input.
+
+### 12.2 The `retime` stage (`core/stages/retime.py`, new)
+
+Runs **immediately after `detect`**, so every later stage sees the reduced frame set and the
+compute saving compounds across the whole pipeline. One ffmpeg pass:
+
+```
+ffmpeg -i IN -vf mpdecimate=hi=<hi>:lo=<lo>:frac=<frac> -fps_mode vfr \
+       -c:v <temp codec> -crf <temp_crf> -c:a copy -y OUT.mkv
+```
+
+`-fps_mode vfr` is load-bearing: it tells ffmpeg to honour the surviving frames' own timestamps
+instead of conforming the output back to a constant rate. The temp is `.mkv` for crash
+resilience, matching the convention the AI stages already use.
+
+The stage **SKIPs** (never fails) when `analyze_cadence` reports `is_padded == False` — an input
+that is already honest costs one cheap decode pass and no re-encode. It also skips when the
+input has no video stream, and degrades to SKIPPED (with a warning, never a hard failure) if the
+analysis pass errors, since a cadence miss must not take down an otherwise fine job.
+
+Stage metadata: `method` (`"mpdecimate"`), `encoded_fps`, `detected_fps`, `nominal_fps`,
+`frames_before`, `frames_after`, `frames_removed`, `duplicate_ratio`, `is_regular`, `grid_rate`.
+
+### 12.3 Propagating the recovered timeline
+
+The recovered cadence is published into the job's `input_info` as `true_framerate`,
+`cadence` (the `CadenceAnalysis`), and `is_vfr`.
+
+**`InterpolateStage` must read `input_info["true_framerate"]` in preference to
+`input_info["framerate"]`** when computing `current_fps`. This is the entire payoff of the
+feature: on a 24-in-60 input targeting 60fps, today's code sees 60→60 and skips as "already at
+target"; with the recovered cadence it correctly sees 24→60 and does real interpolation.
+
+**Critical gotcha — do not re-probe for fps downstream of `retime`.** `probe()._parse_fps()`
+prefers `avg_frame_rate`, and for a VFR Matroska file that value is a container-level nominal
+that *misreports* the real cadence (empirically: a 48-frame, 2-second VFR MKV still advertised
+`avg_frame_rate=60/1`). Any stage needing the rate after `retime` must take it from
+`input_info`, not from a fresh probe.
+
+### 12.4 Timestamp-safety contract (applies to every stage)
+
+Once an intermediate is VFR, any stage that silently re-conforms it to CFR re-inserts the
+duplicate frames and undoes the feature. Each stage falls into one of three classes:
+
+**(a) Filter-only ffmpeg stages** — `crop`, `downscale`, `denoise_video`, `deblock`
+(traditional), `hdr`, `stabilize` (transform pass), `encode`. These pass PTS through correctly
+under ffmpeg 9's default `fps_mode=auto` for Matroska, but the behaviour is muxer-dependent and
+must not be left implicit: add an explicit `-fps_mode passthrough` to the output args via a
+shared helper (`ffmpeg_utils.timing_output_args(...)`) so it is deterministic across muxers and
+ffmpeg versions.
+
+**(b) Raw-frame pipe stages** — `upscale` (AI), `deblock` (AI), `interpolate` (AI/RIFE),
+`stabilize`'s raw pipe. These are the dangerous class.
+
+- **Reader side (mandatory fix).** The decoder feeding the raw pipe *re-expands VFR back to CFR
+  by duplicating frames* unless told otherwise. Verified: piping a 48-frame VFR file to
+  `-f rawvideo` yielded **120 frames** — every duplicate `retime` had just removed was silently
+  put back, at full AI inference cost. The reader's output args must include
+  `-fps_mode passthrough`, which restores the correct 48. This single omission would negate the
+  entire feature while appearing to work.
+- **Writer side.** `rawvideo` carries no timestamps, so the writer must reconstruct them. There
+  is no reliable ffmpeg-native mechanism to graft an arbitrary per-frame PTS table onto a raw
+  stream — both candidate approaches were tested and rejected (see 12.6). The writer therefore
+  uses a **carrier rate equal to `nominal_fps`**, which reproduces the intended timeline
+  *exactly* whenever the content cadence is uniform (the overwhelmingly common padded case) and
+  **linearizes** genuinely irregular cadence to a constant rate. Linearization is a real,
+  bounded limitation: it must be recorded in stage metadata as `timeline_linearized: true` and
+  surfaced in the run report rather than passing silently.
+
+**(c) Timestamp-rewriting stages** — `speed` (`setpts`). Already correct: `setpts` scales
+whatever PTS it is given, so it composes with VFR without change. It must still carry
+`-fps_mode passthrough` so the scaled timestamps survive to the muxer.
+
+### 12.5 Final output timing
+
+`general.output_timing` — `cfr` (default) | `vfr` | `passthrough`. The default keeps the final
+deliverable CFR, preserving the MP4-for-compatibility posture; `vfr` carries the recovered
+timeline all the way out. Intermediates are always VFR regardless — this key governs only the
+last encode.
+
+**A CFR deliverable must be pinned to the stream's TRUE cadence.** `-fps_mode cfr` on its own
+conforms the output to whatever rate the *container* still advertises, which for a retimed
+24-in-60 input is still 60 — so ffmpeg faithfully re-inserts exactly the duplicate frames
+`retime` just removed. Verified end-to-end: 120 frames in → 48 after retime → **120 back out**,
+i.e. running `retime` appeared to do nothing at all. The encode stage therefore also emits
+`-r <true_framerate>` in `cfr` mode, making the deliverable honest 24fps CFR. `vfr`/`passthrough`
+carry real timestamps and must never be rate-pinned.
+
+This makes `true_framerate` mean **"the stream's genuine CURRENT cadence"**, not "the original
+source cadence" — so every stage that legitimately retimes the stream must refresh it.
+`interpolate` does, via `fps_out`, which it must report on **every** completed path (AI *and*
+traditional). Omitting it on the traditional paths caused a retimed 24-in-60 input interpolated
+to 60fps to be encoded back down to `-r 24`, silently discarding every frame minterpolate had
+just synthesized.
+
+**Existing user configs will not pick this stage up.** `pipeline.default_order` is a list, and
+list-valued config keys are REPLACED WHOLESALE by a later cascade layer (AGENTS.md, "Config
+cascade") — so any user whose `~/.config/auto-video-fixer/config.yaml` pins its own
+`default_order` gets a pipeline with no `retime` in it, and `--stage retime` lands the stage at
+the wrong position (after `interpolate`, where it is useless). `avf config upgrade` is the
+supported remedy. This is the same migration hazard `denoise_video`'s default flip hit.
+
+### 12.6 Empirically validated ffmpeg behaviour (ffmpeg n9.0.1)
+
+Recorded so future work does not have to re-derive it. Test case: `testsrc2` at 24fps padded to
+60fps CFR, 2 seconds, 120 frames.
+
+| Behaviour | Result |
+|---|---|
+| `mpdecimate` + `-fps_mode vfr` | 120 → **48** frames; PTS gaps alternate 0.050/0.033s — the true 24-on-60 pulldown pattern, exactly recovered |
+| Filter stage → MKV, default `fps_mode` | VFR preserved (48 frames, PTS intact) |
+| Filter stage → MP4, default `fps_mode` | VFR preserved; `avg_frame_rate` reported as `2880/119` |
+| VFR file → `-f rawvideo` pipe, no `fps_mode` | **48 → 120 frames** (duplicates silently reinserted) |
+| VFR file → `-f rawvideo` pipe, `-fps_mode passthrough` on the reader's output args | 48 frames preserved — the required fix |
+| VFR MKV `avg_frame_rate` | **Unreliable** — advertised `60/1` for a 48-frame 2s file |
+| `mpdecimate,metadata=print:file=-` | **Emits nothing** (0 records) — `metadata=print` needs a pre-attached metadata key; use `showinfo` (48 records) |
+
+Rejected write-side timestamp-graft mechanisms:
+
+- **`sendcmd` + `setpts expr`** (file-driven per-frame command table): command windows do not
+  align reliably with frame boundaries; produced duplicated and out-of-order PTS
+  (`0, 0.042, 0.042, 0.125, …` against a target of `0, 0.050, 0.083, 0.133, …`). Rejected.
+- **`setts` bitstream filter with a closed-form expression**: `N` counts packets in *decode*
+  order, so with B-frames the emitted PTS are scrambled (`0, 11.25, 7.5, 15.0, 3.75, …`).
+  Rejected.
+- **`mkvmerge --timestamps`** (would work correctly): rejected as a new external dependency;
+  not present on the reference machine.
+
+`-fps_mode` is an **output** option. Placing it before `-i` corrupts input parsing (observed as
+spurious `Duplicate element` / EBML errors), so it must be emitted after the input spec.
+
+**Build gotcha — the reader fix lives in Rust.** The `-fps_mode passthrough` reader fix in 12.4b
+must be applied in `rust/avf_framepipe/src/lib.rs` (`FrameReader::new`), because that crate — not
+`ai/frame_processor.py` — is the active reader whenever the extension is installed. The Python
+fallback reads via `cv2.VideoCapture`, which returns the real decoded frames and is therefore
+unaffected by this class of bug.
+
+After editing that Rust source, **`uv sync` / `uv run` serve a STALE CACHED WHEEL** and silently
+revert the fix. Verified: the same reader returned 48 frames from `.venv/bin/python` immediately
+after `maturin develop --release`, but 120 frames again through `uv run`, which reinstalled the
+cached build. Force a real rebuild with:
+
+```
+uv sync --all-extras --reinstall-package avf_framepipe
+```
+
+This failure mode is silent and looks exactly like the bug the fix addresses, so verify the frame
+count through `uv run` (not just a direct venv python) after any change to the Rust reader.
+
+### 12.7 Config surface
+
+```yaml
+stages:
+  retime:
+    enabled: true            # on by default, per user decision
+    hi: 768                  # mpdecimate hi   (64*12)
+    lo: 320                  # mpdecimate lo   (64*5)
+    frac: 0.33               # mpdecimate frac
+    min_duplicate_ratio: 0.05   # below this the stage SKIPs (input already honest)
+    analysis_sample_sec: 120    # 0 = analyse whole file
+    snap_tolerance: 0.02        # nominal_fps snapping window
+    regularity_tolerance: 0.15  # gap CV below this counts as uniform cadence
+    temp_crf: 16
+general:
+  output_timing: cfr         # cfr | vfr | passthrough
+```
+
+CLI: `--retime/--no-retime`, `--retime-min-duplicate-ratio`, `--output-timing`. Overridable at
+every layer the user already expects (config file, preset `enable_stages` + per-stage config,
+`pipeline.default_order` per-occurrence overrides, per-input overrides from `--from-file`
+manifests, and the CLI flags above).
+
+### 12.8 Non-goals / limitations (v1)
+
+- Genuinely irregular cadence is **linearized** through the raw-pipe AI stages (12.4b). Filter
+  stages preserve it exactly.
+- RIFE is not made timestamp-aware — it interpolates on the uniform recovered cadence rather
+  than synthesizing a variable number of frames per gap. `minterpolate` already handles variable
+  gaps natively. Timestamp-aware RIFE is deferred.
+- Interlaced / telecined sources are out of scope; `mpdecimate` is not a field-aware inverse
+  telecine (`fieldmatch`/`decimate` would be the right tools) and no IVTC is attempted.
+
+## 13. Stage-level progress reporting (chunked and ffmpeg-driven) (PLANNED 2026-09-08, user-approved)
+
+**Problem**: feature §11 gave `process` a batch bar and a per-file bar, but the per-file bar only
+advances when a *stage* reports progress. Stages that do one long opaque operation — a single
+`minterpolate` ffmpeg invocation, a whole-file `stabilize` transform pass — jump from 0 to 1 with
+a multi-minute silence in between. The user cannot tell a slow stage from a hung one.
+
+### 13.1 Chunked stages (straightforward)
+
+Stages that already split work into chunks know their own denominator and simply are not
+reporting it. `interpolate`'s traditional path splits into `parallel_chunks` time-chunks; the AI
+stages (`upscale`, `deblock`, `interpolate`) stream in fixed frame-chunks and already log
+`chunk #N (25 frames)` lines via `ai/frame_processor.py`'s instrumentation. Each must call the
+stage `progress_callback` with `chunks_done / chunks_total` (for parallel chunks, count
+completions, not the running index — they finish out of order).
+
+This is the cheap, high-value half and should land first.
+
+### 13.2 Non-chunked ffmpeg stages (parse the live progress stream)
+
+For a single long ffmpeg invocation, use ffmpeg's `-progress pipe:<fd>` machine-readable stream
+rather than scraping the human-readable stderr log. It emits `frame=`, `out_time_us=`,
+`speed=` blocks terminated by `progress=continue` / `progress=end`. `core/ffmpeg_utils.py`
+already has `_parse_ffmpeg_progress()` and `run_ffmpeg()` accepts a progress callback — extend
+that path rather than adding a second mechanism.
+
+**The hard part the user correctly identified is the denominator**, not the numerator. Getting
+"how far along" requires knowing the expected output duration or frame count, which several
+stages change:
+
+- `interpolate` — output frame count is `input_frames * target_fps / current_fps`; duration is
+  unchanged. Prefer progressing on **`out_time_us` against input duration**, which is invariant
+  under framerate change and therefore correct for both minterpolate and RIFE.
+- `speed` — duration changes by exactly `1/speed`; expected output duration is
+  `input_duration / speed`. Known exactly up front.
+- `retime` (§12) — drops frames, so frame-count denominators are wrong, but `out_time_us` still
+  tracks the input timeline. Another argument for timing over frame counting.
+- `crop`/`downscale`/`deblock`/`denoise_video`/`hdr`/`encode` — duration and frame count both
+  preserved; either denominator works.
+
+**Therefore: use `out_time_us / expected_output_duration` as the universal progress metric**, with
+`expected_output_duration` defaulting to the input duration and overridden per stage only where
+the stage provably changes it (`speed`). Frame-count progress is a fallback for stages where
+duration is unknown. Under VFR intermediates (§12) frame counting is actively misleading, so the
+time-based metric is the right primitive regardless.
+
+Scope note: `stabilize` runs two passes (detect + transform); it must report progress across the
+pair as a weighted sum, not restart at 0 for the second pass.
+
+## 14. Per-scene output files (PLANNED 2026-09-08, user-approved)
+
+**Problem**: scene detection and scene-mode processing already exist, but a run always produces
+one output file. For compilation videos — the user's common case — the individually useful
+artifact is one file per detected scene, so scenes can be kept, dropped, or reordered by hand.
+
+### 14.1 Requirements
+
+- Opt-in `--split-scenes` (plus config key) making `process` emit one output file per detected
+  scene instead of (or in addition to — this must be a distinct, explicit choice) the single
+  combined output.
+- Naming must encode **source order**, because scenes may be processed in parallel and therefore
+  file mtimes do NOT reflect scene order (the user flagged this explicitly). Use a zero-padded
+  ordinal plus the source stem: `<stem>_scene_0001.mp4`. The ordinal is the contract §15 relies on.
+- Write a **sidecar manifest** (JSON) beside the clips recording, per scene: source path, scene
+  index, source start/end timestamps, duration, resolution, and the crop rectangle actually
+  applied. Deriving order from filenames alone is fragile; the manifest is authoritative and makes
+  §15 robust.
+- Reuse `core/scenes.py::split_scene_video()` rather than adding a second splitting path.
+
+### 14.2 Per-scene independent auto-crop
+
+Compilation videos splice sources with different aspect ratios, so a single whole-video crop
+rectangle is wrong for most scenes. When `--split-scenes` is active, auto-crop must be
+computable **per scene** rather than once for the whole input.
+
+Note this specifically contradicts the existing whole-video `cropdetect=reset=0` approach
+documented in §3 / AGENTS.md's "Auto-crop" section, which deliberately computes one maximal
+rectangle for the entire file. Per-scene cropping therefore needs its own detection pass scoped
+to each scene's time range, and the two modes must not be silently mixed. The VLM assist
+described in §3 (distinguishing true content bounds from watermarks/overlays) applies per scene
+as well.
+
+## 15. Scene clip concatenation tool (PLANNED 2026-09-08, user-approved)
+
+**Problem**: having produced per-scene clips (§14), the user wants to hand a selected subset back
+to a tool and get one contiguous video.
+
+### 15.1 Requirements
+
+- New CLI command (e.g. `avf concat`) accepting clip paths, directories, or a `--from-file` list
+  (reuse the existing `core/input_parsers/` registry from §10 — do not invent a second list format).
+- **Ordering.** Default to reconstructing the original scene order from the §14.1 manifest when one
+  is present, falling back to the filename ordinal. **Never order by mtime** — parallel scene
+  processing makes timestamps meaningless, which the user called out directly. An explicit
+  `--order` override (`manifest` | `name` | `given`) must exist.
+- **Mixed sources.** When clips come from more than one source video, original scene order is
+  undefined. Default to an error explaining the ambiguity and naming the conflicting sources,
+  with `--order given` as the documented escape hatch (the user's stated position: the intended
+  behaviour is not obvious and should be user-specified).
+- **Mismatched resolution/framerate/codec.** Concatenating streams that differ cannot be done with
+  a stream copy. Default to erroring with a clear diff of what differs, and offer an opt-in
+  `--normalize` that re-encodes all inputs to a common spec. Silent re-encoding must not be the
+  default — it is lossy and slow, and the user should choose it.
+- Use the ffmpeg `concat` **demuxer** with `-c copy` on the fast path; `core/scenes.py` already has
+  `_concat_demuxer()` and `concat_video_clips()` to build on.
+- Audio must be handled explicitly: clips with and without audio tracks cannot be concat-copied
+  together; detect and report rather than producing a silent or truncated result.

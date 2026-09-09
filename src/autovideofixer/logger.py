@@ -4,12 +4,12 @@ from __future__ import annotations
 
 import logging
 import os
-from typing import Optional
+from typing import IO, Optional
 
 from rich.console import Console
 from rich.logging import RichHandler
 
-from autovideofixer.config import VALID_LOG_TYPES, sanitize_console_text
+from autovideofixer.config import VALID_COLOR_MODES, VALID_LOG_TYPES, sanitize_console_text
 from autovideofixer.logclean import get_pii_cleaner
 
 # All module loggers are named "autovideofixer.<module>" (see get_logger() call
@@ -81,6 +81,77 @@ class _CleaningFileFormatter(logging.Formatter):
         return get_pii_cleaner().clean(formatted)
 
 
+def build_console(
+    *, stderr: bool = False, color: str = "auto", file: Optional[IO[str]] = None
+) -> Console:
+    """Build a Rich ``Console`` honoring the ``reporting.color`` tri-state.
+
+    Shared by cli.py's module-level ``console``/``err_console`` globals and
+    setup_logging()'s RichHandler console below, so all three consoles the
+    CLI touches are built the exact same way -- see config.py's
+    ``DEFAULTS["reporting"]["color"]`` comment for the full "auto"/"always"/
+    "never" rationale (the ``tee`` motivation) and set_console_color() for
+    retargeting an *already-built* console (e.g. one already wired into a
+    live RichHandler) after the fact.
+
+    "auto" (default) returns a plain ``Console(stderr=...)`` -- Rich's own
+    TTY autodetection stays in charge, unchanged from before this feature.
+    "always" passes ``force_terminal=True`` so colour renders even when the
+    underlying stream isn't a real terminal (piped through ``tee``, etc.).
+    "never" passes ``no_color=True`` so colour never renders even when
+    attached to a real terminal. Never affects file handlers -- those are
+    plain ``logging.FileHandler``s this function has nothing to do with.
+
+    Args:
+        stderr: Same meaning as ``Console(stderr=...)`` -- write to stderr
+            instead of stdout when neither `file` nor an explicit stream is
+            given.
+        color: One of VALID_COLOR_MODES.
+        file: Optional explicit stream, forwarded to ``Console(file=...)``.
+            Production call sites never pass this (they want Rich's normal
+            dynamic stdout/stderr resolution); tests use it to capture
+            output without needing a real TTY or monkeypatching sys.stdout.
+
+    Raises:
+        ValueError: `color` isn't one of VALID_COLOR_MODES.
+    """
+    if color not in VALID_COLOR_MODES:
+        raise ValueError(f"Invalid color: {color!r} (must be one of {VALID_COLOR_MODES!r})")
+    if color == "always":
+        return Console(stderr=stderr, force_terminal=True, file=file)
+    if color == "never":
+        return Console(stderr=stderr, no_color=True, file=file)
+    return Console(stderr=stderr, file=file)
+
+
+def set_console_color(color: str) -> None:
+    """Retarget the shared "autovideofixer" root logger's RichHandler console.
+
+    `process` can only resolve the final ``reporting.color``/``--color``/
+    ``--no-color`` value once its own preset/config/CLI-flag cascade has
+    finished applying -- well after `setup_logging()` already built the
+    initial RichHandler console in the group callback (`main()`), which only
+    ever saw the un-layered base config. This function lets a later,
+    fully-resolved value be applied retroactively: it reassigns
+    ``RichHandler.console`` (a plain public attribute, not a private one) to
+    a freshly built console via `build_console()`, rather than mutating any
+    private ``Console`` internals.
+
+    Only ever touches the RichHandler's console -- file handlers
+    (`auto_log_file`/`--log-file`) are never touched here, so forcing colour
+    can never leak ANSI codes into a log file.
+
+    A no-op if `setup_logging()` hasn't been called yet (no RichHandler
+    attached), which is harmless -- `setup_logging()` itself accepts a
+    `color` argument for the normal startup path.
+    """
+    new_console = build_console(stderr=True, color=color)
+    root = logging.getLogger(_ROOT_NAME)
+    for handler in root.handlers:
+        if isinstance(handler, RichHandler):
+            handler.console = new_console
+
+
 def _insert_log_suffix(path: str, suffix: str) -> str:
     """Insert `suffix` into `path`'s filename for "both" log_type mode.
 
@@ -104,6 +175,7 @@ def setup_logging(
     log_type: str = "raw",
     log_suffix_raw: str = "",
     log_suffix_clean: str = "-clean",
+    color: str = "auto",
 ) -> list[str]:
     """Configure the single shared "autovideofixer" logger.
 
@@ -136,6 +208,15 @@ def setup_logging(
             `log_file` param (see above) is always raw too.
         log_suffix_raw: "both" mode only -- suffix for the raw file's name.
         log_suffix_clean: "both" mode only -- suffix for the clean file's name.
+        color: reporting.color tri-state ("auto" default | "always" | "never")
+            for the RichHandler console this function builds -- see
+            build_console()'s docstring. Only ever affects THIS console, not
+            any file handler below, and not cli.py's own module-level
+            `console`/`err_console` (those are built/rebuilt separately, see
+            cli.py's `_apply_color_mode`). This is the value known at group-
+            callback time (before `process`'s own config cascade); a later,
+            fully-resolved value from `process` is applied retroactively via
+            set_console_color().
 
     Returns:
         The list of file paths actually opened for `auto_log_file` (0, 1, or
@@ -162,7 +243,7 @@ def setup_logging(
     root.setLevel(numeric_level)
     root.propagate = False
 
-    console = Console(stderr=True)
+    console = build_console(stderr=True, color=color)
     console_handler = RichHandler(
         console=console,
         show_time=True,

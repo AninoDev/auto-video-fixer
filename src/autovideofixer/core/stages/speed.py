@@ -76,7 +76,7 @@ class SpeedStage(BaseStage):
             )
 
         try:
-            from autovideofixer.core.ffmpeg_utils import run_ffmpeg
+            from autovideofixer.core.ffmpeg_utils import run_ffmpeg, timing_output_args
 
             speed = factor if factor is not None else self._stage_config.get("factor", 1.0)
 
@@ -109,6 +109,7 @@ class SpeedStage(BaseStage):
                 "18",
                 "-c:a",
                 "aac",
+                *timing_output_args(),
                 "-y",
                 output_path,
             ]

@@ -118,6 +118,30 @@ draws an explicit VERIFIED / UNVERIFIED line instead of a flat done/not-done che
   edge, logged at INFO on every run. See REQUIREMENTS.md's R3.5 and AGENTS.md's "Mixed
   Python/Rust"/"Auto-crop" sections.
 
+- **True source cadence recovery & timestamp-safe pipeline** (`retime` stage, on by default —
+  REQUIREMENTS.md § 12) — recovers a video's real content framerate when it was padded up to a
+  higher encoded rate by duplicated frames (24fps published at 60fps, VFR captures transcoded to
+  CFR). `core/cadence.py` runs one decode-only `mpdecimate,showinfo` pass to recover the true
+  timeline; the `retime` stage then drops the duplicates and emits a genuine VFR intermediate
+  (`-fps_mode vfr`), and the recovered rate is published as `input_info["true_framerate"]` which
+  `interpolate` now prefers over the (lying) probed rate. Verified live on a synthetic 24-in-60
+  file: 120 frames → 48 unique, `duplicate_ratio` 0.60, `detected_fps`/`nominal_fps` 24.0,
+  `grid_rate` 60.0.
+
+  Two findings worth remembering, both recorded in REQUIREMENTS.md § 12.6's validated-behaviour
+  table: (1) a VFR Matroska's `avg_frame_rate` is **unreliable** — it advertised `60/1` for a
+  48-frame 2-second file, so nothing downstream of `retime` may re-probe for the framerate;
+  (2) feeding a VFR file into a `rawvideo` pipe **silently re-expands it back to CFR** (48 frames
+  became 120), so every AI stage's frame reader needs `-fps_mode passthrough` or the whole
+  feature is negated at full GPU cost. Known limitation (§ 12.4b): genuinely irregular cadence is
+  linearized through the raw-pipe AI stages, flagged as `timeline_linearized` in the run report;
+  filter stages preserve it exactly.
+- **Cancelled runs report real results** — Ctrl-C during `avf process` used to print a zeroed
+  summary and `Job outcomes aggregate: {}` because the CLI's `results` list was populated only
+  from `Pipeline.execute_all()`'s return value, which is never assigned when the call is
+  interrupted. Results are now accumulated in the per-job completion callback, so a cancelled run
+  reports exactly the jobs that finished. Regression tests in `tests/unit/test_cancel_reporting.py`.
+
 ### Implemented but not independently verified
 
 These have working code paths and existing unit tests, but have not been checked end-to-end
@@ -143,7 +167,31 @@ above have been. Treat their behavior as "probably correct, unconfirmed" rather 
 
 See `docs/REQUIREMENTS.md` for full detail on the original design considerations. Features 1-3
 (scene-based processing, per-scene strength, auto-crop) have all moved to "Implemented and
-verified working" above; nothing remains in this list.
+verified working" above.
+
+**Backlog added 2026-09-08** (specs in `docs/REQUIREMENTS.md` §§ 13-15; § 12 is implemented and
+listed under "Implemented" above):
+
+1. **Stage-level progress reporting** (§ 13) — chunked stages report `chunks_done/chunks_total`;
+   single-invocation ffmpeg stages report via `-progress pipe:` parsed against an expected output
+   duration. Conclusion recorded in the spec: use `out_time_us / expected_duration` as the
+   universal metric, because frame-count denominators are wrong for any stage that changes the
+   frame count (`interpolate`, `retime`) and are actively misleading under VFR intermediates.
+   The chunked half is the cheap, high-value part and should land first.
+2. **Per-scene output files** (§ 14) — `--split-scenes` emits one file per detected scene plus a
+   JSON sidecar manifest, with per-scene independent auto-crop for compilation videos whose
+   sources have differing aspect ratios. Note this deliberately conflicts with the existing
+   whole-video `cropdetect=reset=0` approach (§ 3) and needs its own per-scene detection pass.
+   Filenames carry a zero-padded source-order ordinal because scenes may be processed in
+   parallel, so file mtimes do **not** encode scene order.
+3. **Scene clip concatenation tool** (§ 15) — `avf concat`, reconstructing original scene order
+   from the § 14 manifest (never from mtime), erroring by default on mixed sources and on
+   mismatched resolution/framerate/codec rather than silently re-encoding.
+
+Also deferred, from § 12.8: timestamp-aware RIFE (interpolating a variable number of frames per
+gap rather than on a uniform cadence — `minterpolate` already does this natively), and inverse
+telecine for interlaced/telecined sources (`mpdecimate` is not field-aware; `fieldmatch`/
+`decimate` would be the right tools).
 
 **Rust rewrite targets**, scoped in full in `docs/REQUIREMENTS.md`'s "5. Rust rewrite candidates"
 section. Integration approach for all three: PyO3 + `maturin`, narrow per-function bindings (not a

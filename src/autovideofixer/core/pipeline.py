@@ -41,6 +41,7 @@ from autovideofixer.core.stages.base import (
 # list[str] since DEFAULTS itself never uses mapping entries.
 DEFAULT_STAGE_ORDER: list[str] = [
     "detect",
+    "retime",
     "crop",
     "downscale",
     "deblock",
@@ -380,6 +381,14 @@ class Pipeline:
         # 1. Analysis stage (always first)
         stages.append("detect")
 
+        # Cadence recovery -- on by default (see Config.DEFAULTS["stages"]["retime"]
+        # and docs/REQUIREMENTS.md § 12). pipeline.default_order places it right
+        # after "detect" regardless of insertion order here; its own should_run()/
+        # execute() SKIPs cheaply (no re-encode) on an already-honest input.
+        retime_config = self.config.get("stages", "retime", default={})
+        if retime_config.get("enabled", True):
+            stages.append("retime")
+
         # 2. Enhancement stages based on input properties. Note: resolution is
         # deliberately NOT read here for the upscale membership decision --
         # see the comment above `if target_resolution:` below for why a
@@ -477,7 +486,21 @@ class Pipeline:
     # forward onto the new probe dict, since a fresh probe never sets them
     # itself. Extend this tuple, not the re-probe call sites, if a future
     # change injects another key.
-    _INJECTED_INPUT_INFO_KEYS: tuple[str, ...] = ("target_format",)
+    #
+    # true_framerate/cadence/is_vfr (REQUIREMENTS.md § 12.3): set once, right
+    # after the `retime` stage completes (see execute_job()'s stage loop),
+    # and carried forward across every subsequent re-probe -- a fresh
+    # get_video_info() probe never sets these itself (they come from
+    # analyze_cadence(), not ffprobe), and re-probing avg_frame_rate on a VFR
+    # intermediate is actively unreliable (empirically: a 48-frame 2s VFR MKV
+    # still advertised avg_frame_rate=60/1) -- see AGENTS.md's "do not
+    # re-probe for fps downstream of retime" gotcha.
+    _INJECTED_INPUT_INFO_KEYS: tuple[str, ...] = (
+        "target_format",
+        "true_framerate",
+        "cadence",
+        "is_vfr",
+    )
 
     def _reprobe_input_info(
         self, path: str, previous_info: dict[str, Any], context: str
@@ -1394,6 +1417,52 @@ class Pipeline:
                             self.logger.error(f"Stopping pipeline: {stage_name} failed")
                             break
                     else:
+                        if (
+                            entry.name == "retime"
+                            and result.status == StageStatus.COMPLETED
+                            and result.metadata.get("nominal_fps")
+                        ):
+                            # REQUIREMENTS.md § 12.3: publish the recovered
+                            # timeline into input_info BEFORE the re-probe
+                            # below so _INJECTED_INPUT_INFO_KEYS carries it
+                            # forward across every subsequent stage
+                            # transition -- a fresh probe of the retimed
+                            # (now VFR) intermediate never sets these keys
+                            # itself, and its own avg_frame_rate is
+                            # unreliable for a VFR file anyway (see that same
+                            # gotcha). "cadence" is a plain dict subset of the
+                            # full analysis (RetimeStage's own stage
+                            # metadata, JSON-reportable), not the
+                            # CadenceAnalysis dataclass itself.
+                            input_info["true_framerate"] = result.metadata["nominal_fps"]
+                            input_info["cadence"] = result.metadata
+                            # The retimed intermediate is genuinely VFR
+                            # regardless of is_regular -- even a REGULAR
+                            # padded cadence (e.g. 24-in-60 pulldown) produces
+                            # alternating (non-constant) frame gaps at the
+                            # container level (empirically 0.050/0.033s, see
+                            # § 12.6); is_regular only says whether that
+                            # cadence is itself uniform, not whether the
+                            # container is CFR.
+                            input_info["is_vfr"] = True
+                        elif (
+                            entry.name == "interpolate"
+                            and result.status == StageStatus.COMPLETED
+                            and result.metadata.get("fps_out")
+                        ):
+                            # REQUIREMENTS.md § 12.5: `true_framerate` means
+                            # "the stream's genuine CURRENT cadence", not
+                            # "the original source cadence" -- so any stage
+                            # that legitimately retimes the stream must
+                            # refresh it. interpolate does exactly that: it
+                            # produces a real CFR stream at fps_out. Without
+                            # this, a 24-in-60 input interpolated to 60fps
+                            # would still carry true_framerate=24 and the
+                            # encode stage's CFR path (below) would force
+                            # `-r 24`, throwing away every frame RIFE/
+                            # minterpolate just synthesized.
+                            input_info["true_framerate"] = result.metadata["fps_out"]
+                            input_info["is_vfr"] = False
                         if result.output_path:
                             if result.output_path != current_path:
                                 # This stage produced a NEW file -- re-probe so any

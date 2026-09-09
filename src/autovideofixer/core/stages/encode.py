@@ -57,6 +57,7 @@ class EncodeStage(BaseStage):
                 build_hwaccel_args,
                 resolve_hwaccel,
                 run_ffmpeg,
+                timing_output_args,
             )
 
             actual_hwaccel = resolve_hwaccel(hwaccel)
@@ -138,6 +139,35 @@ class EncodeStage(BaseStage):
             if vf:
                 args.extend(["-vf", vf])
 
+            # REQUIREMENTS.md § 12.5: encode is the FINAL stage, so its
+            # -fps_mode is governed by general.output_timing rather than
+            # always "passthrough" (unlike every other class-(a) stage) --
+            # "cfr" (default) keeps the deliverable CFR (matches ffmpeg's
+            # prior implicit default, now explicit), "vfr" carries the
+            # recovered/genuine VFR timeline all the way to the deliverable,
+            # "passthrough" is the same idea without timestamp
+            # normalization. Intermediates upstream of this stage are always
+            # VFR regardless -- this key governs only the last encode.
+            output_timing = self.config.get("general", "output_timing", default="cfr")
+            args.extend(timing_output_args(output_timing))
+
+            # REQUIREMENTS.md § 12.5: a CFR deliverable must be constant at the
+            # stream's TRUE cadence, not at whatever nominal rate the container
+            # still advertises. `-fps_mode cfr` alone conforms to the container
+            # rate, which for a retimed 24-in-60 input is still 60 -- so ffmpeg
+            # would faithfully re-insert exactly the duplicate frames `retime`
+            # just removed (verified: 120 frames in, 48 after retime, 120 back
+            # out). Pinning `-r` to the recovered cadence is what makes the
+            # user-visible deliverable honest 24fps CFR instead of re-padded
+            # 60fps. `true_framerate` is kept current by the pipeline (retime
+            # sets it, interpolate refreshes it to its own fps_out), so this
+            # correctly becomes the INTERPOLATED rate when interpolation ran.
+            # Only applies to "cfr"; "vfr"/"passthrough" carry real timestamps
+            # and must never be pinned to a constant rate.
+            true_fps = (kwargs.get("input_info") or {}).get("true_framerate")
+            if output_timing == "cfr" and true_fps:
+                args.extend(["-r", str(true_fps)])
+
             args.extend(["-y", output_path])
 
             def cb(p, m):
@@ -164,6 +194,7 @@ class EncodeStage(BaseStage):
                     "preset": preset,
                     "crf": crf,
                     "hwaccel": actual_hwaccel,
+                    "output_timing": output_timing,
                 },
                 duration_sec=time.time() - start,
             )

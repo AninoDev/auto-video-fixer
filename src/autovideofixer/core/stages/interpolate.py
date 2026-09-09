@@ -132,7 +132,12 @@ class InterpolateStage(BaseStage):
             target_fps = quality_target.get("target_framerate")
         if not target_fps:
             return False, "No target framerate specified"
-        current_fps = input_info.get("framerate", 0)
+        # REQUIREMENTS.md § 12.3: prefer the recovered true content cadence
+        # (published by the retime stage) over the encoded/probed framerate
+        # -- on a 24-in-60 input targeting 60fps, "framerate" alone reads as
+        # 60->60 (already at target, skip) when the real content is 24fps
+        # and genuinely needs interpolating.
+        current_fps = input_info.get("true_framerate") or input_info.get("framerate", 0)
         if current_fps >= target_fps:
             return False, "Already at or above target framerate"
         return True, None
@@ -145,6 +150,7 @@ class InterpolateStage(BaseStage):
         target_fps: float | None = None,
         method: str | None = None,
         parallel_chunks: int | None = None,
+        input_info: dict[str, Any] | None = None,
         **kwargs,
     ) -> StageResult:
         start = time.time()
@@ -171,10 +177,22 @@ class InterpolateStage(BaseStage):
         )
 
         try:
-            from autovideofixer.core.ffmpeg_utils import get_video_info
+            # REQUIREMENTS.md § 12.3: prefer the recovered true content
+            # cadence (input_info["true_framerate"], published by the retime
+            # stage) over a fresh probe -- do NOT re-probe for fps downstream
+            # of retime: avg_frame_rate is unreliable on a VFR intermediate
+            # (empirically: a 48-frame 2s VFR MKV still advertised
+            # avg_frame_rate=60/1). Only re-probes as a fallback when the
+            # caller didn't pass input_info at all (e.g. direct/test
+            # invocations), matching the pre-existing behavior exactly.
+            current_fps = (input_info or {}).get("true_framerate") or (input_info or {}).get(
+                "framerate"
+            )
+            if not current_fps:
+                from autovideofixer.core.ffmpeg_utils import get_video_info
 
-            input_info = get_video_info(input_path)
-            current_fps = input_info.get("framerate", 30.0)
+                probed_info = get_video_info(input_path)
+                current_fps = probed_info.get("framerate", 30.0)
 
             if method == "ai":
                 return self._execute_ai(
@@ -184,6 +202,7 @@ class InterpolateStage(BaseStage):
                     start,
                     target_fps=target_fps,
                     current_fps=current_fps,
+                    input_info=input_info,
                 )
             return self._execute_traditional(
                 input_path,
@@ -338,7 +357,18 @@ class InterpolateStage(BaseStage):
         return StageResult(
             status=StageStatus.COMPLETED,
             output_path=output_path,
-            metadata={"method": "traditional", "factor": factor, "parallel_chunks": 1},
+            # "fps_out" must be reported on EVERY completed path (AI and
+            # traditional alike): the pipeline uses it to refresh
+            # input_info["true_framerate"] so the encode stage's CFR path
+            # pins -r to the INTERPOLATED rate. Omitting it here made a
+            # retimed 24-in-60 input encode back down to 24fps, silently
+            # discarding every frame minterpolate had just synthesized.
+            metadata={
+                "method": "traditional",
+                "factor": factor,
+                "parallel_chunks": 1,
+                "fps_out": target,
+            },
             duration_sec=time.time() - start,
         )
 
@@ -497,6 +527,10 @@ class InterpolateStage(BaseStage):
                     "method": "traditional",
                     "factor": factor,
                     "parallel_chunks": n_chunks,
+                    # See the single-chunk path above: "fps_out" is required
+                    # on every completed path so encode's CFR pin uses the
+                    # interpolated rate, not the pre-interpolation cadence.
+                    "fps_out": target,
                 },
                 duration_sec=time.time() - start,
             )
@@ -511,6 +545,7 @@ class InterpolateStage(BaseStage):
         start: float,
         target_fps: float | None = None,
         current_fps: float | None = None,
+        input_info: dict[str, Any] | None = None,
         **kwargs,
     ) -> StageResult:
         """AI frame interpolation using RIFE model.
@@ -905,19 +940,28 @@ class InterpolateStage(BaseStage):
 
                 self._report_progress(1.0, "AI frame interpolation complete", progress_callback)
                 orig_count = probe_info.frame_count or 0
+                interp_metadata: dict[str, Any] = {
+                    "method": "ai",
+                    "model": self._ai_model,
+                    "factor": factor,
+                    "rife_factor": factor,
+                    "minterpolate_finish": plan.run_minterpolate_finish,
+                    "fps_out": target_fps,
+                    "frames_in": orig_count,
+                    "frames_out": frames_written,
+                }
+                cadence = (input_info or {}).get("cadence")
+                if cadence and not cadence.get("is_regular", True):
+                    # REQUIREMENTS.md § 12.4b: the raw-pipe writer's fixed
+                    # carrier rate (fps = source_fps * factor above)
+                    # linearizes a genuinely irregular recovered cadence to
+                    # a constant rate -- a real, bounded limitation that
+                    # must be surfaced, never silent.
+                    interp_metadata["timeline_linearized"] = True
                 return StageResult(
                     status=StageStatus.COMPLETED,
                     output_path=output_path,
-                    metadata={
-                        "method": "ai",
-                        "model": self._ai_model,
-                        "factor": factor,
-                        "rife_factor": factor,
-                        "minterpolate_finish": plan.run_minterpolate_finish,
-                        "fps_out": target_fps,
-                        "frames_in": orig_count,
-                        "frames_out": frames_written,
-                    },
+                    metadata=interp_metadata,
                     duration_sec=time.time() - start,
                 )
             finally:

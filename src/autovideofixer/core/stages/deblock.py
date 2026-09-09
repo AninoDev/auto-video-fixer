@@ -6,7 +6,7 @@ import os
 import time
 from typing import Any
 
-from autovideofixer.core.ffmpeg_utils import probe, run_ffmpeg
+from autovideofixer.core.ffmpeg_utils import probe, run_ffmpeg, timing_output_args
 from autovideofixer.core.stages.base import BaseStage, StageResult, StageStatus
 
 
@@ -44,6 +44,7 @@ class DeblockStage(BaseStage):
         progress_callback=None,
         strength: str | None = None,
         method: str | None = None,
+        input_info: dict[str, Any] | None = None,
         **kwargs,
     ) -> StageResult:
         start = time.time()
@@ -65,7 +66,9 @@ class DeblockStage(BaseStage):
 
         try:
             if method == "ai":
-                return self._execute_ai(input_path, output_path, progress_callback, start)
+                return self._execute_ai(
+                    input_path, output_path, progress_callback, start, input_info=input_info
+                )
             return self._execute_traditional(
                 input_path, output_path, progress_callback, start, strength or self._strength
             )
@@ -103,6 +106,7 @@ class DeblockStage(BaseStage):
             "-vf",
             f"unsharp=luma_msize_x={lmx}:luma_msize_y={lmy}:luma_amount={lamount}:"
             f"chroma_msize_x={cmx}:chroma_msize_y={cmy}:chroma_amount={camount}",
+            *timing_output_args(),
             "-c:a",
             "copy",
             "-y",
@@ -135,6 +139,7 @@ class DeblockStage(BaseStage):
         output_path: str,
         progress_callback,
         start: float,
+        input_info: dict[str, Any] | None = None,
     ) -> StageResult:
         """AI-based deblocking using Real-ESRGAN (scale=1, no spatial scaling).
 
@@ -234,7 +239,11 @@ class DeblockStage(BaseStage):
         total_est = probe_info.frame_count or 0
 
         try:
-            fps = self._get_input_fps(input_path)
+            # REQUIREMENTS.md § 12.3/12.4b: prefer the recovered true content
+            # cadence for the raw-pipe writer's carrier rate over a fresh
+            # probe -- unreliable on a VFR intermediate (avg_frame_rate lies
+            # downstream of retime; see AGENTS.md's gotcha).
+            fps = (input_info or {}).get("true_framerate") or self._get_input_fps(input_path)
             width, height = probe_info.resolution
             # The temp file's extension must NOT be derived from the input's
             # extension: the frame writer always muxes with codec="libx264"
@@ -368,14 +377,21 @@ class DeblockStage(BaseStage):
                     )
 
                 self._report_progress(1.0, "AI deblocking complete", progress_callback)
+                metadata: dict[str, Any] = {
+                    "method": "ai",
+                    "model": deblock_model,
+                    "frames_processed": frames_written,
+                }
+                cadence = (input_info or {}).get("cadence")
+                if cadence and not cadence.get("is_regular", True):
+                    # See UpscaleStage._execute_ai's identical note -- the
+                    # raw-pipe writer's fixed carrier rate linearizes a
+                    # genuinely irregular recovered cadence.
+                    metadata["timeline_linearized"] = True
                 return StageResult(
                     status=StageStatus.COMPLETED,
                     output_path=output_path,
-                    metadata={
-                        "method": "ai",
-                        "model": deblock_model,
-                        "frames_processed": frames_written,
-                    },
+                    metadata=metadata,
                     duration_sec=time.time() - start,
                 )
             finally:

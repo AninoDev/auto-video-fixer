@@ -7,6 +7,53 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **`reporting.color` tri-state console colour override + `--color`/`--no-color`.** New config
+  key `reporting.color` (default `"auto"`) and matching `avf process --color`/`--no-color` flag
+  force Rich console colour on/off, fixing lost colour when piping through `tee` (`avf process
+  ... | tee run.log` -- the pipe makes stdout non-interactive, so Rich normally disables colour
+  automatically). `"always"` forces colour on (`Console(force_terminal=True)`) even off a real
+  terminal; `"never"` forces it off (`Console(no_color=True)`) even on one. Applies to the CLI's
+  `console`/`err_console` and the logging `RichHandler` console (`logger.py::build_console()` /
+  `set_console_color()`); never affects file logs, which stay plain-text always. Deliberately
+  independent of the live progress bars (`--progress-batch`/`--progress-file`): forcing colour on
+  does NOT re-enable bars for piped/redirected output, since their redraw control codes would
+  still corrupt the captured file -- that gate still requires the real `sys.stdout.isatty()`
+  signal regardless of this setting. CLI flag wins over the config file, which wins over `"auto"`.
+- **True source cadence recovery & timestamp-safe pipeline (REQUIREMENTS.md § 12).** A new
+  `retime` stage runs immediately after `detect`, on by default: it recovers a video's TRUE
+  content cadence -- as opposed to the encoded/container framerate -- via a single decode-only
+  `mpdecimate` + `showinfo` pass (`core/cadence.py`'s `analyze_cadence()` -- REQUIREMENTS.md §
+  12.1 sketched `metadata=print`, but empirically (ffmpeg n9.0.1) that filter only emits its
+  per-frame header for a frame already carrying attached metadata, which `mpdecimate` never sets,
+  so it silently printed nothing on every input; `showinfo` has no such precondition and was
+  verified end-to-end -- see `core/cadence.py`'s module docstring), and drops
+  padding/duplicate frames while preserving genuine VFR timing (`-fps_mode vfr`) when the input
+  is actually padded (SKIPs cheaply, never fails, otherwise). This fixes two real problems: (1)
+  `InterpolateStage` now reads `input_info["true_framerate"]` in preference to the probed
+  `framerate`, so a 24fps-in-60fps-CFR input targeting 60fps correctly plans 24->60 interpolation
+  instead of reading 60->60 and silently skipping; (2) every downstream stage (`upscale`,
+  `deblock`, `denoise_video`, `stabilize`) stops spending compute re-processing duplicate frames
+  the source itself doesn't have. Every stage in the pipeline now carries a VFR intermediate
+  safely: filter-only stages (`crop`, `downscale`, `denoise_video`, `deblock` traditional, `hdr`,
+  `speed`) get an explicit `-fps_mode passthrough` via the new shared
+  `ffmpeg_utils.timing_output_args()` helper; raw-frame-pipe stages (`upscale`/`deblock` AI,
+  `interpolate` AI/RIFE, `stabilize`'s decode/transform pipe) get the same fix on their DECODE
+  reader (mandatory -- without it ffmpeg silently re-expands a VFR input back to CFR by
+  duplicating frames, verified: 48 real frames -> 120 output frames, negating the whole feature
+  at full AI-inference cost) and use the recovered `nominal_fps` as their writer's carrier rate,
+  marking `timeline_linearized: true` in stage metadata on the (bounded, documented) case where a
+  genuinely irregular cadence gets linearized to a constant rate by that writer. New config:
+  `stages.retime.*` (`enabled`, `hi`/`lo`/`frac`, `min_duplicate_ratio`, `analysis_sample_sec`,
+  `snap_tolerance`, `regularity_tolerance`, `temp_crf`) and `general.output_timing`
+  (`cfr`/`vfr`/`passthrough` -- governs only the FINAL `encode` stage). New CLI flags:
+  `--retime`/`--no-retime`, `--retime-min-duplicate-ratio`, `--output-timing`.
+  `pipeline.default_order`/`DEFAULT_STAGE_ORDER` gain `retime` right after `detect`;
+  `pipeline.max_stages` bumped 15 -> 16 to match. See `docs/REQUIREMENTS.md` § 12 for the full
+  spec, including the empirically-validated ffmpeg behavior (§ 12.6) and non-goals (§ 12.8:
+  irregular cadence through the raw-pipe AI stages is linearized, not timestamp-aware; RIFE
+  itself isn't made timestamp-aware; interlaced/telecined sources are out of scope).
+
 ### Changed
 - **2026-07-22: BREAKING (default behavior) -- pipeline default order and default deblock model
   changed for ALL users; `denoise_video` is now OFF by default.** No config change is required
