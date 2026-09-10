@@ -1445,24 +1445,31 @@ class Pipeline:
                             # cadence is itself uniform, not whether the
                             # container is CFR.
                             input_info["is_vfr"] = True
-                        elif (
-                            entry.name == "interpolate"
-                            and result.status == StageStatus.COMPLETED
-                            and result.metadata.get("fps_out")
+                        elif result.status == StageStatus.COMPLETED and result.metadata.get(
+                            "fps_out"
                         ):
                             # REQUIREMENTS.md § 12.5: `true_framerate` means
                             # "the stream's genuine CURRENT cadence", not
-                            # "the original source cadence" -- so any stage
+                            # "the original source cadence" -- so ANY stage
                             # that legitimately retimes the stream must
-                            # refresh it. interpolate does exactly that: it
-                            # produces a real CFR stream at fps_out. Without
-                            # this, a 24-in-60 input interpolated to 60fps
-                            # would still carry true_framerate=24 and the
-                            # encode stage's CFR path (below) would force
-                            # `-r 24`, throwing away every frame RIFE/
-                            # minterpolate just synthesized.
+                            # refresh it. This is deliberately keyed on the
+                            # PRESENCE of `fps_out` rather than on a specific
+                            # stage name: keying it to "interpolate" meant
+                            # `speed` silently kept the pre-speed rate, so a
+                            # 0.5x slow-motion clip stayed tagged 60fps while
+                            # carrying 30fps of real motion, and encode's CFR
+                            # pin then duplicated frames to fill the gap.
+                            # Any future stage that changes the cadence gets
+                            # correct propagation just by reporting fps_out.
                             input_info["true_framerate"] = result.metadata["fps_out"]
-                            input_info["is_vfr"] = False
+                            if entry.name == "interpolate":
+                                # interpolate resamples onto a uniform target
+                                # grid, so its output is genuinely CFR. Other
+                                # retiming stages (e.g. `speed`, which only
+                                # rescales existing PTS via setpts) preserve
+                                # whatever regularity the input had, so their
+                                # is_vfr must be left untouched.
+                                input_info["is_vfr"] = False
                         if result.output_path:
                             if result.output_path != current_path:
                                 # This stage produced a NEW file -- re-probe so any

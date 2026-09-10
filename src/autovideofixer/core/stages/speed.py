@@ -127,12 +127,41 @@ class SpeedStage(BaseStage):
                 )
 
             self._report_progress(1.0, "Speed adjustment complete", progress_callback)
+
+            # `setpts` rescales timestamps and keeps the frame COUNT, so the
+            # stream's real cadence changes even though nothing here re-times
+            # frames: N frames over a duration of D/speed is an effective rate
+            # of `in_fps * speed`. Reporting it as `fps_out` is what keeps
+            # input_info["true_framerate"] current (see Pipeline.execute_job's
+            # fps_out propagation), and that matters twice over:
+            #   - `encode`'s CFR path pins `-r true_framerate`; without this a
+            #     0.5x slow-motion clip stayed tagged at its PRE-speed rate, so
+            #     ffmpeg duplicated frames to reach it -- the output claimed
+            #     60fps while carrying only 30fps of real motion.
+            #   - a second `interpolate` occurrence placed after `speed` (via a
+            #     repeated pipeline.default_order entry) can only plan real
+            #     slow-motion interpolation if it sees the post-speed rate.
+            in_fps = 0.0
+            info = kwargs.get("input_info") or {}
+            try:
+                in_fps = float(info.get("true_framerate") or info.get("framerate") or 0.0)
+            except TypeError, ValueError:
+                in_fps = 0.0
+
+            metadata: dict[str, Any] = {
+                # REQUIREMENTS.md § 6.4: speed is traditional-only (FFmpeg
+                # setpts/atempo, no AI path) -- uniform provenance.
+                "method": "traditional",
+                "speed_factor": speed,
+            }
+            if in_fps > 0:
+                metadata["fps_in"] = in_fps
+                metadata["fps_out"] = in_fps * speed
+
             return StageResult(
                 status=StageStatus.COMPLETED,
                 output_path=output_path,
-                # REQUIREMENTS.md § 6.4: speed is traditional-only (FFmpeg
-                # setpts/atempo, no AI path) -- uniform provenance.
-                metadata={"method": "traditional", "speed_factor": speed},
+                metadata=metadata,
                 duration_sec=time.time() - start,
             )
 
