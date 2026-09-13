@@ -181,6 +181,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - See `docs/REQUIREMENTS.md` § 8 for the full rationale.
 
 ### Fixed
+- **Live progress bars no longer garble the console.** Rich coordinates output only between
+  writers sharing one `Console` object. `process`'s per-job report tables already printed through
+  the same console `ProgressReporter` was handed, so they interleaved correctly -- but the log
+  handler owns a SEPARATE stderr console built by `setup_logging()`, so every INFO/DEBUG line
+  emitted while the bars were live was written straight to the terminal mid-redraw and spliced
+  into them, leaving the output effectively unreadable. `ProgressReporter` now borrows the
+  progress console for the duration of its live region (new `logger.swap_log_console()`) and
+  restores the original on exit, including when the run raises or is cancelled. The swap only
+  occurs when a live region actually starts -- which requires a real TTY -- so piped/redirected
+  runs keep logging to stderr unchanged, and `avf config`'s machine-readable stdout is never in
+  scope.
 - **`deblock`/`denoise_video` progress no longer reports "Upscaling".** `ai/wrappers/upscale.py`'s
   `RealESRGANUpscaler.upscale_video()` (the shared Real-ESRGAN implementation behind the
   `upscale`, `deblock`, and `denoise_video` stages) hardcoded `f"Upscaling frame {i}/{total}"` in

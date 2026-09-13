@@ -152,6 +152,47 @@ def set_console_color(color: str) -> None:
             handler.console = new_console
 
 
+def swap_log_console(console: Console | None) -> Console | None:
+    """Point the root RichHandler at `console`, returning the previous one.
+
+    Rich coordinates output ONLY between writers sharing the same ``Console``
+    object: a ``Progress`` live region renders anything printed through its own
+    console cleanly above the bars, but has no idea about writes made through a
+    DIFFERENT Console -- those land straight on the terminal mid-redraw and
+    shred the display.
+
+    That is exactly the split this codebase had. `process`'s per-job Rich report
+    tables already print through the shared CLI console that `ProgressReporter`
+    was handed, so they interleave correctly. The log handler, however, owns a
+    separate stderr console built by `setup_logging()`, so every INFO/DEBUG line
+    emitted while the bars were live was spliced into them.
+
+    `ProgressReporter` uses this to borrow the progress console for the duration
+    of its live region and hand the original back afterwards. Two properties
+    make that safe:
+
+    - The swap only happens when a live region actually starts, which requires a
+      real TTY (see `resolve_show_progress`), so redirected/piped/non-TTY runs
+      are completely unaffected and logging stays on stderr as before.
+    - It is strictly scoped and restored on exit, so `avf config dump`'s stdout
+      (a machine-readable YAML payload that must never gain log lines) is never
+      in scope -- those subcommands never start a progress region.
+
+    Passing ``None`` is a no-op that still reports the current console, and the
+    whole function is a no-op when `setup_logging()` hasn't attached a
+    RichHandler yet.
+    """
+    root = logging.getLogger(_ROOT_NAME)
+    previous: Console | None = None
+    for handler in root.handlers:
+        if isinstance(handler, RichHandler):
+            if previous is None:
+                previous = handler.console
+            if console is not None:
+                handler.console = console
+    return previous
+
+
 def _insert_log_suffix(path: str, suffix: str) -> str:
     """Insert `suffix` into `path`'s filename for "both" log_type mode.
 

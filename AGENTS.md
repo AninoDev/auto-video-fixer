@@ -666,6 +666,19 @@ functions) plus new `JobResult` fields and `cli.py` display/write wiring:
   interleave — there's one file bar, not one per job, so it just reflects whichever job most
   recently reported (switching jobs resets it to that job's own progress); the batch bar is
   unaffected since it always reflects the true completed-job count.
+
+  **Log lines and the live region share ONE console.** Rich coordinates output only between
+  writers holding the SAME `Console` object -- a live region renders anything printed through its
+  own console above the bars, but knows nothing about writes through a different one, which land
+  mid-redraw and shred the display. The per-job report tables were always fine (they use the same
+  `console`), but the log handler owns a SEPARATE stderr console built by `setup_logging()`, so
+  every INFO/DEBUG line emitted during a run was spliced into the bars and made the output
+  unusable. `ProgressReporter.__enter__` now calls `logger.swap_log_console()` to borrow the
+  progress console for the region and restores the original in `__exit__` (including on
+  exception/cancel). Two properties keep this safe: the swap only happens when a region actually
+  starts, which requires a real TTY, so piped/redirected runs still log to stderr exactly as
+  before; and it is strictly scoped, so `avf config dump`'s machine-readable stdout -- which must
+  never gain log lines -- is never in scope, since those subcommands never start a region.
 - **`reporting.color` tri-state + `--color/--no-color`** (default `"auto"`): overrides Rich
   colour on the CLI's module-level `console`/`err_console` (`cli.py`) and the logging
   `RichHandler`'s console (`logger.py::setup_logging`) — motivated by `avf process ... | tee

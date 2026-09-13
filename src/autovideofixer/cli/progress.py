@@ -114,6 +114,9 @@ class ProgressReporter:
         self.file_enabled = file_enabled
 
         self.jobs_done = 0
+        # The log handler's own console, stashed while the live region borrows
+        # ours (see __enter__) so it can be handed back on exit.
+        self._prev_log_console: Console | None = None
         self._current_job_key: str | None = None
 
         self._progress = Progress(
@@ -131,6 +134,22 @@ class ProgressReporter:
         return self.batch_enabled or self.file_enabled
 
     def __enter__(self) -> ProgressReporter:
+        # Borrow the log handler's console for the duration of the live region.
+        # Rich only coordinates writers that share one Console object, so log
+        # lines emitted through the handler's OWN (separate, stderr) console
+        # were being written straight to the terminal mid-redraw and shredding
+        # the bars. Routing them through the progress console makes Rich render
+        # them above the live region instead -- the same mechanism that already
+        # makes the per-job report tables interleave cleanly.
+        #
+        # Only reached when a live region actually starts, which requires a real
+        # TTY, so piped/redirected runs keep logging to stderr exactly as
+        # before. Restored in __exit__ so nothing outside this region (notably
+        # `avf config dump`'s machine-readable stdout) is ever affected.
+        from autovideofixer.logger import swap_log_console
+
+        self._prev_log_console = swap_log_console(self.console)
+
         self._progress.start()
         if self.batch_enabled:
             self._batch_task = self._progress.add_task(
@@ -142,6 +161,13 @@ class ProgressReporter:
 
     def __exit__(self, *exc_info: Any) -> None:
         self._progress.stop()
+
+        # Hand the original console back, even if the run raised/was cancelled.
+        from autovideofixer.logger import swap_log_console
+
+        if self._prev_log_console is not None:
+            swap_log_console(self._prev_log_console)
+            self._prev_log_console = None
 
     def _batch_description(self, current_progress: float) -> str:
         return f"Batch {self.jobs_done}/{self.total_jobs}"
