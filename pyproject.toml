@@ -28,6 +28,12 @@ dependencies = [
     "rich>=13.0",
     "opencv-python-headless>=4.8",
     "numpy>=1.24",
+    # Used on the CORE (non-AI) path by core/stages/stabilize.py's scene-change
+    # detection (`from PIL import Image`), and also by
+    # ai/backends/ncnn_interpolate.py's RIFE ncnn backend -- declared here
+    # (not under an extra) because the stabilize usage runs unconditionally,
+    # not only when AI/ncnn extras are installed.
+    "pillow>=10.0",
     "avf-scenes",
     "avf-hashing",
     "avf-framepipe",

@@ -8,6 +8,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Configurable audio speed method for the `speed` stage (`stages.speed.audio_method`).** The
+  `speed` stage's audio path used to be `atempo` only -- pitch-preserving, but chained
+  (`SpeedStage._build_atempo_chain`) for factors outside a single atempo's `[0.5, 100]` range, with
+  real audible quality loss (robotic timbre/artifacting) at extreme slow-motion factors (e.g. a
+  0.25x/4x-slow-motion chain is three stacked `atempo=0.5` stages). New config keys
+  `stages.speed.audio_method` (`atempo` | `rubberband` | `asetrate`, default `atempo` -- behavior
+  unchanged from before this key existed), `stages.speed.audio_sample_rate` (output `-ar` in Hz,
+  default `48000`; `0` leaves the input's own rate alone), and `stages.speed.resampler` (`soxr` |
+  `swr`, used by `asetrate`'s `aresample` step, default `soxr`). `rubberband` uses ffmpeg's
+  `rubberband` filter -- also pitch-preserving, but a single filter covers the whole factor range
+  with none of atempo's chaining artifacts; falls back to `atempo` (WARNING logged) if this
+  ffmpeg build lacks librubberband (`core/ffmpeg_utils.has_filter()`/`list_ffmpeg_filters()`, new).
+  `asetrate` is DELIBERATELY pitch-changing: it relabels the audio at a new sample rate
+  (`input_sample_rate * factor`, probed via `core/ffmpeg_utils.probe()`'s existing
+  `StreamInfo.sample_rate`) instead of time-stretching it -- the correct choice, not a compromise,
+  for phone slow-motion footage recorded at an elevated mic sample rate and mapped down to normal
+  playback speed: speeding it back up with `asetrate` restores the mic's true original pitch,
+  which a pitch-preserving method would leave artificially wrong. Falls back to `atempo` (WARNING
+  logged) if the input's sample rate can't be probed. New matching CLI flags
+  `--audio-speed-method`/`--audio-sample-rate`/`--audio-resampler`. Filter-chain construction
+  stays in pure, unit-tested static helpers (`SpeedStage._build_atempo_chain`/
+  `_build_rubberband_filter`/`_build_asetrate_chain`); see `tests/unit/test_speed_audio_methods.py`.
 - **`reporting.color` tri-state console colour override + `--color`/`--no-color`.** New config
   key `reporting.color` (default `"auto"`) and matching `avf process --color`/`--no-color` flag
   force Rich console colour on/off, fixing lost colour when piping through `tee` (`avf process
@@ -159,6 +181,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - See `docs/REQUIREMENTS.md` § 8 for the full rationale.
 
 ### Fixed
+- **`deblock`/`denoise_video` progress no longer reports "Upscaling".** `ai/wrappers/upscale.py`'s
+  `RealESRGANUpscaler.upscale_video()` (the shared Real-ESRGAN implementation behind the
+  `upscale`, `deblock`, and `denoise_video` stages) hardcoded `f"Upscaling frame {i}/{total}"` in
+  its progress callback, so a `deblock` or `denoise_video` run reported "Upscaling" progress
+  messages, making it look like the pipeline was on the wrong stage. `upscale_video()` now takes
+  an `operation_label` keyword (default `"Upscaling"`, unchanged for the `upscale` stage); the
+  `deblock`/`denoise_video` stages pass `"Deblocking"`/`"Denoising"` respectively.
+- **Declared `Pillow` as a base dependency.** `PIL`/`Pillow` was imported
+  (`core/stages/stabilize.py`'s scene-change detection, `ai/backends/ncnn_interpolate.py`'s RIFE
+  ncnn backend) but declared nowhere in `pyproject.toml` -- it only worked by accident, pulled in
+  transitively by another dependency (e.g. `torchvision`) when the `ai` extra was installed. Since
+  `stabilize` is a core, non-AI stage, `pillow>=10.0` is now a main `dependencies` entry, not an
+  extra. `uv.lock` regenerated (`uv lock`).
 - **2026-07-22: AI/RIFE interpolation now reaches the exact target framerate for non-integer
   factors (hybrid RIFE + minterpolate finish pass)**: `InterpolateStage._execute_ai()` used to
   compute `factor = int(target_fps / current_fps)` and force `factor = 2` whenever that floored

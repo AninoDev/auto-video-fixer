@@ -235,9 +235,15 @@ def _parse_probe_result(data: dict, filepath: str) -> ProbeResult:
             height=s.get("height", 0),
             fps=_parse_fps(s),
             duration=_safe_float(s.get("duration", 0)),
-            bit_rate=s.get("bit_rate", 0) or 0,
-            channels=s.get("channels", 0),
-            sample_rate=s.get("sample_rate", 0),
+            # ffprobe returns these as STRINGS ("44100", "2", "128000"), so they
+            # need the same _safe_int coercion the other numeric fields get --
+            # the dataclass annotations say int, and callers rely on that. A raw
+            # string here crashed SpeedStage's asetrate path with
+            # "'<=' not supported between instances of 'str' and 'int'" on any
+            # real input (unit tests passed ints directly and never caught it).
+            bit_rate=_safe_int(s.get("bit_rate", 0)),
+            channels=_safe_int(s.get("channels", 0)),
+            sample_rate=_safe_int(s.get("sample_rate", 0)),
             pixel_format=s.get("pix_fmt", ""),
             profile=s.get("profile", ""),
             color_space=s.get("color_space", ""),
@@ -363,6 +369,51 @@ def resolve_hwaccel(preferred: str = "auto") -> str:
         return preferred.lower()
 
     return "none"
+
+
+_FILTER_CACHE: dict[str, set[str]] = {}
+
+
+def list_ffmpeg_filters(config: Config | None = None) -> set[str]:
+    """Return the set of filter names this ffmpeg build advertises (``ffmpeg -filters``).
+
+    Cached per resolved ffmpeg binary path -- a given ffmpeg build's filter set never
+    changes mid-process, so repeated capability checks (e.g. SpeedStage's
+    rubberband-availability check, see stages.speed.audio_method) don't re-spawn ffmpeg
+    on every call. Returns an empty set (rather than raising) if ffmpeg can't be found
+    or the ``-filters`` probe itself fails/times out -- callers treat that the same as
+    "filter not available".
+    """
+    ffmpeg = get_ffmpeg_path(config)
+    cached = _FILTER_CACHE.get(ffmpeg)
+    if cached is not None:
+        return cached
+
+    names: set[str] = set()
+    try:
+        result = subprocess.run(
+            [ffmpeg, "-hide_banner", "-filters"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            stdin=subprocess.DEVNULL,
+        )
+        # Each filter line looks like: " T.C rubberband        A->A       Apply time-...".
+        # The first token is the capability flags column, the second is the filter name.
+        for line in result.stdout.splitlines():
+            parts = line.split()
+            if len(parts) >= 3 and re.match(r"^[A-Za-z][A-Za-z0-9_]*$", parts[1]):
+                names.add(parts[1])
+    except OSError, subprocess.TimeoutExpired:
+        pass
+
+    _FILTER_CACHE[ffmpeg] = names
+    return names
+
+
+def has_filter(name: str, config: Config | None = None) -> bool:
+    """Whether this ffmpeg build supports the named filter (see ``list_ffmpeg_filters``)."""
+    return name in list_ffmpeg_filters(config)
 
 
 def build_hwaccel_args(hwaccel: str) -> list[str]:

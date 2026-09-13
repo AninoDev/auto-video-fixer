@@ -1153,6 +1153,42 @@ def _log_effective_settings(
     "stages.retime.min_duplicate_ratio; default 0.05).",
 )
 @click.option(
+    "--audio-speed-method",
+    default=None,
+    type=click.Choice(["atempo", "rubberband", "asetrate"]),
+    help="Audio algorithm for the speed stage (overrides stages.speed.audio_method; "
+    "default atempo). 'atempo': pitch-preserving, chained for factors outside a single "
+    "atempo's [0.5, 100] range -- audible quality loss at extreme slow-motion/speed-up "
+    "factors. 'rubberband': pitch-preserving via ffmpeg's rubberband filter, one filter "
+    "covers the whole range with none of atempo's chaining artifacts (needs an ffmpeg "
+    "build with librubberband; falls back to atempo with a WARNING if missing). "
+    "'asetrate': DELIBERATELY pitch-changing -- relabels the audio at a new sample rate "
+    "instead of time-stretching it, which is the correct choice (not a compromise) for "
+    "phone slow-motion footage recorded at an elevated mic sample rate and mapped down "
+    "to normal speed: speeding it back up with asetrate restores the mic's true pitch "
+    "(needs the input's probed audio sample rate; falls back to atempo with a WARNING "
+    "if that can't be determined). Only takes effect when the speed stage runs "
+    "(stages.speed.enabled/--enable-stage speed and a non-1.0 --set stages.speed.factor).",
+)
+@click.option(
+    "--audio-sample-rate",
+    type=int,
+    default=None,
+    help="Output audio sample rate in Hz (-ar) after the speed stage's audio filter "
+    "(overrides stages.speed.audio_sample_rate; default 48000). 0 leaves the input's "
+    "own sample rate alone (no -ar emitted). Also used as the 'asetrate' audio method's "
+    "aresample target -- see --audio-speed-method.",
+)
+@click.option(
+    "--audio-resampler",
+    default=None,
+    type=click.Choice(["soxr", "swr"]),
+    help="Resampler used by the speed stage's 'asetrate' audio method (ignored by "
+    "atempo/rubberband, which don't resample) -- overrides stages.speed.resampler; "
+    "default soxr (libsoxr, higher quality; needs an ffmpeg build with --enable-libsoxr, "
+    "which falls back to swr itself with its own warning if missing).",
+)
+@click.option(
     "--output-timing",
     default=None,
     type=click.Choice(["cfr", "vfr", "passthrough"]),
@@ -1329,6 +1365,9 @@ def process(
     downscale: bool | None,
     retime: bool | None,
     retime_min_duplicate_ratio: float | None,
+    audio_speed_method: str | None,
+    audio_sample_rate: int | None,
+    audio_resampler: str | None,
     output_timing: str | None,
     resolution_fit_mode: str | None,
     dimension_multiple: int | None,
@@ -1527,6 +1566,26 @@ def process(
                 ["stages", "retime", "min_duplicate_ratio"],
                 retime_min_duplicate_ratio,
             )
+        )
+    if audio_speed_method is not None:
+        cli_candidates.append(
+            (
+                ("--audio-speed-method",),
+                ["stages", "speed", "audio_method"],
+                audio_speed_method,
+            )
+        )
+    if audio_sample_rate is not None:
+        cli_candidates.append(
+            (
+                ("--audio-sample-rate",),
+                ["stages", "speed", "audio_sample_rate"],
+                audio_sample_rate,
+            )
+        )
+    if audio_resampler is not None:
+        cli_candidates.append(
+            (("--audio-resampler",), ["stages", "speed", "resampler"], audio_resampler)
         )
     if output_timing is not None:
         cli_candidates.append((("--output-timing",), ["general", "output_timing"], output_timing))

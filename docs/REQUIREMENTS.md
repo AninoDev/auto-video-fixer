@@ -1705,3 +1705,63 @@ motion, not from `vidstabtransform`'s internally-computed smoothed camera path, 
 cannot see. So `0.0` is "zoom out by our best estimate of the worst displacement", not a
 mathematical guarantee that no pixel is ever lost. `1.0` remains exact because it delegates to
 `optzoom=1` rather than to the estimate.
+
+## 18. Selectable audio speed method (PLANNED 2026-09-12, user-approved)
+
+**Problem**: `SpeedStage` only ever had one audio path — a chained `atempo`. That is pitch-preserving,
+which is the right default, but a single `atempo` only accepts a tempo factor in `[0.5, 100]`, so
+extreme slow-motion stacks multiple stages (0.25x = three chained `atempo=0.5`). The artefacts
+compound and the result sounds noticeably degraded, which is exactly the case a user hit while
+testing 4x slow motion.
+
+There is also a case where changing the pitch is the *desired* behaviour, not a defect. Phone
+slow-motion video is captured with the microphone running at a higher sample rate and mapped down
+to the slowed video. Speeding such a clip back up with a resample restores the audio as it actually
+sounded in the room; forcing pitch preservation there produces audio that is "correct" by the
+filter's definition and wrong by the listener's.
+
+**Fix**: make the audio path selectable, with the existing behaviour as the default.
+
+### 18.1 Methods
+
+- **`atempo`** (default) — the existing chained implementation, bit-for-bit unchanged. Pitch
+  preserving, degrades at extreme factors.
+- **`rubberband`** — `rubberband=tempo=<speed>`. Also pitch-preserving, but far better quality at
+  extreme factors than stacked `atempo`. Requires an ffmpeg built with `--enable-librubberband`
+  (present on the reference build, n9.0.1).
+- **`asetrate`** — `asetrate=<input_rate * speed>,aresample=<audio_sample_rate>:resampler=<resampler>`.
+  Resample-based: **changes pitch** and introduces no time-stretch artefacts at all. This is the
+  phone-slow-motion case above, and the pitch change must be documented as intended rather than
+  buried.
+
+### 18.2 Config
+
+```yaml
+stages:
+  speed:
+    factor: 1.0
+    audio_method: atempo      # atempo | rubberband | asetrate
+    audio_sample_rate: 48000  # emitted as -ar; 0 = leave the input rate alone
+    resampler: soxr           # soxr | swr, used by the aresample step
+```
+
+`asetrate` needs the input stream's **actual** sample rate, so it must be probed rather than
+assumed — hardcoding 48000 would silently mis-speed any 44.1kHz source by ~8.8%.
+
+### 18.3 Fallbacks (must never fail the stage)
+
+Both non-default methods degrade to `atempo` with a WARNING rather than failing:
+
+- `rubberband` selected but the filter is missing from the local ffmpeg build.
+- `asetrate` selected but the input sample rate could not be determined.
+
+This matches the codebase's fail-open convention for auxiliary capability (see `analyze_cadence`
+and the AI-fallback policy): an audio-filter availability problem must not take down an otherwise
+successful job.
+
+### 18.4 Note on `fps_out`
+
+Unrelated to audio, but adjacent: `speed` also reports `fps_in`/`fps_out` so downstream stages see
+the post-speed cadence (§ 12.5's propagation, keyed on the presence of `fps_out`). Any change to
+this stage must preserve that — without it, `encode`'s CFR pin duplicates frames and a chained
+second `interpolate` skips as "already at target".

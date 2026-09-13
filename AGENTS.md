@@ -1133,6 +1133,15 @@ path" above) but is still NOT wired up to `StageTimer` — its per-chunk loop sh
 frame prepend/drop, `factor`x output growth per chunk) enough that reusing the shared instrumentation
 wasn't in scope for the streaming fix; a future pass could add it.
 
+`RealESRGANUpscaler.upscale_video()` itself is shared the same way -- one implementation, three
+stages -- so its per-frame progress-callback message needs the same care. It takes an
+`operation_label` keyword (default `"Upscaling"`, matching the `upscale` stage's own progress
+text); `deblock`/`denoise_video` pass `operation_label="Deblocking"`/`"Denoising"` at their
+`upscale_video()` call sites so a deblock/denoise run's progress messages don't misreport
+"Upscaling frame N/total" while a different stage is actually running. `StageTimer`'s own
+`stage_name` (above) was already correct per call site before this fix -- only the progress
+*callback* string (as opposed to the DEBUG/INFO throughput logs) had the shared-wrapper mislabel.
+
 ## Upscaling & Aspect Ratio
 
 The upscale stage respects `quality.quality_target.keep_aspect_ratio` (default `True`):
@@ -1792,6 +1801,56 @@ Opt-in, off by default (`stages.crop.enabled: false`). See `core/stages/crop.py`
   which is almost always what's wanted (the user wants the *content* at the target resolution, not
   the pre-crop letterboxed frame).
 
+## Speed stage audio methods (`stages.speed.audio_method`)
+
+`core/stages/speed.py`'s `SpeedStage` supports three audio speed-change algorithms, selected via
+`stages.speed.audio_method` / `avf process --audio-speed-method`. All three build their filter
+chain in a pure static helper (`_build_atempo_chain`/`_build_rubberband_filter`/
+`_build_asetrate_chain`) so the exact filter string is unit-testable without ffmpeg -- see
+`tests/unit/test_speed_audio_methods.py`.
+
+- **`atempo`** (default, unchanged from before this feature): the classic pitch-preserving
+  time-stretch. A single `atempo` filter only accepts tempo factors in `[0.5, 100]`, so
+  `_build_atempo_chain` chains multiple stages for factors outside that range (e.g. 0.25x chains
+  two `atempo=0.5` stages). This chaining has real, audible quality loss (robotic timbre,
+  artifacting) at extreme slow-motion/speed-up factors.
+- **`rubberband`**: `rubberband=tempo=<speed>` (ffmpeg's `rubberband` filter, needs an ffmpeg build
+  with `--enable-librubberband`). Also pitch-preserving, but librubberband's `tempo` parameter
+  accepts any positive value directly -- one filter covers the whole factor range with none of
+  atempo's chaining artifacts, so it's the better choice at extreme factors when available.
+  Availability is checked via the new `core/ffmpeg_utils.has_filter("rubberband")` /
+  `list_ffmpeg_filters()` (parses `ffmpeg -filters`, cached per resolved ffmpeg binary path); if
+  missing, `SpeedStage._resolve_audio_filter()` falls back to `atempo` with a WARNING log rather
+  than failing the stage.
+- **`asetrate`**: `asetrate=<input_sample_rate * speed>,aresample=<audio_sample_rate>:resampler=<resampler>`.
+  DELIBERATELY pitch-changing, not pitch-preserving -- `asetrate` relabels the stream at a new
+  sample rate without resampling the underlying samples, so playback speed AND pitch shift
+  together. This is the CORRECT choice (not a lesser fallback) for phone slow-motion footage: such
+  clips are captured at an elevated mic sample rate and mapped down to normal playback speed in the
+  container, so speeding the audio back up with `asetrate` restores the mic's true original pitch
+  -- a pitch-preserving method (`atempo`/`rubberband`) would leave that pitch artificially low.
+  Needs the INPUT stream's real audio sample rate, probed automatically via
+  `core/ffmpeg_utils.probe()`'s existing `StreamInfo.sample_rate` (no probe schema change needed --
+  the field already existed, just unused by any caller before this). If the input's sample rate
+  can't be determined (no audio stream, or the probe itself fails), falls back to `atempo` with a
+  WARNING log rather than guessing. The trailing `aresample` step renormalizes the now-mislabeled
+  sample rate to `stages.speed.audio_sample_rate` (or back to the original input rate when that key
+  is `0`) using `stages.speed.resampler` (`soxr` default -- needs `--enable-libsoxr`, or `swr`).
+- **`stages.speed.audio_sample_rate`** (default `48000`) also independently controls a plain `-ar`
+  on the stage's output for ALL THREE methods (`0` = omit `-ar`, leave the input's rate alone).
+- **CLI**: `--audio-speed-method {atempo,rubberband,asetrate}`, `--audio-sample-rate INT`,
+  `--audio-resampler {soxr,swr}` -- same override pattern as the other per-stage flags (`--crop-
+  limit`, `--interpolate-*`, etc.); the speed stage itself still needs `stages.speed.enabled`/
+  `--enable-stage speed` and a non-`1.0` factor to actually run.
+- **`stages.speed.audio_method`/`resampler` are validated at use-time** (inside
+  `_resolve_audio_filter()`, raising `ValueError` for an unrecognized value), not eagerly at
+  `Config`/`Pipeline` construction -- same posture as `core/output_check.py`'s `fit_mode` check,
+  since an invalid value only matters if the speed stage actually runs. The valid sets
+  (`VALID_AUDIO_SPEED_METHODS`, `VALID_AUDIO_RESAMPLERS`) live in `config.py` alongside
+  `VALID_LOG_TYPES`/`VALID_COLOR_MODES`.
+- **Metadata**: `StageResult.metadata["audio_method"]` reports the method actually used, which can
+  differ from the configured `audio_method` when a fallback kicked in.
+
 ## Rust rewrite candidates
 
 Three CPU-hot-path targets are scoped for PyO3/`maturin`-based Rust rewrites, prioritized soon on
@@ -1870,6 +1929,12 @@ Global (before the subcommand):
   see REQUIREMENTS.md § 12 and "Pipeline Behavior" above
 - `--retime-min-duplicate-ratio FLOAT`: minimum duplicate-frame fraction before `retime` actually
   re-encodes (`stages.retime.min_duplicate_ratio`, default 0.05) — below it the stage SKIPs
+- `--audio-speed-method {atempo,rubberband,asetrate}`: audio algorithm for the `speed` stage
+  (`stages.speed.audio_method`, default `atempo`) — see "Speed stage audio methods" above
+- `--audio-sample-rate INT`: output `-ar` after the `speed` stage's audio filter
+  (`stages.speed.audio_sample_rate`, default `48000`; `0` leaves the input's rate alone)
+- `--audio-resampler {soxr,swr}`: resampler for the `asetrate` audio method's `aresample` step
+  (`stages.speed.resampler`, default `soxr`) — ignored by `atempo`/`rubberband`
 - `--output-timing {cfr,vfr,passthrough}`: timing mode for the FINAL `encode` stage only
   (`general.output_timing`, default `cfr`) — see REQUIREMENTS.md § 12.5
 - `--resolution-fit-mode {preserve_aspect,snap_limiting}`: how upscale/downscale fit an input

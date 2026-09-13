@@ -259,6 +259,16 @@ VALID_LOG_TYPES = ("raw", "clean", "both", "none")
 # as VALID_LOG_TYPES: config.py is the layer both cli.py and logger.py
 # already import from.
 VALID_COLOR_MODES = ("auto", "always", "never")
+# Canonical set for stages.speed.audio_method -- validated at use-time by
+# SpeedStage (same "use-time, not construction-time" posture as
+# core/output_check.py's fit_mode check) rather than eagerly here, since an
+# invalid value only matters if the speed stage actually runs. Kept here (not
+# duplicated in speed.py) for the same reason as VALID_LOG_TYPES/
+# VALID_COLOR_MODES: config.py is the layer stages already import from.
+VALID_AUDIO_SPEED_METHODS = ("atempo", "rubberband", "asetrate")
+# Canonical set for stages.speed.resampler -- the `aresample` resampler used
+# by the "asetrate" audio_method (see SpeedStage._build_asetrate_chain).
+VALID_AUDIO_RESAMPLERS = ("soxr", "swr")
 
 
 def validate_output_handling_config(config: "Config") -> None:
@@ -995,6 +1005,56 @@ class Config:
             "speed": {
                 "enabled": False,
                 "factor": 1.0,
+                # Which audio speed-change algorithm to use -- one of
+                # VALID_AUDIO_SPEED_METHODS above. "atempo" (default): the
+                # classic pitch-preserving time-stretch, chained
+                # (SpeedStage._build_atempo_chain) for factors outside a
+                # single atempo's [0.5, 100] range -- e.g. a 0.25x (4x
+                # slow-motion) chain is three stacked atempo=0.5 stages,
+                # which has real, audible quality loss (robotic timbre,
+                # artifacting) at that extreme. Behavior here is unchanged
+                # from before this key existed. "rubberband": ffmpeg's
+                # `rubberband` filter (needs an ffmpeg build with
+                # --enable-librubberband) -- also pitch-preserving, but one
+                # filter covers the entire factor range with none of
+                # atempo's chaining artifacts, so it's the better choice at
+                # extreme factors when librubberband is available. Falls
+                # back to "atempo" (WARNING logged) if this ffmpeg build
+                # lacks librubberband -- never fails the stage over it.
+                # "asetrate": resample-based and DELIBERATELY
+                # pitch-changing -- relabels the audio at a new sample rate
+                # (input sample rate * factor) instead of time-stretching
+                # it, so slowing down also drops the pitch and speeding up
+                # raises it. This isn't a lesser fallback: it's the CORRECT
+                # choice for phone slow-motion footage, which is captured at
+                # an elevated mic sample rate and mapped down to normal
+                # speed in the container -- speeding that audio back up
+                # with asetrate restores the mic's true original pitch,
+                # which a pitch-preserving method (atempo/rubberband) would
+                # leave artificially low/wrong. Needs the INPUT stream's
+                # real audio sample rate, probed automatically
+                # (ffmpeg_utils.probe/StreamInfo.sample_rate); falls back to
+                # "atempo" (WARNING logged) if that can't be determined (no
+                # audio stream, or the probe fails).
+                "audio_method": "atempo",
+                # Output audio sample rate in Hz, applied via `-ar` on the
+                # muxed output regardless of audio_method. 0 = leave the
+                # input's own sample rate alone (no `-ar` emitted). Also
+                # used as the "asetrate" method's `aresample` target (the
+                # step that renormalizes the sample rate asetrate itself
+                # relabeled) -- when this is 0, that renormalization targets
+                # the ORIGINAL input rate instead.
+                "audio_sample_rate": 48000,
+                # Resampler used by the "asetrate" method's `aresample` step
+                # (ignored by "atempo"/"rubberband", which don't resample) --
+                # one of VALID_AUDIO_RESAMPLERS above. "soxr" (default): the
+                # libsoxr resampler, higher quality than ffmpeg's built-in
+                # "swr" (swresample), at extra CPU cost. Requires an ffmpeg
+                # build with --enable-libsoxr; ffmpeg itself falls back to
+                # swr with its own warning if soxr isn't compiled in (this
+                # stage does not additionally detect/fall back for this
+                # key).
+                "resampler": "soxr",
             },
             "crop": {
                 # Auto-crop: detect and remove black borders (letterbox/pillarbox),

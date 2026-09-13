@@ -1020,6 +1020,7 @@ class RealESRGANUpscaler:
         frames: list[Any],
         progress_callback=None,
         timer: Any = None,
+        operation_label: str = "Upscaling",
     ) -> list[Any]:
         """Upscale a sequence of frames.
 
@@ -1028,6 +1029,13 @@ class RealESRGANUpscaler:
             progress_callback: Optional callback(current, total, message).
             timer: Optional `ai.frame_processor.StageTimer`, forwarded to
                 `upscale()`/`upscale_batch()` -- see `upscale()`'s docstring.
+            operation_label: Verb used in the progress message (e.g.
+                "Upscaling frame N/total"). This wrapper's Real-ESRGAN
+                implementation is shared by the `upscale`, `deblock`, and
+                `denoise_video` stages, so the default "Upscaling" is only
+                accurate for the `upscale` stage -- callers running it as a
+                deblock or denoise pass should pass "Deblocking"/"Denoising"
+                so progress messages describe the stage actually running.
 
         Returns:
             List of upscaled numpy arrays.
@@ -1042,7 +1050,7 @@ class RealESRGANUpscaler:
                 results.append(result)
 
                 if progress_callback and total > 0:
-                    progress_callback(i + 1, total, f"Upscaling frame {i + 1}/{total}")
+                    progress_callback(i + 1, total, f"{operation_label} frame {i + 1}/{total}")
 
             return results
 
@@ -1054,7 +1062,7 @@ class RealESRGANUpscaler:
             processed += len(chunk)
 
             if progress_callback and total > 0:
-                progress_callback(processed, total, f"Upscaling frame {processed}/{total}")
+                progress_callback(processed, total, f"{operation_label} frame {processed}/{total}")
 
         return results
 

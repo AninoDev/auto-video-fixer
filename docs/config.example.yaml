@@ -872,6 +872,33 @@ stages:
     enabled: false
     # Playback speed multiplier (1.0 = unchanged, 2.0 = 2x faster, 0.5 = half speed).
     factor: 1.0
+    # Audio speed-change algorithm: atempo | rubberband | asetrate.
+    # "atempo" (default): pitch-preserving, chained for factors outside a single
+    # atempo's [0.5, 100] range -- e.g. 0.25x chains two atempo=0.5 stages, with real
+    # quality loss (robotic timbre) at extreme factors.
+    # "rubberband": also pitch-preserving, via ffmpeg's rubberband filter -- one filter
+    # covers the whole range with none of atempo's chaining artifacts. Needs an ffmpeg
+    # build with --enable-librubberband; falls back to atempo (WARNING logged) if
+    # missing.
+    # "asetrate": resample-based and DELIBERATELY pitch-changing -- relabels the audio
+    # at a new sample rate (input rate * factor) instead of time-stretching it. This is
+    # the CORRECT choice (not a compromise) for phone slow-motion footage recorded at
+    # an elevated mic sample rate and mapped down to normal speed: speeding it back up
+    # with asetrate restores the mic's true original pitch, which atempo/rubberband
+    # would leave artificially wrong. Needs the input's real audio sample rate
+    # (probed automatically); falls back to atempo (WARNING logged) if that can't be
+    # determined.
+    audio_method: atempo
+    # Output audio sample rate in Hz (-ar), applied regardless of audio_method.
+    # 0 = leave the input's own sample rate alone (no -ar emitted). Also used as the
+    # "asetrate" method's aresample target -- when 0, that step targets the ORIGINAL
+    # input rate instead.
+    audio_sample_rate: 48000
+    # Resampler for the "asetrate" method's aresample step (ignored by atempo/
+    # rubberband): soxr | swr. "soxr" (default) is higher quality, needs an ffmpeg
+    # build with --enable-libsoxr (ffmpeg itself falls back to swr with its own
+    # warning if missing).
+    resampler: soxr
 
   # Auto-crop (opt-in, off by default). Detects a video's true content bounds -- the union
   # over the whole video, not a per-frame crop -- via FFmpeg cropdetect with reset=0, and

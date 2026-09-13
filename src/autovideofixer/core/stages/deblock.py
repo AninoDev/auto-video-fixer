@@ -308,7 +308,9 @@ class DeblockStage(BaseStage):
                     if chunk is None:
                         break
 
-                    chunk_out = upscaler.upscale_video(chunk, progress_callback=cb, timer=timer)
+                    chunk_out = upscaler.upscale_video(
+                        chunk, progress_callback=cb, timer=timer, operation_label="Deblocking"
+                    )
                     # Write each chunk's output straight to the ffmpeg pipe
                     # instead of buffering the whole video's frames in memory.
                     t0 = time.time()

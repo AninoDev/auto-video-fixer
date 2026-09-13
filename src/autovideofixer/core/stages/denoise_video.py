@@ -298,7 +298,7 @@ class DenoiseVideoStage(BaseStage):
                         break
 
                     chunk_denoised = upscaler.upscale_video(
-                        chunk, progress_callback=cb, timer=timer
+                        chunk, progress_callback=cb, timer=timer, operation_label="Denoising"
                     )
                     # Write each chunk's output straight to the ffmpeg pipe
                     # instead of buffering the whole video's frames in memory.

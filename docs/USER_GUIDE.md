@@ -644,6 +644,38 @@ quality:
     target_framerate: 60.0
 ```
 
+### Choosing an Audio Speed Method
+
+When you slow down or speed up a video (`stages.speed.factor` / a future `--speed` flag), the
+audio has to change speed too, and there are three ways to do that
+(`stages.speed.audio_method` / `--audio-speed-method`):
+
+- **`atempo`** (default) -- keeps the original pitch. Good for normal speed-ups/slow-downs, but at
+  extreme factors (e.g. 4x slow-motion) it can sound a bit robotic/artifacted.
+- **`rubberband`** -- also keeps pitch, but sounds noticeably cleaner than `atempo` at extreme
+  factors. Requires an FFmpeg build with librubberband support; if yours doesn't have it, Auto
+  Video Fixer automatically falls back to `atempo` and logs a warning.
+- **`asetrate`** -- deliberately changes pitch along with speed. This is the right choice, not a
+  workaround, if your clip is **phone slow-motion footage**: phones record slow-mo audio at a
+  higher microphone sample rate and then map it down to play at normal speed, so by the time you
+  speed the clip back up, a pitch-preserving method leaves the audio pitched too low. `asetrate`
+  undoes that mapping and restores the voice/sound to how it actually sounded when recorded.
+
+```yaml
+stages:
+  speed:
+    enabled: true
+    factor: 0.25          # 4x slow-motion
+    audio_method: asetrate # atempo | rubberband | asetrate
+    audio_sample_rate: 48000
+    resampler: soxr        # soxr | swr
+```
+
+```bash
+avf process slowmo.mp4 --enable-stage speed --set stages.speed.factor=0.25 \
+  --audio-speed-method asetrate
+```
+
 ### Hardware Acceleration
 
 Enable GPU encoding:
