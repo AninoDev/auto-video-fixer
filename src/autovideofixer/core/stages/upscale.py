@@ -6,6 +6,7 @@ import os
 import time
 from typing import Any
 
+from autovideofixer.core.cadence_guard import cadence_metadata, resolve_cadence
 from autovideofixer.core.ffmpeg_utils import probe, run_ffmpeg
 from autovideofixer.core.output_check import SKIP_SCALE_THRESHOLD, compute_fitted_dimensions
 from autovideofixer.core.output_check import effective_target_bounds as _effective_target_bounds_fn
@@ -307,6 +308,12 @@ class UpscaleStage(BaseStage):
         # Run AI upscaling in passes
         current_input = input_path
         intermediate_files = []  # Track intermediate files for cleanup
+        # REQUIREMENTS.md § 19.1: cadence-guard fields from whichever pass
+        # ran over the ORIGINAL input (the only pass with a real
+        # override_fps/input_duration to check -- later passes' input is
+        # this stage's own already-CFR intermediate, nothing to guard
+        # there), carried forward to the stage-level metadata below.
+        pass_cadence_meta: dict[str, Any] = {}
 
         for pass_num in range(num_passes):
             is_last_pass = pass_num == num_passes - 1
@@ -431,6 +438,13 @@ class UpscaleStage(BaseStage):
                         os.unlink(f)
                 return result
 
+            if result.metadata.get("cadence_mismatch"):
+                pass_cadence_meta = {
+                    k: v for k, v in result.metadata.items() if k.startswith("cadence_")
+                }
+                if "fps_out" in result.metadata:
+                    pass_cadence_meta["fps_out"] = result.metadata["fps_out"]
+
             current_input = pass_output
 
         # Clean up intermediate files
@@ -460,6 +474,7 @@ class UpscaleStage(BaseStage):
                     return fix_result
 
         metadata: dict[str, Any] = {"method": "ai", "model": self._ai_model, "passes": num_passes}
+        metadata.update(pass_cadence_meta)
         cadence = (input_info or {}).get("cadence")
         if cadence and not cadence.get("is_regular", True):
             # REQUIREMENTS.md § 12.4b: the raw-pipe writer's carrier rate
@@ -779,6 +794,21 @@ class UpscaleStage(BaseStage):
                         duration_sec=time.time() - start,
                     )
 
+                # REQUIREMENTS.md § 19.1: the writer above already tagged
+                # `temp_path` with `fps` as its carrier rate -- verify that
+                # was consistent with what actually came through before
+                # trusting it any further. `probe_info.duration` is this
+                # pass's own input's duration (unaffected by anything that
+                # happened inside this pass), so it stays valid to compare
+                # against regardless of which pass this is.
+                cadence_resolution = resolve_cadence(frames_written, probe_info.duration, fps)
+                if cadence_resolution.mismatch:
+                    self.logger.warning(
+                        "upscale: cadence/frame-count mismatch on %s: %s",
+                        input_path,
+                        cadence_resolution.reason,
+                    )
+
                 # Mux processed video back with the original audio (if any).
                 # The input may have no audio stream at all - mapping
                 # "0:a:0" unconditionally would make ffmpeg fail, and NOT
@@ -797,7 +827,17 @@ class UpscaleStage(BaseStage):
                 # generation plus a wasted full x264 pass. Stream-copying the
                 # already-encoded video track makes this mux bit-identical to
                 # the temp file's video stream.
-                mux_args = ["-i", input_path, "-i", temp_path]
+                mux_args = ["-i", input_path]
+                if cadence_resolution.mismatch:
+                    # § 19.1: do NOT use the bad carrier -- re-interpret
+                    # temp_path's raw frames at the resolved (self-consistent)
+                    # rate instead of whatever it was actually muxed at, by
+                    # placing `-r` before ITS `-i` (an ffmpeg input option
+                    # only affects the input it precedes). With `-c:v copy`
+                    # below, this retags the copied video track's timestamps
+                    # to the corrected rate rather than re-encoding.
+                    mux_args += ["-r", f"{cadence_resolution.resolved_fps:.6f}"]
+                mux_args += ["-i", temp_path]
                 mux_args += ["-map", "0:a:0", "-map", "1:v:0"] if has_audio else ["-map", "1:v:0"]
                 mux_args += ["-c:v", "copy", "-c:a", "copy", "-y", output_path]
                 mux_result = run_ffmpeg(mux_args, timeout=self.stage_timeout())
@@ -811,10 +851,17 @@ class UpscaleStage(BaseStage):
                         duration_sec=time.time() - start,
                     )
 
+                pass_metadata: dict[str, Any] = {"method": "ai", "scale": scale_factor}
+                pass_metadata.update(cadence_metadata(cadence_resolution))
+                if cadence_resolution.mismatch:
+                    # § 12.5: any stage that legitimately retimes the stream
+                    # must refresh true_framerate -- keyed on `fps_out`'s
+                    # presence in core/pipeline.py's stage loop.
+                    pass_metadata["fps_out"] = cadence_resolution.resolved_fps
                 return StageResult(
                     status=StageStatus.COMPLETED,
                     output_path=output_path,
-                    metadata={"method": "ai", "scale": scale_factor},
+                    metadata=pass_metadata,
                     duration_sec=time.time() - start,
                 )
             finally:

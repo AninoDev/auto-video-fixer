@@ -1038,13 +1038,16 @@ class TestPerStageReprobe:
         result = self.pipeline.execute_job(job)
 
         assert result.success is True
-        # Exactly two probes: the initial up-front probe of the job's
-        # original input, and the re-probe after fake_b (which DOES produce
-        # a new output, as the terminal stage). fake_a was skipped (no
-        # output produced), so it must not have triggered a re-probe of its
-        # own -- if it had, there would be three calls instead of two, with
-        # the extra one repeating input_file back-to-back.
-        assert probe_calls == [str(input_file), job.output_path]
+        # Three probes: the initial up-front probe of the job's original
+        # input, then -- for fake_b, the only stage that actually produces a
+        # new output -- REQUIREMENTS.md § 19.2's duration-guard probe of that
+        # new output (Pipeline._check_duration_guard(), runs BEFORE the
+        # ordinary per-stage re-probe below it in the loop) followed by that
+        # ordinary re-probe itself, both of job.output_path. fake_a was
+        # skipped (no output produced), so it must not have triggered any
+        # probe of its own -- if it had, there would be a fourth call
+        # repeating input_file back-to-back.
+        assert probe_calls == [str(input_file), job.output_path, job.output_path]
 
     def test_reprobe_failure_logs_warning_and_keeps_previous_input_info(
         self, tmp_path, monkeypatch, caplog
@@ -1718,3 +1721,254 @@ class TestExitCodeCountsFailedOnly:
             JobResult(input_path="/c.mp4", outcome="skipped", skip_reason="output-exists"),
         ]
         assert _count_failed(results) == 1
+
+
+class TestDurationGuard:
+    """REQUIREMENTS.md § 19.2: Pipeline.execute_job()'s duration invariant
+    check. Mirrors TestPerStageReprobe's fake-stage/fake-probe pattern --
+    get_video_info() is mocked entirely, no real ffmpeg/video files."""
+
+    def setup_method(self):
+        self.config = Config(Path(tempfile.mkdtemp()) / "nonexistent.yaml")
+        self.pipeline = Pipeline(self.config)
+
+    def _register_fake_stage(self, monkeypatch, *, name="fake_dur", preserves_duration=True):
+        """Registers a single test-only stage that writes a dummy output
+        file and always COMPLETEs. Returns nothing -- callers configure
+        get_video_info() themselves per test."""
+        from autovideofixer.core.stages.base import BaseStage
+
+        class FakeStage(BaseStage):
+            display_name = "Fake Duration Stage"
+            description = "test-only stage producing a new output file"
+            category = "test"
+            priority = 10
+            produces_output = True
+
+            def should_run(self, input_info):
+                return True, None
+
+            def execute(self, input_path, output_path=None, progress_callback=None, **kwargs):
+                with open(output_path, "wb") as f:
+                    f.write(b"fake-output")
+                return StageResult(status=StageStatus.COMPLETED, output_path=output_path)
+
+        FakeStage.name = name
+        FakeStage.preserves_duration = preserves_duration
+
+        registry = {name: FakeStage}
+
+        def fake_get_stage(n):
+            return registry.get(n)
+
+        def fake_create_stage(n, config, overrides=None):
+            cls = registry.get(n)
+            return cls(config, overrides) if cls else None
+
+        monkeypatch.setattr("autovideofixer.core.pipeline.get_stage", fake_get_stage)
+        monkeypatch.setattr("autovideofixer.core.pipeline.create_stage", fake_create_stage)
+        return FakeStage
+
+    def _register_probe(self, monkeypatch, input_file, input_duration, output_duration):
+        """get_video_info() returns `input_duration` for the exact original
+        input path, and `output_duration` for anything else (the stage's
+        generated temp output path, unknown ahead of time -- same
+        by-exclusion trick TestPerStageReprobe uses)."""
+
+        def fake_get_video_info(path):
+            if path == str(input_file):
+                return {"resolution": (1920, 1080), "framerate": 30.0, "duration": input_duration}
+            return {"resolution": (1920, 1080), "framerate": 30.0, "duration": output_duration}
+
+        monkeypatch.setattr("autovideofixer.core.pipeline.get_video_info", fake_get_video_info)
+
+    def test_within_tolerance_is_silent(self, tmp_path, monkeypatch):
+        input_file = tmp_path / "in.mp4"
+        input_file.write_bytes(b"fake input")
+        self._register_probe(monkeypatch, input_file, input_duration=10.0, output_duration=10.3)
+        self._register_fake_stage(monkeypatch)
+        self.config.set(["fake_dur"], "pipeline", "default_order")
+
+        job = self.pipeline.add_job(str(input_file))
+        job.stages = ["fake_dur"]
+        result = self.pipeline.execute_job(job)
+
+        assert result.success is True
+        assert result.duration_guard_warnings == []
+        assert "duration_guard_mismatch" not in result.stage_results["fake_dur"].metadata
+
+    def test_beyond_tolerance_warns_and_records_on_job_result(self, tmp_path, monkeypatch):
+        input_file = tmp_path / "in.mp4"
+        input_file.write_bytes(b"fake input")
+        self._register_probe(monkeypatch, input_file, input_duration=10.0, output_duration=20.0)
+        self._register_fake_stage(monkeypatch)
+        self.config.set(["fake_dur"], "pipeline", "default_order")
+
+        job = self.pipeline.add_job(str(input_file))
+        job.stages = ["fake_dur"]
+        result = self.pipeline.execute_job(job)
+
+        # warn mode: job still succeeds, stage stays COMPLETED.
+        assert result.success is True
+        assert result.stage_results["fake_dur"].status == StageStatus.COMPLETED
+        assert len(result.duration_guard_warnings) == 1
+        warning = result.duration_guard_warnings[0]
+        assert warning["stage"] == "fake_dur"
+        assert warning["input_duration"] == 10.0
+        assert warning["output_duration"] == 20.0
+        assert warning["ratio"] == pytest.approx(2.0)
+        meta = result.stage_results["fake_dur"].metadata
+        assert meta["duration_guard_mismatch"] is True
+        assert meta["duration_guard_input_duration"] == 10.0
+        assert meta["duration_guard_output_duration"] == 20.0
+
+    def test_fail_mode_marks_stage_failed(self, tmp_path, monkeypatch):
+        input_file = tmp_path / "in.mp4"
+        input_file.write_bytes(b"fake input")
+        self._register_probe(monkeypatch, input_file, input_duration=10.0, output_duration=20.0)
+        self._register_fake_stage(monkeypatch)
+        self.config.set("fail", "pipeline", "duration_guard")
+        self.config.set(["fake_dur"], "pipeline", "default_order")
+
+        job = self.pipeline.add_job(str(input_file))
+        job.stages = ["fake_dur"]
+        result = self.pipeline.execute_job(job)
+
+        assert result.success is False
+        stage_result = result.stage_results["fake_dur"]
+        assert stage_result.status == StageStatus.FAILED
+        assert stage_result.error is not None
+        assert len(result.duration_guard_warnings) == 1
+        assert any("fake_dur" in e for e in result.errors)
+
+    def test_off_mode_never_fires(self, tmp_path, monkeypatch):
+        input_file = tmp_path / "in.mp4"
+        input_file.write_bytes(b"fake input")
+        # Wildly stretched duration -- would trip both warn and fail.
+        self._register_probe(monkeypatch, input_file, input_duration=10.0, output_duration=100.0)
+        self._register_fake_stage(monkeypatch)
+        self.config.set("off", "pipeline", "duration_guard")
+        self.config.set(["fake_dur"], "pipeline", "default_order")
+
+        job = self.pipeline.add_job(str(input_file))
+        job.stages = ["fake_dur"]
+        result = self.pipeline.execute_job(job)
+
+        assert result.success is True
+        assert result.duration_guard_warnings == []
+        assert "duration_guard_mismatch" not in result.stage_results["fake_dur"].metadata
+
+    def test_exempt_stage_not_flagged(self, tmp_path, monkeypatch):
+        """A stage declaring preserves_duration=False (like speed/retime)
+        must never be flagged, no matter how different its output duration
+        is -- mirrors speed's real 0.5x-factor doubling of duration."""
+        input_file = tmp_path / "in.mp4"
+        input_file.write_bytes(b"fake input")
+        self._register_probe(monkeypatch, input_file, input_duration=10.0, output_duration=20.0)
+        self._register_fake_stage(monkeypatch, name="fake_speed", preserves_duration=False)
+        self.config.set(["fake_speed"], "pipeline", "default_order")
+
+        job = self.pipeline.add_job(str(input_file))
+        job.stages = ["fake_speed"]
+        result = self.pipeline.execute_job(job)
+
+        assert result.success is True
+        assert result.duration_guard_warnings == []
+        assert "duration_guard_mismatch" not in result.stage_results["fake_speed"].metadata
+
+    def test_real_speed_stage_is_exempt_by_declaration(self):
+        """SpeedStage itself declares the exemption (not just a test double)."""
+        from autovideofixer.core.stages.speed import SpeedStage
+
+        assert SpeedStage.preserves_duration is False
+
+    def test_real_retime_stage_is_exempt_by_declaration(self):
+        """RetimeStage itself declares the exemption (not just a test double)."""
+        from autovideofixer.core.stages.retime import RetimeStage
+
+        assert RetimeStage.preserves_duration is False
+
+    def test_default_stages_preserve_duration(self):
+        """Spot-check a few ordinary stages keep BaseStage's True default."""
+        from autovideofixer.core.stages.deblock import DeblockStage
+        from autovideofixer.core.stages.encode import EncodeStage
+        from autovideofixer.core.stages.upscale import UpscaleStage
+
+        assert DeblockStage.preserves_duration is True
+        assert EncodeStage.preserves_duration is True
+        assert UpscaleStage.preserves_duration is True
+
+    def test_unknown_input_duration_skips_check(self, tmp_path, monkeypatch):
+        input_file = tmp_path / "in.mp4"
+        input_file.write_bytes(b"fake input")
+        self._register_probe(monkeypatch, input_file, input_duration=0.0, output_duration=100.0)
+        self._register_fake_stage(monkeypatch)
+        self.config.set(["fake_dur"], "pipeline", "default_order")
+
+        job = self.pipeline.add_job(str(input_file))
+        job.stages = ["fake_dur"]
+        result = self.pipeline.execute_job(job)
+
+        assert result.success is True
+        assert result.duration_guard_warnings == []
+
+    def test_unknown_output_duration_skips_check(self, tmp_path, monkeypatch):
+        input_file = tmp_path / "in.mp4"
+        input_file.write_bytes(b"fake input")
+        self._register_probe(monkeypatch, input_file, input_duration=10.0, output_duration=0.0)
+        self._register_fake_stage(monkeypatch)
+        self.config.set(["fake_dur"], "pipeline", "default_order")
+
+        job = self.pipeline.add_job(str(input_file))
+        job.stages = ["fake_dur"]
+        result = self.pipeline.execute_job(job)
+
+        assert result.success is True
+        assert result.duration_guard_warnings == []
+
+    def test_probe_error_fails_open(self, tmp_path, monkeypatch):
+        input_file = tmp_path / "in.mp4"
+        input_file.write_bytes(b"fake input")
+
+        def fake_get_video_info(path):
+            if path == str(input_file):
+                return {"resolution": (1920, 1080), "framerate": 30.0, "duration": 10.0}
+            raise RuntimeError("probe failed")
+
+        monkeypatch.setattr("autovideofixer.core.pipeline.get_video_info", fake_get_video_info)
+        self._register_fake_stage(monkeypatch)
+        self.config.set(["fake_dur"], "pipeline", "default_order")
+
+        job = self.pipeline.add_job(str(input_file))
+        job.stages = ["fake_dur"]
+        result = self.pipeline.execute_job(job)
+
+        # The stage's own re-probe (for input_info propagation) fails open
+        # too (see Pipeline._reprobe_input_info) -- the job must still
+        # complete successfully, just with no duration-guard verdict.
+        assert result.success is True
+        assert result.duration_guard_warnings == []
+
+    def test_incident_regression_3x_duration_stretch_is_flagged(self, tmp_path, monkeypatch):
+        """REQUIREMENTS.md § 19's real incident, reproduced at the pipeline
+        level: a duration-preserving stage whose output is ~3x its input's
+        duration (23.8s -> ~72.4s, matching the exact real numbers) must be
+        flagged. This is the test that would have caught the original bug
+        even with zero per-stage cadence awareness."""
+        input_file = tmp_path / "in.mp4"
+        input_file.write_bytes(b"fake input")
+        self._register_probe(monkeypatch, input_file, input_duration=23.8, output_duration=72.4)
+        self._register_fake_stage(monkeypatch, name="fake_upscale")
+        self.config.set(["fake_upscale"], "pipeline", "default_order")
+
+        job = self.pipeline.add_job(str(input_file))
+        job.stages = ["fake_upscale"]
+        result = self.pipeline.execute_job(job)
+
+        assert result.success is True  # warn mode (default): job still completes
+        assert len(result.duration_guard_warnings) == 1
+        warning = result.duration_guard_warnings[0]
+        assert warning["ratio"] == pytest.approx(72.4 / 23.8, rel=1e-6)
+        assert warning["ratio"] > 2.9  # roughly the real 3.04x disagreement
+        meta = result.stage_results["fake_upscale"].metadata
+        assert meta["duration_guard_mismatch"] is True

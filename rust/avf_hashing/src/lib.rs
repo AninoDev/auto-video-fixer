@@ -151,7 +151,16 @@ fn sample_frames(
 
     let mut child = match Command::new(ffmpeg_path)
         .args([
-            "-v", "error", "-nostdin", "-i", filepath, "-vf", &vf, "-vsync", "vfr", "-f",
+            // `-fps_mode vfr`, NOT the legacy `-vsync vfr`: ffmpeg REMOVED
+            // `-vsync` (it had been deprecated for years), so on ffmpeg 9+ this
+            // command died instantly with "Unrecognized option 'vsync'". The
+            // spawn still succeeded, ffmpeg wrote zero bytes, `sample_frames`
+            // returned empty, and `compute_phash_rs` fell through to its
+            // `None => String::new()` path -- so EVERY video hashed to "" and
+            // all perceptual-hash/duplicate-detection functionality silently
+            // did nothing. stderr is piped to null here, so the error was
+            // invisible; the only symptom was an empty hash.
+            "-v", "error", "-nostdin", "-i", filepath, "-vf", &vf, "-fps_mode", "vfr", "-f",
             "rawvideo", "-pix_fmt", "gray", "-",
         ])
         .stdin(Stdio::null())

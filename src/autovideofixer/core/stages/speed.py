@@ -21,6 +21,9 @@ class SpeedStage(BaseStage):
     category = "enhancement"
     priority = 50
     supports_gpu = False
+    # REQUIREMENTS.md § 19.2: speed deliberately scales duration by 1/factor
+    # -- exempt from the pipeline's duration invariant check.
+    preserves_duration = False
 
     def __init__(self, config, overrides: dict[str, Any] | None = None):
         super().__init__(config, overrides)

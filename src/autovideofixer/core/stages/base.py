@@ -59,6 +59,20 @@ class BaseStage(ABC):
     # Capability flags
     can_parallelize: bool = False
     needs_intermediate: bool = False  # Must run on intermediate file, not source
+    # REQUIREMENTS.md § 19.2: whether this stage's output duration is
+    # expected to match its input's. True for the overwhelming majority of
+    # stages (crop/deblock/denoise/upscale/stabilize/encode/etc. all filter
+    # frames without changing the timeline) -- Pipeline.execute_job()'s
+    # duration invariant check (`pipeline.duration_guard`) compares
+    # input/output duration after every stage that produces a NEW file, and
+    # skips that comparison entirely for a stage with this False. A class
+    # attribute (matching the existing produces_output/can_parallelize
+    # capability-flag pattern) rather than a hardcoded stage-name list in the
+    # pipeline, so a stage declares its own contract right where its other
+    # capabilities already live. Only ``speed`` (scales by 1/factor) and
+    # ``retime`` (may trim trailing duplicate/padding frames) override this
+    # to False -- see those stages' own comments.
+    preserves_duration: bool = True
 
     def __init__(self, config: Config, overrides: dict[str, Any] | None = None):
         """Create a stage instance.

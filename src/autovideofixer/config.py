@@ -269,10 +269,14 @@ VALID_AUDIO_SPEED_METHODS = ("atempo", "rubberband", "asetrate")
 # Canonical set for stages.speed.resampler -- the `aresample` resampler used
 # by the "asetrate" audio_method (see SpeedStage._build_asetrate_chain).
 VALID_AUDIO_RESAMPLERS = ("soxr", "swr")
+# Canonical set for pipeline.duration_guard (REQUIREMENTS.md § 19.2).
+_VALID_DURATION_GUARD = ("warn", "fail", "off")
 
 
 def validate_output_handling_config(config: "Config") -> None:
-    """Validate the § 6.1/6.2/6.7 ``general.*`` enum-valued keys eagerly.
+    """Validate the § 6.1/6.2/6.7 ``general.*`` enum-valued keys eagerly (also
+    ``pipeline.duration_guard``, § 19.2 -- same "fail fast at construction,
+    not at first use" rationale, just a different config section).
 
     Called once per ``Pipeline`` construction so a typo'd value (e.g.
     ``general.existing_output: sikp``) is a clear startup error instead of a
@@ -304,6 +308,12 @@ def validate_output_handling_config(config: "Config") -> None:
         raise ValueError(
             f"Invalid general.existing_mismatched: {existing_mismatched!r} "
             f"(must be one of {_VALID_EXISTING_MISMATCHED!r})"
+        )
+    duration_guard = config.get("pipeline", "duration_guard", default="warn")
+    if duration_guard not in _VALID_DURATION_GUARD:
+        raise ValueError(
+            f"Invalid pipeline.duration_guard: {duration_guard!r} "
+            f"(must be one of {_VALID_DURATION_GUARD!r})"
         )
     max_renames = config.get("general", "mismatched_max_renames", default=None)
     if max_renames is not None:
@@ -620,6 +630,49 @@ class Config:
             # timeouts regardless of this key -- a hang there indicates real
             # breakage, not a long input.
             "stage_timeout": None,
+            # REQUIREMENTS.md § 19.2: duration invariant check -- the pipeline-
+            # level catch-all half of the duration/cadence guard (§ 19.1's
+            # per-stage frame-count check, in core/cadence_guard.py and the
+            # raw-pipe stages, is the other half). After a stage that declares
+            # `preserves_duration = True` (BaseStage's default -- see that
+            # class attribute's own comment; `speed` and `retime` are the only
+            # stages that override it to False) produces a NEW output file,
+            # Pipeline.execute_job() compares that file's duration to its
+            # input's.
+            #
+            # This exists because of a real incident: a stale `avf_framepipe`
+            # build (see stages.retime's § 12.6 build-gotcha reference) made a
+            # raw-pipe stage re-expand a 235-frame retimed VFR intermediate
+            # back to 714 CFR frames, then tag those 714 frames at the
+            # recovered 9.864fps cadence -- correct only for the 235-frame
+            # stream -- producing a 72.4s output from a 23.8s input. Every
+            # stage reported COMPLETED, the run exited 0, and nothing checked.
+            # This guard is the tripwire: it would have caught that 3x
+            # disagreement even with no per-stage cadence awareness at all.
+            #
+            # "warn" (default): log loudly (WARNING) and record the
+            # discrepancy on the job result (JobResult.duration_guard_warnings
+            # in core/pipeline.py) -- the job still completes. "fail": mark
+            # the offending stage FAILED instead, so
+            # pipeline.skip_stage_on_error=false stops the run rather than
+            # building further stages on a broken intermediate (with the
+            # default skip_stage_on_error=true, a "fail" verdict here behaves
+            # like any other stage failure: logged as an error, pipeline
+            # continues from the pre-stage file). "off" disables the check
+            # entirely. Defaults to "warn" rather than "fail": duration
+            # estimates from container metadata are not always exact (VFR
+            # files especially -- see stages.retime's § 12.3 reference on
+            # `avg_frame_rate` being unreliable there), and a guard that fails
+            # good jobs on false alarms is worse than one that flags bad ones
+            # loudly. A duration that's unknown/zero on either side (common
+            # for VFR containers, and for the mocked probes many pipeline
+            # tests use) skips the check rather than dividing by zero or
+            # firing a false alarm.
+            "duration_guard": "warn",
+            # Fraction (0.05 = 5%) an output's duration may differ from its
+            # input's before pipeline.duration_guard fires, for a stage that
+            # declares preserves_duration = True.
+            "duration_guard_tolerance": 0.05,
         },
         "stages": {
             "upscale": {

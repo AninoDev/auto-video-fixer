@@ -47,6 +47,9 @@ class RetimeStage(BaseStage):
     # ordering signal for callers that don't consult it.
     priority = 2
     supports_gpu = False
+    # REQUIREMENTS.md § 19.2: retime may legitimately trim trailing duplicate/
+    # padding frames -- exempt from the pipeline's duration invariant check.
+    preserves_duration = False
 
     def should_run(self, input_info: dict[str, Any]) -> tuple[bool, str | None]:
         if not self.is_enabled():

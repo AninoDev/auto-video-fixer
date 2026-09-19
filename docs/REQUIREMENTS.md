@@ -1765,3 +1765,67 @@ Unrelated to audio, but adjacent: `speed` also reports `fps_in`/`fps_out` so dow
 the post-speed cadence (§ 12.5's propagation, keyed on the presence of `fps_out`). Any change to
 this stage must preserve that — without it, `encode`'s CFR pin duplicates frames and a chained
 second `interpolate` skips as "already at target".
+
+## 19. Duration/cadence guard: never silently emit a stretched video (PLANNED 2026-09-15, user-approved)
+
+**Problem**: a user's 23.8s clip came out 72 seconds long and badly stuttery, and nothing in the
+pipeline noticed. Every stage reported COMPLETED, the run exited 0, all gates passed, and the JSON
+report looked healthy. The defect was only discoverable by watching the output.
+
+The mechanism (diagnosed 2026-09-10): the installed `avf_framepipe` binary was a stale cached
+wheel built before the § 12.4b `-fps_mode passthrough` reader fix, so the raw-frame reader
+re-expanded a retimed VFR intermediate from 235 frames back to 714 CFR frames. The writer then
+tagged those 714 frames at `true_framerate` = 9.864fps — the *recovered* cadence, which is only
+correct for the 235-frame stream — giving 714 / 9.864 = 72.4 seconds.
+
+The stale wheel was the trigger, and rebuilding fixed it. But the deeper failure is that a
+**detectable** inconsistency produced a silently wrong deliverable. The frame count and the
+cadence disagreed by 3x and nothing checked.
+
+**Fix**: assert the invariants that were violated, at the two points where they are cheap to check.
+
+### 19.1 Frame-count vs. cadence check (raw-pipe AI stages)
+
+The raw-pipe stages (`upscale`, `deblock`, `denoise_video` via the shared Real-ESRGAN wrapper;
+`interpolate`'s AI path; `stabilize`'s pipe) know both the number of frames the reader actually
+yielded and the cadence they are about to tag them with. Those two must be consistent with the
+input's duration:
+
+```
+expected_frames ~= input_duration * carrier_fps
+```
+
+When the actual frame count disagrees by more than `tolerance`, the carrier rate is wrong — do
+**not** tag the output with it. Instead:
+
+- Log a WARNING naming both numbers and the likely cause (a VFR stream re-expanded to CFR; on a
+  mixed Python/Rust install, a stale `avf_framepipe` build — see § 12.6's build gotcha).
+- Derive the carrier from what actually came through (`actual_frames / input_duration`), which is
+  self-consistent by construction and yields a correct-duration output even when the reader
+  misbehaved.
+- Record `cadence_mismatch: true` (plus both counts) in stage metadata so it surfaces in the
+  per-job report and the JSON run report rather than only in a log nobody reads.
+
+### 19.2 Duration invariant check (pipeline-level, catch-all)
+
+19.1 only covers stages that know their own frame counts. A cheaper and broader net: most stages
+must not change the stream's duration at all. After a stage produces a new file, compare its
+duration to the input's.
+
+- Stages that legitimately change duration declare it (`speed` scales by `1/factor`; `retime` may
+  trim trailing duplicates). Everything else is duration-preserving and is checked.
+- `pipeline.duration_guard`: `warn` (default) | `fail` | `off`, with
+  `pipeline.duration_guard_tolerance` (default `0.05`, i.e. 5%).
+- `warn` logs loudly and records the discrepancy in the job result; `fail` marks the stage FAILED
+  so `skip_stage_on_error: false` stops the run rather than continuing to build on a broken
+  intermediate.
+
+Default `warn` rather than `fail`: duration estimates from container metadata are not always exact
+(VFR files especially, § 12.3), and a guard that fails good jobs is worse than one that flags bad
+ones. It must be loud enough to notice and visible in the report.
+
+### 19.3 Non-goals
+
+This does not attempt to detect *quality* regressions, only gross structural ones (wrong frame
+count, wrong duration). It is a tripwire for a class of silent corruption, not a correctness
+proof.

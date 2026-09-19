@@ -29,6 +29,7 @@ from autovideofixer.core.ffmpeg_utils import (
 from autovideofixer.core.output_check import check_output_spec, effective_output_targets
 from autovideofixer.core.reporting import classify_stage, format_media_info_lines
 from autovideofixer.core.stages.base import (
+    BaseStage,
     StageResult,
     StageStatus,
     create_stage,
@@ -197,6 +198,14 @@ class JobResult:
     # per § 6.4's "reprocessed-mismatch jobs are ordinary completed jobs
     # noted as reprocessed" requirement.
     reprocessed_mismatch: bool = False
+    # REQUIREMENTS.md § 19.2: one entry per stage occurrence whose output
+    # duration disagreed with its input's beyond pipeline.duration_guard_tolerance
+    # (both "warn" and "fail" mode append here -- "fail" ALSO marks that
+    # stage's StageResult FAILED, see Pipeline._check_duration_guard()).
+    # Each entry: {"stage": label, "input_duration": float, "output_duration":
+    # float, "ratio": float}. Empty when duration_guard="off", or when no
+    # stage tripped it.
+    duration_guard_warnings: list[dict[str, Any]] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         if self.outcome:
@@ -524,6 +533,85 @@ class Pipeline:
             if key in previous_info:
                 fresh_info[key] = previous_info[key]
         return fresh_info
+
+    def _check_duration_guard(
+        self,
+        stage_label: str,
+        stage: BaseStage,
+        prior_info: dict[str, Any],
+        result: StageResult,
+    ) -> None:
+        """REQUIREMENTS.md § 19.2: pipeline-level duration invariant check.
+
+        Called for every stage occurrence that just produced a NEW output
+        file (``result.output_path`` distinct from what fed it), right
+        after the stage returns and before the FAILED/else branch below
+        decides how to handle its status -- so a "fail"-mode verdict here
+        flows through the exact same ``skip_stage_on_error`` handling as any
+        other stage failure, not a bolted-on second path.
+
+        Mutates ``result`` in place: on a detected mismatch it always
+        records ``duration_guard_*`` fields in ``result.metadata`` (which
+        ``execute_job()`` collects into ``JobResult.duration_guard_warnings``
+        after the stage loop), and additionally flips ``result.status`` to
+        FAILED (with ``result.error`` set) when ``pipeline.duration_guard``
+        is "fail".
+
+        Fails open (silently returns, no check performed) whenever the
+        comparison isn't meaningful: ``duration_guard`` is "off", the stage
+        declares ``preserves_duration = False`` (``speed``/``retime``, see
+        those stages' own comments), either duration is unknown/zero (VFR
+        containers often report this -- REQUIREMENTS.md § 12.3 -- as do the
+        mocked probes many pipeline tests use), or probing the new output
+        fails outright.
+        """
+        mode = self.config.get("pipeline", "duration_guard", default="warn")
+        # getattr with a True default (not a bare attribute read): several
+        # existing tests register plain duck-typed stage doubles that
+        # satisfy the pipeline's actual runtime contract (should_run/execute)
+        # without subclassing BaseStage, so they never picked up this new
+        # class attribute -- default matches BaseStage's own default, so a
+        # real stage's explicit override always still wins.
+        if mode == "off" or not getattr(stage, "preserves_duration", True):
+            return
+        input_duration = prior_info.get("duration") or 0.0
+        if input_duration <= 0:
+            return
+        assert result.output_path is not None
+        try:
+            output_duration = get_video_info(result.output_path).get("duration") or 0.0
+        except Exception as e:
+            self.logger.debug(
+                "duration guard: failed to probe %s for stage '%s'; skipping check: %s",
+                result.output_path,
+                stage_label,
+                e,
+            )
+            return
+        if output_duration <= 0:
+            return
+
+        tolerance = self.config.get("pipeline", "duration_guard_tolerance", default=0.05)
+        ratio = output_duration / input_duration
+        if abs(ratio - 1.0) <= tolerance:
+            return
+
+        msg = (
+            f"Stage '{stage_label}' output duration ({output_duration:.2f}s) differs from "
+            f"its input duration ({input_duration:.2f}s) by {abs(ratio - 1.0) * 100:.1f}% "
+            f"(tolerance {tolerance * 100:.0f}%) -- this stage is expected to preserve "
+            "duration; possible silent corruption (REQUIREMENTS.md § 19.2)"
+        )
+        result.metadata["duration_guard_mismatch"] = True
+        result.metadata["duration_guard_input_duration"] = input_duration
+        result.metadata["duration_guard_output_duration"] = output_duration
+        result.metadata["duration_guard_ratio"] = ratio
+        if mode == "fail":
+            self.logger.error(msg)
+            result.status = StageStatus.FAILED
+            result.error = msg
+        else:
+            self.logger.warning(msg)
 
     def _apply_config_encoding_overrides(self, job: Job) -> None:
         """Merge config["encoding"] (from a preset or user config) into
@@ -1392,6 +1480,19 @@ class Pipeline:
 
                     stage_results[stage_name] = result
 
+                    # REQUIREMENTS.md § 19.2: duration invariant check --
+                    # runs BEFORE the FAILED/else branch below so a
+                    # guard-triggered "fail" verdict is handled through the
+                    # exact same skip_stage_on_error path as any other stage
+                    # failure, and so the § 6.5 finished-in log line right
+                    # below already reflects the corrected status.
+                    if (
+                        result.status == StageStatus.COMPLETED
+                        and result.output_path
+                        and result.output_path != current_path
+                    ):
+                        self._check_duration_guard(stage_name, stage, input_info, result)
+
                     # REQUIREMENTS.md § 6.5: surface each stage's wall-clock
                     # duration at INFO right after it completes/fails (skips
                     # are logged above with 0 duration -- should_run() never
@@ -1567,6 +1668,21 @@ class Pipeline:
         # rather than spending a second ffprobe process on the same file.
         output_info: dict[str, Any] = dict(input_info) if final_output_path else {}
 
+        # REQUIREMENTS.md § 19.2: collect every stage occurrence
+        # _check_duration_guard() flagged (warn AND fail mode both record
+        # here -- fail mode additionally flipped that StageResult to FAILED)
+        # into the job-level summary.
+        duration_guard_warnings = [
+            {
+                "stage": name,
+                "input_duration": sr.metadata["duration_guard_input_duration"],
+                "output_duration": sr.metadata["duration_guard_output_duration"],
+                "ratio": sr.metadata["duration_guard_ratio"],
+            }
+            for name, sr in stage_results.items()
+            if sr.metadata.get("duration_guard_mismatch")
+        ]
+
         # Build result
         job_result = JobResult(
             input_path=job.input_path,
@@ -1583,6 +1699,7 @@ class Pipeline:
             reprocessed_mismatch=reprocessed_mismatch,
             job_wall_ms=(time.monotonic() - job_start) * 1000.0,
             processing_ms=(time.monotonic() - processing_start) * 1000.0,
+            duration_guard_warnings=duration_guard_warnings,
         )
 
         media_info_lines = format_media_info_lines(

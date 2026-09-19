@@ -9,7 +9,8 @@ import time
 from typing import Any
 
 from autovideofixer.config import resolve_timeout
-from autovideofixer.core.ffmpeg_utils import run_ffmpeg, timing_output_args
+from autovideofixer.core.cadence_guard import cadence_metadata, resolve_cadence
+from autovideofixer.core.ffmpeg_utils import probe, run_ffmpeg, timing_output_args
 from autovideofixer.core.stages.base import BaseStage, StageResult, StageStatus
 
 
@@ -1087,6 +1088,59 @@ class StabilizeStage(BaseStage):
 
             self._report_progress(1.0, "Stabilization complete", progress_callback)
 
+            # REQUIREMENTS.md § 19.1: this raw pipe (unlike the
+            # get_frame_reader/writer-based AI stages) never counts frames
+            # itself -- transform_proc writes output_path directly -- so
+            # verify post-hoc via a probe of what actually landed. `duration`
+            # comes from `input_info` (this job's up-to-date probe, carried
+            # forward across stages per _INJECTED_INPUT_INFO_KEYS) rather
+            # than re-probing input_path, since a VFR intermediate's own
+            # avg_frame_rate/duration can be unreliable downstream of retime
+            # (see AGENTS.md's "do not re-probe for fps downstream of
+            # retime" gotcha) -- input_info is the trustworthy source.
+            assert output_path is not None  # always set by this point (used throughout above)
+            try:
+                actual_frames = probe(output_path).frame_count
+            except Exception:
+                actual_frames = 0
+            input_duration = (input_info or {}).get("duration")
+            cadence_resolution = resolve_cadence(actual_frames, input_duration, framerate)
+            if cadence_resolution.mismatch:
+                self.logger.warning(
+                    "stabilize: cadence/frame-count mismatch on %s: %s",
+                    output_path,
+                    cadence_resolution.reason,
+                )
+                # No later mux step exists on this raw pipe to fold a `-r`
+                # fix into (transform_proc IS the final write) -- retag
+                # output_path in place with one cheap stream-copy remux,
+                # same "-r before the -i it governs" trick used by the
+                # get_frame_writer-based stages (see
+                # UpscaleStage._run_single_ai_pass's identical note).
+                retag_path = f"{output_path}.cadence_retag.mp4"
+                retag_args = [
+                    "-r",
+                    f"{cadence_resolution.resolved_fps:.6f}",
+                    "-i",
+                    output_path,
+                    "-c",
+                    "copy",
+                    "-y",
+                    retag_path,
+                ]
+                retag_result = run_ffmpeg(retag_args, timeout=self.stage_timeout())
+                if retag_result.returncode == 0 and os.path.exists(retag_path):
+                    os.replace(retag_path, output_path)
+                else:
+                    self.logger.warning(
+                        "stabilize: cadence retag remux failed for %s; output keeps the "
+                        "mismatched carrier rate: %s",
+                        output_path,
+                        retag_result.stderr[:300],
+                    )
+                    if os.path.exists(retag_path):
+                        os.unlink(retag_path)
+
             stab_metadata: dict[str, Any] = {
                 # REQUIREMENTS.md § 6.4: stabilize is traditional-only
                 # (FFmpeg vidstab, no AI path) -- uniform provenance.
@@ -1101,6 +1155,12 @@ class StabilizeStage(BaseStage):
                 "zoom_coverage": self._zoom_coverage,
                 "static_zoom_pct": static_zoom_pct,
             }
+            stab_metadata.update(cadence_metadata(cadence_resolution))
+            if cadence_resolution.mismatch:
+                # § 12.5: any stage that legitimately retimes the stream
+                # must refresh true_framerate -- keyed on `fps_out`'s
+                # presence in core/pipeline.py's stage loop.
+                stab_metadata["fps_out"] = cadence_resolution.resolved_fps
             cadence = (input_info or {}).get("cadence")
             if cadence and not cadence.get("is_regular", True):
                 # REQUIREMENTS.md § 12.4b: the raw pipe's fixed carrier rate

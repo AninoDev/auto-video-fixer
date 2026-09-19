@@ -167,6 +167,8 @@ _VALUE_FLAGS = {
     "--from-file-parser",
     "--retime-min-duplicate-ratio",
     "--output-timing",
+    "--duration-guard",
+    "--duration-guard-tolerance",
     "--interpolate-target-approach",
     "--interpolate-direct-synthesis-max",
     "--interpolate-gap-fallback",
@@ -1199,6 +1201,24 @@ def _log_effective_settings(
     "normalization. Intermediates upstream of encode are always VFR-safe regardless.",
 )
 @click.option(
+    "--duration-guard",
+    default=None,
+    type=click.Choice(["warn", "fail", "off"]),
+    help="REQUIREMENTS.md § 19.2 duration invariant check (overrides pipeline.duration_guard; "
+    "default warn). After a duration-preserving stage produces a new output file, compares "
+    "its duration to its input's -- 'warn' logs loudly and records the mismatch on the job "
+    "result; 'fail' marks the offending stage FAILED instead (stops the run when combined "
+    "with pipeline.skip_stage_on_error=false); 'off' disables the check. speed/retime are "
+    "exempt (they legitimately change duration).",
+)
+@click.option(
+    "--duration-guard-tolerance",
+    type=float,
+    default=None,
+    help="Fraction an output's duration may differ from its input's before --duration-guard "
+    "fires (overrides pipeline.duration_guard_tolerance; default 0.05 = 5%).",
+)
+@click.option(
     "--resolution-fit-mode",
     default=None,
     type=click.Choice(["preserve_aspect", "snap_limiting"]),
@@ -1369,6 +1389,8 @@ def process(
     audio_sample_rate: int | None,
     audio_resampler: str | None,
     output_timing: str | None,
+    duration_guard: str | None,
+    duration_guard_tolerance: float | None,
     resolution_fit_mode: str | None,
     dimension_multiple: int | None,
     snap_tolerance: float | None,
@@ -1589,6 +1611,18 @@ def process(
         )
     if output_timing is not None:
         cli_candidates.append((("--output-timing",), ["general", "output_timing"], output_timing))
+    if duration_guard is not None:
+        cli_candidates.append(
+            (("--duration-guard",), ["pipeline", "duration_guard"], duration_guard)
+        )
+    if duration_guard_tolerance is not None:
+        cli_candidates.append(
+            (
+                ("--duration-guard-tolerance",),
+                ["pipeline", "duration_guard_tolerance"],
+                duration_guard_tolerance,
+            )
+        )
     if resolution_fit_mode is not None:
         cli_candidates.append(
             (

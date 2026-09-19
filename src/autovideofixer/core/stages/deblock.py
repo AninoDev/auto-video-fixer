@@ -6,6 +6,7 @@ import os
 import time
 from typing import Any
 
+from autovideofixer.core.cadence_guard import cadence_metadata, resolve_cadence
 from autovideofixer.core.ffmpeg_utils import probe, run_ffmpeg, timing_output_args
 from autovideofixer.core.stages.base import BaseStage, StageResult, StageStatus
 
@@ -345,6 +346,17 @@ class DeblockStage(BaseStage):
                         duration_sec=time.time() - start,
                     )
 
+                # REQUIREMENTS.md § 19.1: verify the writer's carrier rate
+                # (`fps`) against what actually came through before trusting
+                # it any further.
+                cadence_resolution = resolve_cadence(frames_written, probe_info.duration, fps)
+                if cadence_resolution.mismatch:
+                    self.logger.warning(
+                        "deblock: cadence/frame-count mismatch on %s: %s",
+                        input_path,
+                        cadence_resolution.reason,
+                    )
+
                 # Mux processed video back with the original audio (if any).
                 # The input may have no audio stream at all - mapping
                 # "0:a:0" unconditionally would make ffmpeg fail, and NOT
@@ -364,7 +376,15 @@ class DeblockStage(BaseStage):
                 # for no quality benefit. Stream-copying the already-encoded
                 # video track makes this mux bit-identical to the temp file's
                 # video stream.
-                mux_args = ["-i", input_path, "-i", temp_path]
+                mux_args = ["-i", input_path]
+                if cadence_resolution.mismatch:
+                    # § 19.1: re-interpret temp_path's frames at the
+                    # resolved (self-consistent) rate rather than the bad
+                    # carrier -- see UpscaleStage._run_single_ai_pass's
+                    # identical note for why `-r` before THIS `-i` works
+                    # with `-c:v copy` below.
+                    mux_args += ["-r", f"{cadence_resolution.resolved_fps:.6f}"]
+                mux_args += ["-i", temp_path]
                 mux_args += ["-map", "0:a:0", "-map", "1:v:0"] if has_audio else ["-map", "1:v:0"]
                 mux_args += ["-c:v", "copy", "-c:a", "copy", "-y", output_path]
                 mux_result = run_ffmpeg(mux_args, timeout=self.stage_timeout())
@@ -384,6 +404,9 @@ class DeblockStage(BaseStage):
                     "model": deblock_model,
                     "frames_processed": frames_written,
                 }
+                metadata.update(cadence_metadata(cadence_resolution))
+                if cadence_resolution.mismatch:
+                    metadata["fps_out"] = cadence_resolution.resolved_fps
                 cadence = (input_info or {}).get("cadence")
                 if cadence and not cadence.get("is_regular", True):
                     # See UpscaleStage._execute_ai's identical note -- the

@@ -8,6 +8,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Duration/cadence guard (REQUIREMENTS.md § 19): never silently emit a stretched video.**
+  Fixes a real incident where a stale `avf_framepipe` build made a raw-pipe stage re-expand a
+  235-frame retimed VFR intermediate back to 714 CFR frames, then tag those frames at the
+  recovered 9.864fps cadence (correct only for the 235-frame stream) -- silently producing a
+  72.4s output from a 23.8s input. Every stage reported COMPLETED and the run exited 0; nothing
+  checked. Two tripwires now guard against this class of bug:
+  - **§ 19.1, per-stage frame-count vs. cadence check.** New pure, unit-tested
+    `core/cadence_guard.py::resolve_cadence(actual_frames, input_duration, candidate_fps,
+    tolerance=0.15)` asserts `expected_frames ~= input_duration * candidate_fps` before a
+    raw-pipe stage (`upscale`, `deblock`, `denoise_video`, `interpolate`'s AI path,
+    `stabilize`'s raw pipe) trusts its writer's carrier framerate. On disagreement beyond
+    tolerance, it derives a self-consistent `resolved_fps = actual_frames / input_duration`
+    instead of the bad candidate, and the affected stage logs a WARNING (naming both numbers and
+    the likely cause -- VFR re-expanded to CFR, or a stale `avf_framepipe` build, § 12.6) and
+    records `cadence_mismatch`/`cadence_expected_frames`/`cadence_actual_frames` in its stage
+    metadata (reaches the per-job report and § 6.6 JSON run report, not just a log). The
+    corrected rate is applied by retagging the already-written temp file's timestamps at final
+    mux (`-r <resolved_fps>` immediately before that temp file's `-i`, combined with `-c:v
+    copy`) rather than re-encoding.
+  - **§ 19.2, pipeline-level duration invariant check.** After a stage produces a NEW output
+    file, `Pipeline.execute_job()` compares its duration to its input's, for any stage
+    declaring the new `BaseStage.preserves_duration = True` class attribute (the default --
+    only `speed`, which scales duration by `1/factor`, and `retime`, which may trim trailing
+    duplicate/padding frames, override it to `False`). New config `pipeline.duration_guard`
+    (`"warn"` default | `"fail"` | `"off"`) and `pipeline.duration_guard_tolerance` (default
+    `0.05`, i.e. 5%); `"warn"` logs loudly and records the discrepancy on
+    `JobResult.duration_guard_warnings` (also in the JSON run report), `"fail"` marks the
+    offending stage FAILED so `pipeline.skip_stage_on_error: false` stops the run instead of
+    building further stages on a broken intermediate. Fails open (no check, no false alarm) on
+    an unknown/zero duration on either side, since VFR containers (§ 12.3) legitimately hit
+    this. New CLI flags `--duration-guard warn|fail|off` and `--duration-guard-tolerance FLOAT`.
+    See `tests/unit/test_cadence_guard.py` and `tests/unit/test_pipeline.py`'s duration-guard
+    tests, including a regression test reproducing the incident's exact shape (a
+    duration-preserving stage whose output is ~3x its input's duration).
 - **Configurable audio speed method for the `speed` stage (`stages.speed.audio_method`).** The
   `speed` stage's audio path used to be `atempo` only -- pitch-preserving, but chained
   (`SpeedStage._build_atempo_chain`) for factors outside a single atempo's `[0.5, 100]` range, with
@@ -181,6 +215,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - See `docs/REQUIREMENTS.md` § 8 for the full rationale.
 
 ### Fixed
+- **Perceptual hashing / duplicate detection was completely non-functional.**
+  `rust/avf_hashing/src/lib.rs` invoked ffmpeg with the legacy `-vsync vfr`. ffmpeg has REMOVED
+  `-vsync` (long deprecated), so on ffmpeg 9 the sampling command aborted immediately with
+  "Unrecognized option 'vsync'". The spawn still succeeded and ffmpeg wrote zero bytes, so
+  `sample_frames()` returned empty and `compute_phash_rs` fell through its
+  `None => String::new()` path -- **every** video hashed to `""`, and since `hash_similarity`
+  returns 0.0 for empty input, nothing ever matched anything. `avf find-duplicates` silently
+  reported no duplicates for any input. Two things hid it: that call pipes stderr to null, and the
+  pure-Python fallback works fine -- but `compute_video_phash()` prefers the Rust path whenever the
+  extension is installed, which is the normal case after `uv sync`. Now uses `-fps_mode vfr`.
+  Verified: Rust and Python hashes agree at 0.969 similarity, and `find-duplicates` correctly
+  matches a CRF-34 recompress and a 2x downscale at 98.4% while rejecting unrelated content.
+  `-vsync` appeared exactly once in the codebase. This is what the six long-standing
+  `tests/unit/test_hashing.py` failures were; the suite is now fully green.
 - **Live progress bars no longer garble the console.** Rich coordinates output only between
   writers sharing one `Console` object. `process`'s per-job report tables already printed through
   the same console `ProgressReporter` was handed, so they interleaved correctly -- but the log

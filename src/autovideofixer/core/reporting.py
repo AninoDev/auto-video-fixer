@@ -95,6 +95,11 @@ def job_summary_line(result: "JobResult") -> str:
         parts.append(
             f"scenes={ss.get('kept')}/{ss.get('total')} kept ({ss.get('dropped')} dropped)"
         )
+    if result.duration_guard_warnings:
+        # REQUIREMENTS.md § 19.2: never let a duration-guard mismatch be
+        # visible only in a log line nobody reads -- surface it in the same
+        # per-job summary § 6.4's table/console output is built from.
+        parts.append(f"duration_guard_mismatches={len(result.duration_guard_warnings)}")
     parts.append(f"job_wall_ms={result.job_wall_ms:.1f}")
     parts.append(f"processing_ms={result.processing_ms:.1f}")
     return f"{os.path.basename(result.input_path)}: " + ", ".join(parts)
@@ -289,6 +294,12 @@ def job_to_json(jr: "JobResult") -> dict[str, Any]:
         "input_info": redact_secrets(jr.input_info),
         "output_info": redact_secrets(jr.output_info),
         "scene_stats": jr.scene_stats,
+        # REQUIREMENTS.md § 19.2: job-level summary of every duration-guard
+        # mismatch (warn and fail mode both populate this); the per-stage
+        # `cadence_mismatch`/`duration_guard_mismatch` fields (§ 19.1/19.2)
+        # already reach this report via each stage's own "metadata" key
+        # below, redacted the same as any other stage metadata.
+        "duration_guard_warnings": list(jr.duration_guard_warnings),
         "job_wall_ms": jr.job_wall_ms,
         "processing_ms": jr.processing_ms,
         "quality_score": jr.quality_score,

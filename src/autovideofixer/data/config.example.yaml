@@ -474,6 +474,40 @@ pipeline:
   # indicates real breakage, not a long input.
   stage_timeout: null
 
+  # REQUIREMENTS.md § 19.2: duration invariant check -- the pipeline-level catch-all half of
+  # the duration/cadence guard (§ 19.1's per-stage frame-count check, in core/cadence_guard.py
+  # and the raw-pipe stages, is the other half). After a stage that declares
+  # `preserves_duration = True` (BaseStage's default; `speed` and `retime` are the only stages
+  # that override it to False, since they legitimately change duration) produces a NEW output
+  # file, Pipeline.execute_job() compares that file's duration to its input's.
+  #
+  # This exists because of a real incident: a stale `avf_framepipe` build (see the § 12.6
+  # build-gotcha referenced near stages.retime below) made a raw-pipe stage re-expand a
+  # 235-frame retimed VFR intermediate back to 714 CFR frames, then tag those 714 frames at the
+  # recovered 9.864fps cadence -- correct only for the 235-frame stream -- producing a 72.4s
+  # output from a 23.8s input. Every stage reported COMPLETED, the run exited 0, and nothing
+  # checked. This guard is the tripwire: it would have caught that 3x disagreement even with no
+  # per-stage cadence awareness at all.
+  #
+  # "warn" (default): log loudly (WARNING) and record the discrepancy on the job result
+  # (JobResult.duration_guard_warnings, also in the § 6.6 JSON run report) -- the job still
+  # completes. "fail": mark the offending stage FAILED instead, so
+  # pipeline.skip_stage_on_error: false stops the run rather than building further stages on a
+  # broken intermediate (with the default skip_stage_on_error: true, a "fail" verdict here
+  # behaves like any other stage failure: logged as an error, pipeline continues from the
+  # pre-stage file). "off" disables the check entirely. Defaults to "warn" rather than "fail":
+  # duration estimates from container metadata are not always exact (VFR files especially --
+  # see § 12.3's note on `avg_frame_rate` being unreliable there), and a guard that fails good
+  # jobs on false alarms is worse than one that flags bad ones loudly. A duration that's
+  # unknown/zero on either side (common for VFR containers) skips the check rather than
+  # dividing by zero or firing a false alarm. CLI: --duration-guard warn|fail|off.
+  duration_guard: warn
+
+  # Fraction (0.05 = 5%) an output's duration may differ from its input's before
+  # pipeline.duration_guard fires, for a stage that declares preserves_duration: true.
+  # CLI: --duration-guard-tolerance FLOAT.
+  duration_guard_tolerance: 0.05
+
 stages:
   # Per-stage timeout override: EVERY stage accepts an optional `timeout:` key (not listed
   # explicitly on each stage below since it's absent -> inherits the global default), resolved

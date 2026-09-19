@@ -1484,6 +1484,38 @@ per-run number baked into this codebase.
   for the pattern; do not sanitize the whole f-string blindly if it also contains deliberate Rich
   markup (`[red]...[/red]`) the code itself emits.
 
+- **Duration/cadence guard (REQUIREMENTS.md § 19)**: a real incident -- a stale `avf_framepipe`
+  build (missing the § 12.4b reader fix above) made a raw-pipe stage re-expand a 235-frame
+  retimed VFR intermediate back to 714 CFR frames, then tag those 714 frames at the recovered
+  9.864fps cadence (correct only for the 235-frame stream), silently producing a 72.4s output
+  from a 23.8s input. Every stage reported COMPLETED, the run exited 0, nothing checked. Two
+  tripwires now guard against this class of bug:
+  - **§ 19.1, per-stage**: `core/cadence_guard.py`'s pure `resolve_cadence(actual_frames,
+    input_duration, candidate_fps, tolerance=0.15)` checks `expected_frames ~=
+    input_duration * candidate_fps` before a raw-pipe stage (`upscale`, `deblock`,
+    `denoise_video`, `interpolate` AI, `stabilize`'s raw pipe) trusts its writer's carrier fps.
+    On a mismatch it derives a self-consistent `resolved_fps = actual_frames / input_duration`
+    instead, logs a WARNING naming both numbers, and records `cadence_mismatch`/
+    `cadence_expected_frames`/`cadence_actual_frames` in stage metadata. The FIX is applied at
+    each stage's final mux: `-r <resolved_fps>` is placed immediately before the `-i` for the
+    already-written (bad-carrier) temp file -- an ffmpeg input option only governs the input it
+    precedes, so with `-c:v copy` this retags the copied video track's timestamps to the
+    corrected rate without re-encoding (`stabilize`, which has no later mux step, does one cheap
+    extra stream-copy remux in place instead). See `UpscaleStage._run_single_ai_pass` for the
+    canonical worked example; `deblock.py`/`denoise_video.py`/`interpolate.py`/`stabilize.py`
+    mirror it.
+  - **§ 19.2, pipeline-level catch-all**: `Pipeline._check_duration_guard()` (`core/pipeline.py`)
+    compares a stage's output duration to its input's after every stage that produces a NEW
+    file, for any stage with `BaseStage.preserves_duration = True` (the default -- `speed` and
+    `retime` are the only stages that override it to `False`, since they legitimately change
+    duration). Controlled by `pipeline.duration_guard` (`warn` default | `fail` | `off`) and
+    `pipeline.duration_guard_tolerance` (default `0.05`). `warn` logs loudly and records the
+    mismatch on `JobResult.duration_guard_warnings` (also in the § 6.6 JSON report); `fail`
+    flips that stage's `StageResult` to FAILED so `pipeline.skip_stage_on_error: false` stops the
+    run. Fails open (no check) on an unknown/zero duration on either side -- VFR containers (§
+    12.3) and the mocked probes most pipeline tests use both legitimately hit this. CLI:
+    `--duration-guard warn|fail|off`, `--duration-guard-tolerance FLOAT`.
+
 ## Known bugs / pitfalls to avoid
 
 The bugs formerly listed here (`cb` scoping crash in chunked AI paths, `upscaled`/`all_upscaled`

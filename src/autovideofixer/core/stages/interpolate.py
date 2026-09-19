@@ -8,6 +8,7 @@ import time
 from dataclasses import dataclass
 from typing import Any, Iterator
 
+from autovideofixer.core.cadence_guard import cadence_metadata, resolve_cadence
 from autovideofixer.core.ffmpeg_utils import probe, run_ffmpeg
 from autovideofixer.core.stages.base import BaseStage, StageResult, StageStatus
 
@@ -956,6 +957,19 @@ class InterpolateStage(BaseStage):
                     duration_sec=time.time() - start,
                 )
 
+            # REQUIREMENTS.md § 19.1: verify the RIFE writer's carrier rate
+            # (`fps` = source_fps * factor) against what actually came
+            # through before trusting it any further -- checked against the
+            # ORIGINAL input's duration (probe_info.duration), which is
+            # unaffected by anything downstream of this raw pipe.
+            cadence_resolution = resolve_cadence(frames_written, probe_info.duration, fps)
+            if cadence_resolution.mismatch:
+                self.logger.warning(
+                    "interpolate: cadence/frame-count mismatch on %s: %s",
+                    input_path,
+                    cadence_resolution.reason,
+                )
+
             # Hybrid finish pass: the RIFE temp above is at intermediate_fps
             # (an exact integer multiple of current_fps), short of the exact
             # target -- run ONE minterpolate pass over it (video only) to
@@ -978,9 +992,18 @@ class InterpolateStage(BaseStage):
                     f".avf_interp_finish_{os.path.splitext(os.path.basename(input_path))[0]}.mkv",
                 )
                 finish_vf = self._minterpolate_filter(target_fps)
-                finish_args = [
-                    "-i",
-                    temp_path,
+                finish_args = ["-i", temp_path]
+                if cadence_resolution.mismatch:
+                    # § 19.1: re-interpret temp_path's frames at the
+                    # resolved (self-consistent) rate before minterpolate
+                    # resamples them to target_fps -- otherwise minterpolate
+                    # faithfully retimes the WRONG (bad-carrier) timeline,
+                    # reproducing the same stretched duration one step
+                    # later. See UpscaleStage._run_single_ai_pass's
+                    # identical note on placing `-r` before the `-i` it
+                    # governs.
+                    finish_args = ["-r", f"{cadence_resolution.resolved_fps:.6f}", *finish_args]
+                finish_args += [
                     "-vf",
                     finish_vf,
                     "-an",
@@ -1025,7 +1048,15 @@ class InterpolateStage(BaseStage):
                 # target_fps) -- either way it's already fully encoded once,
                 # so this mux still stream-copies the video track.
                 has_audio = probe_info.has_audio
-                mux_args = ["-i", input_path, "-i", video_source_for_mux]
+                mux_args = ["-i", input_path]
+                if cadence_resolution.mismatch and not plan.run_minterpolate_finish:
+                    # § 19.1: no finish pass ran to already correct this (the
+                    # finish-pass branch above applies the same fix on ITS
+                    # own `-i temp_path`) -- video_source_for_mux is still
+                    # the raw RIFE temp with the bad carrier baked in, so fix
+                    # it here instead.
+                    mux_args += ["-r", f"{cadence_resolution.resolved_fps:.6f}"]
+                mux_args += ["-i", video_source_for_mux]
                 if has_audio:
                     mux_args += ["-map", "0:a:0", "-map", "1:v:0"]
                 else:
@@ -1059,6 +1090,7 @@ class InterpolateStage(BaseStage):
                     "frames_in": orig_count,
                     "frames_out": frames_written,
                 }
+                interp_metadata.update(cadence_metadata(cadence_resolution))
                 cadence = (input_info or {}).get("cadence")
                 if cadence and not cadence.get("is_regular", True):
                     # REQUIREMENTS.md § 12.4b: the raw-pipe writer's fixed
@@ -1422,9 +1454,26 @@ class InterpolateStage(BaseStage):
                     duration_sec=time.time() - start,
                 )
 
+            # REQUIREMENTS.md § 19.1: verify the writer's carrier rate
+            # (`target_fps` -- this path's output IS the target grid, no
+            # finish pass) against what actually came through.
+            cadence_resolution = resolve_cadence(frames_written, probe_info.duration, target_fps)
+            if cadence_resolution.mismatch:
+                self.logger.warning(
+                    "interpolate (adaptive): cadence/frame-count mismatch on %s: %s",
+                    input_path,
+                    cadence_resolution.reason,
+                )
+
             try:
                 has_audio = probe_info.has_audio
-                mux_args = ["-i", input_path, "-i", temp_path]
+                mux_args = ["-i", input_path]
+                if cadence_resolution.mismatch:
+                    # § 19.1: re-interpret temp_path's frames at the resolved
+                    # rate instead of the bad carrier -- see
+                    # UpscaleStage._run_single_ai_pass's identical note.
+                    mux_args += ["-r", f"{cadence_resolution.resolved_fps:.6f}"]
+                mux_args += ["-i", temp_path]
                 if has_audio:
                     mux_args += ["-map", "0:a:0", "-map", "1:v:0"]
                 else:
@@ -1444,30 +1493,32 @@ class InterpolateStage(BaseStage):
                 self._report_progress(
                     1.0, "Adaptive AI frame interpolation complete", progress_callback
                 )
+                adaptive_metadata: dict[str, Any] = {
+                    "method": "ai",
+                    "model": self._ai_model,
+                    "adaptive": True,
+                    "fps_out": target_fps,
+                    "frames_in": total_original_frames,
+                    "frames_out": frames_written,
+                    "frames_synthesized": stats["frames_synthesized"],
+                    "frames_passed_through": stats["frames_passed_through"],
+                    "gaps_capped": stats["gaps_capped"],
+                    # § 16.7 -- how many gaps needed recursive
+                    # subdivision (more than direct_synthesis_max
+                    # intermediates) and the deepest recursion level
+                    # used anywhere in this run (0 if none did).
+                    "gaps_subdivided": stats["gaps_subdivided"],
+                    "max_subdivision_depth": stats["max_subdivision_depth"],
+                    # § 16.1.2/16.6: the adaptive output lands on the
+                    # target grid exactly -- timing is honoured, never
+                    # linearized, on this path.
+                    "timeline_linearized": False,
+                }
+                adaptive_metadata.update(cadence_metadata(cadence_resolution))
                 return StageResult(
                     status=StageStatus.COMPLETED,
                     output_path=output_path,
-                    metadata={
-                        "method": "ai",
-                        "model": self._ai_model,
-                        "adaptive": True,
-                        "fps_out": target_fps,
-                        "frames_in": total_original_frames,
-                        "frames_out": frames_written,
-                        "frames_synthesized": stats["frames_synthesized"],
-                        "frames_passed_through": stats["frames_passed_through"],
-                        "gaps_capped": stats["gaps_capped"],
-                        # § 16.7 -- how many gaps needed recursive
-                        # subdivision (more than direct_synthesis_max
-                        # intermediates) and the deepest recursion level
-                        # used anywhere in this run (0 if none did).
-                        "gaps_subdivided": stats["gaps_subdivided"],
-                        "max_subdivision_depth": stats["max_subdivision_depth"],
-                        # § 16.1.2/16.6: the adaptive output lands on the
-                        # target grid exactly -- timing is honoured, never
-                        # linearized, on this path.
-                        "timeline_linearized": False,
-                    },
+                    metadata=adaptive_metadata,
                     duration_sec=time.time() - start,
                 )
             finally:
