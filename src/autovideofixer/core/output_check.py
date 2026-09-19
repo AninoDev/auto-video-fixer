@@ -254,7 +254,27 @@ def resolution_satisfies(
     bound_w, bound_h = effective_target_bounds(
         existing_width, existing_height, target_width, target_height, keep_aspect_ratio
     )
-    scale_needed = max(bound_w / existing_width, bound_h / existing_height)
+    if keep_aspect_ratio:
+        # An aspect-preserving fit into a bounding box only ever touches ONE
+        # bound -- the other stays short by exactly the aspect mismatch. A 4:3
+        # source fitted into a 1920x1080 box is 1440x1080: correct, complete,
+        # and at the target height, but 480px short of the target WIDTH.
+        # Requiring BOTH bounds (max(...)) therefore flagged every output whose
+        # aspect ratio isn't exactly the target's as a spec mismatch --
+        # measured: 4:3 1440x1080, ultrawide 1920x540 and portrait 1080x1440 all
+        # reported "resolution 1440x1080<1920x1080" and got renamed/reprocessed
+        # despite being exactly what compute_fitted_dimensions() produces.
+        #
+        # min(...) is the correct test: the output satisfies the target once
+        # EITHER dimension has reached its bound (within threshold), which is
+        # precisely the aspect-preserving fit condition. A genuinely
+        # undersized output is still caught, because BOTH ratios exceed the
+        # threshold then (960x540 into 1920x1080 -> min(2.0, 2.0) = 2.0).
+        scale_needed = min(bound_w / existing_width, bound_h / existing_height)
+    else:
+        # keep_aspect_ratio=False means a stretch-to-fill was requested, so the
+        # output is expected to meet both bounds exactly -- unchanged.
+        scale_needed = max(bound_w / existing_width, bound_h / existing_height)
     return scale_needed <= threshold
 
 

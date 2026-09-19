@@ -93,3 +93,36 @@ class TestPipelinePropagatesAnyFpsOut:
 
         assert result.status.name == "COMPLETED"
         assert isinstance(result.metadata.get("fps_out"), float)
+
+
+class TestFpsOutProbeFallback:
+    """A missing input rate must be probed, never silently skipped.
+
+    Omitting `fps_out` leaves `input_info["true_framerate"]` stale at the
+    PRE-speed rate. A later `interpolate` occurrence then sees "already at or
+    above target framerate" and skips, so slow motion is never re-interpolated
+    and the deliverable lands at the reduced rate (e.g. 15fps under a 60fps
+    preset) instead of the target.
+    """
+
+    def test_empty_input_info_falls_back_to_probing_the_file(self):
+        class _Probe:
+            framerate = 60.0
+
+        with patch("autovideofixer.core.ffmpeg_utils.probe", return_value=_Probe()):
+            result = _run(0.25, {})
+
+        assert result.metadata["fps_in"] == 60.0
+        assert result.metadata["fps_out"] == 15.0, (
+            "speed omitted fps_out when input_info carried no rate -- "
+            "true_framerate stays stale and a chained interpolate will skip"
+        )
+
+    def test_probe_failure_still_never_fails_the_stage(self):
+        with patch(
+            "autovideofixer.core.ffmpeg_utils.probe", side_effect=RuntimeError("probe died")
+        ):
+            result = _run(0.25, {})
+
+        assert result.status.name == "COMPLETED"
+        assert "fps_out" not in result.metadata

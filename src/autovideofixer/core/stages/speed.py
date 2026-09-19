@@ -282,6 +282,22 @@ class SpeedStage(BaseStage):
                 in_fps = float(info.get("true_framerate") or info.get("framerate") or 0.0)
             except TypeError, ValueError:
                 in_fps = 0.0
+            if in_fps <= 0:
+                # Last resort: probe the file directly. Silently omitting
+                # fps_out leaves input_info["true_framerate"] STALE at the
+                # PRE-speed rate, and a stale rate is actively harmful: a later
+                # `interpolate` occurrence then sees "already at or above target
+                # framerate" and skips, so slow motion never gets
+                # re-interpolated and the deliverable comes out at the reduced
+                # rate (e.g. 15fps instead of the preset's 60). One extra probe
+                # is far cheaper than that failure.
+                try:
+                    from autovideofixer.core.ffmpeg_utils import probe as _probe
+
+                    in_fps = float(_probe(input_path).framerate or 0.0)
+                except Exception as e:  # never fail the stage over this
+                    self.logger.debug(f"speed: could not probe input framerate: {e}")
+                    in_fps = 0.0
 
             metadata: dict[str, Any] = {
                 # REQUIREMENTS.md § 6.4: speed is traditional-only (FFmpeg

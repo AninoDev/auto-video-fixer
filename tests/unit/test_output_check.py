@@ -175,3 +175,41 @@ class TestEffectiveOutputTargets:
         targets = effective_output_targets(config, make_job())
         assert targets.video_codec is None
         assert targets.audio_codec is None
+
+
+class TestAspectPreservedOutputsSatisfyTheTarget:
+    """An aspect-preserving fit only ever touches ONE bound of the target box.
+
+    A 4:3 source fitted into a 1920x1080 box is 1440x1080 -- correct, complete,
+    and already at the target HEIGHT, but 480px short of the target width.
+    `resolution_satisfies()` required BOTH bounds, so every output whose aspect
+    ratio wasn't exactly the target's was reported as a spec mismatch and got
+    renamed/reprocessed despite being exactly what `compute_fitted_dimensions()`
+    produces. Measured before the fix: 4:3 1440x1080, ultrawide 1920x540 AND
+    portrait 1080x1440 all failed against a 1920x1080 target.
+    """
+
+    TARGET = (1920, 1080)
+
+    def test_four_three_output_satisfies_1080p_box(self):
+        assert resolution_satisfies(1440, 1080, *self.TARGET, keep_aspect_ratio=True)
+
+    def test_sixteen_nine_output_still_satisfies(self):
+        assert resolution_satisfies(1920, 1080, *self.TARGET, keep_aspect_ratio=True)
+
+    def test_ultrawide_output_satisfies(self):
+        assert resolution_satisfies(1920, 540, *self.TARGET, keep_aspect_ratio=True)
+
+    def test_portrait_output_satisfies_rotated_bounds(self):
+        assert resolution_satisfies(1080, 1440, *self.TARGET, keep_aspect_ratio=True)
+
+    def test_genuinely_undersized_output_is_still_a_mismatch(self):
+        """The guard must not become a rubber stamp."""
+        assert not resolution_satisfies(960, 540, *self.TARGET, keep_aspect_ratio=True)
+
+    def test_undersized_four_three_output_is_still_a_mismatch(self):
+        assert not resolution_satisfies(720, 540, *self.TARGET, keep_aspect_ratio=True)
+
+    def test_stretch_mode_still_requires_both_bounds(self):
+        """keep_aspect_ratio=False asked for a fill, so both bounds apply."""
+        assert not resolution_satisfies(1440, 1080, *self.TARGET, keep_aspect_ratio=False)
