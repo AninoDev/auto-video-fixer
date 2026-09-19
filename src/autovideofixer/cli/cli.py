@@ -174,6 +174,7 @@ _VALUE_FLAGS = {
     "--interpolate-gap-fallback",
     "--interpolate-max-intermediates-per-gap",
     "--interpolate-max-gap-sec",
+    "--symlinks",
 }
 
 # Boolean/flag-value options that map to a config key -- recorded with a
@@ -919,6 +920,16 @@ def _log_effective_settings(
     help="Explicit output filename (only valid with exactly one input file)",
 )
 @click.option("--recursive", "-r", is_flag=True, help="Scan directories recursively")
+@click.option(
+    "--symlinks",
+    default=None,
+    type=click.Choice(["files_only", "follow", "skip"]),
+    help="How directory scanning treats symlinks (overrides general.symlinks; default "
+    "files_only). 'files_only': a symlinked file is picked up, a symlinked directory is "
+    "never descended into. 'follow': also descend into symlinked directories (guards "
+    "against symlink loops). 'skip': ignore every symlink, file or directory. See "
+    "docs/REQUIREMENTS.md § 21.",
+)
 @click.option("--dry-run", is_flag=True, help="Show what would be done without processing")
 @click.option("--list-presets", "list_presets_flag", is_flag=True, help="List available presets")
 @click.option(
@@ -1353,6 +1364,7 @@ def process(
     output: str | None,
     output_name: str | None,
     recursive: bool,
+    symlinks: str | None,
     dry_run: bool,
     list_presets_flag: bool,
     stages: tuple[str, ...],
@@ -1611,6 +1623,8 @@ def process(
         )
     if output_timing is not None:
         cli_candidates.append((("--output-timing",), ["general", "output_timing"], output_timing))
+    if symlinks is not None:
+        cli_candidates.append((("--symlinks",), ["general", "symlinks"], symlinks))
     if duration_guard is not None:
         cli_candidates.append(
             (("--duration-guard",), ["pipeline", "duration_guard"], duration_guard)
@@ -1818,10 +1832,14 @@ def process(
     # output_override comes from a --from-file spec's per-entry output
     # (csv 'output' column / json "output" key) and is None for everything
     # else, falling through to the normal add_job()-computed output path.
+    symlinks_policy = config.get("general", "symlinks", default="files_only")
     resolved_inputs: list[tuple[str, str | None]] = []
     for path in paths:
         if os.path.isdir(path):
-            resolved_inputs.extend((f, None) for f in scan_directory(path, recursive=recursive))
+            resolved_inputs.extend(
+                (f, None)
+                for f in scan_directory(path, recursive=recursive, symlinks=symlinks_policy)
+            )
         elif is_video_file(path):
             resolved_inputs.append((path, None))
         else:
@@ -1858,7 +1876,10 @@ def process(
             if os.path.isdir(input_path):
                 entry_recursive = spec.recursive if spec.recursive is not None else recursive
                 resolved_inputs.extend(
-                    (f, None) for f in scan_directory(input_path, recursive=entry_recursive)
+                    (f, None)
+                    for f in scan_directory(
+                        input_path, recursive=entry_recursive, symlinks=symlinks_policy
+                    )
                 )
                 continue
             if not is_video_file(input_path):
@@ -2442,6 +2463,14 @@ def config_upgrade(
 @click.option("--no-clip", "clip_output", flag_value="", help="Skip clip extraction")
 @click.option("--recursive", "-r", is_flag=True, help="Scan directories recursively")
 @click.option(
+    "--symlinks",
+    default=None,
+    type=click.Choice(["files_only", "follow", "skip"]),
+    help="How directory scanning treats symlinks (overrides general.symlinks; default "
+    "files_only). See `avf process --help` for the three modes, and docs/REQUIREMENTS.md "
+    "§ 21.",
+)
+@click.option(
     "--scene-threshold",
     "scene_threshold",
     type=float,
@@ -2540,6 +2569,7 @@ def analyze(
     classify_events: bool,
     clip_output: str | None,
     recursive: bool,
+    symlinks: str | None,
     scene_threshold: float | None,
     min_scene_duration: float | None,
     full_output: bool,
@@ -2565,10 +2595,15 @@ def analyze(
 
     analyzer = VideoAnalyzer(config)
 
+    symlinks_policy = (
+        symlinks
+        if symlinks is not None
+        else config.get("general", "symlinks", default="files_only")
+    )
     input_files: list[str] = []
     for path in paths:
         if os.path.isdir(path):
-            input_files.extend(scan_directory(path, recursive=recursive))
+            input_files.extend(scan_directory(path, recursive=recursive, symlinks=symlinks_policy))
         elif is_video_file(path):
             input_files.append(path)
         else:
@@ -2698,15 +2733,34 @@ def analyze(
 @click.argument("reference")
 @click.argument("directory")
 @click.option("--threshold", type=float, default=0.85, help="Similarity threshold (0-1)")
+@click.option(
+    "--symlinks",
+    default=None,
+    type=click.Choice(["files_only", "follow", "skip"]),
+    help="How directory scanning treats symlinks (overrides general.symlinks; default "
+    "files_only). See `avf process --help` for the three modes, and docs/REQUIREMENTS.md "
+    "§ 21.",
+)
 @click.pass_context
-def find_duplicates(ctx: click.Context, reference: str, directory: str, threshold: float) -> None:
+def find_duplicates(
+    ctx: click.Context,
+    reference: str,
+    directory: str,
+    threshold: float,
+    symlinks: str | None,
+) -> None:
     """Find similar/duplicate videos in a directory."""
     config = ctx.obj["config"]
     from autovideofixer.core.analysis import VideoAnalyzer
 
     analyzer = VideoAnalyzer(config)
 
-    candidates = scan_directory(directory)
+    symlinks_policy = (
+        symlinks
+        if symlinks is not None
+        else config.get("general", "symlinks", default="files_only")
+    )
+    candidates = scan_directory(directory, symlinks=symlinks_policy)
     console.print(f"Comparing {_safe(reference)} against {len(candidates)} candidate(s)...")
 
     results = analyzer.find_similar(reference, candidates, threshold)

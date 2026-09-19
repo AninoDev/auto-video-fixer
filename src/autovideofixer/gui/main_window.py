@@ -200,7 +200,8 @@ class MainWindow(QMainWindow):
         """Open directory dialog and scan for videos."""
         directory = QFileDialog.getExistingDirectory(self, "Select Directory")
         if directory:
-            videos = scan_directory(directory, recursive=True)
+            symlinks_policy = self.config.get("general", "symlinks", default="files_only")
+            videos = scan_directory(directory, recursive=True, symlinks=symlinks_policy)
             for v in videos:
                 self._add_job_to_table(v)
             self.gui_status.setText(f"Added {len(videos)} video(s) from directory")

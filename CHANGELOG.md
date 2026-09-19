@@ -8,6 +8,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **`deinterlace` stage (REQUIREMENTS.md § 20): convert interlaced (fielded) content to
+  progressive frames.** New stage runs right after `retime`, before `crop` in
+  `pipeline.default_order`, so every downstream stage (crop bounds, scene detection, RIFE
+  interpolation) sees comb-free frames instead of comb-striped ones. **Off by default**
+  (`stages.deinterlace.enabled: false`) -- detection uses ffmpeg's `idet` filter, which is a
+  heuristic that false-positives on detailed progressive motion (measured on the reference build,
+  ffmpeg n9.0.1: a progressive `testsrc2` clip reported `TFF: 31, Progressive: 0`, genuinely
+  interlaced content reported `TFF: 50, Progressive: 0`, and a static progressive clip reported
+  `Undetermined: 50`), so this must never auto-enable off a probe -- opt in explicitly. Three
+  output-rate modes (`stages.deinterlace.mode`): `frame` (one progressive frame per input frame,
+  half the field rate, e.g. 50i -> 25p), `field` (default once enabled -- one frame per field,
+  full motion, e.g. 50i -> 50p, `<filter>=mode=1`) and `bob` (each field line-doubled to full
+  height at the full field rate, built from a separate filter-independent
+  `setfield`+`separatefields`+`scale` chain since none of the four supported filters expose a
+  literal line-doubling mode). `field`/`bob` report `fps_out` in stage metadata (§ 12.5) so the
+  pipeline's `fps_out`-presence propagation keeps `input_info["true_framerate"]` current --
+  without it `encode`'s CFR path would pin the pre-deinterlace rate. Filter choice
+  (`stages.deinterlace.filter`): `bwdif` (default), `yadif`, `w3fdif`, `estdif`. Field order
+  (`stages.deinterlace.field_order`): `auto` (default -- from `idet`, requiring the interlaced
+  fraction of *classified* frames, excluding `Undetermined`, to strictly exceed
+  `stages.deinterlace.min_interlaced_ratio` (default 0.7), else SKIPs with the raw counts in the
+  skip reason) or an explicit `tff`/`bff` (skips `idet` detection entirely). A detection failure
+  fails open (WARNING log, SKIP -- never FAILs a job over a detection problem), matching
+  `analyze_cadence()`'s convention. Does NOT implement REQUIREMENTS.md § 20.3 (recovering
+  interlaced content from an already-progressive/line-doubled conversion) -- deliberately
+  deferred, blocked on real affected samples.
+- **Symlink policy for directory scanning (REQUIREMENTS.md § 21).** New `general.symlinks` /
+  CLI `--symlinks`: `"files_only"` (default -- today's original behavior, now documented rather
+  than accidental: a symlinked file is picked up, a symlinked directory is never descended into),
+  `"follow"` (also descend into symlinked directories, with a loop guard against `a -> b -> a`
+  cycles), or `"skip"` (ignore every symlink, file or directory -- tested on the entry itself,
+  not the resolved target). Fixes an inconsistency where `scan_directory()` silently treated
+  symlinked files and symlinked directories differently with no way to control or even observe
+  it. Threaded through every caller: `process` (including `--from-file` directory expansion),
+  `analyze`, `find-duplicates`, and the GUI's "Add Directory" button.
 - **Duration/cadence guard (REQUIREMENTS.md § 19): never silently emit a stretched video.**
   Fixes a real incident where a stale `avf_framepipe` build made a raw-pipe stage re-expand a
   235-frame retimed VFR intermediate back to 714 CFR frames, then tag those frames at the

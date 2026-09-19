@@ -1829,3 +1829,101 @@ ones. It must be loud enough to notice and visible in the report.
 This does not attempt to detect *quality* regressions, only gross structural ones (wrong frame
 count, wrong duration). It is a tripwire for a class of silent corruption, not a correctness
 proof.
+
+## 20. Deinterlacing (PLANNED 2026-09-19, user-approved)
+
+**Problem**: AVF has no deinterlace stage at all. Interlaced input passes through untouched, so
+combing artefacts survive into the output and every later stage (crop bounds, scene detection,
+RIFE interpolation) operates on comb-striped frames.
+
+### 20.1 The `deinterlace` stage
+
+Runs early -- after `detect`/`retime`, before `crop` -- since every downstream stage benefits from
+seeing progressive frames, and comb artefacts actively corrupt motion-based analysis.
+
+**Output rate modes** (`stages.deinterlace.mode`):
+
+- **`frame`** — one progressive frame per input *frame*, i.e. half the field rate. 50i -> 25p.
+  `yadif=mode=0` / `bwdif=mode=0`. Lowest cost, discards half the temporal information.
+- **`field`** (default) — one progressive frame per *field*, preserving full motion. 50i -> 50p.
+  `yadif=mode=1` / `bwdif=mode=1`. This is what makes interlaced content look right, and it
+  doubles the frame count, so it must report `fps_out` (§ 12.5 propagation) or `encode` will pin
+  the pre-deinterlace rate.
+- **`bob`** — each field line-doubled to full height at the full field rate. Cheapest, visibly
+  softer; included because it is what some sources were themselves produced with (see 20.3).
+
+**Filters** (`stages.deinterlace.filter`): `bwdif` (default -- best quality of the motion-adaptive
+set), `yadif` (fastest, most familiar), `w3fdif`, `estdif`. All four are present in the reference
+build (ffmpeg n9.0.1). CUDA variants (`yadif_cuda`, `bwdif_cuda`) exist but are out of scope for
+v1: the stage is an ffmpeg filter pass, not part of the raw-frame AI pipe.
+
+**Field order** (`stages.deinterlace.field_order`): `auto` (default, from `idet`) | `tff` | `bff`.
+Getting this backwards produces juddering worse than leaving the content interlaced, so it must be
+overridable.
+
+### 20.2 Detection, and why it is opt-in
+
+`idet` reports per-frame TFF/BFF/Progressive/Undetermined counts. It works, but it is a heuristic
+and **it false-positives on detailed progressive motion** — measured on the reference build, a
+progressive `testsrc2` clip reported `TFF: 31, Progressive: 0`, while genuinely interlaced content
+reported `TFF: 50, Progressive: 0` and a static progressive clip reported `Undetermined: 50`.
+
+Consequences for the design:
+
+- `stages.deinterlace.enabled` defaults to **false**. Deinterlacing progressive content is
+  destructive (it halves either resolution or frame rate for no reason), so this must never
+  auto-enable off a heuristic.
+- When enabled with `field_order: auto`, require a strong majority: interlaced classification must
+  exceed `min_interlaced_ratio` (default 0.7) of *classified* frames, with Undetermined excluded
+  from the denominator. Below that, SKIP with the counts in the skip reason rather than guessing.
+- Report the raw `idet` counts in stage metadata so a wrong call is diagnosable after the fact.
+
+### 20.3 Recovering interlaced content from a progressive conversion (DEFERRED — not v1)
+
+The user also asked for detection of interlaced material that was already converted to progressive
+(each field line-doubled to full height), recovery of the original fields, and generation of a
+correct double-rate progressive output.
+
+This is **not** a small addition and is deliberately excluded from v1. The mechanics of the
+recovery are tractable — `separatefields` to split, drop the duplicated lines, `weave`/`il` to
+reassemble, then deinterlace normally — but the *detection* is the hard part, and a wrong
+detection destroys real vertical resolution:
+
+- The obvious test (are adjacent row pairs near-identical?) is strongly content-dependent. An
+  initial probe on synthetic sources was inconclusive because `smptebars` and `testsrc2` contain
+  large vertically-constant regions, which score identically to genuine line-doubling.
+- Distinguishing "line-doubled from a field" from "genuinely soft or upscaled vertically" needs
+  the *phase* to alternate per frame (field parity), which is the signal worth building on — a
+  real detector should test that alternation across frames, not per-frame row similarity.
+- There is no ffmpeg filter for this; it needs a real detector plus validation against actual
+  affected material.
+
+**Blocked on real samples.** This needs to be designed against genuine affected files rather than
+synthetic approximations, because the whole difficulty is telling real line-doubling from content
+that merely looks like it. Revisit as its own requirement with samples in hand.
+
+## 21. Symlink policy when scanning for inputs (PLANNED 2026-09-19, user-approved)
+
+**Problem**: `core/analysis.py::scan_directory()` treats symlinks inconsistently, and the
+behaviour is undocumented, which is why a user could not tell whether they were ignored:
+
+- Symlinked **files** ARE picked up — they appear in `os.walk`'s `files` list and `is_video_file()`
+  follows them.
+- Symlinked **directories** are NOT descended into — `os.walk` defaults to `followlinks=False`.
+
+So a symlink to a video is processed, but a symlink to a folder of videos is silently invisible.
+Neither behaviour is stated anywhere.
+
+**Fix**: `general.symlinks` — `files_only` (default, current behaviour, documented rather than
+accidental) | `follow` (also descend into symlinked directories) | `skip` (ignore every symlink,
+file or directory). CLI `--symlinks`.
+
+Notes:
+
+- `follow` must guard against **symlink loops** (`a -> b -> a`), which will hang `os.walk` with
+  `followlinks=True`. Track visited real directory paths (`os.path.realpath` + `os.stat` st_dev/
+  st_ino) and refuse to re-enter one.
+- `follow` can surface the same file twice (via the link and via the real path). The existing
+  per-run input dedup (which keys on `realpath` first) already collapses that, so no new handling
+  is needed — but the interaction must be covered by a test so it does not silently regress.
+- `skip` uses `os.path.islink()` on the entry itself, not on the resolved target.

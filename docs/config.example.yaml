@@ -202,6 +202,27 @@ general:
   # last encode.
   output_timing: "cfr"
 
+  # docs/REQUIREMENTS.md § 21: how core.analysis.scan_directory() (and therefore
+  # `process`/`analyze`/`find-duplicates`/the GUI's "Add Directory" scan) treats symlinks
+  # encountered while scanning a directory for video files.
+  #
+  # "files_only" (default): today's original behavior, now documented rather than
+  # accidental -- a symlinked FILE is followed/picked up normally, but a symlinked
+  # DIRECTORY is never descended into (matches os.walk's own followlinks=False default).
+  # This asymmetry is exactly why a user couldn't tell whether symlinks were being
+  # ignored: a symlink to a single video was processed, but a symlink to a folder of
+  # videos was silently invisible.
+  # "follow": also descend into symlinked directories. Guards against symlink LOOPS
+  # (a -> b -> a) by tracking visited real directories (os.path.realpath) and refusing to
+  # re-enter one -- plain os.walk(followlinks=True) has no such guard and would hang
+  # forever on a cycle. A file reachable via both the symlink and its real path can
+  # surface twice; the existing per-run input dedup (keyed on realpath first) already
+  # collapses that.
+  # "skip": ignore every symlink, file or directory -- tested via os.path.islink() on the
+  # entry itself, not the resolved target (a symlink to a genuinely valid video is still
+  # skipped).
+  symlinks: "files_only"
+
 gpu:
   # Whether to auto-detect GPU capability at all (informational; auto-detection itself happens
   # in ai/torch_utils.py and core/ffmpeg_utils.py regardless -- this mainly gates whether
@@ -384,9 +405,14 @@ pipeline:
   # frames, so the reduced, honest frame set -- and the compute saving -- carries through every
   # later stage. On by default; SKIPs (never fails, never re-encodes) cheaply on an
   # already-honest input. See core/stages/retime.py and core/cadence.py.
+  # deinterlace runs right after retime, before crop (docs/REQUIREMENTS.md § 20.1): every
+  # downstream stage (crop bounds, scene detection, RIFE interpolation) benefits from seeing
+  # progressive frames, and comb artefacts actively corrupt motion-based analysis. Off by
+  # default -- see stages.deinterlace.enabled below for why. See core/stages/deinterlace.py.
   default_order:
     - detect
     - retime
+    - deinterlace
     - crop
     - downscale
     - deblock
@@ -405,6 +431,7 @@ pipeline:
   #   default_order:
   #     - detect
   #     - retime
+  #     - deinterlace
   #     - crop
   #     - downscale
   #     - deblock
@@ -430,6 +457,7 @@ pipeline:
   #   default_order:
   #     - detect
   #     - retime
+  #     - deinterlace
   #     - crop
   #     - downscale
   #     - deblock
@@ -447,10 +475,10 @@ pipeline:
 
   # Safety cap on how many stage OCCURRENCES a single job may run (guards against
   # pathological --stage/default_order repetition, not normal preset/auto-determined
-  # pipelines -- must stay >= 14, the length of a full default run). A stage repeated via
+  # pipelines -- must stay >= 15, the length of a full default run). A stage repeated via
   # default_order counts once per repetition. Exceeding this fails the job outright rather
   # than silently truncating (which could drop the always-last "encode" stage).
-  max_stages: 16
+  max_stages: 17
 
   # Whether a stage that FAILS aborts the whole job (false) or is skipped, continuing the
   # pipeline with the last successfully-produced intermediate as input to the next stage
@@ -555,6 +583,62 @@ stages:
     # intermediate .mkv temp every later stage reads from). Default 16 (near-visually-lossless),
     # matching the AI stages' own temp_crf default.
     temp_crf: 16
+
+  deinterlace:
+    # docs/REQUIREMENTS.md § 20: converts interlaced (fielded) content to progressive frames.
+    # Runs right after retime, before crop -- see pipeline.default_order above.
+    #
+    # MUST default false. idet (the detector below) is a heuristic and it false-positives on
+    # detailed progressive motion: measured on the reference build (ffmpeg n9.0.1), a
+    # progressive testsrc2 clip reported TFF: 31, Progressive: 0 (i.e. it looked "genuinely
+    # interlaced" by count alone), genuinely interlaced content reported TFF: 50,
+    # Progressive: 0, and a static progressive clip reported Undetermined: 50. Deinterlacing
+    # progressive content is destructive -- it halves either resolution (bob) or frame rate
+    # (frame mode) for no reason, or duplicates rows/motion that was never actually fielded --
+    # so this must never auto-enable off a probe. Opt in explicitly once you know the source
+    # is interlaced.
+    enabled: false
+    # Output rate mode:
+    #   frame -- one progressive frame per input FRAME (half the field rate, e.g. 50i -> 25p).
+    #     Lowest cost, discards half the temporal information. <filter>=mode=0.
+    #   field (default once enabled) -- one progressive frame per FIELD, preserving full
+    #     motion (e.g. 50i -> 50p). <filter>=mode=1. This DOUBLES the frame count, so the
+    #     stage reports fps_out in its metadata (docs/REQUIREMENTS.md § 12.5) -- without that,
+    #     encode's CFR path would pin the pre-deinterlace rate and duplicate frames to reach it.
+    #   bob -- each field line-doubled to full height at the full FIELD rate (also doubles
+    #     frame count, same fps_out reporting as field). Cheapest, visibly softer than a real
+    #     motion-adaptive deinterlacer. None of the four filters below expose a literal
+    #     line-doubling mode (checked against ffmpeg n9.0.1's own `-h filter=<name>` for all
+    #     four -- each only supports mode=0/frame and mode=1/field, nothing else), so bob is
+    #     built from a separate, filter-INDEPENDENT chain instead (setfield+separatefields+
+    #     scale) -- stages.deinterlace.filter is ignored when mode is bob.
+    mode: field
+    # Which deinterlacing filter to use for frame/field mode (ignored for bob, see above).
+    # bwdif (default -- best quality of the motion-adaptive set), yadif (fastest, most
+    # familiar), w3fdif, estdif. All four are present in the reference build (ffmpeg n9.0.1)
+    # and -- verified against that build -- all four support the same mode=0/1 (frame/field)
+    # option identically; there is no per-filter mode restriction to map around in v1. CUDA
+    # variants (yadif_cuda, bwdif_cuda) exist but are out of scope: this stage is a plain
+    # ffmpeg filter pass, not part of the raw-frame AI pipe.
+    filter: bwdif
+    # Field order: auto (default, decided by idet -- see min_interlaced_ratio below), tff
+    # (top-field-first), bff (bottom-field-first). Getting this backwards produces juddering
+    # worse than leaving the content interlaced, so an explicit tff/bff is always honored
+    # outright and SKIPS idet detection entirely.
+    field_order: auto
+    # Only used when field_order is auto. idet classifies each analysed frame as TFF/BFF/
+    # Progressive/Undetermined; this is the minimum fraction of CLASSIFIED frames (TFF+BFF+
+    # Progressive -- Undetermined is excluded from the denominator) that must be interlaced
+    # (TFF+BFF) before the stage actually deinterlaces. Below this ratio, the stage SKIPS with
+    # the raw counts in the skip reason rather than guessing. 0.7 = a strong majority is
+    # required, precisely because idet false-positives on detailed progressive motion (see the
+    # "MUST default false" note above).
+    min_interlaced_ratio: 0.7
+    # Analysis pass (idet) is limited to the first N seconds of content -- cheaper decision,
+    # matching stages.retime.analysis_sample_sec's convention. 0 = analyse the whole file. The
+    # actual deinterlace pass, once triggered, always runs over the WHOLE input regardless of
+    # this.
+    analysis_sample_sec: 120
 
   upscale:
     enabled: true

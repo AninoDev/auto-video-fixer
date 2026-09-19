@@ -271,6 +271,14 @@ VALID_AUDIO_SPEED_METHODS = ("atempo", "rubberband", "asetrate")
 VALID_AUDIO_RESAMPLERS = ("soxr", "swr")
 # Canonical set for pipeline.duration_guard (REQUIREMENTS.md § 19.2).
 _VALID_DURATION_GUARD = ("warn", "fail", "off")
+# Canonical set for general.symlinks (REQUIREMENTS.md § 21) -- validated at
+# use-time by core.analysis.scan_directory() itself (same "use-time, not
+# construction-time" posture as VALID_AUDIO_SPEED_METHODS above) rather than
+# eagerly here, since an invalid value only matters if a directory scan
+# actually runs. Kept here (not duplicated in analysis.py/cli.py) for the
+# same reason as every other VALID_* tuple in this module: config.py is the
+# layer both cli.py and core/analysis.py already import from.
+VALID_SYMLINKS_POLICIES = ("files_only", "follow", "skip")
 
 
 def validate_output_handling_config(config: "Config") -> None:
@@ -448,6 +456,31 @@ class Config:
             # (``-fps_mode passthrough``) regardless of this key -- it only
             # affects the last encode.
             "output_timing": "cfr",
+            # REQUIREMENTS.md § 21: how core.analysis.scan_directory() (and
+            # therefore `process`/`analyze`/`find-duplicates`/the GUI's
+            # "Add Directory" scan -- see AGENTS.md for the full caller
+            # list) treats symlinks encountered while scanning a directory
+            # for video files.
+            #
+            # "files_only" (default): today's original behavior, now
+            # documented rather than accidental -- a symlinked FILE is
+            # followed/picked up normally, but a symlinked DIRECTORY is
+            # never descended into (matches os.walk's own followlinks=False
+            # default). This asymmetry is exactly why a user couldn't tell
+            # whether symlinks were being ignored: a symlink to a single
+            # video was processed, but a symlink to a folder of videos was
+            # silently invisible.
+            # "follow": also descend into symlinked directories. Guards
+            # against symlink LOOPS (a -> b -> a) by tracking visited real
+            # directories (os.path.realpath) and refusing to re-enter one --
+            # plain os.walk(followlinks=True) has no such guard and would
+            # hang forever on a cycle. A file reachable via both the symlink
+            # and its real path can surface twice; the existing per-run
+            # input dedup (keyed on realpath first) already collapses that.
+            # "skip": ignore every symlink, file or directory -- tested via
+            # os.path.islink() on the entry itself, not the resolved target
+            # (a symlink to a genuinely valid video is still skipped).
+            "symlinks": "files_only",
         },
         "gpu": {
             "auto_detect": True,
@@ -582,9 +615,17 @@ class Config:
             # every later stage. Enabled by default; SKIPs (never fails)
             # cheaply on an already-honest input. See core/stages/retime.py
             # and core/cadence.py.
+            #
+            # deinterlace runs right after retime, before crop (REQUIREMENTS.md
+            # § 20.1): every downstream stage (crop bounds, scene detection,
+            # RIFE interpolation) benefits from seeing progressive frames, and
+            # comb artefacts actively corrupt motion-based analysis. Off by
+            # default -- see stages.deinterlace.enabled below for why. See
+            # core/stages/deinterlace.py.
             "default_order": [
                 "detect",
                 "retime",
+                "deinterlace",
                 "crop",
                 "downscale",
                 "deblock",
@@ -598,12 +639,12 @@ class Config:
                 "hdr",
                 "encode",
             ],
-            # Must stay >= len(default_order) above (14) since a full default run
+            # Must stay >= len(default_order) above (15) since a full default run
             # legitimately uses every stage; this only guards against pathological
             # --stage/default_order repetition, not normal preset/auto-determined
             # pipelines. Counts resolved OCCURRENCES, not unique stage names -- a
             # stage repeated via default_order counts once per repetition.
-            "max_stages": 16,
+            "max_stages": 17,
             "skip_stage_on_error": True,
             # Default timeout (seconds) for a stage's MAIN ffmpeg processing/mux
             # pass(es) -- see BaseStage.stage_timeout() in core/stages/base.py.
@@ -795,6 +836,86 @@ class Config:
                 # every later stage reads from). Default 16 (near-visually-
                 # lossless), matching the AI stages' own temp_crf default.
                 "temp_crf": 16,
+            },
+            "deinterlace": {
+                # REQUIREMENTS.md § 20: converts interlaced (fielded) content
+                # to progressive frames. Runs right after retime, before crop
+                # -- see pipeline.default_order above.
+                #
+                # MUST default False. idet (the detector below) is a
+                # heuristic and it false-positives on detailed progressive
+                # motion: measured on the reference build (ffmpeg n9.0.1), a
+                # progressive testsrc2 clip reported TFF: 31, Progressive: 0
+                # (i.e. it looked "genuinely interlaced" by count alone),
+                # genuinely interlaced content reported TFF: 50,
+                # Progressive: 0, and a static progressive clip reported
+                # Undetermined: 50. Deinterlacing progressive content is
+                # destructive -- it halves either resolution (bob) or frame
+                # rate (frame mode) for no reason, or duplicates rows/motion
+                # that was never actually fielded -- so this must never
+                # auto-enable off a probe. Opt in explicitly once you know
+                # the source is interlaced.
+                "enabled": False,
+                # Output rate mode:
+                #   "frame" -- one progressive frame per input FRAME (half
+                #     the field rate, e.g. 50i -> 25p). Lowest cost, discards
+                #     half the temporal information. <filter>=mode=0.
+                #   "field" (default once enabled) -- one progressive frame
+                #     per FIELD, preserving full motion (e.g. 50i -> 50p).
+                #     <filter>=mode=1. This DOUBLES the frame count, so the
+                #     stage reports fps_out in its metadata (REQUIREMENTS.md
+                #     § 12.5) -- without that, encode's CFR path would pin
+                #     the pre-deinterlace rate and duplicate frames to reach
+                #     it.
+                #   "bob" -- each field line-doubled to full height at the
+                #     full FIELD rate (also doubles frame count, same
+                #     fps_out reporting as "field"). Cheapest, visibly
+                #     softer than a real motion-adaptive deinterlacer.
+                #     None of the four filters below expose a literal
+                #     line-doubling mode (checked against ffmpeg n9.0.1's
+                #     own `-h filter=<name>` for all four -- each only
+                #     supports mode=0/frame and mode=1/field, nothing else),
+                #     so "bob" is built from a separate, filter-INDEPENDENT
+                #     chain instead (setfield+separatefields+scale) --
+                #     stages.deinterlace.filter is ignored when mode is
+                #     "bob". See core/stages/deinterlace.py.
+                "mode": "field",
+                # Which deinterlacing filter to use for "frame"/"field" mode
+                # (ignored for "bob", see above). "bwdif" (default -- best
+                # quality of the motion-adaptive set), "yadif" (fastest, most
+                # familiar), "w3fdif", "estdif". All four are present in the
+                # reference build (ffmpeg n9.0.1) and -- verified against
+                # that build -- all four support the same mode=0/1 (frame/
+                # field) option identically; there is no per-filter mode
+                # restriction to map around in v1. CUDA variants
+                # (yadif_cuda, bwdif_cuda) exist but are out of scope: this
+                # stage is a plain ffmpeg filter pass, not part of the
+                # raw-frame AI pipe.
+                "filter": "bwdif",
+                # Field order: "auto" (default, decided by idet -- see
+                # min_interlaced_ratio below), "tff" (top-field-first),
+                # "bff" (bottom-field-first). Getting this backwards produces
+                # juddering worse than leaving the content interlaced, so an
+                # explicit tff/bff is always honored outright and SKIPS idet
+                # detection entirely.
+                "field_order": "auto",
+                # Only used when field_order is "auto". idet classifies each
+                # analysed frame as TFF/BFF/Progressive/Undetermined; this is
+                # the minimum fraction of CLASSIFIED frames (TFF+BFF+
+                # Progressive -- Undetermined is excluded from the
+                # denominator) that must be interlaced (TFF+BFF) before the
+                # stage actually deinterlaces. Below this ratio, the stage
+                # SKIPS with the raw counts in the skip reason rather than
+                # guessing. 0.7 = a strong majority is required, precisely
+                # because idet false-positives on detailed progressive
+                # motion (see the "MUST default False" note above).
+                "min_interlaced_ratio": 0.7,
+                # Analysis pass (idet) is limited to the first N seconds of
+                # content -- cheaper decision, matching stages.retime.
+                # analysis_sample_sec's convention. 0 = analyse the whole
+                # file. The actual deinterlace pass, once triggered, always
+                # runs over the WHOLE input regardless of this.
+                "analysis_sample_sec": 120,
             },
             "downscale": {
                 # Shrinks an oversized input down to the target resolution

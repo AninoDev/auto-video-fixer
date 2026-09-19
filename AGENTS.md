@@ -309,8 +309,8 @@ one of `--output-name`/a per-file `--from-file` output may apply -- combining th
   gone -- `DEFAULTS["pipeline"]["default_order"]` (and a matching `DEFAULT_STAGE_ORDER` constant
   in `core/pipeline.py`, used only as a fallback when the config key is missing/empty) now
   **is** the actual execution order. Default order:
-  `detect, retime, crop, downscale, deblock, stabilize, denoise_video, upscale, interpolate,
-  normalize_volume, normalize_audio, speed, hdr, encode`.
+  `detect, retime, deinterlace, crop, downscale, deblock, stabilize, denoise_video, upscale,
+  interpolate, normalize_volume, normalize_audio, speed, hdr, encode`.
   - `retime` runs **immediately after `detect`** (REQUIREMENTS.md § 12): it recovers the input's
     TRUE content cadence (as opposed to the encoded/container framerate) via a single decode-only
     `mpdecimate`+`metadata=print` pass (`core/cadence.py`) and drops padding/duplicate frames
@@ -320,8 +320,31 @@ one of `--output-name`/a per-file `--from-file` output may apply -- combining th
     -- this is the actual payoff: a 24-in-60 input targeting 60fps now correctly plans 24->60
     interpolation instead of reading 60->60 and skipping. See "Timestamp safety across stages"
     below for how the rest of the pipeline stays VFR-safe downstream of this stage.
-  - `crop` now runs **first** among the enhancement stages, right after `retime` (previously it
-    ran after `stabilize`):
+  - `deinterlace` runs right after `retime`, before `crop` (REQUIREMENTS.md § 20): converts
+    interlaced (fielded) content into progressive frames so every downstream stage (crop bounds,
+    scene detection, RIFE interpolation) sees comb-free frames. **Off by default**
+    (`stages.deinterlace.enabled: false`) -- detection is an `idet`-based heuristic that
+    false-positives on detailed progressive motion, so it must never auto-enable itself; the user
+    opts in explicitly once a source is known to be interlaced. Three output-rate modes
+    (`stages.deinterlace.mode`): `frame` (half the field rate, unchanged frame count), `field`
+    (default once enabled -- full motion, doubles the frame count) and `bob` (line-doubled, also
+    doubles the frame count). `field`/`bob` report `fps_out` in stage metadata (see "Timestamp
+    safety across stages"/§ 12.5) so the pipeline's generic `fps_out`-presence propagation updates
+    `input_info["true_framerate"]` -- without it `encode`'s CFR path would pin the pre-deinterlace
+    rate. Filter choice (`stages.deinterlace.filter`): `bwdif` (default), `yadif`, `w3fdif`,
+    `estdif` -- all four support the same `mode=0`/`mode=1` (frame/field) option identically in
+    the reference ffmpeg build (n9.0.1); `bob` is built from a separate, filter-independent
+    `setfield`+`separatefields`+`scale` chain instead since none of the four expose a literal
+    line-doubling mode. Field order (`stages.deinterlace.field_order`): `auto` (default, decided
+    by `idet` -- requires the interlaced fraction of *classified* frames, excluding
+    `Undetermined`, to strictly exceed `stages.deinterlace.min_interlaced_ratio` (default 0.7),
+    else SKIPs with the raw counts in the skip reason) or an explicit `tff`/`bff` (skips `idet`
+    detection entirely). Detection failure fails open (WARNING log, SKIP), matching
+    `analyze_cadence()`'s convention. See `core/stages/deinterlace.py`. Does NOT implement
+    REQUIREMENTS.md § 20.3 (recovering interlaced content from an already-progressive/
+    line-doubled conversion) -- deliberately deferred, blocked on real affected samples.
+  - `crop` now runs **first** among the enhancement stages, right after `retime`/`deinterlace`
+    (previously it ran after `stabilize`):
     `stabilize`'s zoom is now a real percentile-based "borderless" zoom (not the old motion-guess
     zoom), so it no longer leaves a black border for a later crop to clean up -- there's nothing
     left for a post-stabilize crop to do. Running crop first also means `downscale` (which sits
@@ -396,6 +419,20 @@ one of `--output-name`/a per-file `--from-file` output may apply -- combining th
   `job.output_path` instead of being deleted.
 - `scan_directory()` (`core/analysis.py`) skips hidden files (dotfiles), including orphaned
   `.avf_*` intermediate temp files that may be left next to an input after a crash.
+- **Symlink policy** (`general.symlinks`, CLI `--symlinks`, REQUIREMENTS.md § 21): governs how
+  `scan_directory()` treats symlinks encountered while scanning a directory for video files.
+  `"files_only"` (default) -- today's original behavior: a symlinked FILE is picked up (matches
+  `os.walk`'s own `files` list + `is_video_file()` transparently following it), but a symlinked
+  DIRECTORY is never descended into (`os.walk`'s own `followlinks=False` default). `"follow"` --
+  also descends into symlinked directories; guards against symlink LOOPS (`a -> b -> a`) by
+  tracking, per directory-walk, the realpaths of symlinked directory entries already descended
+  into and refusing to re-enter one (plain non-symlink directories are never tracked/pruned, so a
+  symlink that happens to point at an already-walked real directory is allowed to surface that
+  directory's files a second time -- collapsed by the existing per-run content dedup, which keys
+  on realpath first, not by `scan_directory()` itself). `"skip"` -- ignores every symlink, file or
+  directory, tested via `os.path.islink()` on the entry itself, not the resolved target. Threaded
+  through every caller: `process` (both the positional-path and `--from-file` directory-expansion
+  paths), `analyze`, `find-duplicates`, and the GUI's "Add Directory" button (`self.config`).
 - Stage outputs chain: each stage's `output_path` becomes the next stage's `input_path`.
 - **`input_info` is re-probed after every stage that produces a new output file**, not just
   once up front. `execute_job()` probes `job.input_path` once before the loop starts, then

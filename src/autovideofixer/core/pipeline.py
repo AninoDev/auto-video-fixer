@@ -43,6 +43,7 @@ from autovideofixer.core.stages.base import (
 DEFAULT_STAGE_ORDER: list[str] = [
     "detect",
     "retime",
+    "deinterlace",
     "crop",
     "downscale",
     "deblock",
@@ -397,6 +398,15 @@ class Pipeline:
         retime_config = self.config.get("stages", "retime", default={})
         if retime_config.get("enabled", True):
             stages.append("retime")
+
+        # Deinterlacing -- opt-in, off by default (REQUIREMENTS.md § 20.2: an
+        # idet-based heuristic false-positives on detailed progressive
+        # motion, so this must never auto-enable off a probe). pipeline.
+        # default_order places it right after "retime", before "crop",
+        # regardless of insertion order here.
+        deinterlace_config = self.config.get("stages", "deinterlace", default={})
+        if deinterlace_config.get("enabled", False):
+            stages.append("deinterlace")
 
         # 2. Enhancement stages based on input properties. Note: resolution is
         # deliberately NOT read here for the upscale membership decision --

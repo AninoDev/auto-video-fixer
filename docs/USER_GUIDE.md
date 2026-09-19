@@ -205,6 +205,8 @@ avf process [PATHS...] [OPTIONS]
 - `-p, --preset TEXT`: Processing preset name (see [Presets](#processing-presets))
 - `-o, --output TEXT`: Output directory
 - `-r, --recursive`: Scan directories recursively
+- `--symlinks [files_only|follow|skip]`: How directory scanning treats symlinks (default
+  `files_only`). See [Symlinks When Scanning Directories](#symlinks-when-scanning-directories).
 - `--dry-run`: Show what would be processed without processing
 - `--stage TEXT`: Specific stage to run (can repeat)
 - `--threads INT`: Number of concurrent processing threads
@@ -330,6 +332,9 @@ avf analyze [FILEPATH] [OPTIONS]
 
 **Options:**
 - `--vlm`: Run VLM content analysis (requires configuration)
+- `-r, --recursive`: Scan directories recursively
+- `--symlinks [files_only|follow|skip]`: How directory scanning treats symlinks (default
+  `files_only`). See [Symlinks When Scanning Directories](#symlinks-when-scanning-directories).
 
 **Example:**
 ```bash
@@ -344,6 +349,8 @@ avf find-duplicates REFERENCE DIRECTORY [OPTIONS]
 
 **Options:**
 - `--threshold FLOAT`: Similarity threshold (0-1, default: 0.95)
+- `--symlinks [files_only|follow|skip]`: How directory scanning treats symlinks (default
+  `files_only`).
 
 **Example:**
 ```bash
@@ -632,6 +639,35 @@ Run specific stages only:
 avf process video.mp4 --stage detect --stage upscale --stage encode
 ```
 
+### Deinterlacing
+
+Interlaced source video (combing artefacts visible on motion) can be converted to progressive
+frames with the `deinterlace` stage. It's **off by default** -- automatic detection (via ffmpeg's
+`idet` filter) is a heuristic that can misclassify detailed progressive motion, and deinterlacing
+progressive content is destructive, so this is opt-in only:
+
+```bash
+avf process interlaced.mkv --enable-stage deinterlace
+```
+
+Or in `config.yaml`:
+```yaml
+stages:
+  deinterlace:
+    enabled: true
+    mode: field          # frame | field | bob -- field (default) preserves full motion
+    filter: bwdif        # bwdif | yadif | w3fdif | estdif
+    field_order: auto     # auto | tff | bff -- auto uses idet detection
+    min_interlaced_ratio: 0.7
+```
+
+`mode: field` (and `bob`) double the output frame rate (e.g. 50i -> 50p) to preserve full motion
+-- the stage reports this new rate so later stages (including the final encode) use it correctly.
+With `field_order: auto`, the stage runs ffmpeg's `idet` filter first and only deinterlaces when a
+strong majority of classified frames are interlaced; otherwise it skips and logs why (visible with
+`--verbose` or in the JSON run report). If you already know the field order, set it explicitly
+(`tff`/`bff`) to skip detection entirely.
+
 ### Quality Targeted Processing
 
 Set quality targets in configuration:
@@ -694,6 +730,28 @@ avf gpu-info
 Process all videos in a directory:
 ```bash
 avf process ./videos/ -r -p max_quality -o ./output/
+```
+
+### Symlinks When Scanning Directories
+
+When a directory argument (to `process`, `analyze`, or `find-duplicates`) is scanned for video
+files, `general.symlinks` / `--symlinks` controls how symlinks are treated:
+
+- `files_only` (default): a symlinked *file* is picked up like any other file, but a symlinked
+  *directory* is never descended into. This is Auto Video Fixer's original behavior, now
+  documented rather than silent.
+- `follow`: also descend into symlinked directories. Loops (`a -> b -> a`) are detected and
+  refused rather than hanging. If the same file is reachable both directly and through a symlink,
+  it may be scanned twice -- the existing per-run duplicate-input detection collapses that back
+  down to a single job.
+- `skip`: ignore every symlink entirely, whether it points at a file or a directory.
+
+```bash
+# Also walk into symlinked subdirectories
+avf process ./library/ -r --symlinks follow
+
+# Never touch anything reached through a symlink
+avf process ./library/ -r --symlinks skip
 ```
 
 ### Batch Processing with Priority

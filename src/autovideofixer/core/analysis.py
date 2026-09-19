@@ -17,7 +17,7 @@ import tempfile
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
-from autovideofixer.config import Config
+from autovideofixer.config import VALID_SYMLINKS_POLICIES, Config
 
 logger = logging.getLogger(__name__)
 
@@ -87,20 +87,75 @@ def is_image_file(path: str) -> bool:
 def scan_directory(
     directory: str,
     recursive: bool = True,
+    symlinks: str = "files_only",
 ) -> list[str]:
-    """Scan a directory for video files."""
+    """Scan a directory for video files.
+
+    ``symlinks`` (REQUIREMENTS.md § 21, ``general.symlinks``) governs how
+    symlinked files/directories are treated:
+
+    - ``"files_only"`` (default) -- today's original behavior, now
+      documented rather than accidental: a symlinked FILE is followed
+      (``is_video_file()`` resolves it normally, same as any other path),
+      but a symlinked DIRECTORY is never descended into (``os.walk``'s own
+      ``followlinks=False`` default).
+    - ``"follow"`` -- also descend into symlinked directories. Guards
+      against symlink LOOPS (``a -> b -> a``) by tracking visited real
+      directories (``os.path.realpath``) and refusing to re-enter one --
+      ``os.walk(followlinks=True)`` has no such guard on its own and would
+      hang forever on a cycle. A file reachable via both a symlink and its
+      real path can surface twice here; the caller's own per-run input
+      dedup (which keys on realpath first) collapses that, so no extra
+      handling is needed here.
+    - ``"skip"`` -- ignore every symlink, file or directory. Tested via
+      ``os.path.islink()`` on the entry ITSELF, not on the resolved target
+      (a symlink to a valid video is still skipped).
+
+    Raises ``ValueError`` for an unrecognized ``symlinks`` value.
+    """
     videos: list[str] = []
     if not os.path.isdir(directory):
         return videos
+    if symlinks not in VALID_SYMLINKS_POLICIES:
+        raise ValueError(
+            f"Invalid symlinks policy: {symlinks!r} (must be one of {VALID_SYMLINKS_POLICIES})"
+        )
 
     if recursive:
-        for root, _dirs, files in os.walk(directory):
+        follow = symlinks == "follow"
+        # Real directories reached via a SYMLINK chain -- a symlinked
+        # directory entry whose target is already in here is refused
+        # (breaks an a -> b -> a loop). Deliberately does NOT track plain
+        # (non-symlink) directories: os.walk's own traversal of the real
+        # filesystem tree can't cycle on its own, and a symlink that happens
+        # to point at an already-walked REAL directory is allowed to
+        # surface that directory's files a second time -- REQUIREMENTS.md
+        # § 21 documents this as expected, collapsed by the caller's own
+        # realpath-keyed input dedup, not by this function. Only populated/
+        # consulted when follow=True; unused otherwise.
+        visited_symlink_targets: set[str] = set()
+        for root, dirs, files in os.walk(directory, followlinks=follow):
+            if follow:
+                pruned = []
+                for d in dirs:
+                    full_d = os.path.join(root, d)
+                    if os.path.islink(full_d):
+                        real = os.path.realpath(full_d)
+                        if real in visited_symlink_targets:
+                            continue
+                        visited_symlink_targets.add(real)
+                    pruned.append(d)
+                dirs[:] = pruned
+            elif symlinks == "skip":
+                dirs[:] = [d for d in dirs if not os.path.islink(os.path.join(root, d))]
             for f in sorted(files):
                 if f.startswith("."):
                     # Skip hidden files, including orphaned ".avf_*" intermediate
                     # temp files that pipeline.py writes next to the input.
                     continue
                 full = os.path.join(root, f)
+                if symlinks == "skip" and os.path.islink(full):
+                    continue
                 if is_video_file(full):
                     videos.append(full)
     else:
@@ -108,6 +163,8 @@ def scan_directory(
             if f.startswith("."):
                 continue
             full = os.path.join(directory, f)
+            if symlinks == "skip" and os.path.islink(full):
+                continue
             if is_video_file(full):
                 videos.append(full)
 
