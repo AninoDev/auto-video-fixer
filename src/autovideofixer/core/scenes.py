@@ -40,6 +40,11 @@ from autovideofixer.core.stages.interpolate import InterpolateStage
 from autovideofixer.core.stages.stabilize import StabilizeStage
 
 logger = logging.getLogger(__name__)
+# Absolute floor (seconds) for the scene-coverage guard in run_scene_pipeline():
+# a scene list is allowed to fall this far short of the probed duration before
+# the guard fires, so ordinary trailing-frame/timestamp rounding never trips it.
+# The guard uses max(this, 2% of duration), so long inputs scale proportionally.
+SCENE_COVERAGE_TOLERANCE_SEC = 0.5
 
 
 @dataclass
@@ -457,6 +462,46 @@ def run_scene_pipeline(
     try:
         analyzer = VideoAnalyzer(config)
         scenes = analyzer.detect_events(input_path)
+
+        # COVERAGE GUARD: scene mode processes ONLY the detected scenes and
+        # concatenates them, so anything the scene list doesn't cover is
+        # silently DELETED from the output. A scene list's final end_time comes
+        # from the last frame the detector actually decoded -- if decoding stops
+        # early (a damaged/odd stream, a decoder quirk), the tail of the video
+        # just disappears with no error anywhere.
+        #
+        # Observed in the field: a 44.93s input produced scenes covering only
+        # 0.000-11.208s, so 33.7s (75% of the video) was dropped. Every stage
+        # then processed 673 frames instead of ~2700, every stage reported
+        # COMPLETED, and the run exited 0. With a 0.25x speed stage downstream
+        # the 11.2s became a 45s output that looked superficially plausible
+        # against a 44.93s input -- which is exactly how it went unnoticed.
+        #
+        # Extending the final scene to the real duration is the safe repair:
+        # the content is recovered, and the worst case is one scene that spans a
+        # cut the detector never saw -- strictly better than deleting it.
+        if scenes:
+            try:
+                probed_duration = float(probe(input_path).duration or 0.0)
+            except Exception:  # never fail scene mode over the guard itself
+                probed_duration = 0.0
+            covered = float(getattr(scenes[-1], "end_time", 0.0) or 0.0)
+            if probed_duration > 0 and covered > 0:
+                shortfall = probed_duration - covered
+                if shortfall > max(SCENE_COVERAGE_TOLERANCE_SEC, probed_duration * 0.02):
+                    logger.warning(
+                        "Scene detection covered only %.2fs of a %.2fs input for %s -- "
+                        "%.2fs (%.1f%%) would have been DROPPED. Extending the final scene "
+                        "to the full duration so no content is lost; the scene boundaries "
+                        "in that tail are unverified (the detector stopped early).",
+                        covered,
+                        probed_duration,
+                        input_path,
+                        shortfall,
+                        shortfall / probed_duration * 100.0,
+                    )
+                    scenes[-1].end_time = probed_duration
+
         if len(scenes) < 2:
             logger.info(
                 "Scene mode: only %d scene(s) detected for %s, nothing to split -- "
