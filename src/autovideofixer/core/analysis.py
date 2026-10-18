@@ -442,7 +442,12 @@ class VideoAnalyzer:
             output_dir = tempfile.mkdtemp(prefix="avf_clip_")
 
         stem = os.path.splitext(os.path.basename(filepath))[0]
-        output_path = os.path.join(output_dir, f"{stem}_clip_{start_time:.1f}_{end_time:.1f}.mp4")
+        # Stream-copied clip: keep the SOURCE's container (REQUIREMENTS.md § 22.3).
+        # A hardcoded ".mp4" could not hold e.g. Vorbis from a .webm source.
+        clip_ext = os.path.splitext(filepath)[1] or ".mp4"
+        output_path = os.path.join(
+            output_dir, f"{stem}_clip_{start_time:.1f}_{end_time:.1f}{clip_ext}"
+        )
 
         try:
             run_ffmpeg(

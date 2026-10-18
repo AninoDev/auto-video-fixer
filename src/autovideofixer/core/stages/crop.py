@@ -2,7 +2,9 @@
 
 Detects a video's true content bounds (stripping letterboxing/pillarboxing,
 including any residual border stabilize can introduce) and crops to them.
-Strictly opt-in -- see docs/REQUIREMENTS.md feature 3.
+On by default since docs/REQUIREMENTS.md § 22.1 (opt-in before; see
+feature 3 for the original design) -- ``should_run()`` SKIPs cheaply on a
+borderless input.
 
 Detection (``execute()``'s authoritative pass, via ``_detect_crop_full()``) runs
 FFmpeg's ``cropdetect`` filter with ``reset=1`` (recompute per analyzed frame,

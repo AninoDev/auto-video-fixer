@@ -11,6 +11,7 @@ from autovideofixer.core.stages.encode import EncodeStage
 from autovideofixer.core.stages.hdr import HDRStage
 from autovideofixer.core.stages.interpolate import InterpolateStage
 from autovideofixer.core.stages.normalize_audio import NormalizeAudioStage, NormalizeVolumeStage
+from autovideofixer.core.stages.normalize_codecs import NormalizeCodecsStage
 from autovideofixer.core.stages.remux import RemuxStage
 from autovideofixer.core.stages.retime import RetimeStage
 from autovideofixer.core.stages.speed import SpeedStage
@@ -20,6 +21,7 @@ from autovideofixer.core.stages.upscale import UpscaleStage
 # Register all stages
 register_stage(DetectStage)
 register_stage(RetimeStage)
+register_stage(NormalizeCodecsStage)
 register_stage(DeinterlaceStage)
 register_stage(StabilizeStage)
 register_stage(CropStage)
@@ -41,6 +43,7 @@ __all__ = [
     "StageStatus",
     "DetectStage",
     "RetimeStage",
+    "NormalizeCodecsStage",
     "DeinterlaceStage",
     "StabilizeStage",
     "CropStage",

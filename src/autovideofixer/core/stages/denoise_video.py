@@ -245,6 +245,10 @@ class DenoiseVideoStage(BaseStage):
             # a .webm input produced a ".avf_denoise_test.webm" temp target
             # that ffmpeg then failed to write into. ".mp4" always matches
             # the actual codec being written, regardless of input container.
+            # MP4 is kept HERE deliberately (REQUIREMENTS.md § 22.3 audit): this
+            # temp holds only the writer-generated H.264 video (no source stream
+            # is copied into it); the source audio is muxed in afterwards, into
+            # the real output container.
             temp_path = _os.path.join(
                 _os.path.dirname(input_path) or ".",
                 f".avf_denoise_{_os.path.splitext(_os.path.basename(input_path))[0]}.mp4",

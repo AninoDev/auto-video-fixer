@@ -8,6 +8,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **`normalize_codecs` stage (REQUIREMENTS.md § 22.2): unusual codecs are normalized to H.264/AAC
+  before the heavy stages run.** New stage, on by default, placed right after `retime` in
+  `pipeline.default_order` (and `DEFAULT_STAGE_ORDER`; `pipeline.max_stages` 17 -> 18 to keep two
+  repeats of headroom over the now 16-entry order). Inputs with VP9/AV1 video or Opus/Vorbis/FLAC/
+  PCM audio (typical YouTube `.webm`) used to hit stages that stream-copy a source-derived stream
+  (`-c:a copy`, `-c copy`) into a container that can't hold it. The stage touches a stream only if
+  it has to: video not in `video_codecs_allowed` (default `[h264]`) is re-encoded with `libx264`
+  at `temp_crf` 16 / `medium` (8-bit -> `yuv420p`, >8-bit -> `yuv420p10le`, colour metadata
+  carried so `hdr` still detects HDR, odd dimensions trimmed to even); audio not in
+  `audio_codecs_allowed` (default `[aac]`) becomes AAC 256k with its channel layout preserved;
+  everything else is `copy`; and it SKIPs with no new file when nothing needs changing. Uses
+  ffmpeg's default stream selection (no `-map`, same as the other ffmpeg-pass stages) and
+  `-fps_mode passthrough` so a VFR `retime` output keeps its dropped frames (verified: 120-frame
+  padded input -> 48 after retime -> 48 after normalize). Stage metadata reports each stream as
+  `copied` / `transcoded (from->to)`. New CLI `--normalize-codecs/--no-normalize-codecs`;
+  config keys under `stages.normalize_codecs` (`enabled`, `video_codecs_allowed`,
+  `audio_codecs_allowed`, `video_encoder`, `temp_crf`, `preset`, `audio_codec`, `audio_bitrate`,
+  `timeout`). Probe parsing gained `color_primaries`, `bits_per_raw_sample`, attached-picture and
+  channel-layout fields plus `pix_fmt`/`bit_depth`/`selected_*_codec` keys in `input_info`.
+  **Existing user configs that pin `pipeline.default_order` will NOT get the stage until the
+  config-migration phase (§ 24, P3) -- add `normalize_codecs` after `retime` by hand or run it
+  with `--enable-stage`/`--stage`.**
 - **`deinterlace` stage (REQUIREMENTS.md § 20): convert interlaced (fielded) content to
   progressive frames.** New stage runs right after `retime`, before `crop` in
   `pipeline.default_order`, so every downstream stage (crop bounds, scene detection, RIFE
@@ -200,6 +222,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   on this path). See `docs/REQUIREMENTS.md` § 16 (§ 16.7 for subdivision) for the full spec.
 
 ### Changed
+- **2026-10-17: `stages.crop.enabled` now defaults to `true` (REQUIREMENTS.md § 22.1).** Auto-crop
+  was opt-in; it is now part of every auto-determined plan and SKIPs cheaply (one sample, no
+  re-encode) on borderless input. A `stages.crop.enabled: false` already written in a user's
+  config keeps crop off until the § 24 config migration (P3) flips it. Both
+  `config.example.yaml` copies updated.
+
 - **2026-09-09: BREAKING -- `stages.stabilize.zoom_coverage` is now a SIGNED dial spanning
   zoom-OUT as well as zoom-IN; `0.0`'s meaning changed (REQUIREMENTS.md § 17).** Previously
   `zoom_coverage=0.0` meant "no zoom at all" (`optzoom=0, zoom=0`) -- but no zoom is not no
@@ -250,6 +278,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - See `docs/REQUIREMENTS.md` § 8 for the full rationale.
 
 ### Fixed
+- **Container-safety audit (REQUIREMENTS.md § 22.3).** (a) `Pipeline._promote_temp_to_output()`
+  used to rename an `.mkv` intermediate straight onto an `.mp4` job output -- Matroska bytes in a
+  file named `.mp4` -- whenever the terminal stage was skipped. It now remuxes into the output's
+  real container (`-c copy`, then audio->AAC, then video->libx264 only for a stream the target
+  standard doesn't list; Vorbis/FFV1 etc. are treated as non-MP4 even though this repo's ffmpeg
+  n9.0.1 muxes them without error) and, if everything fails, keeps the result as `<output>.mkv`
+  with an ERROR log; it now returns the path it landed on. (b) Scratch files that are
+  `os.replace()`d over a destination now keep the destination's extension (new
+  `ffmpeg_utils.sibling_temp_path()`): upscale's resize scratch and stabilize's cadence-retag
+  remux were hardcoded `.mp4` (MP4 bytes inside `.mkv`-named files, and source audio like Vorbis
+  rejected), normalize_audio's in-place scratch likewise. (c) Upscale's multi-pass intermediates
+  (`.avf_ai_pass*.mp4`) received the SOURCE audio via `-c:a copy`; now `.mkv`. (d) `analyze`
+  clip extraction (`-c copy`) now keeps the source's container instead of forcing `.mp4`. Sites
+  that legitimately stay MP4 (AI writer temps, interpolate chunks, scene-mode files -- no
+  source-derived stream is copied into them) now carry a comment saying why.
+
 - **Perceptual hashing / duplicate detection was completely non-functional.**
   `rust/avf_hashing/src/lib.rs` invoked ffmpeg with the legacy `-vsync vfr`. ffmpeg has REMOVED
   `-vsync` (long deprecated), so on ffmpeg 9 the sampling command aborted immediately with

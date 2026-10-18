@@ -45,6 +45,17 @@ class StreamInfo:
     color_space: str = ""
     color_range: str = ""
     color_transfer: str = ""
+    # Added for normalize_codecs (REQUIREMENTS.md § 22.2): carried explicitly
+    # through a video re-encode so the later `hdr` stage still sees HDR.
+    color_primaries: str = ""
+    # ffprobe's raw bits_per_raw_sample ("10", "N/A", ...) parsed to an int,
+    # 0 when absent. Secondary to pix_fmt for bit depth (see pix_fmt_bit_depth).
+    bits_per_raw_sample: int = 0
+    # disposition.attached_pic: cover art stored as a "video" stream. Never the
+    # stream ffmpeg's default selection picks as the real video.
+    is_attached_pic: bool = False
+    # ffprobe's channel_layout string ("stereo", "5.1(side)", ""), informational.
+    channel_layout: str = ""
     is_default: bool = False
     language: str = ""
     nb_frames: int = 0
@@ -88,6 +99,27 @@ class ProbeResult:
             if s.is_video:
                 return s
         return None
+
+    @property
+    def selected_video_stream(self) -> StreamInfo | None:
+        """The video stream ffmpeg's DEFAULT stream selection (no ``-map``)
+        picks: the highest-resolution non-attached-picture video stream (first
+        on ties); falls back to ``video_stream`` when only cover art exists.
+        Used by stages that must reason about the exact stream a map-less
+        command will carry (normalize_codecs)."""
+        real = [s for s in self.streams if s.is_video and not s.is_attached_pic]
+        if not real:
+            return self.video_stream
+        return max(real, key=lambda s: (s.width * s.height, -s.index))
+
+    @property
+    def selected_audio_stream(self) -> StreamInfo | None:
+        """The audio stream ffmpeg's default selection picks: most channels,
+        first on ties."""
+        auds = self.audio_streams
+        if not auds:
+            return None
+        return max(auds, key=lambda s: (s.channels, -s.index))
 
     @property
     def audio_streams(self) -> list[StreamInfo]:
@@ -147,10 +179,61 @@ class ProbeResult:
             "video_codec": vs.codec_name if vs else "",
             "audio_codecs": [s.codec_name for s in self.audio_streams],
             "audio_count": len(self.audio_streams),
+            # normalize_codecs inputs (REQUIREMENTS.md § 22.2): the stream
+            # ffmpeg's default (map-less) selection carries, described by the
+            # fields the stage needs. "" / 0 / [] when absent.
+            "pix_fmt": (
+                self.selected_video_stream.pixel_format if self.selected_video_stream else ""
+            ),
+            "bit_depth": pix_fmt_bit_depth(
+                self.selected_video_stream.pixel_format if self.selected_video_stream else "",
+                self.selected_video_stream.bits_per_raw_sample if self.selected_video_stream else 0,
+            ),
+            "color_primaries": (
+                self.selected_video_stream.color_primaries if self.selected_video_stream else ""
+            ),
+            "color_trc": (
+                self.selected_video_stream.color_transfer if self.selected_video_stream else ""
+            ),
+            "color_space": (
+                self.selected_video_stream.color_space if self.selected_video_stream else ""
+            ),
+            "color_range": (
+                self.selected_video_stream.color_range if self.selected_video_stream else ""
+            ),
+            "selected_video_codec": (
+                self.selected_video_stream.codec_name if self.selected_video_stream else ""
+            ),
+            "selected_audio_codec": (
+                self.selected_audio_stream.codec_name if self.selected_audio_stream else ""
+            ),
             "streams": len(self.streams),
             "probe_stderr": self.stderr,
             "title": self.title,
         }
+
+
+def pix_fmt_bit_depth(pix_fmt: str, bits_per_raw_sample: int = 0) -> int:
+    """Bits per component implied by an ffmpeg pixel-format name.
+
+    ``yuv420p`` -> 8, ``yuv420p10le`` -> 10, ``p010le`` -> 10, ``gbrp12le`` ->
+    12, ``gray16le`` -> 16, ``nv12`` -> 8. Falls back to ``bits_per_raw_sample``
+    (ffprobe's value, already int-coerced) when the name carries no depth, and
+    finally to 8 for a non-empty name / 0 for an empty one (unknown). The
+    probe value is only a fallback because encoders pad: a 10-bit-in-12 file
+    can report either, whereas the pix_fmt is what a filter graph will see.
+    """
+    name = (pix_fmt or "").lower()
+    if not name:
+        return bits_per_raw_sample if bits_per_raw_sample > 0 else 0
+    if name.startswith("p0") and name[1:4].isdigit():  # p010le, p016le
+        return int(name[1:4])
+    m = re.search(r"p(\d{2})(?:le|be)?$", name) or re.search(r"(\d{2})(?:le|be)$", name)
+    if m:
+        return min(int(m.group(1)), 16)  # rgb48le etc. report packed totals
+    if bits_per_raw_sample > 8:
+        return bits_per_raw_sample
+    return 8
 
 
 def get_ffmpeg_path(config: Config | None = None) -> str:
@@ -249,6 +332,10 @@ def _parse_probe_result(data: dict, filepath: str) -> ProbeResult:
             color_space=s.get("color_space", ""),
             color_range=s.get("color_range", ""),
             color_transfer=s.get("color_transfer", ""),
+            color_primaries=s.get("color_primaries", ""),
+            bits_per_raw_sample=_safe_int(s.get("bits_per_raw_sample", 0)),
+            is_attached_pic=s.get("disposition", {}).get("attached_pic", 0) == 1,
+            channel_layout=s.get("channel_layout", ""),
             is_default=s.get("disposition", {}).get("default", 0) != 0,
             language=tags.get("language", ""),
             nb_frames=_safe_int(s.get("nb_frames", 0)),
@@ -605,6 +692,21 @@ def generate_temp_path(
     base = temp_dir or os.path.dirname(original_path) or base_dir
     os.makedirs(base, exist_ok=True)
     return os.path.join(base, f".avf_{uuid.uuid4().hex[:8]}{suffix}{ext}")
+
+
+def sibling_temp_path(path: str, tag: str) -> str:
+    """A scratch path next to ``path`` that keeps ``path``'s extension.
+
+    ``<root>.<tag><ext>`` -- e.g. ``/t/a.mkv`` -> ``/t/a.resize_tmp.mkv``. Stage
+    code that writes a scratch file and then ``os.replace``s it over the real
+    destination MUST use this rather than a hardcoded extension: ffmpeg picks
+    the muxer from the extension, so a hardcoded ``.mp4`` scratch replaced onto a
+    ``.mkv`` destination leaves MP4 bytes in a file named ``.mkv`` (and a
+    stream-copied Vorbis/Opus/FLAC track can't be written to the ``.mp4``
+    scratch at all). REQUIREMENTS.md § 22.3.
+    """
+    root, ext = os.path.splitext(path)
+    return f"{root}.{tag}{ext or '.mkv'}"
 
 
 def get_video_info(input_path: str) -> dict[str, Any]:

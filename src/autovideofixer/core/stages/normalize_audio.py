@@ -128,7 +128,7 @@ class NormalizeAudioStage(BaseStage):
         else:
             return None
 
-        from autovideofixer.core.ffmpeg_utils import run_ffmpeg
+        from autovideofixer.core.ffmpeg_utils import run_ffmpeg, sibling_temp_path
 
         # Same in-place-vs-explicit-output-path handling as the normal apply
         # pass below: writing directly onto input_path while also reading it
@@ -136,7 +136,9 @@ class NormalizeAudioStage(BaseStage):
         # output_path is None else output_path` (not the equivalent
         # `in_place`-first form) so mypy narrows the else-branch to `str`.
         in_place = output_path is None
-        dest: str = f"{input_path}.normalize_tmp.mp4" if output_path is None else output_path
+        dest: str = (
+            sibling_temp_path(input_path, "normalize_tmp") if output_path is None else output_path
+        )
 
         copy_result = run_ffmpeg(
             ["-hide_banner", "-i", input_path, "-c", "copy", "-y", dest],
@@ -193,7 +195,7 @@ class NormalizeAudioStage(BaseStage):
             )
             label = stage_label if stage_label is not None else self.name
 
-            from autovideofixer.core.ffmpeg_utils import run_ffmpeg
+            from autovideofixer.core.ffmpeg_utils import run_ffmpeg, sibling_temp_path
 
             # Two-pass loudnorm: first pass measures, second pass applies
             args = [
@@ -260,7 +262,7 @@ class NormalizeAudioStage(BaseStage):
             # the same file. Write to a distinct temp path and only replace
             # input_path with it after a successful encode.
             in_place = output_path is None
-            dest = f"{input_path}.normalize_tmp.mp4" if in_place else output_path
+            dest = sibling_temp_path(input_path, "normalize_tmp") if in_place else output_path
 
             args = [
                 "-i",

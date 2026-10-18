@@ -118,6 +118,14 @@ draws an explicit VERIFIED / UNVERIFIED line instead of a flat done/not-done che
   edge, logged at INFO on every run. See REQUIREMENTS.md's R3.5 and AGENTS.md's "Mixed
   Python/Rust"/"Auto-crop" sections.
 
+- **Codec normalization, crop-on-by-default & container-safety audit** (REQUIREMENTS.md § 22,
+  phase P1 of the 2026-10 feature set) — implemented 2026-10-17. `normalize_codecs` (on by
+  default, right after `retime`) rewrites only unusual codecs (VP9/AV1 video, Opus/Vorbis/FLAC/
+  PCM audio) to H.264/AAC and SKIPs when nothing needs changing, so `.webm` inputs stop tripping
+  stages that stream-copy source streams; `stages.crop.enabled` now defaults to true; and the
+  container audit fixed `.mkv`-renamed-to-`.mp4` promotion plus several hardcoded-`.mp4`
+  scratch files. Existing pinned `pipeline.default_order` configs get the new stage via the P3
+  config migration (§ 24), not before.
 - **True source cadence recovery & timestamp-safe pipeline** (`retime` stage, on by default —
   REQUIREMENTS.md § 12) — recovers a video's real content framerate when it was padded up to a
   higher encoded rate by duplicated frames (24fps published at 60fps, VFR captures transcoded to

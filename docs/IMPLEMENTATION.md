@@ -52,6 +52,7 @@ This document outlines the detailed implementation plan for Auto Video Fixer, br
 - [x] Implement stage registry
 - [x] Create pipeline orchestrator
 - [x] Add smart stage ordering
+- [x] Codec normalization stage (`normalize_codecs`, after `retime`) + container-safety audit (REQUIREMENTS.md § 22, 2026-10-17)
 - [x] Implement job management
 - [x] Write pipeline tests
 

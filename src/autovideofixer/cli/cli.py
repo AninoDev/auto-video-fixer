@@ -194,6 +194,8 @@ _BOOL_FLAGS = {
     "--no-downscale",
     "--retime",
     "--no-retime",
+    "--normalize-codecs",
+    "--no-normalize-codecs",
 }
 
 
@@ -1063,8 +1065,8 @@ def _log_effective_settings(
     type=int,
     default=None,
     help="cropdetect luma threshold for the auto-crop stage (overrides stages.crop.limit); "
-    "the crop stage itself still needs --enable-stage crop or stages.crop.enabled: true "
-    "in config, since auto-crop is opt-in.",
+    "the crop stage is on by default (stages.crop.enabled; --enable-stage crop forces it "
+    "on for one run).",
 )
 @click.option(
     "--interpolate-hybrid/--no-interpolate-hybrid",
@@ -1155,6 +1157,15 @@ def _log_effective_settings(
     "cadence (as opposed to the encoded/container framerate) and drops padding/"
     "duplicate frames while preserving genuine VFR timing (overrides "
     "stages.retime.enabled; on by default). See docs/REQUIREMENTS.md § 12.",
+)
+@click.option(
+    "--normalize-codecs/--no-normalize-codecs",
+    "normalize_codecs",
+    default=None,
+    help="Enable/disable the normalize_codecs stage, which rewrites ONLY streams with an "
+    "'unusual' codec (VP9/AV1 video, Opus/Vorbis/FLAC/PCM audio, e.g. YouTube .webm) into "
+    "H.264/AAC before the heavy stages run, and SKIPs when nothing needs changing (overrides "
+    "stages.normalize_codecs.enabled; on by default). See docs/REQUIREMENTS.md § 22.2.",
 )
 @click.option(
     "--retime-min-duplicate-ratio",
@@ -1396,6 +1407,7 @@ def process(
     interpolate_max_gap_sec: float | None,
     downscale: bool | None,
     retime: bool | None,
+    normalize_codecs: bool | None,
     retime_min_duplicate_ratio: float | None,
     audio_speed_method: str | None,
     audio_sample_rate: int | None,
@@ -1592,6 +1604,14 @@ def process(
     if retime is not None:
         cli_candidates.append(
             (("--retime", "--no-retime"), ["stages", "retime", "enabled"], retime)
+        )
+    if normalize_codecs is not None:
+        cli_candidates.append(
+            (
+                ("--normalize-codecs", "--no-normalize-codecs"),
+                ["stages", "normalize_codecs", "enabled"],
+                normalize_codecs,
+            )
         )
     if retime_min_duplicate_ratio is not None:
         cli_candidates.append(

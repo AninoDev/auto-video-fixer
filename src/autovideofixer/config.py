@@ -616,7 +616,15 @@ class Config:
             # cheaply on an already-honest input. See core/stages/retime.py
             # and core/cadence.py.
             #
-            # deinterlace runs right after retime, before crop (REQUIREMENTS.md
+            # normalize_codecs runs right after retime, before every heavy stage
+            # (REQUIREMENTS.md § 22.2): it rewrites only the streams whose codec
+            # is "unusual" (VP9/AV1 video, Opus/Vorbis/FLAC/PCM audio -- typical
+            # YouTube .webm) into H.264/AAC so no later stage ever stream-copies
+            # a codec its container (or ffmpeg build) can't hold. A no-op SKIP
+            # when everything is already H.264/AAC. See
+            # core/stages/normalize_codecs.py.
+            #
+            # deinterlace runs right after retime(+normalize_codecs), before crop (REQUIREMENTS.md
             # § 20.1): every downstream stage (crop bounds, scene detection,
             # RIFE interpolation) benefits from seeing progressive frames, and
             # comb artefacts actively corrupt motion-based analysis. Off by
@@ -625,6 +633,7 @@ class Config:
             "default_order": [
                 "detect",
                 "retime",
+                "normalize_codecs",
                 "deinterlace",
                 "crop",
                 "downscale",
@@ -639,12 +648,14 @@ class Config:
                 "hdr",
                 "encode",
             ],
-            # Must stay >= len(default_order) above (15) since a full default run
+            # Must stay >= len(default_order) above (16) since a full default run
             # legitimately uses every stage; this only guards against pathological
             # --stage/default_order repetition, not normal preset/auto-determined
             # pipelines. Counts resolved OCCURRENCES, not unique stage names -- a
-            # stage repeated via default_order counts once per repetition.
-            "max_stages": 17,
+            # stage repeated via default_order counts once per repetition. Kept at
+            # len(default_order) + 2 (two repeats of headroom): bump it whenever a
+            # stage is added to default_order.
+            "max_stages": 18,
             "skip_stage_on_error": True,
             # Default timeout (seconds) for a stage's MAIN ffmpeg processing/mux
             # pass(es) -- see BaseStage.stage_timeout() in core/stages/base.py.
@@ -836,6 +847,36 @@ class Config:
                 # every later stage reads from). Default 16 (near-visually-
                 # lossless), matching the AI stages' own temp_crf default.
                 "temp_crf": 16,
+            },
+            "normalize_codecs": {
+                # REQUIREMENTS.md § 22.2. Makes every stream the pipeline keeps
+                # one of a small universally-compatible set of codecs, touching a
+                # stream ONLY if it has to (SKIPs with no new file when nothing
+                # needs changing). Why it exists: stages stream-copy source
+                # streams (`-c:a copy`, `-c copy`) into containers that may not
+                # hold them (Vorbis in MP4, ...), killing the job; normalizing
+                # once, up front, makes every later copy path safe without each
+                # stage reasoning about codecs. Video is re-encoded even though a
+                # later stage often re-encodes again, because this temp is
+                # visually lossless (temp_crf) and the alternative is per-stage
+                # codec special-casing. Disable only if you know every input is
+                # already H.264/AAC (then it SKIPs for free anyway).
+                "enabled": True,
+                # Video codecs (ffprobe codec_name) kept with `-c:v copy`.
+                # Anything else is re-encoded with `video_encoder`.
+                "video_codecs_allowed": ["h264"],
+                # Audio codecs kept with `-c:a copy`, per audio stream. Anything
+                # else is re-encoded with `audio_codec` at `audio_bitrate`.
+                "audio_codecs_allowed": ["aac"],
+                "video_encoder": "libx264",
+                # Temp quality for a video transcode -- matches the AI stages'
+                # and retime's temp_crf (near-visually-lossless intermediate).
+                "temp_crf": 16,
+                "preset": "medium",
+                "audio_codec": "aac",
+                "audio_bitrate": "256k",
+                # Per-stage timeout (seconds); None -> pipeline.stage_timeout.
+                "timeout": None,
             },
             "deinterlace": {
                 # REQUIREMENTS.md § 20: converts interlaced (fielded) content
@@ -1232,9 +1273,14 @@ class Config:
             },
             "crop": {
                 # Auto-crop: detect and remove black borders (letterbox/pillarbox),
-                # including residual borders stabilize can introduce. Strictly
-                # opt-in -- see docs/REQUIREMENTS.md feature 3, AGENTS.md stage list.
-                "enabled": False,
+                # including residual borders stabilize can introduce. On by
+                # default since REQUIREMENTS.md § 22.1 (it was opt-in before):
+                # should_run() SKIPs cheaply (one cropdetect sample, no
+                # re-encode) on a borderless input, and cropping first saves
+                # every downstream stage compute. Existing user configs that
+                # spell out `enabled: false` keep it until the P3 config
+                # migration (§ 24) flips it. See AGENTS.md "Auto-crop".
+                "enabled": True,
                 # cropdetect luma threshold (0-255, ffmpeg default is 24) -- pixels
                 # darker than this are treated as "black" border.
                 "limit": 24,

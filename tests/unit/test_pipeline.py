@@ -1,6 +1,7 @@
 """Tests for pipeline engine."""
 
 import os
+import subprocess
 import tempfile
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -338,8 +339,25 @@ class TestSkippedTerminalStagePromotion:
                 return True, None
 
             def execute(self, input_path, output_path=None, progress_callback=None, **kwargs):
-                with open(output_path, "wb") as f:
-                    f.write(b"produced content")
+                # A REAL (tiny) Matroska temp: since REQUIREMENTS.md § 22.3 the
+                # promotion remuxes a .mkv temp into the .mp4 job output rather
+                # than renaming bytes, so opaque fake content can't survive it.
+                subprocess.run(
+                    [
+                        "ffmpeg",
+                        "-v",
+                        "error",
+                        "-y",
+                        "-f",
+                        "lavfi",
+                        "-i",
+                        "testsrc2=s=64x48:r=10:d=1",
+                        "-c:v",
+                        "libx264",
+                        output_path,
+                    ],
+                    check=True,
+                )
                 return StageResult(status=StageStatus.COMPLETED, output_path=output_path)
 
         class SkipStage(BaseStage):
@@ -385,8 +403,22 @@ class TestSkippedTerminalStagePromotion:
         assert result.success is True
         assert result.output_path == job.output_path
         assert os.path.exists(job.output_path)
-        with open(job.output_path, "rb") as f:
-            assert f.read() == b"produced content"
+        out_probe = subprocess.run(
+            [
+                "ffprobe",
+                "-v",
+                "error",
+                "-show_entries",
+                "format=format_name",
+                "-of",
+                "csv=p=0",
+                job.output_path,
+            ],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout
+        assert "mp4" in out_probe  # real MP4, not Matroska bytes named .mp4
 
         # No .avf_* intermediate temp files left behind anywhere near the input.
         for f in os.listdir(input_dir):

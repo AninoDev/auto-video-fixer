@@ -221,7 +221,9 @@ src/autovideofixer/
 │       ├── base.py         # BaseStage, register_stage(), StageResult
 │       ├── detect.py       # "detect" (analysis, priority=1, produces_output=False)
 │       ├── stabilize.py    # "stabilize" — pipes raw YUV420P (decode→transform)
-│       ├── crop.py         # "crop" (auto-crop, opt-in, off by default)
+│       ├── retime.py       # "retime" (cadence recovery, REQUIREMENTS.md § 12)
+│       ├── normalize_codecs.py # "normalize_codecs" (VP9/AV1/Opus/Vorbis -> H.264/AAC, § 22)
+│       ├── crop.py         # "crop" (auto-crop, ON by default since § 22.1)
 │       ├── deblock.py      # "deblock"
 │       ├── denoise_video.py# "denoise_video"
 │       ├── upscale.py      # "upscale" (AI or traditional)
@@ -309,8 +311,10 @@ one of `--output-name`/a per-file `--from-file` output may apply -- combining th
   gone -- `DEFAULTS["pipeline"]["default_order"]` (and a matching `DEFAULT_STAGE_ORDER` constant
   in `core/pipeline.py`, used only as a fallback when the config key is missing/empty) now
   **is** the actual execution order. Default order:
-  `detect, retime, deinterlace, crop, downscale, deblock, stabilize, denoise_video, upscale,
-  interpolate, normalize_volume, normalize_audio, speed, hdr, encode`.
+  `detect, retime, normalize_codecs, deinterlace, crop, downscale, deblock, stabilize,
+  denoise_video, upscale, interpolate, normalize_volume, normalize_audio, speed, hdr, encode`
+  (16 entries; `pipeline.max_stages` is 18 = that + 2 repeats of headroom -- **bump it whenever you
+  add a stage to `default_order`**).
   - `retime` runs **immediately after `detect`** (REQUIREMENTS.md § 12): it recovers the input's
     TRUE content cadence (as opposed to the encoded/container framerate) via a single decode-only
     `mpdecimate`+`metadata=print` pass (`core/cadence.py`) and drops padding/duplicate frames
@@ -320,7 +324,29 @@ one of `--output-name`/a per-file `--from-file` output may apply -- combining th
     -- this is the actual payoff: a 24-in-60 input targeting 60fps now correctly plans 24->60
     interpolation instead of reading 60->60 and skipping. See "Timestamp safety across stages"
     below for how the rest of the pipeline stays VFR-safe downstream of this stage.
-  - `deinterlace` runs right after `retime`, before `crop` (REQUIREMENTS.md § 20): converts
+  - `normalize_codecs` runs **right after `retime`**, before every heavy stage (REQUIREMENTS.md
+    § 22.2), ON by default. **Why it exists**: stages stream-copy source-derived streams
+    (`-c:a copy`, `-c copy`) into containers/ffmpeg builds that may not hold them (Vorbis/FFV1 in
+    MP4, ...) -- typical of YouTube `.webm` (VP9 + Opus/Vorbis). It makes every stream it keeps
+    H.264 / AAC, touching a stream **only if it has to** (`video_codecs_allowed` default `[h264]`
+    -> `-c:v copy`, else `libx264` at `temp_crf` 16 / `medium`, 8-bit -> `yuv420p`, >8-bit ->
+    `yuv420p10le`, colour primaries/trc/matrix/range carried explicitly so `hdr` still sees HDR,
+    odd dimensions cropped even; `audio_codecs_allowed` default `[aac]` -> `-c:a copy`, else `aac`
+    256k with the layout preserved), and **SKIPs with no new file** when nothing needs changing.
+    Why video is re-encoded even though a later stage usually re-encodes again: the temp is
+    visually lossless (CRF 16) and the alternative is every stage reasoning about codecs/containers
+    -- the failure mode being removed. Why it is not folded into `retime`: retime SKIPs on honest
+    input, which is exactly the honest-cadence `.webm` this stage is for. Stream selection is
+    **ffmpeg's default (no `-map`)**, like every other ffmpeg-pass stage; the copy/transcode
+    decision is made for the stream that default picks (`ProbeResult.selected_video_stream` =
+    highest-resolution non-cover-art; `selected_audio_stream` = most channels, first on ties).
+    Timestamp safety: `-fps_mode passthrough` on the output so a VFR `retime` intermediate is not
+    re-conformed to CFR (verified on a real retime output: 48 frames in, 48 out, not 120). The
+    stage probes `input_path` itself in `execute()` (input_info only drives the cheap
+    `should_run()` pre-check). Stage metadata lists each stream as `copied (codec)` /
+    `transcoded (a->b)`. Revisit the allowed lists if a later stage gains a hard requirement on
+    another codec, or if hardware encoders should replace `libx264` here.
+  - `deinterlace` runs right after `retime`(+`normalize_codecs`), before `crop` (REQUIREMENTS.md § 20): converts
     interlaced (fielded) content into progressive frames so every downstream stage (crop bounds,
     scene detection, RIFE interpolation) sees comb-free frames. **Off by default**
     (`stages.deinterlace.enabled: false`) -- detection is an `idet`-based heuristic that
@@ -1459,6 +1485,28 @@ per-run number baked into this codebase.
   input parsing). Also do **not** re-probe for fps on a file downstream of `retime`:
   `avg_frame_rate` is unreliable on a VFR intermediate (empirically a 48-frame 2s VFR MKV still
   advertised `avg_frame_rate=60/1`) -- take the rate from `input_info["true_framerate"]` instead.
+- **Container safety (REQUIREMENTS.md § 22.3)**: a file's extension picks ffmpeg's muxer, so a
+  scratch file named `.mp4` that is `os.replace()`d onto a `.mkv` destination leaves MP4 bytes in a
+  `.mkv`-named file (and a stream-copied source audio track may not be legal in MP4 at all).
+  Rules: (1) a scratch file that is renamed over a destination takes the destination's extension
+  -- use `ffmpeg_utils.sibling_temp_path(path, tag)` (done for upscale's resize scratch,
+  stabilize's cadence-retag remux, normalize_audio's in-place scratch); (2) a stage-internal temp
+  that receives a **source-derived** stream via `-c copy`/`-c:a copy` is `.mkv` (upscale's
+  multi-pass intermediates were `.mp4` and are now `.mkv`); (3) `.mp4` is kept ONLY where nothing
+  source-derived is copied in -- the AI stages' writer temps (`.avf_upscaled_*/deblock_*/
+  denoise_*.mp4`, libx264 frames only; source audio is muxed afterwards into the real output), the
+  interpolate chunk/concat files (`-an`, minterpolate-generated H.264) and scene mode's per-scene
+  files (video re-encoded to libx264 and audio to AAC before any copy) -- each has a comment saying
+  so; (4) `Pipeline._promote_temp_to_output()` never renames across container extensions: an `.mkv`
+  temp landing on an `.mp4` output is REMUXED (`-c copy` -> audio-only transcode -> full
+  transcode ladder, starting at the first rung whose codecs the target's *standard* lists --
+  `_MP4_VIDEO_CODECS`/`_MP4_AUDIO_CODECS` -- because this repo's ffmpeg n9.0.1 happily muxes
+  Vorbis/FFV1 into MP4 and exits 0), and if every rung fails the result is kept as
+  `<output>.mkv` with an ERROR log rather than as MKV bytes named `.mp4`. It returns the path it
+  actually landed on. **Not covered**: a stage that is the *terminal* stage writes straight to the
+  job's `.mp4` output with `-c:a copy`; with `normalize_codecs` disabled and Vorbis audio that
+  produces a non-standard (Vorbis-in-MP4) file on this ffmpeg. `normalize_codecs` (on by default)
+  is the guard for that; revisit if users routinely disable it.
 - **stabilize.py `_get_video_dimensions` / `_get_video_framerate`**: Must use `stdout=subprocess.PIPE` (not `subprocess.DEVNULL`). Using DEVNULL discards output and forces fallback to 1920×1080 / 30fps, stretching portrait video to landscape.
 - **stabilize pipe sizing**: The decode subprocess **must** include `-s {width}x{height}` to match the transform's `-s` input. Without it, anamorphic or non-standard resolution videos produce corrupted output due to stride mismatch.
 - **vid.stab B-frame corruption**: Known bug (github.com/georgmartius/vid.stab#144). The pipeline pipes raw YUV420P between decode and transform to avoid it. Use accuracy=15 (higher causes FFmpeg return code 222).
@@ -1768,7 +1816,14 @@ inside ffmpeg. CLI: `--sharpen`/`--no-sharpen` (`stages.stabilize.sharpen_enable
 
 ## Auto-crop
 
-Opt-in, off by default (`stages.crop.enabled: false`). See `core/stages/crop.py`,
+**On by default** since REQUIREMENTS.md § 22.1 (`stages.crop.enabled: true`; it was opt-in
+before). The stage's own `should_run()` SKIPs cheaply (one sample, no re-encode) on a borderless
+input, and cropping first saves every downstream stage compute. **Existing user configs spell out
+every key, so a `stages.crop.enabled: false` already in someone's config.yaml keeps crop off** --
+the config-schema migration that flips it ships in P3 (§ 24); until then tell users to run
+`avf config upgrade`/edit the key. Note a synthetic `testsrc2` clip has side bars the Rust border
+detector crops (320x240 -> 266x240), so end-to-end tests on `testsrc2` see a changed resolution.
+See `core/stages/crop.py`,
 `Config.DEFAULTS["stages"]["crop"]`, `core/analysis.py::run_crop_vlm_check`/
 `_parse_crop_vlm_response`, and `docs/REQUIREMENTS.md` feature 3.
 
@@ -2001,14 +2056,19 @@ Global (before the subcommand):
   non-content by the VLM+coordinator pass (`scenes.drop_non_content`) — fails open on any
   failure, see "Scene mode" above
 - `--crop-limit INT`: cropdetect luma threshold override for the auto-crop stage
-  (`stages.crop.limit`) — auto-crop itself is still opt-in, enable it via `--enable-stage crop`
-  or `stages.crop.enabled: true` in config; see "Auto-crop" above
+  (`stages.crop.limit`) — auto-crop is ON by default (§ 22.1); `--disable-stage crop` or
+  `stages.crop.enabled: false` turns it off; see "Auto-crop" above
 - `--downscale` / `--no-downscale`: enable/disable the `downscale` stage (`stages.downscale.
   enabled`, off by default), which shrinks an oversized input to the target resolution box
   before the heavier stages run — see "Resolution fit modes & the `downscale` stage" above
 - `--retime` / `--no-retime`: enable/disable the `retime` stage (`stages.retime.enabled`, ON by
   default), which recovers a video's TRUE source cadence and drops padding/duplicate frames —
   see REQUIREMENTS.md § 12 and "Pipeline Behavior" above
+- `--normalize-codecs` / `--no-normalize-codecs`: enable/disable the `normalize_codecs` stage
+  (`stages.normalize_codecs.enabled`, ON by default), which rewrites only streams with an unusual
+  codec (VP9/AV1/Opus/Vorbis/FLAC/PCM) to H.264/AAC and SKIPs when nothing needs changing — see
+  "Pipeline Behavior" above and REQUIREMENTS.md § 22.2. Wired through the same final-CLI-layer /
+  argv-scan bookkeeping as `--retime` (`_BOOL_FLAGS` in `cli/cli.py`)
 - `--retime-min-duplicate-ratio FLOAT`: minimum duplicate-frame fraction before `retime` actually
   re-encodes (`stages.retime.min_duplicate_ratio`, default 0.05) — below it the stage SKIPs
 - `--audio-speed-method {atempo,rubberband,asetrate}`: audio algorithm for the `speed` stage

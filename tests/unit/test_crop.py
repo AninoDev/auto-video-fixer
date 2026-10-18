@@ -89,7 +89,7 @@ class TestCropConfigDefaults:
         config = _config(tmp_path)
         crop_cfg = config.get("stages", "crop")
         assert crop_cfg == {
-            "enabled": False,
+            "enabled": True,  # § 22.1: on by default
             "limit": 24,
             "round": 2,
             "min_crop_px": 8,
@@ -132,10 +132,24 @@ class TestCropStageRegistration:
         )
         assert ordered == ["detect", "crop", "deblock", "stabilize", "encode"]
 
-    def test_not_enabled_by_default_in_auto_determine(self, tmp_path):
+    def test_enabled_by_default_in_auto_determine(self, tmp_path):
         from autovideofixer.core.pipeline import Job, Pipeline
 
         pipeline = Pipeline(_config(tmp_path))
+        video = tmp_path / "in.mp4"
+        video.write_bytes(b"\x00")
+        job = Job(input_path=str(video), output_path=str(tmp_path / "out.mp4"))
+        with patch(
+            "autovideofixer.core.pipeline.get_video_info",
+            return_value={"resolution": (640, 480), "framerate": 30, "is_hdr": False},
+        ):
+            stages = pipeline.auto_determine_stages(job)
+        assert "crop" in stages  # REQUIREMENTS.md § 22.1: on by default
+
+    def test_explicitly_disabled_excluded_from_auto_determine(self, tmp_path):
+        from autovideofixer.core.pipeline import Job, Pipeline
+
+        pipeline = Pipeline(_config(tmp_path, enabled=False))
         video = tmp_path / "in.mp4"
         video.write_bytes(b"\x00")
         job = Job(input_path=str(video), output_path=str(tmp_path / "out.mp4"))

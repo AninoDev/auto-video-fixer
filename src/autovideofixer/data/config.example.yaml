@@ -405,13 +405,19 @@ pipeline:
   # frames, so the reduced, honest frame set -- and the compute saving -- carries through every
   # later stage. On by default; SKIPs (never fails, never re-encodes) cheaply on an
   # already-honest input. See core/stages/retime.py and core/cadence.py.
-  # deinterlace runs right after retime, before crop (docs/REQUIREMENTS.md § 20.1): every
+  # normalize_codecs runs right after retime, before every heavy stage (docs/REQUIREMENTS.md
+  # § 22.2): it rewrites only the streams whose codec is "unusual" (VP9/AV1 video,
+  # Opus/Vorbis/FLAC/PCM audio -- typical YouTube .webm) into H.264/AAC so no later stage ever
+  # stream-copies a codec its container (or ffmpeg build) can't hold. A no-op SKIP when
+  # everything is already H.264/AAC. See core/stages/normalize_codecs.py.
+  # deinterlace runs right after retime(+normalize_codecs), before crop (docs/REQUIREMENTS.md § 20.1): every
   # downstream stage (crop bounds, scene detection, RIFE interpolation) benefits from seeing
   # progressive frames, and comb artefacts actively corrupt motion-based analysis. Off by
   # default -- see stages.deinterlace.enabled below for why. See core/stages/deinterlace.py.
   default_order:
     - detect
     - retime
+    - normalize_codecs
     - deinterlace
     - crop
     - downscale
@@ -431,6 +437,7 @@ pipeline:
   #   default_order:
   #     - detect
   #     - retime
+  #     - normalize_codecs
   #     - deinterlace
   #     - crop
   #     - downscale
@@ -457,6 +464,7 @@ pipeline:
   #   default_order:
   #     - detect
   #     - retime
+  #     - normalize_codecs
   #     - deinterlace
   #     - crop
   #     - downscale
@@ -475,10 +483,11 @@ pipeline:
 
   # Safety cap on how many stage OCCURRENCES a single job may run (guards against
   # pathological --stage/default_order repetition, not normal preset/auto-determined
-  # pipelines -- must stay >= 15, the length of a full default run). A stage repeated via
-  # default_order counts once per repetition. Exceeding this fails the job outright rather
-  # than silently truncating (which could drop the always-last "encode" stage).
-  max_stages: 17
+  # pipelines -- must stay >= 16, the length of a full default run; kept at that + 2 for two
+  # repeats of headroom). A stage repeated via default_order counts once per repetition.
+  # Exceeding this fails the job outright rather than silently truncating (which could drop
+  # the always-last "encode" stage).
+  max_stages: 18
 
   # Whether a stage that FAILS aborts the whole job (false) or is skipped, continuing the
   # pipeline with the last successfully-produced intermediate as input to the next stage
@@ -583,6 +592,34 @@ stages:
     # intermediate .mkv temp every later stage reads from). Default 16 (near-visually-lossless),
     # matching the AI stages' own temp_crf default.
     temp_crf: 16
+
+  normalize_codecs:
+    # docs/REQUIREMENTS.md § 22.2. Makes every stream the pipeline keeps one of a small
+    # universally-compatible set of codecs, touching a stream ONLY if it has to (SKIPs with no
+    # new file when nothing needs changing). Why it exists: stages stream-copy source streams
+    # (`-c:a copy`, `-c copy`) into containers that may not hold them (Vorbis in MP4, ...),
+    # killing the job; normalizing once, up front, makes every later copy path safe without
+    # each stage reasoning about codecs. Video is re-encoded even though a later stage often
+    # re-encodes again, because this temp is visually lossless (temp_crf) and the alternative
+    # is per-stage codec special-casing. Disable only if you know every input is already
+    # H.264/AAC (then it SKIPs for free anyway).
+    enabled: true
+    # Video codecs (ffprobe codec_name) kept with `-c:v copy`. Anything else is re-encoded with
+    # video_encoder. 8-bit sources -> yuv420p, >8-bit -> yuv420p10le; color metadata carried.
+    video_codecs_allowed:
+      - h264
+    # Audio codecs kept with `-c:a copy`, per audio stream. Anything else is re-encoded with
+    # audio_codec at audio_bitrate (channel layout preserved).
+    audio_codecs_allowed:
+      - aac
+    video_encoder: libx264
+    # Temp quality for a video transcode -- matches the AI stages' and retime's temp_crf.
+    temp_crf: 16
+    preset: medium
+    audio_codec: aac
+    audio_bitrate: 256k
+    # Per-stage timeout (seconds); null falls back to pipeline.stage_timeout.
+    timeout: null
 
   deinterlace:
     # docs/REQUIREMENTS.md § 20: converts interlaced (fielded) content to progressive frames.
@@ -1018,7 +1055,8 @@ stages:
     # warning if missing).
     resampler: soxr
 
-  # Auto-crop (opt-in, off by default). Detects a video's true content bounds -- the union
+  # Auto-crop (ON by default since docs/REQUIREMENTS.md § 22.1; SKIPs cheaply on a borderless
+  # input). Detects a video's true content bounds -- the union
   # over the whole video, not a per-frame crop -- via FFmpeg cropdetect with reset=0, and
   # crops to that single window. Strips letterboxing/pillarboxing, including any residual
   # border stabilize can itself introduce. Runs right after "stabilize" and before every
@@ -1026,7 +1064,7 @@ stages:
   # optimize_stage_order()). Enable via `--enable-stage crop` or `enabled: true` here/in a
   # preset. Also settable per-run via `avf process --crop-limit`.
   crop:
-    enabled: false
+    enabled: true
     # cropdetect luma threshold (0-255) -- pixels darker than this are treated as "black"
     # border.
     limit: 24

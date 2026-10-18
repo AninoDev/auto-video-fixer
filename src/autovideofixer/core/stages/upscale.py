@@ -7,7 +7,7 @@ import time
 from typing import Any
 
 from autovideofixer.core.cadence_guard import cadence_metadata, resolve_cadence
-from autovideofixer.core.ffmpeg_utils import probe, run_ffmpeg
+from autovideofixer.core.ffmpeg_utils import probe, run_ffmpeg, sibling_temp_path
 from autovideofixer.core.output_check import SKIP_SCALE_THRESHOLD, compute_fitted_dimensions
 from autovideofixer.core.output_check import effective_target_bounds as _effective_target_bounds_fn
 from autovideofixer.core.stages.base import BaseStage, StageResult, StageStatus
@@ -367,9 +367,12 @@ class UpscaleStage(BaseStage):
                 import uuid
 
                 input_stem = os.path.splitext(os.path.basename(input_path))[0]
+                # .mkv, not .mp4 (REQUIREMENTS.md § 22.3): _run_single_ai_pass muxes
+                # the SOURCE audio track into this file with `-c:a copy`, and MP4
+                # can't hold Vorbis/FLAC/PCM; Matroska holds anything.
                 pass_output = os.path.join(
                     tempfile.gettempdir(),
-                    f".avf_ai_pass{pass_num + 1}_{input_stem}_{uuid.uuid4().hex[:8]}.mp4",
+                    f".avf_ai_pass{pass_num + 1}_{input_stem}_{uuid.uuid4().hex[:8]}.mkv",
                 )
                 intermediate_files.append(pass_output)
 
@@ -502,7 +505,11 @@ class UpscaleStage(BaseStage):
         way this always goes through a distinct temp file first so an
         in-place call never reads from a file it's concurrently truncating.
         """
-        tmp_path = f"{output_path}.resize_tmp.mp4"
+        # Scratch file keeps output_path's extension (REQUIREMENTS.md § 22.3): it is
+        # os.replace()d over output_path below and `-c:a copy` carries a
+        # source-derived audio stream, so a hardcoded ".mp4" both rejected
+        # Vorbis/etc. and left MP4 bytes inside a ".mkv"-named file.
+        tmp_path = sibling_temp_path(output_path, "resize_tmp")
         args = [
             "-i",
             input_path,
@@ -695,6 +702,10 @@ class UpscaleStage(BaseStage):
             # ".avf_upscaled_test_enhanced.webm" temp file that ffmpeg then
             # failed to write into. ".mp4" always matches the actual codec
             # being written, regardless of the final output's container.
+            # MP4 is kept HERE deliberately (REQUIREMENTS.md § 22.3 audit): this
+            # temp holds only the writer-generated H.264 video (no source stream
+            # is copied into it); the source audio is muxed in later, into the
+            # real output container.
             temp_path = os.path.join(
                 os.path.dirname(output_path) or ".",
                 f".avf_upscaled_{os.path.splitext(os.path.basename(output_path))[0]}.mp4",

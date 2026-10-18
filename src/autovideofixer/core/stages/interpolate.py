@@ -488,6 +488,11 @@ class InterpolateStage(BaseStage):
         k = [round(i * (total_frames - 1) / n_chunks) for i in range(n_chunks + 1)]
 
         tmp_dir = _tempfile.mkdtemp(prefix="avf_interp_chunks_")
+        # MP4 is fine for these chunk files and concat_video.mp4 below
+        # (REQUIREMENTS.md § 22.3 audit): they are video-only (`-an`),
+        # ffmpeg-GENERATED H.264 from minterpolate -- no source-derived stream
+        # is stream-copied into them. The source audio is attached afterwards in
+        # the final mux, straight into `output_path`'s own container.
         chunk_paths: list[str] = [
             os.path.join(tmp_dir, f"chunk_{i:03d}.mp4") for i in range(n_chunks)
         ]

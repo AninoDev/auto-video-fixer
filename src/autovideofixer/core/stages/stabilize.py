@@ -10,7 +10,12 @@ from typing import Any
 
 from autovideofixer.config import resolve_timeout
 from autovideofixer.core.cadence_guard import cadence_metadata, resolve_cadence
-from autovideofixer.core.ffmpeg_utils import probe, run_ffmpeg, timing_output_args
+from autovideofixer.core.ffmpeg_utils import (
+    probe,
+    run_ffmpeg,
+    sibling_temp_path,
+    timing_output_args,
+)
 from autovideofixer.core.stages.base import BaseStage, StageResult, StageStatus
 
 
@@ -1117,7 +1122,11 @@ class StabilizeStage(BaseStage):
                 # same "-r before the -i it governs" trick used by the
                 # get_frame_writer-based stages (see
                 # UpscaleStage._run_single_ai_pass's identical note).
-                retag_path = f"{output_path}.cadence_retag.mp4"
+                # Keeps output_path's extension (REQUIREMENTS.md § 22.3): the
+                # remux `-c copy`s the source audio and is os.replace()d back
+                # over output_path, so a hardcoded ".mp4" scratch both rejected
+                # non-MP4 audio and left MP4 bytes in a ".mkv"-named file.
+                retag_path = sibling_temp_path(output_path, "cadence_retag")
                 retag_args = [
                     "-r",
                     f"{cadence_resolution.resolved_fps:.6f}",

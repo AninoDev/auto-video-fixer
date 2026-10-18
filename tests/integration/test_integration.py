@@ -289,7 +289,13 @@ class TestCropIntegration:
                 "-f",
                 "lavfi",
                 "-i",
-                "testsrc2=size=640x480:rate=24:duration=2",
+                # NOT testsrc2: its flat-coloured side bars read as a border to the
+                # Rust arbitrary-colour detector (it cropped 640x480 -> ~533x480),
+                # so the "borderless" fixture must have genuine content to
+                # every edge.
+                "mandelbrot=size=640x480:rate=24",
+                "-t",
+                "2",
                 "-c:v",
                 "libx264",
                 "-pix_fmt",

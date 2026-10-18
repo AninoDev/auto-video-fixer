@@ -64,6 +64,14 @@ def _run_ffmpeg_ok(args: list[str], timeout: float | None = None) -> bool:
     return result.returncode == 0
 
 
+# REQUIREMENTS.md § 22.3 container-safety audit: every scene-mode intermediate
+# below may be .mp4 because nothing source-derived is stream-copied into one --
+# video is re-encoded to libx264 (split_scene_video / concat_video_clips) and
+# audio to AAC (split_scene_audio / concat_audio_clips) before any `-c copy`
+# mux, so only H.264 + AAC (both MP4-legal) ever reach an MP4. Revisit if a
+# `-c copy` of an original stream is ever added here.
+
+
 def split_scene_video(
     input_path: str,
     scene: SceneEvent,

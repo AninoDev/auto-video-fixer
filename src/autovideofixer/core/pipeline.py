@@ -43,6 +43,7 @@ from autovideofixer.core.stages.base import (
 DEFAULT_STAGE_ORDER: list[str] = [
     "detect",
     "retime",
+    "normalize_codecs",
     "deinterlace",
     "crop",
     "downscale",
@@ -57,6 +58,16 @@ DEFAULT_STAGE_ORDER: list[str] = [
     "hdr",
     "encode",
 ]
+
+
+# Codecs the MP4/MOV family's standards list (see
+# Pipeline._promote_temp_to_output). Deliberately conservative: a codec missing
+# here is merely transcoded when a Matroska temp is promoted to an .mp4 output,
+# never dropped. Vorbis/FFV1/VP8/Theora/PCM are not MP4-standard even where a
+# given ffmpeg build's muxer tolerates them.
+_MP4_FAMILY_EXTS = (".mp4", ".m4v", ".mov")
+_MP4_VIDEO_CODECS = {"h264", "hevc", "av1", "vp9", "mpeg4", "mpeg2video", "mjpeg", "prores"}
+_MP4_AUDIO_CODECS = {"aac", "mp3", "ac3", "eac3", "alac", "opus", "flac"}
 
 
 @dataclass
@@ -399,6 +410,15 @@ class Pipeline:
         if retime_config.get("enabled", True):
             stages.append("retime")
 
+        # Codec normalization -- on by default (Config.DEFAULTS["stages"]
+        # ["normalize_codecs"], REQUIREMENTS.md § 22.2). pipeline.default_order
+        # places it right after "retime"; its own should_run()/execute() SKIPs
+        # (no new file, no re-encode) when every kept stream is already
+        # H.264/AAC.
+        normalize_config = self.config.get("stages", "normalize_codecs", default={})
+        if normalize_config.get("enabled", True):
+            stages.append("normalize_codecs")
+
         # Deinterlacing -- opt-in, off by default (REQUIREMENTS.md § 20.2: an
         # idet-based heuristic false-positives on detailed progressive
         # motion, so this must never auto-enable off a probe). pipeline.
@@ -475,11 +495,12 @@ class Pipeline:
         if speed_config.get("enabled", False):
             stages.append("speed")
 
-        # Auto-crop -- opt-in, off by default (see Config.DEFAULTS["stages"]["crop"]
-        # and docs/REQUIREMENTS.md feature 3). optimize_stage_order() places it
-        # right after "stabilize" regardless of insertion order here.
+        # Auto-crop -- on by default since REQUIREMENTS.md § 22.1 (see
+        # Config.DEFAULTS["stages"]["crop"]); its should_run() SKIPs cheaply on
+        # a borderless input. pipeline.default_order places it right after
+        # "deinterlace" regardless of insertion order here.
         crop_config = self.config.get("stages", "crop", default={})
-        if crop_config.get("enabled", False):
+        if crop_config.get("enabled", True):
             stages.append("crop")
 
         # Downscale -- opt-in, off by default (see Config.DEFAULTS["stages"]["downscale"]
@@ -1657,8 +1678,7 @@ class Pipeline:
                 and final_output_path in generated_temp_paths
                 and final_output_path != job.output_path
             ):
-                self._promote_temp_to_output(final_output_path, job.output_path)
-                final_output_path = job.output_path
+                final_output_path = self._promote_temp_to_output(final_output_path, job.output_path)
                 promoted_output = True
         finally:
             # Safety net: if we exited the block above (return or exception) without
@@ -1892,20 +1912,135 @@ class Pipeline:
                 except OSError:
                     pass
 
-    def _promote_temp_to_output(self, temp_path: str, output_path: str) -> None:
-        """Move a surviving intermediate temp file onto the job's final output path.
+    def _promote_temp_to_output(self, temp_path: str, output_path: str) -> str:
+        """Land a surviving intermediate temp file on the job's final output path.
 
         Used when the terminal stage was skipped or produced no output but an
         earlier stage's temp file is the best available result: without this, the
         unconditional temp cleanup elsewhere would delete the only copy of that
         output before it ever reached the user-visible output path.
+
+        Returns the path the result actually lives at (``output_path`` unless
+        the remux ladder below failed completely).
+
+        Container safety (REQUIREMENTS.md § 22.3): pipeline temps are always
+        ``.mkv`` (``generate_temp_path``), but ``output_path`` is usually
+        ``.mp4``. A bare rename would leave Matroska bytes inside a file NAMED
+        ``.mp4`` -- players that sniff may cope, strict ones and every
+        extension-trusting consumer don't. So when the extensions differ the
+        temp is REMUXED into the output's real container:
+
+        1. ``-c copy`` of video + audio (lossless, the overwhelmingly common
+           case);
+        2. if the target container rejects an audio codec (e.g. Vorbis/Opus
+           into some MP4 builds): audio -> AAC 256k, video still copied;
+        3. if it rejects the video codec too (e.g. FFV1/ProRes into MP4):
+           video -> libx264 CRF 16, audio -> AAC.
+
+        Only the stream the container can't hold is ever transcoded. If every
+        rung fails the temp is moved to ``<output root>.mkv`` instead (correct
+        bytes, honest extension) and that path is returned with an ERROR log --
+        losing the result or lying about its container are both worse.
         """
+        if os.path.splitext(temp_path)[1].lower() == os.path.splitext(output_path)[1].lower():
+            self._move_file(temp_path, output_path)
+            return output_path
+
+        from autovideofixer.config import resolve_timeout
+        from autovideofixer.core.ffmpeg_utils import run_ffmpeg
+
+        timeout = resolve_timeout(
+            self.config.get("pipeline", "stage_timeout", default=None), "pipeline.stage_timeout"
+        )
+        out_ext = os.path.splitext(output_path)[1].lower()
+        container_args = ["-movflags", "+faststart"] if out_ext in _MP4_FAMILY_EXTS else []
+        maps = ["-map", "0:v", "-map", "0:a?", "-dn"]
+        if out_ext == ".webm":
+            vtx = ["-c:v", "libvpx-vp9", "-crf", "20", "-b:v", "0"]
+            atx = ["-c:a", "libopus", "-b:a", "192k"]
+        else:
+            vtx = ["-c:v", "libx264", "-preset", "medium", "-crf", "16"]
+            atx = ["-c:a", "aac", "-b:a", "256k"]
+        ladder: list[list[str]] = [
+            ["-c", "copy"],
+            ["-c:v", "copy", *atx],
+            [*vtx, "-fps_mode", "passthrough", *atx],
+        ]
+        # Muxers are more permissive than the container STANDARDS (this
+        # project's ffmpeg n9.0.1 happily writes Vorbis or FFV1 into an .mp4
+        # and exits 0, producing a file most players reject), so "ffmpeg
+        # didn't fail" is not proof the copy was legitimate. Start the ladder
+        # at the first rung that avoids a codec the target's standard doesn't
+        # list; a failure still steps down from there.
+        start_rung = self._promotion_start_rung(temp_path, out_ext)
+        for rung in range(start_rung, len(ladder)):
+            codec_args = ladder[rung]
+            args = ["-i", temp_path, *maps, *codec_args, *container_args, "-y", output_path]
+            result = run_ffmpeg(args, timeout=timeout)
+            if result.returncode == 0 and os.path.exists(output_path):
+                if rung:
+                    self.logger.warning(
+                        "Promoting %s to %s needed a transcode (rung %d): the target "
+                        "container does not hold a copied stream",
+                        os.path.basename(temp_path),
+                        os.path.basename(output_path),
+                        rung,
+                    )
+                try:
+                    os.remove(temp_path)
+                except OSError:
+                    pass
+                return output_path
+            if os.path.exists(output_path):
+                try:
+                    os.remove(output_path)
+                except OSError:
+                    pass
+            self.logger.debug("remux rung %d failed: %s", rung, (result.stderr or "")[:300])
+
+        fallback = os.path.splitext(output_path)[0] + os.path.splitext(temp_path)[1]
+        self.logger.error(
+            "Could not remux %s into a %s container; keeping the result as %s instead",
+            temp_path,
+            out_ext or "(none)",
+            fallback,
+        )
+        self._move_file(temp_path, fallback)
+        return fallback
+
+    def _promotion_start_rung(self, temp_path: str, out_ext: str) -> int:
+        """First ``_promote_temp_to_output`` ladder rung worth trying: 0 (copy
+        everything), 1 (audio must be transcoded) or 2 (video must be too),
+        judged against the codecs ``out_ext``'s container standard lists.
+        Unknown extensions / probe failures start at 0 and rely on ffmpeg."""
+        if out_ext in _MP4_FAMILY_EXTS:
+            video_ok, audio_ok = _MP4_VIDEO_CODECS, _MP4_AUDIO_CODECS
+        elif out_ext == ".webm":
+            video_ok, audio_ok = {"vp8", "vp9", "av1"}, {"opus", "vorbis"}
+        else:
+            return 0
         try:
-            os.replace(temp_path, output_path)
+            from autovideofixer.core.ffmpeg_utils import probe
+
+            pr = probe(temp_path, self.config)
+        except Exception:
+            return 0
+        vs = pr.selected_video_stream
+        if vs is not None and vs.codec_name.lower() not in video_ok:
+            return 2
+        for a in pr.audio_streams:
+            if a.codec_name.lower() not in audio_ok:
+                return 1
+        return 0
+
+    @staticmethod
+    def _move_file(src: str, dst: str) -> None:
+        try:
+            os.replace(src, dst)
         except OSError:
             # os.replace can fail across filesystems (EXDEV); shutil.move falls
             # back to copy+delete in that case.
-            shutil.move(temp_path, output_path)
+            shutil.move(src, dst)
 
     def generate_report(self, job_result: JobResult) -> str:
         """Generate a human-readable processing report."""

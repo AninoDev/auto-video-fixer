@@ -1927,3 +1927,464 @@ Notes:
   per-run input dedup (which keys on `realpath` first) already collapses that, so no new handling
   is needed — but the interaction must be covered by a test so it does not silently regress.
 - `skip` uses `os.path.islink()` on the entry itself, not on the resolved target.
+
+---
+
+# Feature set 2026-10: analysis overhaul, network/TLS, config schema, codec normalization
+
+**Approved 2026-10-17** (user request + four design decisions taken via explicit Q&A, recorded
+inline as **[USER DECISION]**). Sections 22–28 are the authoritative spec; a fresh session needs no
+chat context. Delivery is phased, one commit per phase, in the user-chosen order:
+
+| Phase | Section | Content | Status |
+|---|---|---|---|
+| P1 | § 22 | crop on by default; `normalize_codecs` stage; container-safety audit | IMPLEMENTED 2026-10-17 |
+| P2 | § 23 | network/TLS policy applied to every network path | PLANNED |
+| P3 | § 24 | config schema versioning + migrations, first-run bootstrap, endpoint registry, per-endpoint timeout/TLS, llama.cpp provider | PLANNED |
+| P4 | § 25 | VLM frame sampling: min/max frames, consecutive-duplicate removal, tile budget, frame-count reporting | PLANNED |
+| P5 | § 26 | new structured output fields (media type, rating reasoning, detail level) + per-call timing/token stats | PLANNED |
+| P6 | § 27 | multi-VLM cross-check (`refine` and `judge` modes) | PLANNED |
+| P7 | § 28 | analysis profiles, reusable analysis module, `analyze` stage + example stages | PLANNED |
+
+Update the Status column (and the section headers) as each phase lands. P2's per-endpoint TLS
+override needs P3's endpoint registry — P2 ships the global policy plus the plumbing
+(`tls=` parameter on every call site), and P3 wires endpoint entries into it.
+
+The user's hand-patched llama.cpp copy of `core/analysis.py` (outside the repo, at
+`/home/furry/auto-video-fixer/`, same base commit a2300b3) is the evidence behind § 24.5: it (1)
+sent the system message as a content-parts list instead of a string, (2) removed
+`response_format: {"type": "json_object"}`, (3) raised the request timeout 120 s → 600 s, and (4)
+downscaled sample frames to ≤720 px on the long side, JPEG quality 85 → 90.
+
+## 22. Process: crop on by default, codec normalization before heavy stages (P1) [IMPLEMENTED 2026-10-17]
+
+### 22.1 `crop` enabled by default
+
+- `DEFAULTS["stages"]["crop"]["enabled"]` → `true`; same in both copies of `config.example.yaml`.
+- Order is already correct (`detect, retime, deinterlace, crop, ...`) — no order change. Note the
+  user described the desired order as "just after deinterlace"; with `normalize_codecs` (§ 22.2)
+  inserted after `retime`, the order becomes
+  `detect, retime, normalize_codecs, deinterlace, crop, downscale, ...`.
+- Crop's own `should_run()` sanity gates still apply (it SKIPs when no border is detected), so
+  enabling it costs one quick `cropdetect` sample on borderless inputs. Its VLM assist stays tied
+  to `analysis.vlm` and is unaffected.
+- **[USER DECISION] Existing configs**: the § 24 v1→v2 migration flips `stages.crop.enabled: false`
+  → `true` (the old default) with a WARNING naming the change. A deliberate `false` is therefore
+  also flipped once; the user accepted that trade-off. Rationale: the bootstrapped/example config
+  spells out every key, so without a migration no existing user would ever receive a default
+  change (the denoise_video and retime defaults already hit this hazard).
+
+### 22.2 The `normalize_codecs` stage
+
+**Problem**: inputs with "unusual" codecs (VP9/AV1 video, Opus/Vorbis/FLAC/PCM audio — typical of
+YouTube `.webm` downloads) fail some stages for no real reason: stages stream-copy a source-derived
+stream (`-c:a copy`, `-c copy`, `-c:v copy`) into a stage-internal `.mp4` temp or into an output
+whose container cannot hold that codec (e.g. Vorbis in MP4), killing the job.
+
+**Fix**: a new stage `normalize_codecs` (`core/stages/normalize_codecs.py`), on by default,
+placed immediately after `retime` in `default_order` (before every heavy stage). It makes every
+stream it keeps one of a small set of universally compatible codecs, **touching a stream only if
+it has to**:
+
+- **Video**: if the codec is in `stages.normalize_codecs.video_codecs_allowed` (default `[h264]`)
+  → `-c:v copy`. Otherwise re-encode with `video_encoder` (default `libx264`) at the stage's
+  `temp_crf` (default 16, matching the AI stages' visually-lossless temp quality) and `preset`
+  (default `medium`). Bit depth is preserved: 8-bit sources → `yuv420p`; >8-bit sources →
+  `yuv420p10le` (libx264 High10) so HDR/10-bit content is not crushed. Color metadata
+  (`color_primaries`, `color_trc`, `colorspace`, `color_range`) is carried explicitly so the
+  later `hdr` stage still detects HDR. Rationale for re-encoding even when a later stage will
+  re-encode anyway: the temp quality is visually lossless, and it makes every stage's stream-copy
+  paths safe without each stage having to reason about codecs.
+- **Audio**: per audio stream, codec in `audio_codecs_allowed` (default `[aac]`) → copy; otherwise
+  → `aac` at `audio_bitrate` (default `256k`), channel layout preserved.
+- Streams the pipeline already drops/keeps: preserve exactly the stream selection existing stages
+  use (do not widen to `-map 0` or narrow it) — audit and match.
+- **Timestamp safety (§ 12.4)**: must not re-conform a VFR intermediate to CFR. Use
+  `-fps_mode passthrough` on the video re-encode and verify frame count + duration on a real VFR
+  `retime` output (memory note: mocked tests have hidden ffmpeg breakage three times).
+- **SKIP** (no new file, no re-encode) when every kept stream is already allowed.
+- Output: `.mkv` intermediate like every pipeline temp.
+- Config `stages.normalize_codecs`: `enabled` (true), `video_codecs_allowed`, `audio_codecs_allowed`,
+  `video_encoder`, `temp_crf`, `preset`, `audio_codec` (`aac`), `audio_bitrate`, `timeout`
+  (standard per-stage timeout semantics). CLI: `--normalize-codecs/--no-normalize-codecs`.
+- Stage metadata reports per stream: `copied` vs `transcoded (from→to)`.
+- The § 24 migration inserts `normalize_codecs` into a pinned `pipeline.default_order` that lacks
+  it (after `retime`; else after `detect`; else at the front).
+
+### 22.3 Container-safety audit (defence in depth)
+
+Normalization makes the common path safe, but the stage may be disabled. Audit every stage-internal
+temp and mux that stream-copies a source-derived stream (`grep -n '"copy"'` across
+`core/stages/*.py`, `core/scenes.py`, `core/pipeline.py`):
+
+- Stage-internal temps that copy a source-derived stream switch to `.mkv` unless the site has a
+  documented reason to need MP4 (keep the reason in a comment).
+- The final output path (e.g. `_promote_temp_to_output()` promoting an `.mkv` temp onto an `.mp4`
+  job output) must produce a file whose container really is the output's container, holding
+  codecs that container accepts — never an MKV renamed to `.mp4`. Remux (or transcode the
+  offending stream) when needed.
+- Test against real ffmpeg with a VP9+Opus and a VP9+Vorbis WebM input, with `normalize_codecs`
+  both enabled and disabled.
+
+### 22.4 Implementation notes (P1, 2026-10-17)
+
+Everything in 22.1–22.3 landed as specified; these are the decisions and findings a future
+maintainer needs.
+
+- **What is NOT built here**: the § 24 migration. Consequences, both documented in AGENTS.md/CHANGELOG:
+  a user `config.yaml` that spells out `stages.crop.enabled: false` keeps crop off, and one that pins
+  `pipeline.default_order` does not get `normalize_codecs` (the bootstrapped/example config pins the
+  order, so in practice **no existing user receives the stage until P3 ships**). The P3 migration
+  must (a) flip crop as § 22.1 says and (b) insert `normalize_codecs` after `retime` (§ 22.2).
+- **`pipeline.max_stages` 17 → 18**: the documented invariant is `>= len(default_order)` (now 16);
+  18 keeps the pre-existing +2 headroom for repeated stages. Bump it whenever the order grows.
+- **Stream selection = ffmpeg's default (no `-map`)**: audited — crop, downscale, deinterlace,
+  retime, hdr, speed all rely on default selection; only the AI-stage final muxes use `-map 0:a:0`.
+  Default selection is one video + one audio (+ one subtitle), so `normalize_codecs` also uses no
+  `-map` and decides copy-vs-transcode for the stream default selection picks
+  (`ProbeResult.selected_video_stream`: highest resolution, cover art excluded;
+  `selected_audio_stream`: most channels, first on ties). A mis-mirror on an exotic multi-stream file
+  is benign (a stream is copied as before, or needlessly transcoded). Revisit if stages ever switch
+  to explicit maps.
+- **Probe, not just `input_info`**: `should_run()` uses `input_info` (now carrying `pix_fmt`,
+  `bit_depth`, `color_*`, `selected_video_codec`, `selected_audio_codec`) only for a cheap
+  positive "nothing to do" pre-check; `execute()` re-probes `input_path` because a stage forced by
+  name or a hand-built `input_info` can describe a different file than the one being read, and a
+  wrong codec there means copying a stream the next stage can't hold. Probe additions:
+  `StreamInfo.color_primaries/bits_per_raw_sample/is_attached_pic/channel_layout`,
+  `pix_fmt_bit_depth()` (name-based first; `bits_per_raw_sample` — an ffprobe STRING, parsed with
+  `_safe_int` — only as a fallback because encoders pad).
+- **Verified with real ffmpeg n9.0.1** (tests in `tests/integration/test_normalize_codecs_e2e.py`
+  and end-to-end `avf process` runs recorded in the P1 hand-off): VP9+Opus and VP9+Vorbis WebM →
+  H.264 + AAC (48/48 frames); H.264+AAC → SKIP, no file; 10-bit HDR10-tagged VP9 + 5.1 Opus →
+  `yuv420p10le`, `smpte2084`/`bt2020` kept, `5.1` layout kept; FFV1 321x241 → even-cropped H.264;
+  VFR: a 24-in-60 WebM is 120 frames, 48 after `retime`, **48 after `normalize_codecs`** (the
+  `-fps_mode passthrough` requirement of § 12.4 holds).
+- **Audit findings (§ 22.3), site by site**:
+  * `Pipeline._promote_temp_to_output()` — **real bug**: bare `os.replace` of the `.mkv` temp onto
+    the `.mp4` output (reachable whenever the terminal stage is skipped, e.g. `--stage crop --stage
+    downscale`). Now a remux ladder (copy → audio→AAC → video→libx264, plus a VP9/Opus ladder for
+    `.webm` targets), starting at the first rung whose codecs the target's *standard* lists
+    (`_MP4_VIDEO_CODECS`/`_MP4_AUDIO_CODECS`). The pre-check is necessary: ffmpeg n9.0.1's mp4
+    muxer accepts Vorbis and FFV1 and exits 0, so "the copy didn't fail" proves nothing. Total
+    failure keeps the data as `<output root>.mkv` (ERROR log) and the method returns the path
+    actually used. Same extension → plain move.
+  * `upscale._resize_to_exact` scratch `<out>.resize_tmp.mp4` — **real bug**: copied source audio
+    into a forced MP4 and was then `os.replace`d over a (usually `.mkv`) output. Now
+    `sibling_temp_path()` (destination's extension).
+  * `upscale` multi-pass intermediates `.avf_ai_pass*.mp4` — received source audio via `-c:a
+    copy`; now `.mkv`.
+  * `stabilize` cadence-retag remux `<out>.cadence_retag.mp4` — same class as the resize scratch;
+    now `sibling_temp_path()`.
+  * `normalize_audio` in-place scratch `<in>.normalize_tmp.mp4` — same class; now
+    `sibling_temp_path()`.
+  * `analysis.extract_clip` (`-c copy` into a hardcoded `.mp4`) — now keeps the source's extension.
+    (It also ignores ffmpeg's return code; left alone, out of scope.)
+  * Kept `.mp4`, now commented: AI writer temps in `upscale`/`deblock`/`denoise_video` (libx264
+    frames only; source audio muxed later into the real output), `interpolate` chunk files +
+    `concat_video.mp4` (`-an`, minterpolate output), `scenes.py` per-scene files (both streams are
+    re-encoded to H.264/AAC before any `-c copy`).
+  * Direct `-c:a copy` into the job's own `.mp4` output by a **terminal** stage (crop, downscale,
+    interpolate traditional, upscale AI mux, ...) was deliberately NOT changed — with
+    `normalize_codecs` disabled and Vorbis audio, ffmpeg n9.0.1 writes a non-standard
+    Vorbis-in-MP4 file (it does not fail). A central fix (route the terminal stage through a temp +
+    promotion) would change `encode`'s direct-to-output behaviour; revisit if users routinely run
+    with the stage disabled.
+- **Observation for test authors**: with crop on by default, a `testsrc2` clip is cropped
+  (320x240 → 266x240) because the Rust border detector treats its side bars as a border; end-to-end
+  assertions on resolution must account for that.
+
+- **RGB sources (found in coordinator verification)**: VP9/FFV1 store RGB input as `gbrp` with
+  matrix `gbr`. Carrying `-colorspace gbr` onto the yuv420p libx264 encode makes ffmpeg refuse to
+  open the output, so the stage failed on every RGB VP9 WebM. For RGB sources only primaries and
+  transfer are carried; matrix and range are dropped (they describe the RGB layout the re-encode
+  removes). Covered by a unit test and a real-ffmpeg integration test.
+
+## 23. Network/TLS policy for every network path (P2)
+
+**Problem**: AVF has no TLS configuration. Self-hosted endpoints with self-signed certs, and
+corporate networks with TLS-inspection firewalls (which re-sign traffic with a private CA), fail
+outright — the user could not download AI models at work, with no override. Python TLS settings
+are not central: `urllib`, `requests`, and the `curl` fallback each need it separately.
+
+### 23.1 Modes
+
+`network.tls.mode`:
+
+- **`verify`** (default) — normal verification: system trust store (`ssl.create_default_context()`)
+  **plus** every PEM in `network.tls.ca_files` (added, never replacing). `ca_files` may hold CA
+  certs *or* a self-signed server (leaf) cert — OpenSSL accepts either as a trust anchor, so this
+  one key covers both "trust this corporate CA" and "trust this specific self-signed server".
+- **`untrusted_ca`** — **[USER DECISION]** accepts a certificate whose chain does not verify
+  (self-signed, unknown/private CA) **but still rejects** an expired / not-yet-valid certificate
+  and a hostname mismatch. Implementation: handshake with `CERT_NONE`, then inspect the leaf
+  (`getpeercert(binary_form=True)`) with the `cryptography` package (new required dependency):
+  check `not_valid_before_utc <= now <= not_valid_after_utc`, and match the requested host against
+  SAN DNS/IP entries (RFC 6125: single left-most wildcard label only; fall back to CN only when no
+  SAN extension exists). Hand-written matcher because `ssl.match_hostname` was removed in 3.12.
+- **`insecure`** — no verification at all (`CERT_NONE`, `check_hostname=False`); traffic is still
+  encrypted. Covers invalid/expired/revoked/mismatched certs.
+
+Revocation (OCSP/CRL) is not checked in any mode (Python's `ssl` does not by default) — document.
+
+### 23.2 Scope: every network path
+
+One module, `autovideofixer/net.py`, owns policy resolution and all HTTP(S) opening:
+
+- `TLSPolicy` (mode, ca_files) + `resolve_tls_policy(config, override=None)` — deep-merges an
+  endpoint's `tls:` mapping (§ 24) over `network.tls`.
+- `build_ssl_context(policy)`, and `open_url(request, *, timeout, tls)` used by **every** urllib
+  call site (VLM/LLM providers in `core/analysis.py`, model downloads in `ai/model_cache.py`).
+- Model-download fallbacks (`ai/model_cache.py::_fetch_to`): `requests` gets `verify=` (False for
+  `insecure`; a bundle path for `verify` + `ca_files`, built as system/certifi bundle + extra
+  files); `curl` gets `--cacert` / `-k`. **Rule: a fallback that cannot faithfully honor the
+  policy is skipped (DEBUG log naming why), never run with weaker checking than configured** —
+  e.g. `untrusted_ca` cannot be expressed to `requests`/`curl`, so both are skipped in that mode.
+- `network.tls` applies to model downloads; `network.download_tls` (optional mapping, same shape)
+  overrides it for downloads only.
+- Grep the whole tree (Python and `rust/`) for any other network use when implementing; each new
+  one must go through `net.py`. ffmpeg network inputs are out of scope (inputs are local files).
+- Log a WARNING once per process per (endpoint/purpose, mode) when `untrusted_ca` or `insecure` is
+  in effect. Validation: unknown mode or unreadable `ca_files` path → clear error at use time.
+- `allow_http` (plain-HTTP opt-in) is unchanged and orthogonal; it moves per-endpoint in § 24.
+- Tests: spin up a local `ssl`-wrapped `http.server` on 127.0.0.1 with generated certs (self-signed,
+  expired, wrong-hostname, private-CA-signed) and assert each mode's accept/reject matrix through
+  the real `open_url` and the real download path. No mocking of the TLS layer itself.
+
+Revisit: if macOS users report corporate-CA failures with `verify` mode, add optional
+`truststore` (OS keychain) support.
+
+## 24. Config schema versioning, first-run bootstrap, endpoint registry (P3)
+
+### 24.1 Schema version + migrations
+
+- Top-level `config_version: <int>` key. A file without it is version **1** (every existing file).
+  Current version after this phase: **2**. Both example configs carry `config_version: 2`.
+- `autovideofixer/config_migrations.py`: ordered registry of `migrate_vN_to_vN+1(doc, notes)`
+  functions operating on a ruamel `CommentedMap` (comments preserved) and also on plain dicts.
+  Each appends human-readable change notes.
+- On load:
+  - **Default-path config** (no `--config`/`AVF_CONFIG`) older than current → write a backup
+    `config.yaml.bak-v<old>-<YYYYMMDD-HHMMSS>`, migrate, rewrite in place, WARNING listing every
+    change note and the backup path.
+  - **Explicit config** (`--config`, `AVF_CONFIG`, `process --config` layers) → migrate in memory
+    only, WARNING suggesting `avf config migrate PATH` (new subcommand: in-place with backup, or
+    `-o OUT`). Preset files are not versioned.
+  - Version newer than this AVF knows → WARNING, load as-is (best effort; downgrades not blocked).
+- **Standing rule (document in AGENTS.md)**: any future default change that should reach existing
+  users must ship a migration that rewrites values equal to the old default, because bootstrapped
+  configs pin every key.
+
+### 24.2 v1 → v2 migration contents
+
+1. `stages.crop.enabled: false` → `true` (§ 22.1).
+2. Insert `normalize_codecs` into a pinned `pipeline.default_order` lacking it (§ 22.2).
+3. Move connection fields out of `analysis.vlm` / `analysis.llm` into endpoint entries
+   (§ 24.4): `provider, model, api_key, api_url, allow_http, max_tokens` → `analysis.endpoints.
+   default_vlm` / `default_llm`, and set `analysis.vlm.endpoint: default_vlm`,
+   `analysis.llm.endpoint: default_llm`. Provider `local` is normalized to `ollama`.
+4. `analysis.vlm.max_sample_frames` → `analysis.vlm.sampling.max_frames`,
+   `sample_interval_sec` → `sampling.interval_sec` (§ 25).
+
+### 24.3 First-run bootstrap
+
+When the default-path config does not exist and no explicit config was given, copy the packaged
+`data/config.example.yaml` there (create parent dirs), INFO log + one console notice with the path.
+Copy failure (read-only FS, permissions) → WARNING, continue on `DEFAULTS`. Opt-out:
+`AVF_NO_CONFIG_BOOTSTRAP=1`. Tests must never bootstrap into the real home (they isolate
+`XDG_CONFIG_HOME`; verify).
+
+### 24.4 Endpoint registry (per-model connection config)
+
+```yaml
+analysis:
+  endpoints:
+    default_vlm:
+      provider: ollama        # ollama | openai | api | llamacpp
+      model: llava
+      api_url: ""
+      api_key: ""
+      allow_http: false
+      timeout_sec: 120        # resolve_timeout() semantics: null/0 = unlimited
+      max_tokens: 1024
+      tls: {}                 # overrides network.tls for this endpoint only (§ 23)
+      compat: {}              # request-shape knobs (§ 24.5)
+      vision: {}              # model image limits / tile model (§ 25.3)
+    default_llm: {...}
+  vlm: { enabled: false, endpoint: default_vlm, sampling: {...}, prompts... }
+  llm: { endpoint: default_llm }
+```
+
+- Every endpoint is fully independent (TLS, timeout, allow_http, key) — local/LAN/cloud alike;
+  no special-casing of any vendor.
+- All consumers resolve an endpoint by name: whole-video + per-scene VLM, crop VLM check
+  (`analysis.vlm.endpoint`), scene coordinator (`analysis.llm.endpoint`), cross-check (§ 27).
+  Unknown endpoint name → clear error at use time.
+- `timeout_sec` replaces every hardcoded `urlopen(..., timeout=120)`.
+- CLI: `analyze --vlm-endpoint NAME`; existing `--vlm-model` / `--vlm-url` override the selected
+  endpoint's fields for the run. Secrets stay config-only (unchanged policy).
+- PII log cleaner registers every endpoint's `api_url` (today it registers two fixed keys).
+
+### 24.5 llama.cpp provider + request-shape compat knobs
+
+OpenAI-shaped providers (`openai`, `api`, `llamacpp`) accept `compat`:
+
+- `system_content`: `string` | `parts` (list of `{"type":"text","text":...}`).
+- `response_format`: `json_object` | `json_schema` (send the § 26 schema) | `none`.
+- `extra_body`: mapping deep-merged into the request payload (e.g. llama.cpp `cache_prompt`,
+  `chat_template_kwargs: {enable_thinking: true}`).
+
+Provider defaults: `openai`, `api` → `string` / `json_object` (today's behavior, unchanged);
+`llamacpp` → `parts` / `none` (the user's working hand edits). `llamacpp` takes the full
+chat-completions URL in `api_url` like `api`.
+
+Response parsing (all providers): strip `<think>…</think>` blocks and code fences, then if the
+text is not pure JSON, extract the first balanced top-level `{...}` object before falling back to
+"whole text = summary". Ignore a separate `reasoning_content` field for parsing but count its
+tokens in § 26 stats when reported.
+
+## 25. VLM frame sampling: min/max frames, duplicate removal, tile budget (P4)
+
+One shared planner/sampler serves whole-video (`run_vlm_analysis`) and per-scene
+(`run_vlm_analysis_for_scene`) calls — "the range" below is the video or the scene.
+
+### 25.1 Frame count
+
+Config `analysis.vlm.sampling`: `min_frames` (default 4), `max_frames` (default 8, was
+`max_sample_frames`), `interval_sec` (default 10.0), `dedupe_consecutive` (true),
+`dedupe_threshold` (mean absolute luma difference on a 64-px-wide grayscale thumbnail, 0–1;
+default 0.002 — calibrate on real VFR/retimed output and record the calibration), `balance`
+(`auto` | `temporal` | `spatial` | `fixed`, default `auto`), `min_long_side_px` (default 336).
+
+1. `n = ceil(range_duration / interval_sec)`, at least 1.
+2. Clamp to `[min_frames, max_frames]`, then to the endpoint's `vision.max_frames_per_call`.
+3. **Never exceed the distinct frames actually in the range**: a range with fewer real frames than
+   `min_frames` sends exactly those frames — never duplicates to pad the count.
+4. Positions: centres of `n` equal segments (`start + (i + 0.5) * dur / n`), not segment starts —
+   avoids landing on the cut frame itself.
+
+### 25.2 Consecutive-duplicate removal (VFR / retimed / static content)
+
+- Compare each candidate with the previously **kept** frame; within `dedupe_threshold` → drop.
+  Non-adjacent repeats (A, B, A) are allowed — only back-to-back duplicates are useless.
+- **Refill**: while kept < target and untried positions remain, sample new candidates at the
+  midpoint of the largest temporal gap between kept frames (or range edges), re-checking against
+  both neighbours. Re-balancing (even unbalancing) the spread to reach the target is acceptable.
+  Stop at the target, when the range is exhausted at frame granularity, or after `4 * target`
+  extraction attempts. A static range may legitimately end below `min_frames`.
+- Report `dropped_duplicates`.
+
+### 25.3 Resolution caps and the tile/token budget
+
+Endpoint `vision` (model limits): `max_long_side_px`, `max_megapixels`, `tile_width`,
+`tile_height`, `tokens_per_tile` (1), `max_tiles_per_frame`, `max_tiles_per_call`,
+`max_frames_per_call`, `jpeg_quality` (90). All null by default except `jpeg_quality`; with no
+tile size configured the tile math is disabled and only the pixel caps apply. The user's
+llama.cpp setup used 720 px long side — use that in the example config's llama.cpp example.
+
+- Tiles for a WxH frame: `ceil(W / tile_width) * ceil(H / tile_height)` (models pad each axis up
+  to a tile multiple); estimated vision tokens = tiles × `tokens_per_tile`.
+- Downscale only (never upscale), aspect preserved, INTER_AREA.
+- **Balancing** when `max_tiles_per_call` is set: pick `(n, scale)` such that
+  `n * tiles(scale) <= max_tiles_per_call` and all per-frame caps hold:
+  - Temporal preference `p` in [0, 1]: `auto` → from a cheap motion probe (mean abs diff across
+    ~8 tiny evenly spaced grayscale thumbnails, normalized) combined with duration saturation
+    `d / (d + 30 s)`; `temporal` → 1; `spatial` → 0; `fixed` → no trade (count from § 25.1,
+    resolution shrunk until the budget fits).
+  - `n_hi` = most frames that fit at `min_long_side_px`; `n = round(n_lo + p * (n_hi - n_lo))`
+    within § 25.1 bounds; then the largest scale that fits.
+  - Priority when constraints conflict: hard limits (`max_tiles_per_call`, `max_frames_per_call`)
+    > `min_frames` > `min_long_side_px` (temporal context was the user's main complaint), with an
+    absolute floor of 64 px long side, below which frames are dropped instead.
+  - Long/high-motion ranges therefore get more, smaller frames; short/static ranges fewer, larger.
+
+### 25.4 Reporting (the user's first ask)
+
+`avf analyze` prints per video (and per scene when scenes are analyzed): frames sent, duplicates
+dropped, frame size, estimated tiles/vision tokens. Same in the CSV (`vlm_frames`,
+`vlm_dropped_duplicates`, `vlm_frame_size`, `vlm_est_vision_tokens`), the INFO log, scene-mode
+logs, and JSON reports.
+
+## 26. Structured output fields + per-call timing/token stats (P5)
+
+### 26.1 New output fields
+
+Config `analysis.vlm.outputs`:
+
+- `media_type` (default true): one of `analysis.vlm.media_type_choices`, default
+  `[real_footage, 3d_rendered, 2d_digital, hand_drawn, ai_generated, screen_capture, mixed, other]`.
+- `rating_reasoning` (default false): the model's justification for its rating. Prompt asks it to
+  consider the content first, then emit `rating` followed by `rating_reasoning` as the **last**
+  JSON keys (generation order matters for non-thinking models; thinking models reason first
+  anyway).
+- `analysis.vlm.detail`: `brief` (default — today's 1–2 sentence summary, so existing behavior is
+  unchanged) | `standard` | `detailed` | `exhaustive`. Higher levels ask for characters, actions,
+  setting, camera work, rendering style; lower levels save tokens/time.
+- The default system prompt is generated from enabled outputs + detail level;
+  `prompt_override`/`system_prompt_override` still replace it wholesale (documented: overrides must
+  request the fields themselves). `compat.response_format: json_schema` sends a JSON Schema built
+  from the same field set.
+- Results: `VideoAnalysis.media_type`, `.rating_reasoning`, `.vlm_extra` (any other keys
+  returned). Table/`--full`/CSV/JSON include them.
+
+### 26.2 Call stats
+
+Every VLM/LLM call (video, scene, crop check, coordinator, cross-check legs) records a `CallStats`:
+endpoint name, provider, model, purpose, wall time, input/output/total tokens, reasoning tokens
+when reported, prompt and generation tokens/s, image count, estimated vision tokens, success/error
+class. Sources: Ollama `prompt_eval_count`/`eval_count`/`*_duration` (ns); llama.cpp `usage` +
+`timings.prompt_per_second`/`predicted_per_second`; OpenAI `usage` only (tokens/s =
+output / wall, flagged `estimated`). Without streaming there is no time-to-first-token; noted as a
+revisit item (add streaming).
+
+Provider functions return a `ProviderResponse(text, stats)` instead of a bare string.
+Reporting: always logged (INFO per call, DEBUG raw usage); `analysis.report_call_stats` (default
+true) prints a per-file call table + run totals in `avf analyze`; new `avf analyze --json PATH`
+writes full structured results including every call; process mode adds stats to the § 6.6 JSON run
+report under the job.
+
+## 27. Multi-VLM cross-check (P6)
+
+**[USER DECISION]** Both modes, selectable. Config `analysis.cross_check`: `enabled` (false),
+`mode` (`refine` | `judge`), `endpoints` (ordered VLM endpoint names; first = primary),
+`judge_endpoint` (text LLM), `arbiter_endpoint` (VLM, typically larger; optional),
+`agreement_threshold` (0.75), `max_parallel` (1 — local GPUs serialize).
+
+- **`refine`**: primary describes; each next endpoint receives the frames + the previous JSON and
+  must verify/correct it, returning the same schema plus `changes`. Last successful output wins.
+- **`judge`**: every endpoint describes independently; the judge LLM receives all JSON outputs and
+  returns `{agreement: 0..1, conflicts: [...], merged: {...}}`. `agreement >= threshold` → final =
+  `merged`. Below → the arbiter receives frames + all descriptions + conflicts and writes the final;
+  with no arbiter, final = primary's output flagged `disagreement: true`.
+- Each endpoint plans its own frames with its own vision limits (§ 25); decoded candidate frames
+  are cached by timestamp so the video is decoded once.
+- **Fail open**: any leg failing degrades to the best available successful output (primary first);
+  never an empty result if any call succeeded. All intermediate outputs + the judge verdict go to
+  JSON outputs; the table shows agreement and whether the arbiter ran.
+- Applies to whole-video and per-scene analysis. Not to the crop VLM check (v1).
+
+## 28. Analysis profiles, reusable analysis module, analysis stages (P7)
+
+- **Profiles**: `analysis.profiles: {name: <partial analysis config>}` plus built-ins `quick`
+  (brief, 2–4 frames), `standard`, `thorough` (detailed, scenes scope, media type, rating
+  reasoning, cross-check if configured). `avf analyze --profile NAME` deep-merges onto `analysis`
+  with the same layering semantics as presets; process uses `stages.analyze.profile`.
+- **Scope**: `analysis.vlm.scope`: `video` (default, today) | `scenes` | `both` — lets `avf
+  analyze` run per-scene VLM (today only process scene mode does).
+- **Module**: `core/analysis_service.py` — a stable facade other stages and custom stages call:
+  `analyze_video(path, config, *, profile=None, scope=None) -> AnalysisResult` (dataclass with
+  `to_dict()`), plus a per-run cache keyed on (path, size, mtime, effective-analysis-config hash) so
+  several stages in one job share one analysis.
+- **`analyze` stage** (process pipeline, off by default, `produces_output=False`): runs the module
+  on its input and publishes `input_info["analysis"]` for later stages and the job report. Placed
+  after `crop`, before `downscale`, so it sees final content framing before heavy stages.
+- **Example stages** (off by default; reference implementations, documented in
+  `docs/DEVELOPER.md` "Writing a stage that uses analysis"):
+  - `analysis_sidecar` — writes `<output>.avf-analysis.json` beside the final output.
+  - `scene_subtitles` — SRT of per-scene descriptions; `mode: sidecar | soft | burn` (soft = muxed
+    track, `mov_text` in MP4 / `srt` in MKV; burn = `subtitles` filter — verify the reference
+    ffmpeg build has libass and degrade to `soft` with a WARNING if not).
+- **Timeline caveat**: analysis timestamps refer to the analyzed intermediate. `retime` preserves
+  real timestamps; `speed` (runs later) changes them — subtitle/sidecar writers must map times
+  through the speed factor. Document and test.
+- External (out-of-package) stage plugins are out of scope; noted for revisit.
