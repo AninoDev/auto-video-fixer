@@ -53,6 +53,7 @@ This document outlines the detailed implementation plan for Auto Video Fixer, br
 - [x] Create pipeline orchestrator
 - [x] Add smart stage ordering
 - [x] Codec normalization stage (`normalize_codecs`, after `retime`) + container-safety audit (REQUIREMENTS.md § 22, 2026-10-17)
+- [x] Central network/TLS policy (`autovideofixer/net.py`: verify / untrusted_ca / insecure, applied to VLM providers and model downloads; REQUIREMENTS.md § 23, 2026-10-18)
 - [x] Implement job management
 - [x] Write pipeline tests
 

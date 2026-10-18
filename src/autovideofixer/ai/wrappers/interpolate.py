@@ -846,9 +846,12 @@ class RIFEInterpolator:
         device_preference: str = "auto",
         backend: str = "torch",
         vulkan_device: int = 0,
+        config: Any = None,
     ):
         """
         Args:
+            config: AVF `Config`, used only so the ncnn backend's model download honours
+                `network.tls` / `network.download_tls` (REQUIREMENTS.md § 23).
             backend: "torch" (default -- unchanged existing behavior) or
                 "ncnn". "ncnn" delegates every method below to
                 `ai.backends.ncnn_interpolate.NcnnInterpolateBackend`
@@ -863,6 +866,7 @@ class RIFEInterpolator:
         self.device_preference = device_preference
         self.backend = backend
         self.vulkan_device = vulkan_device
+        self._config = config
         self._ncnn_backend: Any = None
         self._model: IFNet | None = None
         self._device: Any = None
@@ -891,7 +895,9 @@ class RIFEInterpolator:
             from autovideofixer.ai.backends.ncnn_interpolate import NcnnInterpolateBackend
 
             self._ncnn_backend = NcnnInterpolateBackend(
-                model_name=self.model_name, vulkan_device=self.vulkan_device
+                model_name=self.model_name,
+                vulkan_device=self.vulkan_device,
+                config=self._config,
             )
             self._loaded = self._ncnn_backend.load_model()
             return self._loaded

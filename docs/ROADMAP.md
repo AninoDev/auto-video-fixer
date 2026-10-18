@@ -126,6 +126,12 @@ draws an explicit VERIFIED / UNVERIFIED line instead of a flat done/not-done che
   container audit fixed `.mkv`-renamed-to-`.mp4` promotion plus several hardcoded-`.mp4`
   scratch files. Existing pinned `pipeline.default_order` configs get the new stage via the P3
   config migration (§ 24), not before.
+- **Network/TLS policy** (REQUIREMENTS.md § 23, phase P2 of the 2026-10 feature set) —
+  implemented 2026-10-18. `network.tls` (`verify` + `ca_files` / `untrusted_ca` / `insecure`) and
+  `network.download_tls` apply to every VLM/LLM call and model download, including the `requests`
+  and `curl` fallbacks (skipped rather than weakened). Unblocks corporate TLS-inspection networks
+  and self-signed home servers. Per-endpoint `tls:` overrides arrive with the endpoint registry
+  (P3, § 24.4); optional `truststore` (OS keychain) support is a revisit item for macOS.
 - **True source cadence recovery & timestamp-safe pipeline** (`retime` stage, on by default —
   REQUIREMENTS.md § 12) — recovers a video's real content framerate when it was padded up to a
   higher encoded rate by duplicated frames (24fps published at 60fps, VFR captures transcoded to

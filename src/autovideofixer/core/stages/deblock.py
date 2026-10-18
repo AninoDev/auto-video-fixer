@@ -195,11 +195,11 @@ class DeblockStage(BaseStage):
             if deblock_model == "RealESRGAN_x4plus":
                 deblock_model = "RealESRGAN_x2plus"
 
-            success, msg = ensure_model_available(deblock_model)
+            success, msg = ensure_model_available(deblock_model, config=self.config)
             if not success:
                 if deblock_model != self._ai_model:
                     deblock_model = self._ai_model
-                    success, msg = ensure_model_available(deblock_model)
+                    success, msg = ensure_model_available(deblock_model, config=self.config)
                 if not success:
                     return self._ai_fallback_or_fail(
                         f"model not available: {msg}",

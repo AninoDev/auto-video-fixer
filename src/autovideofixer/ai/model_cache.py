@@ -15,6 +15,15 @@ from typing import Any
 from urllib.parse import urlparse
 
 from autovideofixer.config import get_data_dir
+from autovideofixer.net import (
+    DEFAULT_POLICY,
+    FallbackUnsupported,
+    TLSPolicy,
+    curl_tls_args,
+    open_url,
+    requests_verify,
+    resolve_download_policy,
+)
 
 _logger: logging.Logger | None = None
 
@@ -304,6 +313,7 @@ def _extract_member(
 def ensure_ncnn_model_available(
     logical_name: str,
     force_download: bool = False,
+    config: Any = None,
 ) -> tuple[bool, str]:
     """Ensure an ncnn .param/.bin model pair is downloaded, extracted, and verified.
 
@@ -315,6 +325,10 @@ def ensure_ncnn_model_available(
     Args:
         logical_name: Key into NCNN_MODEL_REGISTRY (e.g. "RealESRGAN_x4plus").
         force_download: If True, redownload the archive even if cached.
+        config: AVF `Config` supplying the download TLS policy
+            (`network.download_tls` over `network.tls`). None = secure default
+            (system trust store only) -- callers with a config must pass it, otherwise a
+            corporate-CA / self-signed setup silently does not apply.
 
     Returns:
         (success, message) tuple. On success, use get_ncnn_model_paths()
@@ -351,7 +365,10 @@ def ensure_ncnn_model_available(
         )
         try:
             _download_file(
-                meta["archive_url"], str(archive_dest), expected_sha256=meta["archive_sha256"]
+                meta["archive_url"],
+                str(archive_dest),
+                expected_sha256=meta["archive_sha256"],
+                tls=resolve_download_policy(config),
             )
         except Exception as e:
             _get_logger().error(f"Failed to download ncnn archive for {logical_name}: {e}")
@@ -467,6 +484,7 @@ def ensure_model_available(
     model_name: str,
     model_path: str | None = None,
     force_download: bool = False,
+    config: Any = None,
 ) -> tuple[bool, str]:
     """Ensure a model is available, downloading if necessary.
 
@@ -474,6 +492,7 @@ def ensure_model_available(
         model_name: Name of the model to check/download.
         model_path: Optional custom path to model file.
         force_download: If True, redownload even if cached.
+        config: AVF `Config` supplying the download TLS policy (see `download_model`).
 
     Returns:
         (success, message) tuple.
@@ -487,17 +506,22 @@ def ensure_model_available(
     if cached and not force_download:
         return True, f"Model already cached at {cached}"
 
-    return download_model(model_name)
+    return download_model(model_name, config=config)
 
 
 def download_model(
     model_name: str,
     url: str | None = None,
     custom_path: str | None = None,
+    config: Any = None,
 ) -> tuple[bool, str]:
     """Download a model from the registry or a custom URL.
 
     Args:
+        config: AVF `Config` supplying the TLS policy (`network.download_tls` over
+            `network.tls`, REQUIREMENTS.md § 23). None = secure default. A bad policy
+            (unknown mode, unreadable ca_files) returns (False, message) like any other
+            download failure. The registry SHA256 check runs in every TLS mode.
         model_name: Name of the model.
         url: Optional override URL for the model.
         custom_path: Optional custom filename.
@@ -544,7 +568,9 @@ def download_model(
     _get_logger().info(f"Downloading {model_name} from {url}")
 
     try:
-        _download_file(url, str(dest), expected_sha256=expected_sha256)
+        _download_file(
+            url, str(dest), expected_sha256=expected_sha256, tls=resolve_download_policy(config)
+        )
         _get_logger().info(f"Model saved to {dest}")
         return True, f"Downloaded to {dest}"
     except Exception as e:
@@ -557,6 +583,7 @@ def _download_file(
     dest: str,
     chunk_size: int = 8192,
     expected_sha256: str | None = None,
+    tls: TLSPolicy | None = None,
 ) -> None:
     """Download a file from URL to dest path.
 
@@ -568,7 +595,7 @@ def _download_file(
     """
     tmp_dest = f"{dest}.part"
     try:
-        _fetch_to(url, tmp_dest, chunk_size)
+        _fetch_to(url, tmp_dest, chunk_size, tls=tls)
 
         if expected_sha256:
             actual = get_model_hash(tmp_dest)
@@ -590,16 +617,25 @@ def _download_file(
 _DOWNLOAD_TIMEOUT_SEC = 60
 
 
-def _fetch_to(url: str, dest: str, chunk_size: int = 8192) -> None:
-    """Fetch `url` to `dest`, trying urllib, then requests, then curl."""
+def _fetch_to(
+    url: str,
+    dest: str,
+    chunk_size: int = 8192,
+    tls: TLSPolicy | None = None,
+) -> None:
+    """Fetch `url` to `dest`, trying urllib, then requests, then curl.
+
+    Every method honours the same TLS policy (`tls`, see net.py / REQUIREMENTS.md § 23). A
+    fallback that cannot faithfully express the policy (`untrusted_ca` for requests/curl) is
+    SKIPPED with a DEBUG log -- it must never run with weaker checking than configured.
+    """
     _validate_https_url(url)
+    policy = tls if tls is not None else DEFAULT_POLICY
     errors: list[str] = []
 
     try:
-        import urllib.request
-
         with (
-            urllib.request.urlopen(url, timeout=_DOWNLOAD_TIMEOUT_SEC) as resp,
+            open_url(url, timeout=_DOWNLOAD_TIMEOUT_SEC, tls=policy) as resp,
             open(dest, "wb") as f,
         ):
             while chunk := resp.read(chunk_size):
@@ -612,28 +648,41 @@ def _fetch_to(url: str, dest: str, chunk_size: int = 8192) -> None:
     try:
         import requests
 
-        resp = requests.get(url, stream=True, timeout=_DOWNLOAD_TIMEOUT_SEC)
-        resp.raise_for_status()
-        with open(dest, "wb") as f:
-            for chunk in resp.iter_content(chunk_size=chunk_size):
-                if chunk:
-                    f.write(chunk)
+        with requests_verify(policy) as verify:
+            resp = requests.get(url, stream=True, timeout=_DOWNLOAD_TIMEOUT_SEC, verify=verify)
+            resp.raise_for_status()
+            with open(dest, "wb") as f:
+                for chunk in resp.iter_content(chunk_size=chunk_size):
+                    if chunk:
+                        f.write(chunk)
         return
     except ImportError:
         pass
+    except FallbackUnsupported as e:
+        _get_logger().debug(f"Skipping requests fallback: {e}")
+        errors.append(f"requests: skipped ({e})")
     except Exception as e:
         errors.append(f"requests: {e}")
         _get_logger().warning(f"Download via requests failed for {url}: {e}")
 
     import subprocess
 
-    result = subprocess.run(
-        ["curl", "-fsSL", "--max-time", "300", "-o", dest, url],
-        capture_output=True,
-        text=True,
-        timeout=300,
-        stdin=subprocess.DEVNULL,
-    )
+    try:
+        with curl_tls_args(policy) as tls_args:
+            result = subprocess.run(
+                ["curl", "-fsSL", *tls_args, "--max-time", "300", "-o", dest, url],
+                capture_output=True,
+                text=True,
+                timeout=300,
+                stdin=subprocess.DEVNULL,
+            )
+    except FallbackUnsupported as e:
+        _get_logger().debug(f"Skipping curl fallback: {e}")
+        errors.append(f"curl: skipped ({e})")
+        raise RuntimeError(f"All download methods failed for {url}: {'; '.join(errors)}") from e
+    except FileNotFoundError:
+        errors.append("curl: not installed")
+        raise RuntimeError(f"All download methods failed for {url}: {'; '.join(errors)}") from None
     if result.returncode != 0:
         errors.append(f"curl: {result.stderr}")
         raise RuntimeError(f"All download methods failed for {url}: {'; '.join(errors)}")

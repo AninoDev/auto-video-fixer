@@ -1939,7 +1939,7 @@ chat context. Delivery is phased, one commit per phase, in the user-chosen order
 | Phase | Section | Content | Status |
 |---|---|---|---|
 | P1 | § 22 | crop on by default; `normalize_codecs` stage; container-safety audit | IMPLEMENTED 2026-10-17 |
-| P2 | § 23 | network/TLS policy applied to every network path | PLANNED |
+| P2 | § 23 | network/TLS policy applied to every network path | IMPLEMENTED 2026-10-18 |
 | P3 | § 24 | config schema versioning + migrations, first-run bootstrap, endpoint registry, per-endpoint timeout/TLS, llama.cpp provider | PLANNED |
 | P4 | § 25 | VLM frame sampling: min/max frames, consecutive-duplicate removal, tile budget, frame-count reporting | PLANNED |
 | P5 | § 26 | new structured output fields (media type, rating reasoning, detail level) + per-call timing/token stats | PLANNED |
@@ -2100,7 +2100,7 @@ maintainer needs.
   transfer are carried; matrix and range are dropped (they describe the RGB layout the re-encode
   removes). Covered by a unit test and a real-ffmpeg integration test.
 
-## 23. Network/TLS policy for every network path (P2)
+## 23. Network/TLS policy for every network path (P2) [IMPLEMENTED 2026-10-18]
 
 **Problem**: AVF has no TLS configuration. Self-hosted endpoints with self-signed certs, and
 corporate networks with TLS-inspection firewalls (which re-sign traffic with a private CA), fail
@@ -2153,6 +2153,66 @@ One module, `autovideofixer/net.py`, owns policy resolution and all HTTP(S) open
 
 Revisit: if macOS users report corporate-CA failures with `verify` mode, add optional
 `truststore` (OS keychain) support.
+
+### 23.3 Implementation notes (2026-10-18)
+
+Delivered as specified; decisions, deviations and findings:
+
+- **Network call sites found (whole tree, Python and `rust/`)**: exactly six `urlopen`/`requests`/
+  `curl` sites -- `_call_ollama`, `_call_openai`, `_call_custom_api` in `core/analysis.py` and the
+  urllib/`requests`/`curl` chain in `ai/model_cache.py::_fetch_to`. The Rust crates have no HTTP
+  dependency; `torch.hub`/`huggingface`/`httpx`/raw sockets are not used anywhere. All six go
+  through `net.py`. The analysis callers are `run_vlm_analysis`, `run_vlm_analysis_for_scene`
+  (via `_dispatch_vlm`), `run_scene_coordinator`, and `run_crop_vlm_check`; downloads come from
+  `download_model` / `ensure_model_available` / `ensure_ncnn_model_available`.
+- **Signature for P3**: every `_call_*`, `_run_*_vlm`, `_dispatch_vlm` and
+  `_call_coordinator_provider` takes `tls: TLSPolicy | None` (None = secure default). The four
+  config-driven entry points resolve `resolve_tls_policy(config, purpose=...)`; P3 swaps that for
+  `resolve_tls_policy(config, endpoint.get("tls"), purpose=endpoint_name)`. `purpose` is the label
+  for the once-per-process WARNING key. Existing timeouts (120 s providers, 60 s downloads) are
+  unchanged -- P3 makes them configurable.
+- **Model-download entry points take `config=`** (not a pre-resolved policy) so a bad policy
+  becomes a normal `(False, message)` result instead of an exception out of a stage;
+  `RealESRGANUpscaler`/`RIFEInterpolator` forward it to the ncnn backends, whose `load_model()` is
+  where the ncnn archives are fetched. `config=None` is the secure default, deliberately *not* an
+  implicit `Config()` read (that would make library/test calls depend on the user's real config).
+- **Error timing**: `ValueError` from policy resolution propagates out of `run_vlm_analysis*`
+  (loud, before frame extraction) but is fail-open in the coordinator and crop check, matching
+  their existing "never raises" contracts.
+- **`ca_files` is validated only in `verify` mode** (deviation from "unreadable ca_file ->
+  ValueError" in the general case): `untrusted_ca`/`insecure` ignore the list, and erroring on it
+  would block the user's escape hatch when the list is the thing that is broken.
+- **Finding: Python 3.13+ `VERIFY_X509_STRICT` rejects typical corporate CAs.** A private CA
+  without Subject/Authority Key Identifier fails with "Missing Authority Key Identifier" under
+  `ssl.create_default_context()`. When `ca_files` is non-empty the flag is cleared (chain and
+  hostname verification are unchanged). A real-TLS test with a key-id-less CA proves it.
+- **Finding: `curl --cacert` / `requests verify=<path>` replace the trust store**, whereas the
+  spec says ca_files are added. The fallbacks therefore get a temp bundle = certifi (else system
+  cafile) + the extra files, deleted afterwards. If no default bundle can be found the fallback is
+  skipped, not run weaker. Note this means the `requests`/`curl` fallbacks trust certifi's roots,
+  not the OS store urllib uses; both are strict "verify" semantics, never weaker.
+- **Redirects**: the `untrusted_ca` leaf check runs inside the connection (`connect()`), so each
+  redirect hop is validated (tested: acceptable server redirecting to an expired one is refused).
+- **Wildcard rule**: only a whole left-most-label `*` with at least two labels after it; partial
+  wildcards (`f*.example.com`) and `*.tld` are rejected -- stricter than the old
+  `ssl.match_hostname`, per the spec's "single left-most-label wildcard only".
+- **Missing `curl` binary** previously surfaced as a raw `FileNotFoundError` out of `_fetch_to`;
+  it is now reported in the aggregated "All download methods failed" error.
+- **CLI**: no new flags. `avf process --set network.tls.mode=insecure` works through the normal
+  cascade (verified: it appears in the effective-settings diff and the policy). `analyze` and
+  `model-download` have no `--set`/layers: they read the top-level config only
+  (`avf --config PATH` / `AVF_CONFIG` / `config.yaml`). `model-download` was changed to pass its
+  config to the download functions (it previously read none).
+- **Tests**: `tests/unit/test_net.py` (policy, matcher, arg generation, skip rules) and
+  `tests/unit/test_net_tls.py` (real `ssl` servers; matrix across verify/ca_files(CA and leaf)/
+  untrusted_ca/insecure; redirects; real `requests` and `curl`; the real download path with
+  sha256; a real provider call). The e2e check ran `avf --config ... analyze clip.mp4 --vlm`
+  against a local self-signed HTTPS OpenAI stub and `avf model-download --url https://127.0.0.1:...`
+  (the custom `--url` makes the registry redirectable without code changes).
+- **Observed behaviour worth knowing**: a VLM TLS failure in `avf analyze` is a WARNING with a
+  traceback and the VLM row is simply absent; the command still exits 0 (existing fail-soft VLM
+  design, unchanged).
+- **Not done / follow-ups**: no OCSP/CRL; no `truststore` (macOS keychain) -- revisit on report.
 
 ## 24. Config schema versioning, first-run bootstrap, endpoint registry (P3)
 

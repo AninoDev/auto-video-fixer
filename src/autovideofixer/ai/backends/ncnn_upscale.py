@@ -60,7 +60,9 @@ class NcnnUpscaleBackend:
         tile_overlap: int = DEFAULT_TILE_OVERLAP,
         use_vulkan: bool = True,
         vulkan_device: int = 0,
+        config: Any = None,
     ):
+        self._config = config
         self.model_name = model_name
         self.scale = scale
         self.tile_size = tile_size
@@ -99,7 +101,7 @@ class NcnnUpscaleBackend:
                 get_ncnn_model_paths,
             )
 
-            success, msg = ensure_ncnn_model_available(self.model_name)
+            success, msg = ensure_ncnn_model_available(self.model_name, config=self._config)
             if not success:
                 _get_logger().error(f"ncnn model unavailable: {msg}")
                 return False

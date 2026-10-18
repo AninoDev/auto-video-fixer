@@ -534,9 +534,12 @@ class RealESRGANUpscaler:
         tile_batch_size: int = 1,
         backend: str = "torch",
         vulkan_device: int = 0,
+        config: Any = None,
     ):
         """
         Args:
+            config: AVF `Config`, used only so the ncnn backend's model download honours
+                `network.tls` / `network.download_tls` (REQUIREMENTS.md § 23).
             backend: "torch" (default -- unchanged existing behavior) or
                 "ncnn". "ncnn" delegates every method below to
                 `ai.backends.ncnn_upscale.NcnnUpscaleBackend` instead of
@@ -572,6 +575,7 @@ class RealESRGANUpscaler:
         self.tile_batch_size = max(1, tile_batch_size)
         self.backend = backend
         self.vulkan_device = vulkan_device
+        self._config = config
         self._ncnn_backend: Any = None
         self._model: Any = None
         self._device: Any = None
@@ -608,6 +612,7 @@ class RealESRGANUpscaler:
                 tile_size=self.tile_size,
                 tile_overlap=self.tile_overlap,
                 vulkan_device=self.vulkan_device,
+                config=self._config,
             )
             self._loaded = self._ncnn_backend.load_model()
             return self._loaded

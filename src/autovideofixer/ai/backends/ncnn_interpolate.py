@@ -95,7 +95,9 @@ class NcnnInterpolateBackend:
         model_name: str = "rife_v4.6",
         use_vulkan: bool = True,
         vulkan_device: int = 0,
+        config: Any = None,
     ):
+        self._config = config
         self.model_name = model_name
         self.use_vulkan = use_vulkan
         self.vulkan_device = vulkan_device
@@ -131,7 +133,7 @@ class NcnnInterpolateBackend:
                 get_ncnn_model_paths,
             )
 
-            success, msg = ensure_ncnn_model_available(self.model_name)
+            success, msg = ensure_ncnn_model_available(self.model_name, config=self._config)
             if not success:
                 _get_logger().error(f"ncnn RIFE model unavailable: {msg}")
                 return False

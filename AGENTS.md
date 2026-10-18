@@ -1409,6 +1409,81 @@ call — useful for tracing which layer set a given effective value. The GUI (`g
 f"preset:{name}")` call when a preset is selected from the dropdown, mutating `self.config` in
 place (never reassigning it — `self.pipeline` holds the same object by reference).
 
+## Network / TLS (REQUIREMENTS.md § 23, `autovideofixer/net.py`)
+
+Every outbound HTTP(S) request AVF makes goes through `net.py`: the VLM/LLM providers
+(`core/analysis.py`: `_call_ollama` / `_call_openai` / `_call_custom_api`, reached from whole-video
+and per-scene VLM, the scene coordinator, and the crop VLM check) and model/archive downloads
+(`ai/model_cache.py::_fetch_to`, used by `_download_file` for `.pth` models and the ncnn archives).
+Grep of the whole tree (Python and `rust/`) found no other network use (the Rust crates have no
+HTTP dependency; ffmpeg network inputs are out of scope -- inputs are local files). **Any new
+network call MUST use `net.open_url(...)` (or the `requests_verify`/`curl_tls_args` helpers for a
+non-urllib fallback) -- never a bare `urlopen`/`requests.get`/`curl`.**
+
+- **Config**: `network.tls: {mode, ca_files}` and optional `network.download_tls` (same shape,
+  overrides `tls` for downloads only; `null` = use `tls`). Modes: `verify` (default; system store
+  **plus** `ca_files`, never replacing), `untrusted_ca`, `insecure`. `ca_files` may hold a CA cert
+  (corporate TLS inspection) or a self-signed server cert (OpenSSL accepts either as an anchor).
+  They are only validated (and only consumed) in `verify` mode, so a stale list cannot block the
+  user from switching to `untrusted_ca`/`insecure`.
+- **Why `untrusted_ca` still checks hostname + expiry**: user decision -- the common real-world
+  case is a self-signed home server, where the chain cannot verify but "is this the right name and
+  is the cert in date" is still meaningful and cheap. Implemented as a `CERT_NONE` handshake, then
+  `net.validate_peer_certificate()` (via `cryptography`, now a required dependency): validity
+  window + a hand-written RFC 6125 matcher (`match_dns_name` / `match_certificate_hostname`:
+  SAN DNS and IP entries; wildcard only as the whole left-most label, matching exactly one label;
+  CN fallback only when there is **no** SAN extension; IDNA/case-folded). `ssl.match_hostname`
+  is gone in 3.12+. For urllib the check lives in `_ValidatingHTTPSConnection.connect()`, i.e. on
+  the live socket right after the handshake and before any request bytes, so it also covers every
+  redirect hop. It is weaker than `verify`: any self-made cert bearing the right name passes.
+- **The never-weaker fallback rule**: `_fetch_to` tries urllib -> `requests` -> `curl`. Each is
+  given the same policy: `requests` gets `verify=False|True|<bundle path>`, `curl` gets
+  `-k`|`--cacert <bundle>`. `curl --cacert` and `requests verify=<path>` *replace* the trust store,
+  so for `verify` + `ca_files` we build a temp PEM = certifi (else system) bundle + the extra
+  files (`net._combined_bundle`, deleted afterwards). `untrusted_ca` cannot be expressed to either
+  (they have no "hostname + expiry only" mode), so in that mode both are **skipped** with a DEBUG
+  log (`FallbackUnsupported`) -- a fallback must never run with weaker checking than configured,
+  and must never succeed where the policy rejects. Missing default bundle => skip, not weaker.
+- **SHA256 stays mandatory**: registry models (and ncnn archives/members) are hash-verified after
+  download in every TLS mode, so even `insecure` cannot substitute tampered weights for a registry
+  model. A custom `--url` model has no pinned hash and gets no such protection (already WARNed).
+- **`VERIFY_X509_STRICT` is cleared when `ca_files` is non-empty**: Python 3.13+ enables it by
+  default and it rejects many real corporate inspection CAs ("Missing Authority Key Identifier").
+  Verified by a test with a key-id-less CA that fails without the clearing. The chain and
+  hostname are still fully verified; only RFC 5280 pedantry is dropped, and only for CAs the user
+  explicitly chose to trust.
+- **WARNING once per process** per `(purpose/endpoint label, mode)` when `untrusted_ca` or
+  `insecure` is in use (`net._warn_if_weak`; labels today: `vlm`, `llm`, `crop-vlm`,
+  `model download`). The message never contains URLs (PII-clean logs).
+- **Errors at use time** (follows `config.resolve_timeout`): unknown mode, non-list `ca_files`, or
+  an unreadable `ca_files` path raises `ValueError` from `resolve_tls_policy`. `run_vlm_analysis*`
+  lets it propagate (a config error should be loud, resolved before frame extraction); the
+  coordinator and crop check fail open as they do for any error; model downloads return
+  `(False, message)`.
+- **Not checked**: certificate revocation (OCSP/CRL) in any mode. **Revisit**: if macOS users
+  report corporate-CA failures with `verify`, add optional `truststore` (OS keychain) support.
+- **Model-download entry points take `config=`** (`ensure_model_available`, `download_model`,
+  `ensure_ncnn_model_available`, threaded through `RealESRGANUpscaler`/`RIFEInterpolator` to the
+  ncnn backends). `config=None` means the secure default -- a caller that has a `Config` and does
+  not pass it silently ignores the user's TLS settings, so pass it.
+- **How to set it per command**: `avf process ... --set network.tls.mode=insecure` (the normal
+  `--set` cascade; also `--set network.download_tls.mode=untrusted_ca`). `analyze` and
+  `model-download` have **no** `--set`/`--config` layers: they read only the top-level config
+  (`~/.config/auto-video-fixer/config.yaml`, or `avf --config PATH` / `AVF_CONFIG`), so use a
+  config file or a throwaway one: `avf --config tls.yaml analyze clip.mp4 --vlm`.
+- **P3 hook (per-endpoint TLS, § 24.4)**: `resolve_tls_policy(config, override, purpose=...)`
+  already deep-merges a mapping over `network.tls`, and every `_call_*` / `_run_*_vlm` /
+  `_dispatch_vlm` / `_call_coordinator_provider` takes `tls: TLSPolicy | None`. P3 only has to
+  resolve each endpoint with `resolve_tls_policy(config, endpoint.get("tls"), purpose=endpoint_name)`
+  at the four call sites that currently call `resolve_tls_policy(config, purpose=...)`
+  (`run_vlm_analysis`, `run_vlm_analysis_for_scene`, `run_scene_coordinator`, `run_crop_vlm_check`).
+- **Tests**: `tests/unit/test_net.py` (policy/matcher/arg generation) and
+  `tests/unit/test_net_tls.py` (real `ssl`-wrapped servers from `tests/unit/_tls_certs.py`: private
+  CA, CA-signed, self-signed, expired, not-yet-valid, wrong-hostname; full accept/reject matrix
+  through the real `open_url`, the real `requests`/`curl`, the real download path and a real
+  provider call). Never mock the TLS layer there -- mutation checks (disabling the expiry/hostname
+  checks, or the STRICT clearing) must turn the tests red.
+
 ## Stage/quality ffmpeg timeouts
 
 Most `run_ffmpeg()` calls that used to hardcode `timeout=600`/`1800`/`3600` (a whole-video

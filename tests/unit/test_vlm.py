@@ -142,7 +142,7 @@ class TestExtractSampleFrames:
 class TestOllamaIntegration:
     """Test Ollama API calls (mocked)."""
 
-    @patch("urllib.request.urlopen")
+    @patch("autovideofixer.core.analysis.open_url")
     def test_call_ollama(self, mock_urlopen):
         """Test calling Ollama API with mock response."""
         content = '{"summary": "test", "tags": "a,b", "objects": "c", "rating": "G"}'
@@ -162,7 +162,7 @@ class TestOllamaIntegration:
         )
         assert "test" in result
 
-    @patch("urllib.request.urlopen")
+    @patch("autovideofixer.core.analysis.open_url")
     def test_call_ollama_failure(self, mock_urlopen):
         """Test Ollama API call failure returns empty string."""
         import urllib.error
@@ -175,7 +175,7 @@ class TestOllamaIntegration:
 class TestOpenAIIntegration:
     """Test OpenAI API calls (mocked)."""
 
-    @patch("urllib.request.urlopen")
+    @patch("autovideofixer.core.analysis.open_url")
     def test_call_openai(self, mock_urlopen):
         """Test calling OpenAI API with mock response."""
         content = '{"summary": "test video", "tags": "a,b", "objects": "c", "rating": "PG"}'
@@ -189,7 +189,7 @@ class TestOpenAIIntegration:
         result = _call_openai("sk-test-key", "gpt-4o", "system", "user", ["base64data"])
         assert "test video" in result
 
-    @patch("urllib.request.urlopen")
+    @patch("autovideofixer.core.analysis.open_url")
     def test_call_openai_failure(self, mock_urlopen):
         """Test OpenAI API call failure."""
         import urllib.error
@@ -202,7 +202,7 @@ class TestOpenAIIntegration:
 class TestCustomAPI:
     """Test custom API calls (mocked)."""
 
-    @patch("urllib.request.urlopen")
+    @patch("autovideofixer.core.analysis.open_url")
     def test_call_custom_api(self, mock_urlopen):
         """Test calling a custom API endpoint."""
         content = '{"summary": "custom", "tags": "x", "objects": "y", "rating": "G"}'
@@ -218,7 +218,7 @@ class TestCustomAPI:
         )
         assert "custom" in result
 
-    @patch("urllib.request.urlopen")
+    @patch("autovideofixer.core.analysis.open_url")
     def test_call_custom_api_no_key(self, mock_urlopen):
         """Test custom API with no API key."""
         mock_response = json.dumps({"choices": [{"message": {"content": '{"summary":"ok"}'}}]})
@@ -235,7 +235,7 @@ class TestCustomAPI:
         req = call_args[0][0]
         assert "Authorization" not in req.headers
 
-    @patch("urllib.request.urlopen")
+    @patch("autovideofixer.core.analysis.open_url")
     def test_plain_http_non_loopback_refused_by_default(self, mock_urlopen):
         """Plain HTTP to a non-loopback host is refused unless allow_http is set."""
         result = _call_custom_api(
@@ -244,7 +244,7 @@ class TestCustomAPI:
         assert result == ""
         mock_urlopen.assert_not_called()
 
-    @patch("urllib.request.urlopen")
+    @patch("autovideofixer.core.analysis.open_url")
     def test_plain_http_non_loopback_allowed_with_override(self, mock_urlopen):
         """allow_http=True permits plain HTTP to a LAN host."""
         content = '{"summary": "lan", "tags": "x", "objects": "y"}'
@@ -266,7 +266,7 @@ class TestCustomAPI:
         )
         assert "lan" in result
 
-    @patch("urllib.request.urlopen")
+    @patch("autovideofixer.core.analysis.open_url")
     def test_https_never_needs_override(self, mock_urlopen):
         """HTTPS to any host works without allow_http."""
         content = '{"summary": "sec", "tags": "x", "objects": "y"}'
@@ -316,7 +316,7 @@ class TestPromptCustomization:
         payload = json.loads(req.data.decode("utf-8"))
         return payload["messages"][0]["content"]
 
-    @patch("urllib.request.urlopen")
+    @patch("autovideofixer.core.analysis.open_url")
     @patch("autovideofixer.core.analysis._extract_sample_frames")
     def test_prompt_append_from_config_extends_default(self, mock_frames, mock_urlopen, tmp_path):
         frame = tmp_path / "frame.jpg"
@@ -335,7 +335,7 @@ class TestPromptCustomization:
         # The appended text comes after the default prompt.
         assert sent.index(_VLM_USER_PROMPT) < sent.index("these are trail camera clips")
 
-    @patch("urllib.request.urlopen")
+    @patch("autovideofixer.core.analysis.open_url")
     @patch("autovideofixer.core.analysis._extract_sample_frames")
     def test_prompt_override_from_config_replaces_default(
         self, mock_frames, mock_urlopen, tmp_path
@@ -352,7 +352,7 @@ class TestPromptCustomization:
         assert sent == "custom prompt only"
         assert _VLM_USER_PROMPT not in sent
 
-    @patch("urllib.request.urlopen")
+    @patch("autovideofixer.core.analysis.open_url")
     @patch("autovideofixer.core.analysis._extract_sample_frames")
     def test_prompt_append_still_applies_after_override(self, mock_frames, mock_urlopen, tmp_path):
         frame = tmp_path / "frame.jpg"
@@ -372,7 +372,7 @@ class TestPromptCustomization:
         sent = self._sent_user_prompt(mock_urlopen)
         assert sent == "custom prompt only\n\nplus this context"
 
-    @patch("urllib.request.urlopen")
+    @patch("autovideofixer.core.analysis.open_url")
     @patch("autovideofixer.core.analysis._extract_sample_frames")
     def test_system_prompt_override_from_config(self, mock_frames, mock_urlopen, tmp_path):
         frame = tmp_path / "frame.jpg"
@@ -387,7 +387,7 @@ class TestPromptCustomization:
 
         assert self._sent_system_prompt(mock_urlopen) == "you are a wildlife expert"
 
-    @patch("urllib.request.urlopen")
+    @patch("autovideofixer.core.analysis.open_url")
     @patch("autovideofixer.core.analysis._extract_sample_frames")
     def test_explicit_arg_beats_config_value(self, mock_frames, mock_urlopen, tmp_path):
         """The equivalent of a CLI flag (an explicit run_vlm_analysis() kwarg) wins
@@ -404,7 +404,7 @@ class TestPromptCustomization:
 
         assert self._sent_user_prompt(mock_urlopen) == "from explicit arg"
 
-    @patch("urllib.request.urlopen")
+    @patch("autovideofixer.core.analysis.open_url")
     @patch("autovideofixer.core.analysis._extract_sample_frames")
     def test_no_customization_uses_defaults(self, mock_frames, mock_urlopen, tmp_path):
         frame = tmp_path / "frame.jpg"
@@ -501,7 +501,7 @@ class TestRunCropVlmCheck:
         assert result["content_outside"] is False
         assert result["failed"] is True
 
-    @patch("urllib.request.urlopen")
+    @patch("autovideofixer.core.analysis.open_url")
     def test_ollama_provider_content_outside_true(self, mock_urlopen, tmp_path):
         full = tmp_path / "full.jpg"
         boxed = tmp_path / "boxed.jpg"
@@ -531,7 +531,7 @@ class TestRunCropVlmCheck:
         payload = json.loads(req.data.decode("utf-8"))
         assert len(payload["messages"][1]["images"]) == 2
 
-    @patch("urllib.request.urlopen")
+    @patch("autovideofixer.core.analysis.open_url")
     def test_ollama_provider_content_outside_false(self, mock_urlopen, tmp_path):
         full = tmp_path / "full.jpg"
         boxed = tmp_path / "boxed.jpg"
@@ -552,7 +552,7 @@ class TestRunCropVlmCheck:
         assert result["content_outside"] is False
         assert result["checked"] is True
 
-    @patch("urllib.request.urlopen")
+    @patch("autovideofixer.core.analysis.open_url")
     def test_provider_error_fails_open(self, mock_urlopen, tmp_path):
         full = tmp_path / "full.jpg"
         boxed = tmp_path / "boxed.jpg"
@@ -566,7 +566,7 @@ class TestRunCropVlmCheck:
         assert result["content_outside"] is False
         assert result["failed"] is True
 
-    @patch("urllib.request.urlopen")
+    @patch("autovideofixer.core.analysis.open_url")
     def test_unparseable_response_fails_open(self, mock_urlopen, tmp_path):
         full = tmp_path / "full.jpg"
         boxed = tmp_path / "boxed.jpg"

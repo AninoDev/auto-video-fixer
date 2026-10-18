@@ -18,6 +18,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable
 
 from autovideofixer.config import VALID_SYMLINKS_POLICIES, Config
+from autovideofixer.net import TLSPolicy, open_url, resolve_tls_policy
 
 logger = logging.getLogger(__name__)
 
@@ -563,6 +564,9 @@ class VideoAnalyzer:
                 progress_callback(phase, detail)
 
         vlm_config = self.config.get("analysis", "vlm", default={})
+        # Resolved up front so a bad network.tls config is a clear error before any
+        # frame extraction work (and not swallowed by _dispatch_vlm's fail-soft except).
+        tls = resolve_tls_policy(self.config, purpose="vlm")
         provider = vlm_config.get("provider", "local")
         model = model if model is not None else vlm_config.get("model", "llava")
         api_url = api_url if api_url is not None else vlm_config.get("api_url", "")
@@ -622,6 +626,7 @@ class VideoAnalyzer:
                 user_prompt,
                 allow_http=bool(vlm_config.get("allow_http", False)),
                 max_tokens=int(vlm_config.get("max_tokens", 1024)),
+                tls=tls,
                 context=filepath,
             )
         finally:
@@ -655,6 +660,9 @@ class VideoAnalyzer:
         import math
 
         vlm_config = self.config.get("analysis", "vlm", default={})
+        # Resolved up front so a bad network.tls config is a clear error before any
+        # frame extraction work (and not swallowed by _dispatch_vlm's fail-soft except).
+        tls = resolve_tls_policy(self.config, purpose="vlm")
         provider = vlm_config.get("provider", "local")
         model = model if model is not None else vlm_config.get("model", "llava")
         api_url = api_url if api_url is not None else vlm_config.get("api_url", "")
@@ -711,6 +719,7 @@ class VideoAnalyzer:
                 user_prompt,
                 allow_http=bool(vlm_config.get("allow_http", False)),
                 max_tokens=int(vlm_config.get("max_tokens", 1024)),
+                tls=tls,
                 context=f"{filepath} scene[{scene.start_time:.1f}-{scene.end_time:.1f}]",
             )
         finally:
@@ -869,6 +878,7 @@ def _call_ollama(
     user_prompt: str,
     image_b64_list: list[str],
     max_tokens: int = 1024,
+    tls: TLSPolicy | None = None,
 ) -> str:
     """Send a request to an Ollama API endpoint.
 
@@ -878,6 +888,8 @@ def _call_ollama(
         system_prompt: System message
         user_prompt: User message text
         image_b64_list: Base64-encoded image strings
+        tls: Resolved TLS policy (``net.resolve_tls_policy``); None = secure default.
+            Per-endpoint overrides (REQUIREMENTS.md § 24.4) are resolved by the caller.
 
     Returns:
         Response text from the model
@@ -906,7 +918,7 @@ def _call_ollama(
             headers={"Content-Type": "application/json"},
             method="POST",
         )
-        with urllib.request.urlopen(req, timeout=120) as resp:
+        with open_url(req, timeout=120, tls=tls) as resp:
             result = json.loads(resp.read().decode("utf-8"))
             return result.get("message", {}).get("content", "")
     except Exception:
@@ -921,6 +933,7 @@ def _call_openai(
     user_prompt: str,
     image_b64_list: list[str],
     max_tokens: int = 1024,
+    tls: TLSPolicy | None = None,
 ) -> str:
     """Send a request to the OpenAI Vision API.
 
@@ -930,6 +943,8 @@ def _call_openai(
         system_prompt: System message
         user_prompt: User message text
         image_b64_list: Base64-encoded image strings
+        tls: Resolved TLS policy (``net.resolve_tls_policy``); None = secure default.
+            Per-endpoint overrides (REQUIREMENTS.md § 24.4) are resolved by the caller.
 
     Returns:
         Response text from the model
@@ -967,7 +982,7 @@ def _call_openai(
             },
             method="POST",
         )
-        with urllib.request.urlopen(req, timeout=120) as resp:
+        with open_url(req, timeout=120, tls=tls) as resp:
             result = json.loads(resp.read().decode("utf-8"))
             return result.get("choices", [{}])[0].get("message", {}).get("content", "")
     except Exception:
@@ -984,6 +999,7 @@ def _call_custom_api(
     image_b64_list: list[str],
     allow_http: bool = False,
     max_tokens: int = 1024,
+    tls: TLSPolicy | None = None,
 ) -> str:
     """Send a request to a custom API endpoint.
 
@@ -996,6 +1012,8 @@ def _call_custom_api(
         system_prompt: System message
         user_prompt: User message text
         image_b64_list: Base64-encoded image strings
+        tls: Resolved TLS policy (``net.resolve_tls_policy``); None = secure default.
+            Per-endpoint overrides (REQUIREMENTS.md § 24.4) are resolved by the caller.
 
     Returns:
         Response text from the API
@@ -1057,7 +1075,7 @@ def _call_custom_api(
             headers=headers,
             method="POST",
         )
-        with urllib.request.urlopen(req, timeout=120) as resp:
+        with open_url(req, timeout=120, tls=tls) as resp:
             result = json.loads(resp.read().decode("utf-8"))
             return result.get("choices", [{}])[0].get("message", {}).get("content", "")
     except Exception:
@@ -1076,6 +1094,7 @@ def _dispatch_vlm(
     allow_http: bool = False,
     context: str = "",
     max_tokens: int = 1024,
+    tls: TLSPolicy | None = None,
 ) -> dict[str, Any]:
     """Shared provider dispatch for both whole-video and per-scene VLM analysis.
 
@@ -1086,11 +1105,11 @@ def _dispatch_vlm(
     try:
         if provider in ("local", "ollama"):
             return _run_ollama_vlm(
-                frames, model, api_url, system_prompt, user_prompt, max_tokens=max_tokens
+                frames, model, api_url, system_prompt, user_prompt, max_tokens=max_tokens, tls=tls
             )
         elif provider == "openai":
             return _run_openai_vlm(
-                frames, api_key, model, system_prompt, user_prompt, max_tokens=max_tokens
+                frames, api_key, model, system_prompt, user_prompt, max_tokens=max_tokens, tls=tls
             )
         elif provider == "api":
             return _run_api_vlm(
@@ -1102,6 +1121,7 @@ def _dispatch_vlm(
                 user_prompt,
                 allow_http=allow_http,
                 max_tokens=max_tokens,
+                tls=tls,
             )
         else:
             return {"summary": "", "tags": [], "objects": [], "rating": None}
@@ -1117,6 +1137,7 @@ def _run_ollama_vlm(
     system_prompt: str = _VLM_SYSTEM_PROMPT,
     user_prompt: str = _VLM_USER_PROMPT,
     max_tokens: int = 1024,
+    tls: TLSPolicy | None = None,
 ) -> dict[str, Any]:
     """Run analysis using Ollama."""
     image_b64 = _frames_to_base64(frames)
@@ -1131,6 +1152,7 @@ def _run_ollama_vlm(
         user_prompt,
         image_b64,
         max_tokens=max_tokens,
+        tls=tls,
     )
     return _parse_vlm_response(response)
 
@@ -1142,6 +1164,7 @@ def _run_openai_vlm(
     system_prompt: str = _VLM_SYSTEM_PROMPT,
     user_prompt: str = _VLM_USER_PROMPT,
     max_tokens: int = 1024,
+    tls: TLSPolicy | None = None,
 ) -> dict[str, Any]:
     """Run analysis using OpenAI Vision API."""
     image_b64 = _frames_to_base64(frames)
@@ -1149,7 +1172,7 @@ def _run_openai_vlm(
         return {"summary": "", "tags": [], "objects": []}
 
     response = _call_openai(
-        api_key, model, system_prompt, user_prompt, image_b64, max_tokens=max_tokens
+        api_key, model, system_prompt, user_prompt, image_b64, max_tokens=max_tokens, tls=tls
     )
     return _parse_vlm_response(response)
 
@@ -1163,6 +1186,7 @@ def _run_api_vlm(
     user_prompt: str = _VLM_USER_PROMPT,
     allow_http: bool = False,
     max_tokens: int = 1024,
+    tls: TLSPolicy | None = None,
 ) -> dict[str, Any]:
     """Run analysis using a custom API endpoint (OpenAI-compatible)."""
     image_b64 = _frames_to_base64(frames)
@@ -1178,6 +1202,7 @@ def _run_api_vlm(
         image_b64,
         allow_http=allow_http,
         max_tokens=max_tokens,
+        tls=tls,
     )
     return _parse_vlm_response(response)
 
@@ -1737,6 +1762,17 @@ def run_scene_coordinator(
     api_key = llm_config.get("api_key", "")
     allow_http = bool(llm_config.get("allow_http", False))
     max_tokens = int(llm_config.get("max_tokens", 4096))
+    try:
+        tls = resolve_tls_policy(config, purpose="llm")
+    except ValueError as e:
+        # Fail open like every other coordinator failure (keep all scenes), but loudly.
+        logger.warning("Scene coordinator: invalid network.tls config (%s); keeping all scenes", e)
+        return {
+            "drop": [],
+            "reasons": {},
+            "main_content_summary": "",
+            "failed": True,
+        }
 
     if not scene_summaries:
         return {"drop": [], "reasons": {}, "main_content_summary": "", "failed": False}
@@ -1756,6 +1792,7 @@ def run_scene_coordinator(
         user_prompt,
         allow_http,
         max_tokens=max_tokens,
+        tls=tls,
     )
     if raw_text is None:
         logger.warning(
@@ -1818,6 +1855,7 @@ def _call_coordinator_provider(
     user_prompt: str,
     allow_http: bool,
     max_tokens: int = 4096,
+    tls: TLSPolicy | None = None,
 ) -> str | None:
     """Call the raw (unparsed) text-completion provider for the coordinator pass.
 
@@ -1831,11 +1869,11 @@ def _call_coordinator_provider(
         if provider in ("local", "ollama"):
             base_url = api_url or "http://localhost:11434"
             text = _call_ollama(
-                base_url, model, system_prompt, user_prompt, [], max_tokens=max_tokens
+                base_url, model, system_prompt, user_prompt, [], max_tokens=max_tokens, tls=tls
             )
         elif provider == "openai":
             text = _call_openai(
-                api_key, model, system_prompt, user_prompt, [], max_tokens=max_tokens
+                api_key, model, system_prompt, user_prompt, [], max_tokens=max_tokens, tls=tls
             )
         elif provider == "api":
             text = _call_custom_api(
@@ -1847,6 +1885,7 @@ def _call_coordinator_provider(
                 [],
                 allow_http=allow_http,
                 max_tokens=max_tokens,
+                tls=tls,
             )
         else:
             return None
@@ -1941,6 +1980,11 @@ def run_crop_vlm_check(
     api_url = vlm_config.get("api_url", "")
     api_key = vlm_config.get("api_key", "")
     allow_http = bool(vlm_config.get("allow_http", False))
+    try:
+        tls = resolve_tls_policy(config, purpose="crop-vlm")
+    except ValueError as e:
+        logger.warning("Crop VLM check: invalid network.tls config (%s)", e)
+        return {"checked": False, "content_outside": False, "reason": str(e), "failed": True}
 
     images_b64 = _frames_to_base64([full_frame_path, boxed_frame_path])
     if len(images_b64) < 2:
@@ -1955,11 +1999,21 @@ def run_crop_vlm_check(
         if provider in ("local", "ollama"):
             base_url = api_url or "http://localhost:11434"
             raw = _call_ollama(
-                base_url, model, _CROP_VLM_SYSTEM_PROMPT, _CROP_VLM_USER_PROMPT, images_b64
+                base_url,
+                model,
+                _CROP_VLM_SYSTEM_PROMPT,
+                _CROP_VLM_USER_PROMPT,
+                images_b64,
+                tls=tls,
             )
         elif provider == "openai":
             raw = _call_openai(
-                api_key, model, _CROP_VLM_SYSTEM_PROMPT, _CROP_VLM_USER_PROMPT, images_b64
+                api_key,
+                model,
+                _CROP_VLM_SYSTEM_PROMPT,
+                _CROP_VLM_USER_PROMPT,
+                images_b64,
+                tls=tls,
             )
         elif provider == "api":
             raw = _call_custom_api(
@@ -1970,6 +2024,7 @@ def run_crop_vlm_check(
                 _CROP_VLM_USER_PROMPT,
                 images_b64,
                 allow_http=allow_http,
+                tls=tls,
             )
         else:
             raw = ""

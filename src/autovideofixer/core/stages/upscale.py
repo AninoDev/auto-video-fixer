@@ -642,7 +642,11 @@ class UpscaleStage(BaseStage):
             # ensure_ncnn_model_available(), and a load failure already routes
             # through _ai_fallback_or_fail() -- so skip the wrong-registry
             # check entirely rather than gating ncnn on cached torch weights.
-            success, msg = (True, "") if backend == "ncnn" else ensure_model_available(pass_model)
+            success, msg = (
+                (True, "")
+                if backend == "ncnn"
+                else ensure_model_available(pass_model, config=self.config)
+            )
             if not success:
                 # Fall back to the originally configured model if the
                 # auto-selected lighter one isn't available (e.g. offline
@@ -650,7 +654,7 @@ class UpscaleStage(BaseStage):
                 # whole stage outright.
                 if pass_model != self._ai_model:
                     pass_model = self._ai_model
-                    success, msg = ensure_model_available(pass_model)
+                    success, msg = ensure_model_available(pass_model, config=self.config)
                 if not success:
                     if fallback_ctx is None:
                         return StageResult(
@@ -672,6 +676,7 @@ class UpscaleStage(BaseStage):
                 tile_batch_size=self._stage_config.get("tile_batch_size", 1),
                 backend=backend,
                 vulkan_device=self.config.get("gpu", "vulkan_device", default=0),
+                config=self.config,
             )
 
             if not upscaler.load_model():

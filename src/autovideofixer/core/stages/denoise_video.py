@@ -184,11 +184,11 @@ class DenoiseVideoStage(BaseStage):
         try:
             from autovideofixer.ai.model_cache import ensure_model_available
 
-            success, msg = ensure_model_available(ai_model_name)
+            success, msg = ensure_model_available(ai_model_name, config=self.config)
             if not success:
                 if ai_model_name != configured_model:
                     ai_model_name = configured_model
-                    success, msg = ensure_model_available(ai_model_name)
+                    success, msg = ensure_model_available(ai_model_name, config=self.config)
                 if not success:
                     return self._ai_fallback_or_fail(
                         f"model not available: {msg}",

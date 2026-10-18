@@ -2914,8 +2914,15 @@ def model_info(model: str | None) -> None:
 @click.option("--model", required=True, help="Model name to download")
 @click.option("--url", default=None, help="Custom download URL")
 @click.option("--force", is_flag=True, help="Force re-download even if cached")
-def model_download(model: str, url: str | None, force: bool) -> None:
-    """Download an AI model for processing."""
+@click.pass_context
+def model_download(ctx: click.Context, model: str, url: str | None, force: bool) -> None:
+    """Download an AI model for processing.
+
+    Honours network.tls / network.download_tls from the (top-level) config; for a one-off
+    override use the top-level flag form, e.g. `avf --config my.yaml model-download ...`
+    (this command has no --set; see AGENTS.md "Network / TLS").
+    """
+    config = ctx.obj["config"]
     from autovideofixer.ai.model_cache import (
         MODEL_REGISTRY,
         download_model,
@@ -2929,7 +2936,7 @@ def model_download(model: str, url: str | None, force: bool) -> None:
 
     if url:
         try:
-            ok, msg = download_model(model, url=url)
+            ok, msg = download_model(model, url=url, config=config)
         except Exception as e:
             console.print(f"[red]Download failed: {e}[/red]")
             sys.exit(1)
@@ -2940,7 +2947,7 @@ def model_download(model: str, url: str | None, force: bool) -> None:
             sys.exit(1)
     elif model in MODEL_REGISTRY:
         try:
-            ok, msg = ensure_model_available(model, force_download=force)
+            ok, msg = ensure_model_available(model, force_download=force, config=config)
         except Exception as e:
             console.print(f"[red]Download failed: {e}[/red]")
             sys.exit(1)

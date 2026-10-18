@@ -796,6 +796,53 @@ analysis:
     api_key: ""
 ```
 
+### Corporate Networks and Self-Signed Servers (TLS)
+
+AVF verifies HTTPS certificates for everything it fetches: model downloads and VLM/LLM endpoints.
+If that fails with `CERTIFICATE_VERIFY_FAILED`, pick the **narrowest** fix below.
+
+**1. Your company's firewall inspects TLS (model downloads fail at work).** The firewall re-signs
+traffic with a private CA. Ask IT for that CA certificate (PEM format), or export it from your
+browser's certificate viewer, and trust it *in addition to* the normal system roots:
+
+```yaml
+network:
+  tls:
+    mode: verify
+    ca_files: [/etc/ssl/certs/acme-corp-inspection-ca.pem]
+```
+
+**2. A self-signed server (e.g. your own llama.cpp/Ollama box behind nginx).** Trust that exact
+certificate; AVF still checks that it matches the host name and is in date:
+
+```bash
+openssl s_client -connect box.lan:8443 -showcerts </dev/null | openssl x509 > ~/certs/box.pem
+```
+```yaml
+network:
+  tls:
+    ca_files: [~/certs/box.pem]
+```
+
+**3. You cannot get the certificate.** `mode: untrusted_ca` accepts a certificate whose chain does
+not verify (self-signed or unknown CA) but still rejects an expired or not-yet-valid certificate
+and one issued for a different host name. It is weaker than option 1/2: anyone on the network
+path could present their own certificate for the right name. `mode: insecure` turns verification
+off entirely (traffic is still encrypted); use it only as a last resort. Both log a WARNING once
+per run. Revocation (OCSP/CRL) is not checked in any mode.
+
+**Downloads only.** `network.download_tls` takes the same keys and overrides `network.tls` for
+model downloads, e.g. relax TLS for the proxy that intercepts the model hosts while keeping your
+VLM endpoint strict. Downloaded models are SHA256-verified in every mode, so even `insecure`
+cannot swap in tampered weights for a registry model (a custom `--url` model has no pinned hash).
+
+**Setting it for one command.**
+
+| Command | How |
+|---|---|
+| `avf process` | `--set network.tls.mode=insecure` (also `--set network.download_tls.mode=untrusted_ca`) |
+| `avf analyze`, `avf model-download` | config file only: edit `config.yaml`, or use a throwaway one: `avf --config tls.yaml analyze clip.mp4 --vlm` |
+
 ---
 
 ## Troubleshooting

@@ -8,6 +8,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Network/TLS policy for every network path (REQUIREMENTS.md § 23, phase P2 of the 2026-10
+  feature set).** New `autovideofixer/net.py` owns TLS policy and all HTTP(S) opening. New config
+  `network.tls: {mode, ca_files}` and `network.download_tls` (downloads-only override). Modes:
+  `verify` (default: system store **plus** `ca_files` -- a corporate TLS-inspection CA *or* a
+  self-signed server cert), `untrusted_ca` (accepts an unverifiable chain but still rejects
+  expired / not-yet-valid certs and hostname mismatches, checked with `cryptography` and a
+  hand-written RFC 6125 matcher, including on redirect hops), and `insecure`. Applied to the VLM/LLM
+  providers (whole-video + per-scene VLM, scene coordinator, crop VLM check) and to model/archive
+  downloads, including the `requests` and `curl` fallbacks, which receive the equivalent setting
+  or are skipped (never run with weaker checking; `untrusted_ca` skips both). WARNING once per
+  run when a non-`verify` mode is used. Registry models stay SHA256-verified in every mode.
+  `--set network.tls.mode=...` works through the existing `avf process` cascade; `analyze` and
+  `model-download` read the top-level config only. `cryptography>=42` is now a required
+  dependency. See `docs/USER_GUIDE.md` ("Corporate networks and self-signed servers").
 - **`normalize_codecs` stage (REQUIREMENTS.md § 22.2): unusual codecs are normalized to H.264/AAC
   before the heavy stages run.** New stage, on by default, placed right after `retime` in
   `pipeline.default_order` (and `DEFAULT_STAGE_ORDER`; `pipeline.max_stages` 17 -> 18 to keep two
@@ -222,6 +236,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   on this path). See `docs/REQUIREMENTS.md` § 16 (§ 16.7 for subdivision) for the full spec.
 
 ### Changed
+- `ai.model_cache.ensure_model_available` / `download_model` / `ensure_ncnn_model_available` and
+  `RealESRGANUpscaler` / `RIFEInterpolator` / the ncnn backends gained an optional `config=`
+  argument (used for the download TLS policy; `None` = secure default). The download fallback chain
+  no longer crashes with a raw `FileNotFoundError` when `curl` is absent.
 - **2026-10-17: `stages.crop.enabled` now defaults to `true` (REQUIREMENTS.md § 22.1).** Auto-crop
   was opt-in; it is now part of every auto-determined plan and SKIPs cheaply (one sample, no
   re-encode) on borderless input. A `stages.crop.enabled: false` already written in a user's

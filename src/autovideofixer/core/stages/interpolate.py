@@ -753,7 +753,9 @@ class InterpolateStage(BaseStage):
             # load_model(); the torch registry pre-flight would check the
             # wrong registry (see the same pattern in upscale.py).
             success, msg = (
-                (True, "") if backend == "ncnn" else ensure_model_available(self._ai_model)
+                (True, "")
+                if backend == "ncnn"
+                else ensure_model_available(self._ai_model, config=self.config)
             )
             if not success:
                 return self._ai_fallback_or_fail(
@@ -806,6 +808,7 @@ class InterpolateStage(BaseStage):
             device_preference=self.config.get("gpu", "preferred_device", default="auto"),
             backend=backend,
             vulkan_device=self.config.get("gpu", "vulkan_device", default=0),
+            config=self.config,
         )
 
         if not interpolator.load_model():
@@ -1285,7 +1288,9 @@ class InterpolateStage(BaseStage):
             from autovideofixer.ai.model_cache import ensure_model_available
 
             success, msg = (
-                (True, "") if backend == "ncnn" else ensure_model_available(self._ai_model)
+                (True, "")
+                if backend == "ncnn"
+                else ensure_model_available(self._ai_model, config=self.config)
             )
             if not success:
                 return self._ai_fallback_or_fail(
@@ -1334,6 +1339,7 @@ class InterpolateStage(BaseStage):
             device_preference=self.config.get("gpu", "preferred_device", default="auto"),
             backend=backend,
             vulkan_device=self.config.get("gpu", "vulkan_device", default=0),
+            config=self.config,
         )
         if not interpolator.load_model():
             return self._ai_fallback_or_fail(

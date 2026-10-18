@@ -1461,6 +1461,35 @@ class Config:
                 "aggressive_smoothness_multiplier": 2.0,
             },
         },
+        # Network/TLS policy for EVERY outbound HTTPS request (VLM/LLM providers, model and
+        # archive downloads) -- docs/REQUIREMENTS.md § 23, autovideofixer/net.py. Exists
+        # because corporate TLS-inspection firewalls re-sign traffic with a private CA that
+        # Python does not trust, and self-hosted inference servers often use self-signed certs;
+        # before this, both failed outright with no override.
+        "network": {
+            "tls": {
+                # verify       -- normal verification (system trust store + ca_files). Default.
+                # untrusted_ca -- accept a chain that does not verify (self-signed / unknown CA)
+                #                 but STILL reject an expired / not-yet-valid certificate and a
+                #                 hostname mismatch. Convenient for a home server; weaker than
+                #                 verify because any self-made cert for the right name is
+                #                 accepted (a man-in-the-middle could present one).
+                # insecure     -- no verification at all (still encrypted). Last resort.
+                # Prefer `verify` + ca_files whenever you can get hold of the certificate.
+                "mode": "verify",
+                # Extra PEM files trusted IN ADDITION to the system store (never replacing it)
+                # in `verify` mode. Each may be a CA certificate (corporate TLS inspection) or
+                # a self-signed server certificate (home server) -- one key covers both.
+                # Ignored by the other modes.
+                "ca_files": [],
+            },
+            # Optional override of `tls` for MODEL DOWNLOADS only (same shape), e.g. relax TLS
+            # for the corporate proxy that intercepts huggingface/github while keeping your
+            # VLM endpoint strict. null = downloads use `tls`. Downloaded models are still
+            # SHA256-verified against the registry in every mode, so even `insecure` cannot
+            # substitute tampered weights for registry models.
+            "download_tls": None,
+        },
         "analysis": {
             "llm": {
                 # Coordinating text-LLM used only when scenes.drop_non_content is true.

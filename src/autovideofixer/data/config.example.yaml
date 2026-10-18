@@ -1221,6 +1221,50 @@ scenes:
     aggressive_shake_threshold: 8.0
     aggressive_smoothness_multiplier: 2.0
 
+# REQUIREMENTS.md § 23: TLS policy for EVERY outbound HTTPS request AVF makes -- VLM/LLM
+# providers (analysis.*) and model/archive downloads. One policy, applied identically to the
+# urllib, `requests` and `curl` code paths. Exists because corporate TLS-inspection firewalls
+# re-sign traffic with a private CA Python does not trust (model downloads fail), and
+# self-hosted inference servers often use self-signed certificates.
+#
+# To set it for ONE `avf process` run: `--set network.tls.mode=insecure`. `analyze` and
+# `model-download` have no --set; use the config file (or a throwaway one via the top-level
+# `avf --config PATH ...` / AVF_CONFIG).
+network:
+  tls:
+    # verify       -- normal verification: system trust store PLUS ca_files. Default; use this
+    #                 whenever you can get hold of the certificate.
+    # untrusted_ca -- accept a chain that does not verify (self-signed, unknown/private CA) but
+    #                 STILL reject an expired / not-yet-valid certificate and a hostname
+    #                 mismatch. Easy for a home server; weaker than `verify`, because any
+    #                 self-made certificate bearing the right name is accepted.
+    # insecure     -- no verification at all (traffic is still encrypted). Last resort.
+    # Revocation (OCSP/CRL) is not checked in any mode. A WARNING is logged once per run
+    # whenever a mode other than `verify` is in use.
+    mode: verify
+    # Extra PEM files trusted IN ADDITION to the system store (never replacing it); only used by
+    # `verify`. Each file may be a CA certificate or a self-signed server certificate, so this
+    # one key covers both worked examples below.
+    #
+    # Example 1 -- corporate TLS inspection (the firewall re-signs everything with its own CA).
+    # Get the CA certificate from IT (or export it from your browser), in PEM format:
+    #   mode: verify
+    #   ca_files: [/etc/ssl/certs/acme-corp-inspection-ca.pem]
+    #
+    # Example 2 -- self-signed home server (e.g. a llama.cpp/Ollama box behind a self-signed
+    # nginx). Trust that exact server certificate; hostname and expiry are still enforced:
+    #   mode: verify
+    #   ca_files: [~/certs/homeserver.pem]
+    #   (fetch it with: openssl s_client -connect box.lan:8443 -showcerts </dev/null | openssl x509 > ~/certs/homeserver.pem)
+    ca_files: []
+  # Optional override of `tls` for MODEL DOWNLOADS only (same keys), e.g. relax TLS for a
+  # corporate proxy that intercepts the model hosts while keeping your VLM endpoint strict.
+  # null = downloads use `tls`. Registry models are SHA256-verified after download in EVERY
+  # mode, so even `insecure` cannot substitute tampered weights for a registry model (a custom
+  # `--url` model has no pinned hash and gets no such protection).
+  #   download_tls: {mode: insecure}
+  download_tls: null
+
 analysis:
   # Coordinating text-LLM used only when scenes.drop_non_content is true. Reviews ALL per-scene
   # VLM summaries together and returns which scene indices (if any) should be dropped. Can be a

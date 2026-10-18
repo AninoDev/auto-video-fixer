@@ -126,7 +126,8 @@ def _install_common_mocks(
 ):
     monkeypatch.setattr("autovideofixer.ai.torch_utils.is_torch_available", lambda: True)
     monkeypatch.setattr(
-        "autovideofixer.ai.model_cache.ensure_model_available", lambda name: (True, "")
+        "autovideofixer.ai.model_cache.ensure_model_available",
+        lambda name, **kw: (True, ""),
     )
     monkeypatch.setattr(
         "autovideofixer.ai.wrappers.interpolate.RIFEInterpolator",
