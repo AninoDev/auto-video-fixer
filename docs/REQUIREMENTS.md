@@ -1940,7 +1940,7 @@ chat context. Delivery is phased, one commit per phase, in the user-chosen order
 |---|---|---|---|
 | P1 | § 22 | crop on by default; `normalize_codecs` stage; container-safety audit | IMPLEMENTED 2026-10-17 |
 | P2 | § 23 | network/TLS policy applied to every network path | IMPLEMENTED 2026-10-18 |
-| P3 | § 24 | config schema versioning + migrations, first-run bootstrap, endpoint registry, per-endpoint timeout/TLS, llama.cpp provider | PLANNED |
+| P3 | § 24 | config schema versioning + migrations, first-run bootstrap, endpoint registry, per-endpoint timeout/TLS, llama.cpp provider | IMPLEMENTED 2026-10-18 |
 | P4 | § 25 | VLM frame sampling: min/max frames, consecutive-duplicate removal, tile budget, frame-count reporting | PLANNED |
 | P5 | § 26 | new structured output fields (media type, rating reasoning, detail level) + per-call timing/token stats | PLANNED |
 | P6 | § 27 | multi-VLM cross-check (`refine` and `judge` modes) | PLANNED |
@@ -2214,7 +2214,7 @@ Delivered as specified; decisions, deviations and findings:
   design, unchanged).
 - **Not done / follow-ups**: no OCSP/CRL; no `truststore` (macOS keychain) -- revisit on report.
 
-## 24. Config schema versioning, first-run bootstrap, endpoint registry (P3)
+## 24. Config schema versioning, first-run bootstrap, endpoint registry (P3) [IMPLEMENTED 2026-10-18]
 
 ### 24.1 Schema version + migrations
 
@@ -2302,6 +2302,57 @@ Response parsing (all providers): strip `<think>…</think>` blocks and code fen
 text is not pure JSON, extract the first balanced top-level `{...}` object before falling back to
 "whole text = summary". Ignore a separate `reasoning_content` field for parsing but count its
 tokens in § 26 stats when reported.
+
+### 24.6 Implementation notes (2026-10-18)
+
+Delivered as specified; decisions, deviations and findings:
+
+- **Modules**: `config_migrations.py` (pure, ruamel `CommentedMap` and plain dict), `endpoints.py`
+  (`Endpoint`, `resolve_endpoint`, `resolve_role_endpoint`, `resolve_compat`), load policy in
+  `Config._migrate_user_config` / `_bootstrap_default_config`, CLI `config migrate`.
+- **Deviation -- layers get only the shape items**: cascade layers (`process --config`, presets,
+  `--set`) have items 3 and 4 applied in memory (with a WARNING) but NOT the crop flip / order
+  insertion (items 1, 2), unless the layer itself declares `config_version: 1`. A partial overlay
+  with `crop.enabled: false` is a deliberate per-run choice; the "stale pinned default" rationale of
+  § 22.1 applies to the base file. Old-style `analysis.vlm.model` in a layer targets the endpoint the
+  base config currently selects and never rewrites the selector. Revisit if users report a layer that
+  really was a full old config (they can add `config_version: 1`).
+- **Safety net on the in-place rewrite**: the ruamel rewrite is committed only if it parses to the
+  same data as the plain-dict migration; otherwise in-memory only + WARNING. The backup is made
+  before the atomic replace. An empty/comment-only file is not stamped or rewritten.
+- **Notices are deferred in the CLI** (`Config(defer_notices=True)` + `emit_notices()`): Config is
+  built before logging exists and before the PII cleaner knows the config directory.
+  "INFO + one console notice" for bootstrap is the INFO log line itself (the console handler shows
+  it at default verbosity) -- a second explicit print would duplicate it.
+- **Finding -- test isolation gap**: before this phase no test isolated `XDG_CONFIG_HOME`; with a
+  default-path migration/bootstrap that would let any test rewrite the real config. An autouse
+  fixture now redirects config/state and disables bootstrap (guard test included). `XDG_DATA_HOME`
+  is intentionally not redirected (opt-in real-model tests read cached weights; redirecting turned
+  them into silent skips). Doing so also exposed that `test_model_info_command` only passed because
+  the developer's cache listed full model names; fixed in code (Name column `no_wrap`).
+- **Finding -- `avf config upgrade` and open mappings**: the template only has `default_*`
+  endpoints, so a user's own endpoint (or `tls`/`compat.extra_body` content under an empty `{}`) was
+  "unknown" and refused/dropped. Such mappings are now open for upgrade.
+- **Known limitation**: a comment directly above a key that gets *moved* (e.g. above `provider:` in
+  `analysis.vlm`) is dropped with it; all other comments survive. Revisit by moving the comment with
+  the key if users care.
+- **Finding (pre-existing)**: `redact_secrets` masks `max_tokens` as `***` (substring "token");
+  harmless but noisy in the settings banner. Not changed here.
+- **Finding (pre-existing)**: `avf process clip.mp4` with a bare relative filename (no directory)
+  fails in `generate_temp_path` (`os.makedirs('')`); absolute/`./` paths work. Not changed here.
+- **Provider routing** was collapsed into `_call_provider_raw` (previously three copies of the
+  if/elif chain: VLM dispatch, coordinator, crop check). `_run_*_vlm` remain as thin wrappers.
+  `json_schema` degrades to `json_object` when a call site supplies no schema.
+- **Tests**: `tests/unit/test_config_migrations.py` (each item, idempotency, comment preservation,
+  mapping-form order, absent keys, newer version, default/explicit load paths, bootstrap/opt-out/
+  failure, `config migrate`/`upgrade` CLI), `tests/unit/test_endpoints.py` (resolver, payload shapes,
+  parsers, a real local HTTP stub asserting the llamacpp payload and a `<think>`+prose reply, per-
+  endpoint timeout, TLS/timeout reaching every consumer, CLI flags), `tests/unit/test_test_isolation.py`.
+- **E2E** (isolated XDG dirs, local llama.cpp-style stub): a v1 default-path config was backed up,
+  rewritten to v2 with comments intact and analyzed against the stub; the second run did not migrate
+  again; the same file via `--config` stayed untouched; `config migrate` worked on a copy; a fresh
+  config dir was bootstrapped (and not with `AVF_NO_CONFIG_BOOTSTRAP=1`); `avf process` ran with
+  `normalize_codecs` and `crop` in the stage table.
 
 ## 25. VLM frame sampling: min/max frames, duplicate removal, tile budget (P4)
 

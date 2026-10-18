@@ -7,7 +7,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- `avf model-info` truncated model names with an ellipsis at 80 columns (two models both showed as
+  `RealESRGAN_x4...`); the Name column no longer truncates.
+
+### Changed
+- Old-shape analysis keys (`analysis.vlm.provider`, `model`, `api_url`, `max_sample_frames`, ...) no
+  longer exist in `Config.DEFAULTS`; see the migration note below. Tests now redirect
+  `XDG_CONFIG_HOME`/`XDG_STATE_HOME` so they can never touch a developer's real config.
+
 ### Added
+- **Config schema versioning, migrations, first-run bootstrap, endpoint registry, llama.cpp
+  provider (REQUIREMENTS.md § 24, phase P3 of the 2026-10 feature set).**
+  - **IMPORTANT -- your default-path config will be auto-migrated on first run.** If
+    `~/.config/auto-video-fixer/config.yaml` (or the platform equivalent) has no
+    `config_version: 2`, the first `avf` run saves a timestamped backup
+    (`config.yaml.bak-v1-YYYYMMDD-HHMMSS`), rewrites the file in place (comments and order kept) and
+    logs a WARNING listing every change: `stages.crop.enabled: false` becomes `true` (a deliberate
+    `false` is flipped once too -- set it back afterwards if you want it off); `normalize_codecs` is
+    inserted into a pinned `pipeline.default_order`; `analysis.vlm`/`analysis.llm` connection fields
+    (`provider, model, api_key, api_url, allow_http, max_tokens`) move into
+    `analysis.endpoints.default_vlm`/`default_llm`; `max_sample_frames`/`sample_interval_sec` become
+    `analysis.vlm.sampling.max_frames`/`interval_sec`. A config given with `--config`/`AVF_CONFIG`
+    is migrated in memory only (file untouched, WARNING); update it with the new
+    `avf config migrate PATH [-o OUT] [--backup/--no-backup]`. `avf config upgrade` runs migrations
+    on its input first. A version newer than the install warns and loads as-is.
+  - **First-run bootstrap**: with no config at the default path, AVF copies the commented example
+    config there (INFO). Disable with `AVF_NO_CONFIG_BOOTSTRAP=1`; a failure to write is a warning.
+    Because that file pins every key, future default changes reach users via migrations.
+  - **Endpoint registry**: `analysis.endpoints.<name>` (provider, model, api_url, api_key,
+    allow_http, `timeout_sec`, max_tokens, per-endpoint `tls`, `compat`, `vision`), selected by
+    `analysis.vlm.endpoint` / `analysis.llm.endpoint` or `avf analyze --vlm-endpoint NAME`;
+    `--vlm-model/--vlm-url` override the selected endpoint for the run. `timeout_sec` replaces the
+    hardcoded 120 s. Used by whole-video and per-scene VLM, the crop VLM check and the scene
+    coordinator; the PII log cleaner registers every endpoint URL.
+  - **`llamacpp` provider + `compat`**: `system_content` (`string|parts`), `response_format`
+    (`json_object|json_schema|none`), `extra_body`. `llamacpp` defaults to parts / no
+    response_format (a known-working llama.cpp setup); openai/api are unchanged.
+  - **Tolerant response parsing** for every provider and for the coordinator and crop-check
+    parsers: `<think>` blocks (also truncated ones) and code fences are stripped and the first
+    balanced JSON object is extracted from surrounding prose.
 - **Network/TLS policy for every network path (REQUIREMENTS.md § 23, phase P2 of the 2026-10
   feature set).** New `autovideofixer/net.py` owns TLS policy and all HTTP(S) opening. New config
   `network.tls: {mode, ca_files}` and `network.download_tls` (downloads-only override). Modes:

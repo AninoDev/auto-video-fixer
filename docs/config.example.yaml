@@ -25,6 +25,12 @@
 # subcommand to load at runtime -- kept identical to this one (enforced by a unit test) and
 # updated together with every release.
 #
+# FIRST RUN: if no config exists at the default path (and none was given with --config /
+# AVF_CONFIG), AVF copies this file there so you have a commented starting point. Set
+# AVF_NO_CONFIG_BOOTSTRAP=1 to disable that. Because the copy pins EVERY key at its current
+# default, changed defaults in later releases reach you only through a config migration
+# (see config_version below) -- or by deleting keys you don't mean to override.
+#
 # You do not need to list every key: Config merges whatever you provide recursively on top of
 # Config.DEFAULTS, so an empty/partial file is valid and any key you omit keeps its default.
 #
@@ -51,6 +57,13 @@
 #
 # Standing rule (see AGENTS.md): any change to a config key here MUST be reflected in
 # Config.DEFAULTS in config.py, and vice versa -- keep this file and the code in sync.
+
+# Config schema version (REQUIREMENTS.md § 24.1). A file without this key is version 1 (every file
+# written before versioning existed). AVF migrates older files on load: the DEFAULT-path config is
+# backed up to config.yaml.bak-v<old>-<timestamp> and rewritten in place (comments kept); a config
+# passed explicitly (--config / AVF_CONFIG) is migrated in memory only -- run `avf config migrate
+# PATH` to update the file. Don't edit this number by hand.
+config_version: 2
 
 general:
   # Directory for auto-generated output filenames ({stem}_enhanced{ext}). null = same
@@ -1266,97 +1279,144 @@ network:
   download_tls: null
 
 analysis:
-  # Coordinating text-LLM used only when scenes.drop_non_content is true. Reviews ALL per-scene
-  # VLM summaries together and returns which scene indices (if any) should be dropped. Can be a
-  # cheaper/faster text-only model than analysis.vlm's vision model -- separate provider/model/
-  # url/key. Same provider set and the same allow_http/HTTPS gate as analysis.vlm below.
+  # Named, fully independent model connections (REQUIREMENTS.md § 24.4). Every consumer resolves
+  # one BY NAME: the whole-video and per-scene VLM and the crop VLM check use the entry
+  # `analysis.vlm.endpoint` names; the scene coordinator uses the one `analysis.llm.endpoint`
+  # names. Add as many entries as you like (local / LAN / cloud -- each has its own URL, key,
+  # timeout, TLS and request shape; nothing is special-cased per vendor) and pick one with
+  # `analysis.vlm.endpoint`, or per run with `avf analyze --vlm-endpoint NAME`. An unknown name
+  # is an error at use time. `avf analyze --vlm-model/--vlm-url` override the selected entry's
+  # model/api_url for that run only. api_key / allow_http are deliberately config-file-only
+  # (no CLI flag): secrets and security posture stay out of shell history.
+  endpoints:
+    default_vlm:
+      # Which backend to call:
+      #   ollama   -- Ollama /api/chat (api_url empty = http://localhost:11434). "local" is an
+      #               accepted legacy alias.
+      #   openai   -- OpenAI Vision (api.openai.com), requires api_key.
+      #   api      -- any OpenAI-compatible chat-completions server; api_url is the FULL
+      #               chat-completions URL; refuses plain HTTP for non-loopback hosts unless
+      #               allow_http.
+      #   llamacpp -- llama.cpp's server (llama-server). Same as `api` but with llama.cpp's
+      #               request-shape defaults (see `compat` below).
+      provider: ollama
+      # Model name passed to the provider, e.g. "llava" (Ollama), "gpt-4o" (OpenAI). llama.cpp
+      # serves one model and usually ignores it, but the field is still sent.
+      model: llava
+      # Base URL (ollama) or full chat-completions URL (api / llamacpp). Not used by openai.
+      api_url: ""
+      # API key for openai/api/llamacpp (sent as a Bearer token if non-empty). Leave empty for a
+      # local Ollama / llama.cpp that needs no auth. NEVER commit a real key here -- it is
+      # redacted ("***") in the startup banner and DEBUG config dumps, but this file on disk is
+      # plaintext.
+      api_key: ""
+      # The api/llamacpp providers refuse plain-HTTP api_url endpoints on non-loopback hosts by
+      # default: sampled frames and the api_key would travel unencrypted. Set true to permit
+      # plain HTTP anyway -- only for a server on a network you control (e.g. a LAN inference
+      # box). HTTPS never needs this.
+      allow_http: false
+      # Request timeout in seconds (replaces the old hardcoded 120). null or 0 = unlimited. Big
+      # local models on many frames can take minutes: the llama.cpp example below uses 600.
+      timeout_sec: 120
+      # Response token budget (max_tokens; Ollama num_predict) per call. Raise this if using a
+      # reasoning VLM whose thinking tokens count against the response budget.
+      max_tokens: 1024
+      # Overrides `network.tls` for THIS endpoint only (same keys: mode, ca_files; § 23) --
+      # e.g. trust one self-signed LAN server without loosening anything else:
+      #   tls: {mode: untrusted_ca}
+      tls: {}
+      # Request-shape knobs for the OpenAI-shaped providers (openai / api / llamacpp); ignored
+      # by ollama. Unset keys take the provider's default (openai/api: string + json_object,
+      # exactly as before; llamacpp: parts + none).
+      #   system_content:  string | parts   -- system message as a plain string, or as a list
+      #                    of {"type": "text", "text": ...} parts (llama.cpp's chat templates
+      #                    for several vision models want the list form).
+      #   response_format: json_object | json_schema | none -- json_schema sends a schema for
+      #                    the fields AVF asks for (summary, tags, objects, rating); none sends
+      #                    no response_format at all (llama.cpp mishandles json_object with
+      #                    some vision/reasoning models).
+      #   extra_body:      mapping deep-merged into the request payload, e.g. llama.cpp's
+      #                    cache_prompt or chat_template_kwargs: {enable_thinking: true}.
+      # Responses are cleaned for every provider before parsing: <think>...</think> blocks and
+      # code fences are stripped, and the first balanced {...} object is extracted from prose.
+      compat: {}
+      # Model image limits / tile model (frame-size limiting arrives with the VLM sampling work,
+      # REQUIREMENTS.md § 25.3); {} = none.
+      vision: {}
+    # Coordinating text-LLM used only when scenes.drop_non_content is true. Reviews ALL per-scene
+    # VLM summaries together and returns which scene indices (if any) should be dropped. Can be
+    # a cheaper/faster text-only model than the VLM -- separate provider/model/url/key.
+    default_llm:
+      provider: ollama
+      model: llama3
+      api_url: ""
+      api_key: ""
+      allow_http: false
+      timeout_sec: 120
+      # Reasoning models spend "thinking" tokens from this same budget BEFORE emitting their
+      # JSON answer -- if the budget runs out mid-thought the response is truncated and the
+      # coordinator fails open (keeps all scenes). If you see "failed open" warnings with a
+      # reasoning model, raise this (8192+) or switch to a non-reasoning model.
+      max_tokens: 4096
+      tls: {}
+      compat: {}
+      vision: {}
+    # --- Example: llama.cpp (llama-server) vision model on a LAN machine -------------------
+    # This mirrors a known-working hand-patched setup: system message as content parts, no
+    # response_format, and a 10-minute timeout (large vision models are slow on big prompts).
+    # Select it with `analysis.vlm.endpoint: llamacpp_lan` or `avf analyze --vlm-endpoint
+    # llamacpp_lan`. NOTE: limiting the size of the frames sent (that setup downscaled frames
+    # to 720 px on the long side) is not configurable yet -- it arrives with the VLM sampling
+    # work under `vision:` (REQUIREMENTS.md § 25.3), e.g. `vision: {max_long_side_px: 720}`.
+    #   llamacpp_lan:
+    #     provider: llamacpp
+    #     model: your-vision-model
+    #     api_url: "http://10.0.1.4:8080/v1/chat/completions"
+    #     allow_http: true              # plain HTTP to a non-loopback LAN host (see above)
+    #     timeout_sec: 600
+    #     max_tokens: 1024
+    #     compat:
+    #       system_content: parts       # (llamacpp default)
+    #       response_format: none       # (llamacpp default)
+    #       extra_body:
+    #         cache_prompt: true
+    #
+    # --- Example: OpenAI Vision ---
+    #   openai_vision:
+    #     provider: openai
+    #     model: gpt-4o
+    #     api_key: "sk-..."
+    #
+    # --- Example: any other OpenAI-compatible server (LM Studio, vLLM, a hosted API) ---
+    #   my_api:
+    #     provider: api
+    #     model: your-vision-model
+    #     api_url: "https://your-api.example.com/v1/chat/completions"
+    #     api_key: "..."
+
+  # Which endpoint the scene coordinator (scenes.drop_non_content) uses.
   llm:
-    provider: ollama  # ollama, openai, api
-    model: llama3
-    api_key: ""
-    api_url: ""
-    allow_http: false
-    # Response token budget (max_tokens; Ollama num_predict) for the coordinator call.
-    # Reasoning models spend "thinking" tokens from this same budget BEFORE emitting their
-    # JSON answer -- if the budget runs out mid-thought the response is truncated and the
-    # coordinator fails open (keeps all scenes). If you see "failed open" warnings with a
-    # reasoning model, raise this (8192+) or switch to a non-reasoning model.
-    max_tokens: 4096
+    endpoint: default_llm
 
   vlm:
     # Master switch for VLM (Vision Language Model) content analysis. Off by default -- costs
-    # API calls / requires a local Ollama instance. The "api" provider has been run end-to-end
-    # against a live server; "ollama"/"openai" share the same code path but haven't themselves
-    # been independently verified -- see docs/ROADMAP.md's verified/unverified breakdown.
+    # API calls / requires a model server. The "api" provider has been run end-to-end against a
+    # live server; "ollama"/"openai" share the same code path but haven't themselves been
+    # independently verified -- see docs/ROADMAP.md's verified/unverified breakdown.
     enabled: false
 
-    # Which backend to call: local, ollama, openai, or api.
-    #   local / ollama -- both currently route to the same Ollama-compatible chat endpoint.
-    #   openai         -- OpenAI Vision (chat completions with an image), requires api_key.
-    #   api            -- any OpenAI-compatible custom endpoint at api_url; requires api_key
-    #                      if the endpoint needs auth, refuses non-HTTPS for non-loopback hosts.
-    provider: local
+    # Which analysis.endpoints entry the VLM uses (whole-video, per-scene and the crop VLM
+    # check). Also settable per-run with `avf analyze --vlm-endpoint NAME`.
+    endpoint: default_vlm
 
-    # Model name passed to the provider, e.g. "llava" (Ollama), "gpt-4o" (OpenAI). Also settable
-    # per-run with `avf analyze --vlm-model TEXT`.
-    model: llava
-
-    # API key for openai/api providers. Leave empty for a local Ollama instance that doesn't
-    # require auth. NEVER commit a real key here -- this value is redacted ("***") in the
-    # startup settings banner and DEBUG config dumps because the key "api_key" matches
-    # config.py's secret-key heuristic, but the config.yaml file on disk is still plaintext.
-    # Deliberately config-file-only: there is no `avf analyze` CLI flag for this (or for
-    # allow_http below) -- keeping secrets/security posture out of shell history/process args.
-    api_key: ""
-
-    # --- Example: local Ollama (default provider) ---
-    # provider: ollama
-    # model: llava
-    # api_url: "http://localhost:11434"   # default if left empty
-    # api_key: ""                          # not needed for local Ollama
-    #
-    # --- Example: OpenAI Vision ---
-    # provider: openai
-    # model: gpt-4o
-    # api_key: "sk-..."                    # required
-    # api_url: ""                          # not used by the openai provider
-    #
-    # --- Example: custom OpenAI-compatible API ---
-    # provider: api
-    # model: your-vision-model
-    # api_url: "https://your-api.example.com/v1/chat/completions"
-    # api_key: "..."                       # sent as a Bearer token if non-empty
-    #
-    # --- Example: llama.cpp / LM Studio / vLLM on a LAN machine (plain HTTP) ---
-    # provider: api
-    # model: your-vision-model
-    # api_url: "http://10.0.1.4:8080/v1/chat/completions"
-    # allow_http: true                     # required for non-loopback plain HTTP (see below)
-
-    # Base URL override for ollama/api providers. Empty string = provider-specific default
-    # (http://localhost:11434 for ollama). Also settable per-run with
-    # `avf analyze --vlm-url TEXT` -- the override still goes through the same allow_http/HTTPS
-    # gate below, unchanged.
-    api_url: ""
-
-    # The "api" provider refuses plain-HTTP api_url endpoints on non-loopback hosts by
-    # default: sampled video frames and the api_key would travel unencrypted. Set true to
-    # permit plain HTTP anyway -- only do this for a server on a network you control
-    # (e.g. a LAN inference box on a private subnet). HTTPS never needs this. Deliberately
-    # config-file-only -- see the api_key note above.
-    allow_http: false
-
-    # Response token budget (max_tokens; Ollama num_predict) per VLM call. Raise this if
-    # using a reasoning VLM whose thinking tokens count against the response budget.
-    max_tokens: 1024
-
-    # Max number of frames sampled from the video and sent to the VLM per analysis call. Also
-    # settable per-run with `avf analyze --max-sample-frames INT`.
-    max_sample_frames: 8
-
-    # Seconds between sampled frames (see _extract_sample_frames() in core/analysis.py). Also
-    # settable per-run with `avf analyze --sample-interval FLOAT`.
-    sample_interval_sec: 10.0
+    # Frame sampling (REQUIREMENTS.md § 25 extends this block).
+    sampling:
+      # Max number of frames sampled from the video and sent to the VLM per analysis call. Also
+      # settable per-run with `avf analyze --max-sample-frames INT`.
+      max_frames: 8
+      # Seconds between sampled frames (see _extract_sample_frames() in core/analysis.py). Also
+      # settable per-run with `avf analyze --sample-interval FLOAT`.
+      interval_sec: 10.0
 
     # --- Prompt customization ---
     # The default prompts ask the model to return JSON with keys "summary", "tags",

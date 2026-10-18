@@ -153,19 +153,44 @@ def upgrade_config_text(
     if template is None:
         template = CommentedMap()
 
+    # Mappings that are USER-EXTENSIBLE rather than fixed schema: `analysis.endpoints` takes any
+    # new endpoint name (REQUIREMENTS.md § 24.4), and an empty `{}` in the template (`tls`,
+    # `compat`, `vision`, `extra_body`) takes arbitrary keys. Without this, `upgrade` would
+    # refuse (or with --drop-unknown, silently delete) a user's own endpoints.
+    created: set[int] = set()
+
+    def _is_open(node: Any, node_path: tuple[str, ...]) -> bool:
+        return (
+            id(node) in created
+            or node_path == ("analysis", "endpoints")
+            or (isinstance(node, dict) and len(node) == 0)
+        )
+
     unknown: list[str] = []
     for path, value in _walk_leaves(input_data):
         *parents, last = path
         node: Any = template
+        node_path: tuple[str, ...] = ()
         ok = True
         for p in parents:
             if isinstance(node, dict) and p in node and isinstance(node[p], dict):
                 node = node[p]
+            elif isinstance(node, dict) and p not in node and _is_open(node, node_path):
+                child = CommentedMap()
+                node[p] = child
+                created.add(id(child))
+                node = child
             else:
                 ok = False
                 break
-        if ok and isinstance(node, dict) and last in node and not isinstance(node[last], dict):
-            node[last] = value
+            node_path = (*node_path, p)
+        if ok and isinstance(node, dict):
+            if last in node and not isinstance(node[last], dict):
+                node[last] = value
+            elif last not in node and _is_open(node, node_path):
+                node[last] = value
+            else:
+                unknown.append(".".join(path))
         else:
             unknown.append(".".join(path))
 
@@ -209,3 +234,36 @@ def apply_file_safety(output_path: Path, *, force: bool, backup: bool) -> str | 
                 "(use --force to overwrite or --backup to keep a copy)"
             )
     return None
+
+
+def migrate_config_file(
+    path: Path, *, output: Path | None = None, backup: bool = True
+) -> tuple[list[str], int, Path | None]:
+    """Migrate the config at `path` to the current schema (comments preserved).
+
+    Backs up `path` to ``PATH.bak-v<old>-<timestamp>`` first when writing IN PLACE and
+    `backup` is true. With `output`, `path` is never touched and the result goes to
+    `output` (caller handles file-safety). Returns `(notes, old_version, backup_path)`;
+    when the file is already current nothing is written in place (`notes` is empty) and
+    `output`, if given, receives an unchanged copy.
+    """
+    import shutil
+
+    from autovideofixer.config_migrations import migrate_text, timestamped_backup_path
+
+    text = path.read_text()
+    new_text, old_version, notes = migrate_text(text)
+    if output is not None:
+        output.write_text(new_text)
+        return notes, old_version, None
+    if not notes and new_text == text:
+        return notes, old_version, None
+    backup_path: Path | None = None
+    if backup:
+        backup_path = timestamped_backup_path(path, old_version)
+        shutil.copy2(path, backup_path)
+    tmp = path.with_name(path.name + ".avf-tmp")
+    tmp.write_text(new_text)
+    shutil.copymode(path, tmp)
+    tmp.replace(path)
+    return notes, old_version, backup_path

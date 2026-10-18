@@ -35,6 +35,7 @@ from autovideofixer.config import (
     redact_secrets,
     sanitize_console_text,
 )
+from autovideofixer.config_migrations import CURRENT_CONFIG_VERSION, migrate_text
 from autovideofixer.core.analysis import is_video_file, scan_directory
 from autovideofixer.core.input_parsers import get_parser, list_parsers
 from autovideofixer.core.pipeline import Job, JobResult, Pipeline
@@ -49,6 +50,7 @@ from autovideofixer.core.reporting import (
     stage_table_rows,
     write_json_report,
 )
+from autovideofixer.endpoints import all_endpoint_urls, resolve_role_endpoint
 from autovideofixer.logclean import get_pii_cleaner
 from autovideofixer.logger import build_console, get_logger, set_console_color, setup_logging
 
@@ -736,10 +738,12 @@ def main(
     # (see AGENTS.md's "Log types" note for why this only ever reads the base
     # config, never a `process`-level --set/--config/--preset layer).
     try:
+        # defer_notices: first-run bootstrap / schema-migration events are logged below,
+        # once log handlers and the PII cleaner's registrations exist (REQUIREMENTS.md § 24).
         if config_path:
-            config = Config(config_path, require_exists=True)
+            config = Config(config_path, require_exists=True, defer_notices=True)
         else:
-            config = Config()
+            config = Config(defer_notices=True)
     except FileNotFoundError as e:
         console.print(f"[red]{_safe(e)}[/red]")
         sys.exit(1)
@@ -824,8 +828,8 @@ def main(
     cleaner.register_directory(str(get_config_dir()), "config")
     if config_path:
         cleaner.register_directory(os.path.dirname(os.path.abspath(config_path)), "config")
-    for section in ("vlm", "llm"):
-        cleaner.register_endpoint(config.get("analysis", section, "api_url", default=None))
+    for endpoint_url in all_endpoint_urls(config):
+        cleaner.register_endpoint(endpoint_url)
     _register_argv_known_paths()
 
     if opened_files:
@@ -833,6 +837,9 @@ def main(
     else:
         logger.info("avf %s -- log file: none (general.log_type=none)", __version__)
     logger.info("Invocation: %s", " ".join(sys.argv))
+
+    # Bootstrap / migration events recorded while loading the config (deferred above).
+    config.emit_notices()
 
     _log_effective_settings(logger, ctx.obj["config"], config_path)
 
@@ -1818,8 +1825,8 @@ def process(
     # input files (below) aren't known yet at this point -- registered
     # right after they're collected instead.
     cleaner = get_pii_cleaner()
-    cleaner.register_endpoint(config.get("analysis", "vlm", "api_url", default=""))
-    cleaner.register_endpoint(config.get("analysis", "llm", "api_url", default=""))
+    for endpoint_url in all_endpoint_urls(config):
+        cleaner.register_endpoint(endpoint_url)
     for layer_path in config_layers:
         cleaner.register_directory(os.path.dirname(os.path.abspath(layer_path)), "config")
     configured_output_dir = config.get("general", "output_dir", default=None)
@@ -2439,6 +2446,26 @@ def config_upgrade(
     refused unless --drop-unknown.
     """
     input_text = Path(input_path).read_text()
+    # Schema migrations first (REQUIREMENTS.md § 24): an old-shape INPUT (e.g. provider/model
+    # directly under analysis.vlm) would otherwise be refused as "keys absent from the
+    # template". The migration is comment-preserving but comments are irrelevant here -- the
+    # TEMPLATE's comments are what the output carries.
+    try:
+        migrated_text, old_version, migration_notes = migrate_text(input_text)
+    except Exception as e:  # malformed YAML etc.
+        err_console.print(f"[red]Could not parse {input_path}: {e}[/red]")
+        sys.exit(1)
+    if migration_notes:
+        err_console.print(
+            f"[yellow]Migrated INPUT from config schema v{old_version} to "
+            f"v{CURRENT_CONFIG_VERSION} before upgrading:[/yellow]"
+        )
+        for note in migration_notes:
+            err_console.print(f"[yellow]  - {_safe(note)}[/yellow]")
+        zoom_source = input_text
+        input_text = migrated_text
+    else:
+        zoom_source = input_text
     template_text = (
         Path(template_path).read_text() if template_path else config_tools.default_template_text()
     )
@@ -2456,10 +2483,68 @@ def config_upgrade(
         err_console.print(
             f"[yellow]Warning: dropping unknown key not present in template: {key}[/yellow]"
         )
-    zoom_note = config_tools.zoom_coverage_migration_note(input_text)
+    zoom_note = config_tools.zoom_coverage_migration_note(zoom_source)
     if zoom_note:
         err_console.print(f"[yellow]Note: {zoom_note}[/yellow]")
     _write_config_output(upgraded, output, force=force, backup=backup)
+
+
+@config_group.command("migrate")
+@click.argument("input_path", type=click.Path(exists=True, dir_okay=False))
+@click.option(
+    "-o",
+    "--output",
+    type=click.Path(),
+    default=None,
+    help="Write the migrated config here instead of rewriting INPUT in place (INPUT is then "
+    "never touched).",
+)
+@click.option(
+    "--backup/--no-backup",
+    "backup",
+    default=True,
+    help="When rewriting in place, first copy INPUT to INPUT.bak-v<old>-<YYYYMMDD-HHMMSS> "
+    "(default: on).",
+)
+@click.option("--force", is_flag=True, help="Overwrite an existing --output file.")
+def config_migrate(input_path: str, output: str | None, backup: bool, force: bool) -> None:
+    """Migrate INPUT to the current config schema (comments and key order preserved).
+
+    Default: rewrite INPUT in place after saving a timestamped backup. With -o, write the
+    result to OUT and leave INPUT alone. A file already at the current schema is left as
+    is. Every change is listed on stderr (stdout is unused, like the other config
+    subcommands' diagnostics).
+    """
+    in_path = Path(input_path)
+    out_path = Path(output) if output else None
+    if out_path is not None:
+        try:
+            message = config_tools.apply_file_safety(out_path, force=force, backup=False)
+        except (ValueError, FileExistsError) as e:
+            err_console.print(f"[red]{e}[/red]")
+            sys.exit(1)
+        if message:
+            err_console.print(message)
+    try:
+        notes, old_version, backup_path = config_tools.migrate_config_file(
+            in_path, output=out_path, backup=backup
+        )
+    except Exception as e:  # malformed YAML, unwritable path, ...
+        err_console.print(f"[red]Migration failed: {_safe(e)}[/red]")
+        sys.exit(1)
+    if old_version >= CURRENT_CONFIG_VERSION:
+        err_console.print(
+            f"{_safe(input_path)} is already at config schema v{old_version}"
+            f"{' (newer than this AVF knows)' if old_version > CURRENT_CONFIG_VERSION else ''}; "
+            "left as is."
+        )
+        return
+    err_console.print(f"Migrated config schema v{old_version} -> v{CURRENT_CONFIG_VERSION}:")
+    for note in notes:
+        err_console.print(f"  - {_safe(note)}")
+    if backup_path is not None:
+        err_console.print(f"Backup saved to {_safe(backup_path)}")
+    err_console.print(f"Wrote {_safe(out_path or in_path)}")
 
 
 @main.command()
@@ -2554,7 +2639,7 @@ def config_upgrade(
     type=int,
     default=None,
     help="Max frames sampled from the video and sent to the VLM provider for this run "
-    "(overrides analysis.vlm.max_sample_frames in config; default 8).",
+    "(overrides analysis.vlm.sampling.max_frames in config; default 8).",
 )
 @click.option(
     "--sample-interval",
@@ -2562,22 +2647,30 @@ def config_upgrade(
     type=float,
     default=None,
     help="Seconds between VLM sample frames for this run (overrides "
-    "analysis.vlm.sample_interval_sec in config; default 10.0).",
+    "analysis.vlm.sampling.interval_sec in config; default 10.0).",
+)
+@click.option(
+    "--vlm-endpoint",
+    "vlm_endpoint",
+    default=None,
+    help="Name of the analysis.endpoints entry to use for the VLM this run (default: the "
+    "one analysis.vlm.endpoint selects). --vlm-model/--vlm-url then override that entry's "
+    "model/api_url for this run. Unknown names are an error.",
 )
 @click.option(
     "--vlm-model",
     "vlm_model",
     default=None,
-    help="VLM model name override for this run (overrides analysis.vlm.model in "
-    "config; e.g. 'llava', 'gpt-4o').",
+    help="VLM model name override for this run (overrides the selected endpoint's model; "
+    "e.g. 'llava', 'gpt-4o').",
 )
 @click.option(
     "--vlm-url",
     "vlm_url",
     default=None,
-    help="VLM provider URL override for this run (overrides analysis.vlm.api_url in "
-    "config). Still subject to the same HTTPS-required-for-non-loopback gate as the "
-    "config value (analysis.vlm.allow_http permits plain HTTP for e.g. a LAN box) -- "
+    help="VLM provider URL override for this run (overrides the selected endpoint's "
+    "api_url). Still subject to the same HTTPS-required-for-non-loopback gate as the "
+    "config value (the endpoint's allow_http permits plain HTTP for e.g. a LAN box) -- "
     "there is no flag for allow_http or api_key; set those in config.yaml only.",
 )
 @click.pass_context
@@ -2600,6 +2693,7 @@ def analyze(
     sample_interval: float | None,
     vlm_model: str | None,
     vlm_url: str | None,
+    vlm_endpoint: str | None,
 ) -> None:
     """Analyze video file(s) for properties, events, and content.
 
@@ -2614,6 +2708,18 @@ def analyze(
     from autovideofixer.core.analysis import VideoAnalyzer
 
     analyzer = VideoAnalyzer(config)
+
+    # An unknown endpoint name is a usage error: fail once, up front, instead of once per file.
+    if (
+        vlm_endpoint is not None
+        or vlm_flag
+        or (vlm_flag is None and config.get("analysis", "vlm", "enabled", default=False))
+    ):
+        try:
+            resolve_role_endpoint(config, "vlm", vlm_endpoint)
+        except ValueError as e:
+            console.print(f"[red]{_safe(e)}[/red]")
+            sys.exit(2)
 
     symlinks_policy = (
         symlinks
@@ -2674,6 +2780,7 @@ def analyze(
                     sample_interval_sec=sample_interval,
                     vlm_model=vlm_model,
                     vlm_api_url=vlm_url,
+                    vlm_endpoint=vlm_endpoint,
                 )
 
                 # analyze() doesn't take a classify_events param, so re-run event
@@ -2872,7 +2979,12 @@ def model_info(model: str | None) -> None:
     console.print("[bold]Available AI Models:[/bold]\n")
 
     table = Table(title="Models")
-    table.add_column("Name", style="cyan")
+    # no_wrap (so Rich shrinks the wrappable Description column first): at 80 columns
+    # "RealESRGAN_x4plus" and
+    # "RealESRGAN_x4plus_anime_6B" both truncated to "RealESRGAN_x4...", so the table could
+    # not tell the model names apart -- the one thing the user needs to type into
+    # `model-download --model`.
+    table.add_column("Name", style="cyan", no_wrap=True)
     table.add_column("Type")
     table.add_column("Description")
     table.add_column("Size")

@@ -24,6 +24,18 @@ from autovideofixer.core.analysis import (
 )
 
 
+def _apply_vlm_overrides(config: Config, overrides: dict) -> None:
+    """Apply test overrides in the v2 schema: connection fields (provider, model, api_url,
+    ...) belong to the ``default_vlm`` endpoint, everything else to ``analysis.vlm``."""
+    from autovideofixer.config_migrations import ENDPOINT_FIELDS
+
+    for key, value in overrides.items():
+        if key in ENDPOINT_FIELDS:
+            config.set(value, "analysis", "endpoints", "default_vlm", key)
+        else:
+            config.set(value, "analysis", "vlm", key)
+
+
 class TestParseVlmResponse:
     """Test VLM response parsing."""
 
@@ -290,9 +302,7 @@ class TestPromptCustomization:
     @staticmethod
     def _analyzer(vlm_overrides: dict) -> VideoAnalyzer:
         config = Config(Path(tempfile.mkdtemp()) / "nonexistent.yaml")
-        merged = dict(config.get("analysis", "vlm", default={}))
-        merged.update(vlm_overrides)
-        config.set(merged, "analysis", "vlm")
+        _apply_vlm_overrides(config, vlm_overrides)
         return VideoAnalyzer(config)
 
     @staticmethod
@@ -473,9 +483,7 @@ class TestRunCropVlmCheck:
     @staticmethod
     def _config_with_vlm(tmp_path, **vlm_overrides) -> Config:
         config = Config(tmp_path / "nonexistent.yaml")
-        merged = dict(config.get("analysis", "vlm", default={}))
-        merged.update(vlm_overrides)
-        config.set(merged, "analysis", "vlm")
+        _apply_vlm_overrides(config, vlm_overrides)
         return config
 
     def test_vlm_disabled_still_dispatches_when_called_directly(self, tmp_path):

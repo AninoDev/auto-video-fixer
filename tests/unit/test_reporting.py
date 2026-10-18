@@ -293,8 +293,8 @@ class TestBuildRunMeta:
         from datetime import datetime, timezone
 
         config = _config()
-        config.set("secret-value", "analysis", "vlm", "api_key")
-        config.set("llava-custom", "analysis", "vlm", "model")
+        config.set("secret-value", "analysis", "endpoints", "default_vlm", "api_key")
+        config.set("llava-custom", "analysis", "endpoints", "default_vlm", "model")
         started = datetime(2026, 1, 1, tzinfo=timezone.utc)
         finished = datetime(2026, 1, 1, 0, 0, 1, tzinfo=timezone.utc)
 
@@ -304,8 +304,13 @@ class TestBuildRunMeta:
         assert meta["started_at"] == started.isoformat()
         assert meta["finished_at"] == finished.isoformat()
         assert meta["elapsed_ms"] == 1000.0
-        assert meta["effective_settings"]["analysis"]["vlm"]["api_key"] == "***"
-        assert meta["effective_settings"]["analysis"]["vlm"]["model"] == "llava-custom"
+        assert (
+            meta["effective_settings"]["analysis"]["endpoints"]["default_vlm"]["api_key"] == "***"
+        )
+        assert (
+            meta["effective_settings"]["analysis"]["endpoints"]["default_vlm"]["model"]
+            == "llava-custom"
+        )
 
 
 class TestJsonReport:

@@ -2,13 +2,21 @@
 
 from __future__ import annotations
 
+import copy
+import logging
 import os
 import re
+import shutil
 import sys
 from pathlib import Path
 from typing import Any
 
 import yaml
+
+from autovideofixer.config_migrations import CURRENT_CONFIG_VERSION
+
+# Set to 1/true/yes/on to stop the first-run bootstrap of the default config (§ 24.3).
+BOOTSTRAP_OPT_OUT_ENV = "AVF_NO_CONFIG_BOOTSTRAP"
 
 
 def get_config_dir() -> Path:
@@ -343,6 +351,9 @@ class Config:
     """Central configuration manager. Loads from disk and provides defaults."""
 
     DEFAULTS: dict[str, Any] = {
+        # Schema version (REQUIREMENTS.md § 24.1) -- see config_migrations.py. A file without
+        # this key is version 1; the loader migrates older files up to this value.
+        "config_version": CURRENT_CONFIG_VERSION,
         "general": {
             "output_dir": None,  # None means same as input
             "output_container": "mp4",  # extension for auto-generated output filenames
@@ -1491,43 +1502,64 @@ class Config:
             "download_tls": None,
         },
         "analysis": {
-            "llm": {
+            # Named, fully independent model connections (REQUIREMENTS.md § 24.4). Every
+            # consumer (whole-video + per-scene VLM, crop VLM check, scene coordinator)
+            # resolves one by name via endpoints.resolve_endpoint(). Add as many as you like
+            # and select them with analysis.vlm.endpoint / analysis.llm.endpoint (or
+            # `avf analyze --vlm-endpoint NAME`).
+            "endpoints": {
+                "default_vlm": {
+                    "provider": "ollama",  # ollama | openai | api | llamacpp
+                    "model": "llava",
+                    "api_url": "",
+                    "api_key": "",
+                    # Plain-HTTP api_url endpoints are refused for non-loopback hosts unless
+                    # this is true (frames + api_key travel unencrypted; only enable for a
+                    # server on a network you control, e.g. a LAN inference box).
+                    "allow_http": False,
+                    # Request timeout in seconds (resolve_timeout() semantics: null/0 =
+                    # unlimited). Slow local models on big prompts need far more than 120.
+                    "timeout_sec": 120,
+                    # Response token budget (max_tokens / Ollama num_predict) per call.
+                    # Raise for reasoning VLMs whose thinking tokens count against it.
+                    "max_tokens": 1024,
+                    # Overrides network.tls for THIS endpoint only (same shape; § 23).
+                    "tls": {},
+                    # Request-shape knobs for OpenAI-shaped providers (openai/api/llamacpp):
+                    # system_content (string|parts), response_format
+                    # (json_object|json_schema|none), extra_body (deep-merged into payload).
+                    "compat": {},
+                    # Model image limits (P4, § 25.3); {} = none.
+                    "vision": {},
+                },
                 # Coordinating text-LLM used only when scenes.drop_non_content is true.
                 # Reviews ALL per-scene VLM summaries together and returns which scene
                 # indices (if any) are not part of the video's main content and should be
-                # dropped (e.g. a "like and subscribe" interstitial, a channel bumper, an
-                # unrelated promotional insert). Can be a cheaper/faster text-only model
-                # than analysis.vlm's vision model -- separate provider/model/url/key.
-                # Same provider set and the same allow_http/HTTPS gate as analysis.vlm.
-                "provider": "ollama",  # ollama, openai, api
-                "model": "llama3",
-                "api_key": "",
-                "api_url": "",
-                "allow_http": False,
-                # Response token budget (max_tokens / Ollama num_predict) for the
-                # coordinator call. Reasoning models spend "thinking" tokens from
-                # this same budget before emitting their JSON -- keep this
-                # generous or the response gets truncated mid-thought (which
-                # fails open: no scenes dropped).
-                "max_tokens": 4096,
+                # dropped. Can be a cheaper/faster text-only model than the VLM.
+                "default_llm": {
+                    "provider": "ollama",
+                    "model": "llama3",
+                    "api_url": "",
+                    "api_key": "",
+                    "allow_http": False,
+                    "timeout_sec": 120,
+                    # Reasoning models spend "thinking" tokens from this same budget before
+                    # emitting their JSON -- keep it generous or the response is truncated
+                    # mid-thought (which fails open: no scenes dropped).
+                    "max_tokens": 4096,
+                    "tls": {},
+                    "compat": {},
+                    "vision": {},
+                },
             },
+            "llm": {"endpoint": "default_llm"},
             "vlm": {
                 "enabled": False,
-                "provider": "local",  # local, api, ollama, openai
-                "model": "llava",
-                "api_key": "",
-                "api_url": "",
-                # Plain-HTTP api_url endpoints are refused for non-loopback
-                # hosts unless this is true (frames + api_key travel
-                # unencrypted; only enable for a server on a network you
-                # control, e.g. a LAN inference box).
-                "allow_http": False,
-                # Response token budget (max_tokens / Ollama num_predict) per VLM
-                # call. Raise if using a reasoning VLM whose thinking tokens
-                # count against the response budget.
-                "max_tokens": 1024,
-                "max_sample_frames": 8,
-                "sample_interval_sec": 10.0,
+                "endpoint": "default_vlm",
+                "sampling": {
+                    "max_frames": 8,
+                    "interval_sec": 10.0,
+                },
                 # Extra text appended to the default (or overridden) user prompt when
                 # non-empty, e.g. job-specific context like "these are wildlife clips
                 # from a trail camera". Also settable per-run via `avf analyze
@@ -1629,6 +1661,7 @@ class Config:
         *,
         config_path: str | Path | None = None,
         require_exists: bool = False,
+        defer_notices: bool = False,
     ):
         """Create a Config.
 
@@ -1645,10 +1678,17 @@ class Config:
                 hard error, not a silent no-op. The default platform config
                 path (neither `path` nor `config_path` given) is never
                 required to exist.
+            defer_notices: Load-time events (first-run bootstrap, schema migration
+                warnings -- REQUIREMENTS.md § 24) are normally logged at the end of
+                construction. The CLI constructs Config before logging is set up, so it
+                passes True and calls `emit_notices()` once the handlers (and the PII
+                cleaner's registrations) exist.
         """
         resolved = path or config_path
         self._path = Path(resolved) if resolved is not None else get_config_path()
+        self._explicit = resolved is not None
         self._require_exists = require_exists and resolved is not None
+        self._notices: list[tuple[int, str]] = []
         if self._require_exists and not self._path.exists():
             raise FileNotFoundError(f"Config file not found: {self._path}")
         self._data = self._merge()
@@ -1661,13 +1701,143 @@ class Config:
         self._sources: list[str] = ["defaults"]
         if self._path.exists():
             self._sources.append(f"user-config:{self._path}")
+        if not defer_notices:
+            self.emit_notices()
+
+    # ---- load-time events (bootstrap / migration), REQUIREMENTS.md § 24 ----
+
+    def _notice(self, level: int, message: str) -> None:
+        self._notices.append((level, message))
+
+    def emit_notices(self) -> None:
+        """Log (and clear) the events recorded while loading the config file."""
+        from autovideofixer.logger import get_logger
+
+        log = get_logger("autovideofixer.config")
+        pending, self._notices = self._notices, []
+        for level, message in pending:
+            log.log(level, "%s", message)
+
+    @property
+    def notices(self) -> list[tuple[int, str]]:
+        """Events recorded at load time and not yet emitted (see `emit_notices`)."""
+        return list(self._notices)
+
+    def _bootstrap_default_config(self) -> None:
+        """First run: copy the packaged example to the default path (§ 24.3).
+
+        Never raises: a read-only filesystem etc. is a WARNING and the run continues on
+        DEFAULTS. Opt out with ``AVF_NO_CONFIG_BOOTSTRAP=1``.
+        """
+        if os.environ.get(BOOTSTRAP_OPT_OUT_ENV, "").strip().lower() in ("1", "true", "yes", "on"):
+            return
+        try:
+            from importlib import resources
+
+            text = (
+                resources.files("autovideofixer").joinpath("data/config.example.yaml").read_text()
+            )
+            self._path.parent.mkdir(parents=True, exist_ok=True)
+            # Exclusive create so two processes starting together cannot clobber each
+            # other (or a file that appeared since the exists() check).
+            with open(self._path, "x", encoding="utf-8") as f:
+                f.write(text)
+        except FileExistsError:
+            return
+        except Exception as e:
+            self._notice(
+                logging.WARNING,
+                f"Could not create default config at {self._path}: {e}. "
+                "Continuing with built-in defaults.",
+            )
+            return
+        self._notice(
+            logging.INFO,
+            f"First run: created a default config at {self._path} (a commented copy of the "
+            f"packaged example). Edit it to customise AVF; set {BOOTSTRAP_OPT_OUT_ENV}=1 to "
+            "disable this.",
+        )
+
+    def _migrate_user_config(self, text: str, user: dict[str, Any]) -> dict[str, Any]:
+        """Apply schema migrations to a freshly loaded user config (§ 24.1).
+
+        Default-path file older than current: timestamped backup, migrate, rewrite in
+        place. Explicit file (--config / AVF_CONFIG): in memory only. Newer than known:
+        warn, load as-is. An empty file has nothing to migrate and is left alone.
+        """
+        from autovideofixer.config_migrations import (
+            get_config_version,
+            migrate,
+            migrate_text,
+            timestamped_backup_path,
+        )
+
+        if not user:
+            return user
+        version = get_config_version(user)
+        if version > CURRENT_CONFIG_VERSION:
+            self._notice(
+                logging.WARNING,
+                f"Config {self._path} has config_version {version}, newer than this AVF "
+                f"understands ({CURRENT_CONFIG_VERSION}); loading it as-is (best effort).",
+            )
+            return user
+        if version == CURRENT_CONFIG_VERSION:
+            return user
+
+        in_memory = copy.deepcopy(user)
+        notes = migrate(in_memory)
+        listing = "".join(f"\n  - {n}" for n in notes) or "\n  - (version stamp only)"
+
+        if not self._explicit:
+            try:
+                new_text, old_version, _ = migrate_text(text)
+                rewritten = yaml.safe_load(new_text) or {}
+                if rewritten != in_memory:
+                    # The comment-preserving rewrite must agree with the plain-dict
+                    # migration; if ruamel round-tripped something unexpectedly, do NOT
+                    # touch the user's file.
+                    raise RuntimeError("round-trip rewrite disagreed with in-memory migration")
+                backup = timestamped_backup_path(self._path, old_version)
+                shutil.copy2(self._path, backup)
+                tmp = self._path.with_name(self._path.name + ".avf-tmp")
+                tmp.write_text(new_text, encoding="utf-8")
+                shutil.copymode(self._path, tmp)
+                os.replace(tmp, self._path)
+            except Exception as e:
+                self._notice(
+                    logging.WARNING,
+                    f"Config {self._path} is schema v{version} (current v{CURRENT_CONFIG_VERSION}) "
+                    f"but could not be rewritten in place ({e}); migrated in memory only. "
+                    f"Run `avf config migrate {self._path}` to rewrite it. Changes:{listing}",
+                )
+                return in_memory
+            self._notice(
+                logging.WARNING,
+                f"Migrated config {self._path} from schema v{version} to "
+                f"v{CURRENT_CONFIG_VERSION}; the original was saved to {backup}. "
+                f"Changes:{listing}",
+            )
+            return rewritten
+        self._notice(
+            logging.WARNING,
+            f"Config {self._path} is schema v{version} (current v{CURRENT_CONFIG_VERSION}); "
+            f"migrated in memory only -- the file was not modified. Run "
+            f"`avf config migrate {self._path}` to update it. Changes:{listing}",
+        )
+        return in_memory
 
     def _merge(self) -> dict[str, Any]:
         merged = self._deep_copy(self.DEFAULTS)
+        if not self._explicit and not self._path.exists():
+            self._bootstrap_default_config()
         if self._path.exists():
             try:
                 with open(self._path) as f:
-                    user = yaml.safe_load(f) or {}
+                    text = f.read()
+                user = yaml.safe_load(text) or {}
+                if isinstance(user, dict):
+                    user = self._migrate_user_config(text, user)
                 self._deep_update(merged, user)
             except Exception as e:
                 from autovideofixer.logger import get_logger
@@ -1710,7 +1880,27 @@ class Config:
         recorded in `self.sources` and logged at DEBUG (redacted) so a run's
         effective config can be traced back to the layer that set each value.
         """
+        from autovideofixer.config_migrations import migrate_layer
         from autovideofixer.logger import get_logger
+
+        if isinstance(layer, dict) and ("analysis" in layer or "config_version" in layer):
+            # Old-shape analysis keys (or a declared old config_version) arriving in a layer
+            # are migrated in memory rather than silently ignored (§ 24.1). The selected
+            # endpoints are looked up on the current data so a layer's old-style
+            # `analysis.vlm.model` lands on the endpoint actually in use.
+            layer = copy.deepcopy(layer)
+            layer_notes = migrate_layer(
+                layer,
+                vlm_endpoint=str(self.get("analysis", "vlm", "endpoint", default="default_vlm")),
+                llm_endpoint=str(self.get("analysis", "llm", "endpoint", default="default_llm")),
+            )
+            if layer_notes:
+                get_logger("autovideofixer.config").warning(
+                    "Config layer %r uses the old (schema v1) analysis shape; migrated in "
+                    "memory (update the source). Changes:%s",
+                    source_label,
+                    "".join(f"\n  - {n}" for n in layer_notes),
+                )
 
         deep_merge(self._data, layer)
         self._sources.append(source_label)

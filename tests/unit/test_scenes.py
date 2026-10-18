@@ -278,10 +278,9 @@ class TestRunScenePipeline:
         config.set(True, "analysis", "vlm", "enabled")
         # Point at a guaranteed-unreachable port so this doesn't depend on
         # whether the test host happens to have something on 11434.
-        config.set("http://127.0.0.1:1", "analysis", "vlm", "api_url")
-        config.set("ollama", "analysis", "vlm", "provider")
-        config.set("http://127.0.0.1:1", "analysis", "llm", "api_url")
-        config.set("ollama", "analysis", "llm", "provider")
+        for name in ("default_vlm", "default_llm"):
+            config.set("http://127.0.0.1:1", "analysis", "endpoints", name, "api_url")
+            config.set("ollama", "analysis", "endpoints", name, "provider")
 
         result = run_scene_pipeline(
             multi_scene_video,

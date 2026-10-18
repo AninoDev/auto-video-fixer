@@ -59,8 +59,8 @@ draws an explicit VERIFIED / UNVERIFIED line instead of a flat done/not-done che
   `avg_frame_rate` over `r_frame_rate` ("tbr"), fixing a 2x-speed-then-freeze artifact on VFR
   sources where the two rates diverge; hardened against ffprobe's `"0/0"` undefined-rate value.
 - **VLM (Vision Language Model) classification** — the generic OpenAI-compatible `api` provider
-  (`analysis.vlm.provider: api`) has been run end-to-end against a live llama.cpp server on the
-  LAN (via `analysis.vlm.allow_http`), producing real summary/tags/objects/rating output. Ollama
+  (`provider: api` on an `analysis.endpoints` entry) has been run end-to-end against a live
+  llama.cpp server on the LAN (via that endpoint's `allow_http`), producing real summary/tags/objects/rating output. Ollama
   and OpenAI Vision providers share the same request/response code path
   (`_call_ollama`/`_call_openai` vs. `_call_custom_api`) and are unit-tested
   (`tests/unit/test_vlm.py`) but have not themselves been run against a live instance/key.
@@ -130,8 +130,15 @@ draws an explicit VERIFIED / UNVERIFIED line instead of a flat done/not-done che
   implemented 2026-10-18. `network.tls` (`verify` + `ca_files` / `untrusted_ca` / `insecure`) and
   `network.download_tls` apply to every VLM/LLM call and model download, including the `requests`
   and `curl` fallbacks (skipped rather than weakened). Unblocks corporate TLS-inspection networks
-  and self-signed home servers. Per-endpoint `tls:` overrides arrive with the endpoint registry
-  (P3, § 24.4); optional `truststore` (OS keychain) support is a revisit item for macOS.
+  and self-signed home servers. Per-endpoint `tls:` overrides shipped with the endpoint registry
+  (P3); optional `truststore` (OS keychain) support is a revisit item for macOS.
+- **Config versioning, endpoint registry, llama.cpp provider** (REQUIREMENTS.md § 24, phase P3) —
+  implemented 2026-10-18. `config_version` + comment-preserving migrations (default-path file
+  backed up and rewritten; explicit configs in memory), first-run bootstrap, `avf config migrate`,
+  `analysis.endpoints` with per-endpoint timeout/TLS/compat, `llamacpp` provider, `<think>`/prose
+  tolerant response parsing. Revisit: frame-size limits for llama.cpp land in P4 (`vision:`);
+  `json_schema` gains the new fields in P5; comments above moved keys are not carried over by the
+  migration.
 - **True source cadence recovery & timestamp-safe pipeline** (`retime` stage, on by default —
   REQUIREMENTS.md § 12) — recovers a video's real content framerate when it was padded up to a
   higher encoded rate by duplicated frames (24fps published at 60fps, VFR captures transcoded to

@@ -785,16 +785,57 @@ general:
 
 ### API and VLM Integration
 
-Configure VLM for content analysis:
+Model connections are **endpoints**: named entries under `analysis.endpoints`, each with its own
+URL, key, timeout, TLS and request shape. `analysis.vlm.endpoint` picks the one the VLM uses
+(`analysis.llm.endpoint` for the scene coordinator), or choose per run with
+`avf analyze --vlm-endpoint NAME`.
+
 ```yaml
 analysis:
+  endpoints:
+    default_vlm:
+      provider: ollama      # ollama | openai | api | llamacpp
+      model: llava
+      api_url: http://localhost:11434
+      api_key: ""
+      timeout_sec: 120      # null or 0 = no timeout
   vlm:
     enabled: true
-    provider: ollama  # or openai, api
-    model: llava
-    api_url: http://localhost:11434
-    api_key: ""
+    endpoint: default_vlm
 ```
+
+**llama.cpp (`llama-server`) setup** -- add an endpoint and select it:
+```yaml
+analysis:
+  endpoints:
+    llamacpp_lan:
+      provider: llamacpp
+      model: your-vision-model
+      api_url: "http://10.0.1.4:8080/v1/chat/completions"
+      allow_http: true       # plain HTTP to a non-loopback LAN host
+      timeout_sec: 600       # big vision models are slow
+      compat:
+        extra_body: {cache_prompt: true}
+  vlm:
+    enabled: true
+    endpoint: llamacpp_lan
+```
+`llamacpp` sends the system message as content parts and no `response_format` (what llama.cpp's
+chat templates need); override with `compat.system_content` (`string|parts`) and
+`compat.response_format` (`json_object|json_schema|none`). Reasoning models' `<think>` blocks and
+chatter around the JSON are stripped automatically. Limiting frame size for the model arrives with
+the upcoming VLM sampling work (`vision:`).
+
+### Config versioning, migration and first run
+
+Your `config.yaml` carries a `config_version`. When AVF is upgraded and your default-path config
+is older, the first run **backs it up** (`config.yaml.bak-v1-YYYYMMDD-HHMMSS`, same folder),
+rewrites it in place with comments preserved, and prints a WARNING listing every change (crop is
+turned on, `normalize_codecs` added to a pinned stage order, VLM/LLM settings moved into
+`analysis.endpoints`, sampling keys renamed). Configs passed with `--config`/`AVF_CONFIG` are only
+migrated in memory -- run `avf config migrate PATH` (or `-o NEW.yaml`) to update the file. With no
+config at all, the first run creates one from the commented example (set
+`AVF_NO_CONFIG_BOOTSTRAP=1` to prevent that).
 
 ### Corporate Networks and Self-Signed Servers (TLS)
 

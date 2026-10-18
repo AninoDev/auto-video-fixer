@@ -1338,6 +1338,91 @@ stages means they never spend compute on pixels that would just be discarded dow
 - A full, commented example covering every `Config.DEFAULTS` key lives at
   `docs/config.example.yaml`.
 
+### Config schema versioning, migrations, first-run bootstrap (REQUIREMENTS.md § 24.1-24.3)
+
+- **`config_version`** (top-level int; absent = 1; current = 2, `config_migrations.CURRENT_CONFIG_VERSION`)
+  is in `Config.DEFAULTS` and both example configs. `src/autovideofixer/config_migrations.py` holds an
+  ordered registry (`MIGRATIONS = {1: _migrate_v1_to_v2}`); each migration edits a ruamel
+  `CommentedMap` (file path, comments preserved) or a plain `dict` (in-memory path) in place and
+  appends human-readable notes. They must be **idempotent** and **must not invent keys** the user
+  didn't have (an absent key stays absent so DEFAULTS apply). v1->v2 does exactly four things:
+  `stages.crop.enabled: false -> true`; insert `normalize_codecs` into a pinned
+  `pipeline.default_order` (after `retime`, else `detect`, else front; mapping-form
+  `- stage: x` entries are recognised); move `provider/model/api_key/api_url/allow_http/max_tokens`
+  from `analysis.vlm`/`analysis.llm` into `analysis.endpoints.default_vlm`/`default_llm` (+ set
+  `analysis.<role>.endpoint`, `local` -> `ollama`); rename `max_sample_frames`/`sample_interval_sec`
+  to `analysis.vlm.sampling.max_frames`/`interval_sec`.
+- **STANDING RULE (default changes need a migration)**: the bootstrapped/example config pins EVERY
+  key, so a changed `Config.DEFAULTS` value never reaches an existing user by itself. Any future
+  default change that should reach existing users MUST ship a migration (bump
+  `CURRENT_CONFIG_VERSION`, add `MIGRATIONS[n]`) that rewrites values equal to the old default, and
+  `config_version` in both example configs. Also add the migration's tests.
+- **Load behaviour (`Config._migrate_user_config`)**: default-path file older than current ->
+  backup `config.yaml.bak-v<old>-<YYYYMMDD-HHMMSS>` (`timestamped_backup_path`), migrate, atomic
+  in-place rewrite (tmp + `os.replace`), WARNING with every note + the backup path. The rewrite is
+  only done if the comment-preserving ruamel result parses to exactly the same data as the
+  plain-dict migration (safety net); any failure (read-only dir, ...) -> WARNING + in-memory
+  migration only. Explicit config (top-level `--config`/`AVF_CONFIG`) -> in memory only + WARNING
+  pointing at `avf config migrate PATH`. Newer than known -> WARNING, loaded as-is. An empty file is
+  left alone. Files already at v2 are parsed exactly as before (no ruamel on the hot path).
+- **Cascade layers** (`Config.apply_layer`): only the *shape* items (3 and 4) are applied to a
+  layer, in memory, with a WARNING -- never the default-flipping items (1, 2): a `--config extra.yaml`
+  with `crop.enabled: false` is a deliberate per-run choice, not a stale pinned default. A layer that
+  itself declares `config_version: 1` gets the full migration. Old-style `analysis.vlm.model` in a
+  layer lands on the endpoint the base config currently *selects*, and never rewrites the selector.
+  `--set analysis.vlm.provider=api` therefore still works (migrated + warned).
+- **`Config(..., defer_notices=True)`**: load events (bootstrap, migration) are recorded and logged
+  by `emit_notices()`. The CLI group callback defers them until log handlers and the PII cleaner's
+  registrations exist, so the config path in the WARNING is placeholder-cleaned in `clean` logs.
+- **First-run bootstrap**: default path absent + no explicit config -> copy the packaged
+  `data/config.example.yaml` there (exclusive create), INFO log; failure -> WARNING and continue on
+  DEFAULTS; `AVF_NO_CONFIG_BOOTSTRAP=1` opts out. The example config must always equal
+  `Config.DEFAULTS` in values (unit-tested) -- a bootstrapped file is byte-identical to the example.
+- **Test isolation**: `tests/conftest.py` has an autouse fixture redirecting `XDG_CONFIG_HOME`,
+  `XDG_STATE_HOME`, `APPDATA` and setting `AVF_NO_CONFIG_BOOTSTRAP=1` for every test (guarded by
+  `tests/unit/test_test_isolation.py`). `XDG_DATA_HOME` is deliberately left alone (opt-in real-model
+  tests read cached weights from it). **When you run `avf` or any script by hand, set all four
+  XDG_* variables to a scratch dir** -- a default-path run migrates/bootstraps the real config.
+- **`avf config migrate PATH [-o OUT] [--backup/--no-backup] [--force]`**: in place with timestamped
+  backup by default; `-o` leaves PATH alone (refuses to overwrite OUT without `--force`);
+  already-current files are left as is. Notes/backup path go to stderr. `avf config upgrade` runs
+  the migrations on INPUT first (so old-shape INPUT isn't refused as "unknown keys") and treats
+  user-extensible mappings (`analysis.endpoints.<new name>`, empty `{}` such as
+  `tls`/`compat`/`vision`) as open, so custom endpoints survive an upgrade.
+- Known limitation: a comment that sat directly above a *moved* key (e.g. above `provider:` in
+  `analysis.vlm`) is dropped with the key; every other comment, order and quoting survive.
+
+### Endpoint registry (REQUIREMENTS.md § 24.4; `autovideofixer/endpoints.py`)
+
+`analysis.endpoints.<name>` = `provider` (`ollama|openai|api|llamacpp`; `local` = legacy alias for
+ollama), `model`, `api_url`, `api_key`, `allow_http`, `timeout_sec` (`resolve_timeout` semantics:
+null/0 unlimited), `max_tokens`, `tls` (per-endpoint override of `network.tls`), `compat`, `vision`
+(reserved for P4). `analysis.vlm.endpoint` / `analysis.llm.endpoint` select entries.
+**Every consumer resolves via `endpoints.resolve_endpoint` / `resolve_role_endpoint`** (returns an
+`Endpoint` dataclass; `ValueError` at use time on unknown name/bad provider/bad timeout/bad
+`compat`): `VideoAnalyzer.run_vlm_analysis` + `run_vlm_analysis_for_scene` (also `endpoint=` param;
+raises before frame extraction), `run_crop_vlm_check` (fails open), `run_scene_coordinator` (fails
+open). Never read `analysis.vlm.provider/model/...` directly -- those keys no longer exist.
+TLS: `resolve_tls_policy(config, endpoint.tls, purpose=f"endpoint:{name}")` (crop check uses
+`crop-vlm:{name}`). `timeout_sec` replaced every hardcoded `timeout=120`. The PII cleaner registers
+every endpoint's `api_url` (`endpoints.all_endpoint_urls`). CLI: `avf analyze --vlm-endpoint NAME`
+(unknown name -> exit 2 up front); `--vlm-model`/`--vlm-url` override the selected endpoint's fields
+for the run; api_key/allow_http stay config-only.
+
+### llama.cpp provider, compat knobs, response cleaning (REQUIREMENTS.md § 24.5)
+
+Provider routing lives in one place, `analysis._call_provider_raw` (VLM dispatch, coordinator, crop
+check). `llamacpp` and `api` share `_call_custom_api` (api_url = full chat-completions URL).
+`compat` (OpenAI-shaped providers only; ollama ignores it): `system_content` `string|parts`,
+`response_format` `json_object|json_schema|none`, `extra_body` (deep-merged into the payload).
+Provider defaults: `openai`/`api` -> `string`/`json_object` (unchanged), `llamacpp` -> `parts`/`none`
+(`endpoints._COMPAT_DEFAULTS`). `json_schema` sends the schema for the current fields
+(`_VLM_RESPONSE_SCHEMA`; coordinator/crop have their own) -- **P5 extends `_VLM_RESPONSE_SCHEMA`**.
+All parsers (`_parse_vlm_response`, `_parse_coordinator_response`, `_parse_crop_vlm_response`) go
+through `_extract_json_dict`: strip `<think>` blocks (also an unterminated leading one and a stray
+`</think>`), strip code fences, try pure JSON, else the first balanced top-level `{...}` that parses
+(string-aware brace matching), else the existing fallback (whole cleaned text = summary).
+
 ### Config cascade
 
 `avf process` builds its effective config as an ordered stack of layers, each deep-merged
@@ -1471,12 +1556,11 @@ non-urllib fallback) -- never a bare `urlopen`/`requests.get`/`curl`.**
   `model-download` have **no** `--set`/`--config` layers: they read only the top-level config
   (`~/.config/auto-video-fixer/config.yaml`, or `avf --config PATH` / `AVF_CONFIG`), so use a
   config file or a throwaway one: `avf --config tls.yaml analyze clip.mp4 --vlm`.
-- **P3 hook (per-endpoint TLS, § 24.4)**: `resolve_tls_policy(config, override, purpose=...)`
-  already deep-merges a mapping over `network.tls`, and every `_call_*` / `_run_*_vlm` /
-  `_dispatch_vlm` / `_call_coordinator_provider` takes `tls: TLSPolicy | None`. P3 only has to
-  resolve each endpoint with `resolve_tls_policy(config, endpoint.get("tls"), purpose=endpoint_name)`
-  at the four call sites that currently call `resolve_tls_policy(config, purpose=...)`
-  (`run_vlm_analysis`, `run_vlm_analysis_for_scene`, `run_scene_coordinator`, `run_crop_vlm_check`).
+- **Per-endpoint TLS (wired in P3, § 24.4)**: each `analysis.endpoints.<name>.tls` mapping is
+  deep-merged over `network.tls` via `resolve_tls_policy(config, endpoint.tls,
+  purpose=f"endpoint:{name}")` at the four call sites (`run_vlm_analysis`,
+  `run_vlm_analysis_for_scene`, `run_scene_coordinator`; the crop check uses `crop-vlm:{name}`), so
+  the once-per-process weak-TLS WARNING is keyed per endpoint.
 - **Tests**: `tests/unit/test_net.py` (policy/matcher/arg generation) and
   `tests/unit/test_net_tls.py` (real `ssl`-wrapped servers from `tests/unit/_tls_certs.py`: private
   CA, CA-signed, self-signed, expired, not-yet-valid, wrong-hostname; full accept/reject matrix
@@ -1775,10 +1859,10 @@ after `current_path = job.input_path`, before the main stage loop).
   incident: with VLM disabled and its endpoint down, the old unconditional VLM call still fired,
   costing ~8 minutes of 120s HTTP timeouts before "keeping all scenes anyway"). When VLM is
   enabled, per-scene VLM sampling (`VideoAnalyzer.run_vlm_analysis_for_scene` -- samples
-  `min(max_sample_frames, ceil(scene_duration / sample_interval_sec))` frames from within just
+  `min(sampling.max_frames, ceil(scene_duration / sampling.interval_sec))` frames from within just
   that scene's time range, via `_extract_sample_frames_range`) feeds a coordinating text-LLM pass
-  (`run_scene_coordinator`, config `analysis.llm.*`: `provider`/`model`/`api_key`/`api_url`/
-  `allow_http`, same HTTPS-required-for-non-loopback gate as `analysis.vlm.allow_http`). The
+  (`run_scene_coordinator`, using the endpoint `analysis.llm.endpoint` selects from
+  `analysis.endpoints`; same HTTPS-required-for-non-loopback gate via that endpoint's `allow_http`). The
   coordinator returns which scene indices to drop and why; dropped scenes are logged at WARNING
   (index, time range, reason) and excluded from the reassembled output. **Fails open on ANY
   failure** -- unreachable endpoint, exception, unparseable JSON response, or a `drop` array
@@ -2214,15 +2298,17 @@ failed.
   `_parse_vlm_response()`'s fallback treats non-JSON text as the summary (empty tags/objects/
   rating) instead of erroring. There's no CLI flag for the system prompt -- use
   `analysis.vlm.system_prompt_override` in config.
-- `--max-sample-frames INT`: Override `analysis.vlm.max_sample_frames` (default 8) for this run.
-- `--sample-interval FLOAT`: Override `analysis.vlm.sample_interval_sec` (default 10.0) for this
+- `--max-sample-frames INT`: Override `analysis.vlm.sampling.max_frames` (default 8) for this run.
+- `--sample-interval FLOAT`: Override `analysis.vlm.sampling.interval_sec` (default 10.0) for this
   run. (Prior to this flag being added, `sample_interval_sec` in config was never actually read
   -- `run_vlm_analysis()` hardcoded 10.0 -- so this also fixes a dead config key.)
-- `--vlm-model TEXT`: Override `analysis.vlm.model` (e.g. `llava`, `gpt-4o`) for this run.
-- `--vlm-url TEXT`: Override `analysis.vlm.api_url` for this run. Still goes through the same
-  HTTPS-required-for-non-loopback-hosts gate as the config value (`_call_custom_api`'s `urlparse`
-  check) -- `analysis.vlm.allow_http` is what permits plain HTTP, and deliberately has no CLI
-  flag, same as `analysis.vlm.api_key`; both stay config-file-only (secrets/security posture
+- `--vlm-endpoint NAME`: Use this `analysis.endpoints` entry for the VLM this run (default: the one
+  `analysis.vlm.endpoint` selects). Unknown name -> usage error (exit 2) before any file is touched.
+- `--vlm-model TEXT`: Override the selected endpoint's `model` (e.g. `llava`, `gpt-4o`) for this run.
+- `--vlm-url TEXT`: Override the selected endpoint's `api_url` for this run. Still goes through the
+  same HTTPS-required-for-non-loopback-hosts gate as the config value (`_call_custom_api`'s
+  `urlparse` check) -- the endpoint's `allow_http` is what permits plain HTTP, and deliberately has
+  no CLI flag, same as `api_key`; both stay config-file-only (secrets/security posture
   shouldn't be one flag away from a shell history entry).
 
 **Scene-score visibility** (added after a real-world report of a flat scene count across

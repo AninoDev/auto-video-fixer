@@ -470,6 +470,11 @@ if is_video_file("video.mp4"):
 analyzer = VideoAnalyzer(config)
 analysis = analyzer.analyze("video.mp4")
 
+# VLM runs use the endpoint analysis.vlm.endpoint selects from analysis.endpoints;
+# override per call: analyzer.analyze(path, include_vlm=True, vlm_endpoint="llamacpp_lan",
+# vlm_model=None, vlm_api_url=None). Unknown endpoint names raise ValueError.
+# Endpoint resolution: autovideofixer.endpoints.resolve_endpoint(config, name) -> Endpoint.
+
 print(f"Resolution: {analysis.resolution}")
 print(f"Duration: {analysis.duration}")
 print(f"Scenes: {analysis.total_scenes}")

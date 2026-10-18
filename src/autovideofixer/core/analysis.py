@@ -8,6 +8,7 @@ and duplicate/similar video detection via perceptual hashing.
 from __future__ import annotations
 
 import base64
+import copy
 import logging
 import os
 import re
@@ -15,9 +16,14 @@ import shutil
 import statistics
 import tempfile
 from dataclasses import dataclass, field
-from typing import Any, Callable
+from typing import Any, Callable, Mapping
 
 from autovideofixer.config import VALID_SYMLINKS_POLICIES, Config
+from autovideofixer.endpoints import (
+    normalize_provider,
+    resolve_compat,
+    resolve_role_endpoint,
+)
 from autovideofixer.net import TLSPolicy, open_url, resolve_tls_policy
 
 logger = logging.getLogger(__name__)
@@ -246,6 +252,7 @@ class VideoAnalyzer:
         sample_interval_sec: float | None = None,
         vlm_model: str | None = None,
         vlm_api_url: str | None = None,
+        vlm_endpoint: str | None = None,
     ) -> VideoAnalysis:
         """Perform full analysis on a video file.
 
@@ -270,14 +277,17 @@ class VideoAnalyzer:
                 VLM sampling/request, done) so callers (e.g. the CLI) can show
                 a live status line on slow videos. See ``ProgressCallback``.
             max_sample_frames: VLM sample-frame count override (None = use
-                ``analysis.vlm.max_sample_frames``). See ``run_vlm_analysis``.
+                ``analysis.vlm.sampling.max_frames``). See ``run_vlm_analysis``.
             sample_interval_sec: VLM frame-sampling interval override in
-                seconds (None = use ``analysis.vlm.sample_interval_sec``).
-            vlm_model: VLM model name override (None = use
-                ``analysis.vlm.model``).
-            vlm_api_url: VLM provider URL override (None = use
-                ``analysis.vlm.api_url``). See ``run_vlm_analysis`` for the
+                seconds (None = use ``analysis.vlm.sampling.interval_sec``).
+            vlm_model: VLM model name override for this run (None = the selected
+                endpoint's ``model``).
+            vlm_api_url: VLM provider URL override for this run (None = the selected
+                endpoint's ``api_url``). See ``run_vlm_analysis`` for the
                 ``allow_http`` gate this still goes through.
+            vlm_endpoint: Name of the ``analysis.endpoints`` entry to use (None = the
+                one ``analysis.vlm.endpoint`` selects). ``vlm_model``/``vlm_api_url``
+                override that entry's fields.
 
         Returns:
             VideoAnalysis with all detected information
@@ -341,6 +351,7 @@ class VideoAnalyzer:
                 sample_interval_sec=sample_interval_sec,
                 model=vlm_model,
                 api_url=vlm_api_url,
+                endpoint=vlm_endpoint,
             )
             analysis.vlm_summary = vlm_result.get("summary")
             analysis.vlm_tags = vlm_result.get("tags", [])
@@ -518,6 +529,7 @@ class VideoAnalyzer:
         max_sample_frames: int | None = None,
         model: str | None = None,
         api_url: str | None = None,
+        endpoint: str | None = None,
     ) -> dict[str, Any]:
         """Run VLM (Vision Language Model) analysis on video content.
 
@@ -527,7 +539,7 @@ class VideoAnalyzer:
         Args:
             filepath: Path to the video file
             sample_interval_sec: Seconds between frame samples (None = use
-                ``analysis.vlm.sample_interval_sec`` from config, default 10.0).
+                ``analysis.vlm.sampling.interval_sec`` from config, default 10.0).
                 Also settable per-run via ``avf analyze --sample-interval``.
             prompt_append: Extra text appended to the (possibly overridden) user
                 prompt, e.g. job-specific context. None falls back to
@@ -543,17 +555,19 @@ class VideoAnalyzer:
                 to the provider ("vlm_request") -- useful since the request
                 itself can take several seconds with no other feedback.
             max_sample_frames: Max frames sampled and sent to the provider
-                (None = use ``analysis.vlm.max_sample_frames``, default 8).
+                (None = use ``analysis.vlm.sampling.max_frames``, default 8).
                 Also settable per-run via ``avf analyze --max-sample-frames``.
-            model: Model name override (None = use ``analysis.vlm.model``,
-                default "llava"). Also settable per-run via
-                ``avf analyze --vlm-model``.
-            api_url: Provider base/endpoint URL override (None = use
-                ``analysis.vlm.api_url``). Also settable per-run via
+            model: Model name override for this run (None = the selected
+                endpoint's ``model``). Also settable via ``avf analyze --vlm-model``.
+            api_url: Provider base/endpoint URL override for this run (None = the
+                selected endpoint's ``api_url``). Also settable per-run via
                 ``avf analyze --vlm-url``. Flows through to the same
                 ``allow_http``/HTTPS-required gate as the config value (see
                 ``_call_custom_api``) -- there is deliberately no CLI override
                 for ``allow_http`` or ``api_key``; those stay config-file-only.
+            endpoint: Name of the ``analysis.endpoints`` entry to use (None = the
+                one ``analysis.vlm.endpoint`` selects; REQUIREMENTS.md § 24.4). An
+                unknown name raises ``ValueError`` before any frame extraction.
 
         Returns:
             Dict with keys: summary, tags, objects, rating
@@ -564,22 +578,17 @@ class VideoAnalyzer:
                 progress_callback(phase, detail)
 
         vlm_config = self.config.get("analysis", "vlm", default={})
-        # Resolved up front so a bad network.tls config is a clear error before any
-        # frame extraction work (and not swallowed by _dispatch_vlm's fail-soft except).
-        tls = resolve_tls_policy(self.config, purpose="vlm")
-        provider = vlm_config.get("provider", "local")
-        model = model if model is not None else vlm_config.get("model", "llava")
-        api_url = api_url if api_url is not None else vlm_config.get("api_url", "")
-        api_key = vlm_config.get("api_key", "")
-        max_frames = (
-            max_sample_frames
-            if max_sample_frames is not None
-            else vlm_config.get("max_sample_frames", 8)
+        # Resolved up front so an unknown endpoint or a bad network.tls config is a clear
+        # error before any frame extraction work (and not swallowed by _dispatch_vlm's
+        # fail-soft except).
+        ep = resolve_role_endpoint(self.config, "vlm", endpoint).with_overrides(
+            model=model, api_url=api_url
         )
+        tls = resolve_tls_policy(self.config, ep.tls, purpose=ep.tls_purpose)
+        cfg_max_frames, cfg_interval = _vlm_sampling_config(vlm_config)
+        max_frames = max_sample_frames if max_sample_frames is not None else cfg_max_frames
         sample_interval_sec = (
-            sample_interval_sec
-            if sample_interval_sec is not None
-            else vlm_config.get("sample_interval_sec", 10.0)
+            sample_interval_sec if sample_interval_sec is not None else cfg_interval
         )
 
         resolved_append = (
@@ -614,19 +623,22 @@ class VideoAnalyzer:
         try:
             _report(
                 "vlm_request",
-                f"Sending {len(frames)} frame(s) to {provider} VLM provider (model={model})",
+                f"Sending {len(frames)} frame(s) to {ep.provider} VLM provider "
+                f"(endpoint={ep.name}, model={ep.model})",
             )
             return _dispatch_vlm(
                 frames,
-                provider,
-                model,
-                api_url,
-                api_key,
+                ep.provider,
+                ep.model,
+                ep.api_url,
+                ep.api_key,
                 system_prompt,
                 user_prompt,
-                allow_http=bool(vlm_config.get("allow_http", False)),
-                max_tokens=int(vlm_config.get("max_tokens", 1024)),
+                allow_http=ep.allow_http,
+                max_tokens=ep.max_tokens,
                 tls=tls,
+                timeout=ep.timeout_sec,
+                compat=ep.compat,
                 context=filepath,
             )
         finally:
@@ -643,6 +655,7 @@ class VideoAnalyzer:
         sample_interval_sec: float | None = None,
         model: str | None = None,
         api_url: str | None = None,
+        endpoint: str | None = None,
     ) -> dict[str, Any]:
         """Run VLM analysis over only the frames within one scene's time range.
 
@@ -660,23 +673,16 @@ class VideoAnalyzer:
         import math
 
         vlm_config = self.config.get("analysis", "vlm", default={})
-        # Resolved up front so a bad network.tls config is a clear error before any
-        # frame extraction work (and not swallowed by _dispatch_vlm's fail-soft except).
-        tls = resolve_tls_policy(self.config, purpose="vlm")
-        provider = vlm_config.get("provider", "local")
-        model = model if model is not None else vlm_config.get("model", "llava")
-        api_url = api_url if api_url is not None else vlm_config.get("api_url", "")
-        api_key = vlm_config.get("api_key", "")
-        max_frames_cfg = (
-            max_sample_frames
-            if max_sample_frames is not None
-            else vlm_config.get("max_sample_frames", 8)
+        # Resolved up front so an unknown endpoint or a bad network.tls config is a clear
+        # error before any frame extraction work (and not swallowed by _dispatch_vlm's
+        # fail-soft except).
+        ep = resolve_role_endpoint(self.config, "vlm", endpoint).with_overrides(
+            model=model, api_url=api_url
         )
-        interval = (
-            sample_interval_sec
-            if sample_interval_sec is not None
-            else vlm_config.get("sample_interval_sec", 10.0)
-        )
+        tls = resolve_tls_policy(self.config, ep.tls, purpose=ep.tls_purpose)
+        cfg_max_frames, cfg_interval = _vlm_sampling_config(vlm_config)
+        max_frames_cfg = max_sample_frames if max_sample_frames is not None else cfg_max_frames
+        interval = sample_interval_sec if sample_interval_sec is not None else cfg_interval
 
         duration = max(scene.duration, 0.0)
         if duration <= 0:
@@ -711,15 +717,17 @@ class VideoAnalyzer:
         try:
             return _dispatch_vlm(
                 frames,
-                provider,
-                model,
-                api_url,
-                api_key,
+                ep.provider,
+                ep.model,
+                ep.api_url,
+                ep.api_key,
                 system_prompt,
                 user_prompt,
-                allow_http=bool(vlm_config.get("allow_http", False)),
-                max_tokens=int(vlm_config.get("max_tokens", 1024)),
+                allow_http=ep.allow_http,
+                max_tokens=ep.max_tokens,
                 tls=tls,
+                timeout=ep.timeout_sec,
+                compat=ep.compat,
                 context=f"{filepath} scene[{scene.start_time:.1f}-{scene.end_time:.1f}]",
             )
         finally:
@@ -829,6 +837,19 @@ class VideoAnalyzer:
 # ─── VLM Providers ─────────────────────────────────────────────────
 
 
+def _vlm_sampling_config(vlm_config: Mapping[str, Any]) -> tuple[int, float]:
+    """``(max_frames, interval_sec)`` from ``analysis.vlm.sampling`` (v2 schema).
+
+    P4 (REQUIREMENTS.md § 25) replaces the sampler itself; P3 only moved the keys
+    (``max_sample_frames`` -> ``sampling.max_frames``, ``sample_interval_sec`` ->
+    ``sampling.interval_sec``), behaviour unchanged.
+    """
+    sampling = vlm_config.get("sampling")
+    if not isinstance(sampling, Mapping):
+        sampling = {}
+    return int(sampling.get("max_frames", 8)), float(sampling.get("interval_sec", 10.0))
+
+
 def _frames_to_base64(frame_paths: list[str]) -> list[str]:
     """Convert frame image paths to base64-encoded strings."""
     encoded: list[str] = []
@@ -841,19 +862,105 @@ def _frames_to_base64(frame_paths: list[str]) -> list[str]:
     return encoded
 
 
-def _parse_vlm_response(response_text: str) -> dict[str, Any]:
-    """Parse a VLM JSON response into analysis results."""
+_THINK_BLOCK_RE = re.compile(r"<think>.*?</think>", re.DOTALL | re.IGNORECASE)
+
+
+def _strip_think(text: str) -> str:
+    """Remove reasoning-model ``<think>...</think>`` blocks from a response.
+
+    Also handles the two truncated shapes seen with llama.cpp reasoning models: an
+    UNTERMINATED leading ``<think>`` (generation hit ``max_tokens`` mid-thought -> nothing
+    after it is an answer) and a stray ``</think>`` with no opener (the chat template
+    already opened the block in the prompt -> everything before the closer is thinking).
+    """
+    text = _THINK_BLOCK_RE.sub("", text)
+    lowered = text.lower()
+    open_at = lowered.find("<think>")
+    if open_at != -1:
+        # Unterminated opener: discard it and everything after it.
+        text = text[:open_at]
+        lowered = text.lower()
+    close_at = lowered.rfind("</think>")
+    if close_at != -1:
+        text = text[close_at + len("</think>") :]
+    return text.strip()
+
+
+def _strip_code_fences(text: str) -> str:
+    """Strip one surrounding markdown code fence. Anchored regexes (not positional
+    line-slicing) so a response truncated before the closing fence doesn't get reduced
+    to an empty string."""
+    text = re.sub(r"^```(?:json)?\s*\n?", "", text.strip())
+    return re.sub(r"\n?```\s*$", "", text).strip()
+
+
+def _balanced_object_end(text: str, start: int) -> int | None:
+    """Index just past the ``}`` closing the ``{`` at ``text[start]``, or None.
+
+    String-aware: braces inside JSON string literals (and escaped quotes within them) do
+    not count toward the nesting depth.
+    """
+    depth = 0
+    in_string = False
+    escaped = False
+    for i in range(start, len(text)):
+        ch = text[i]
+        if in_string:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_string = False
+            continue
+        if ch == '"':
+            in_string = True
+        elif ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return i + 1
+    return None
+
+
+def _extract_json_dict(response_text: str) -> dict[str, Any] | None:
+    """Best-effort extraction of the JSON object a model put in ``response_text``.
+
+    Pipeline (REQUIREMENTS.md § 24.5): strip ``<think>`` blocks and code fences; if what is
+    left is not pure JSON, take the first balanced top-level ``{...}`` that parses as an
+    object (prose before/after, a fence in the middle of chatter, braces inside strings are
+    all fine). Returns None when no object can be recovered (truncated output, plain text).
+    Never raises.
+    """
     import json
 
-    original = response_text.strip()
-    # Strip markdown code fences if present. Anchored regex (not positional
-    # line-slicing) so a response truncated before the closing fence doesn't
-    # get reduced to an empty string.
-    text = re.sub(r"^```(?:json)?\s*\n?", "", original)
-    text = re.sub(r"\n?```\s*$", "", text).strip()
-
+    cleaned = _strip_code_fences(_strip_think(response_text))
     try:
-        data = json.loads(text)
+        data = json.loads(cleaned)
+    except json.JSONDecodeError, TypeError, ValueError:
+        data = None
+    else:
+        return data if isinstance(data, dict) else None
+
+    pos = cleaned.find("{")
+    while pos != -1:
+        end = _balanced_object_end(cleaned, pos)
+        if end is not None:
+            try:
+                candidate = json.loads(cleaned[pos:end])
+            except json.JSONDecodeError, ValueError:
+                candidate = None
+            if isinstance(candidate, dict):
+                return candidate
+        pos = cleaned.find("{", pos + 1)
+    return None
+
+
+def _parse_vlm_response(response_text: str) -> dict[str, Any]:
+    """Parse a VLM JSON response into analysis results."""
+    data = _extract_json_dict(response_text)
+    if data is not None:
         return {
             "summary": data.get("summary", ""),
             "tags": [t.strip() for t in data.get("tags", "").split(",") if t.strip()]
@@ -864,11 +971,117 @@ def _parse_vlm_response(response_text: str) -> dict[str, Any]:
             else data.get("objects", []),
             "rating": data.get("rating"),
         }
-    except json.JSONDecodeError, AttributeError:
-        # Fallback: treat the original (pre-fence-stripping) response as the
-        # summary, so a truncated/malformed fenced response still degrades to
-        # real content instead of the empty string left by failed stripping.
-        return {"summary": original, "tags": [], "objects": [], "rating": None}
+    # Fallback: no recoverable JSON object -- treat the response (minus any reasoning
+    # block, which is never a summary) as the summary, so a truncated/malformed fenced
+    # response still degrades to real content instead of an empty string.
+    return {
+        "summary": _strip_think(response_text),
+        "tags": [],
+        "objects": [],
+        "rating": None,
+    }
+
+
+# JSON Schemas sent when compat.response_format is "json_schema" (§ 24.5). One per response
+# shape the OpenAI-shaped providers are asked for. P5 (§ 26) extends the VLM one with the new
+# output fields -- keep it in step with _parse_vlm_response and the default system prompt.
+_VLM_RESPONSE_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "summary": {"type": "string"},
+        "tags": {"anyOf": [{"type": "array", "items": {"type": "string"}}, {"type": "string"}]},
+        "objects": {"anyOf": [{"type": "array", "items": {"type": "string"}}, {"type": "string"}]},
+        "rating": {"type": "string", "enum": ["G", "PG", "PG-13", "R"]},
+    },
+    "required": ["summary", "tags", "objects", "rating"],
+}
+
+_COORDINATOR_RESPONSE_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "main_content_summary": {"type": "string"},
+        "drop": {"type": "array", "items": {"type": "integer"}},
+        "reasons": {"type": "object", "additionalProperties": {"type": "string"}},
+    },
+    "required": ["main_content_summary", "drop", "reasons"],
+}
+
+_CROP_RESPONSE_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {"content_outside": {"type": "boolean"}, "reason": {"type": "string"}},
+    "required": ["content_outside", "reason"],
+}
+
+
+def _build_openai_payload(
+    model: str,
+    system_prompt: str,
+    user_prompt: str,
+    image_b64_list: list[str],
+    max_tokens: int,
+    compat: Mapping[str, Any] | None,
+    response_schema: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    """Chat-completions payload shared by the openai / api / llamacpp providers.
+
+    ``compat`` is the endpoint's *effective* request-shape mapping (see
+    ``endpoints.resolve_compat``); None means the long-standing openai/api shape. Why these
+    knobs exist: llama.cpp's chat-template handling rejects a plain-string system message
+    for some models (wants ``parts``) and mishandles ``response_format: json_object`` with
+    vision/reasoning models -- the user's working hand-patch changed exactly those two.
+    """
+    compat = compat if compat is not None else _DEFAULT_OPENAI_COMPAT
+    system_content: Any = system_prompt
+    if compat.get("system_content", "string") == "parts":
+        system_content = [{"type": "text", "text": system_prompt}]
+
+    content: list[dict[str, Any]] = [{"type": "text", "text": user_prompt}]
+    for b64 in image_b64_list:
+        content.append(
+            {
+                "type": "image_url",
+                "image_url": {"url": f"data:image/jpeg;base64,{b64}"},
+            }
+        )
+
+    payload: dict[str, Any] = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": system_content},
+            {"role": "user", "content": content},
+        ],
+        "max_tokens": max_tokens,
+    }
+    fmt = compat.get("response_format", "json_object")
+    if fmt == "json_schema" and response_schema is not None:
+        payload["response_format"] = {
+            "type": "json_schema",
+            "json_schema": {"name": "avf_response", "strict": True, "schema": response_schema},
+        }
+    elif fmt in ("json_object", "json_schema"):
+        # json_schema without a schema for this call degrades to json_object rather than
+        # sending nothing: the caller asked for constrained JSON.
+        payload["response_format"] = {"type": "json_object"}
+    extra = compat.get("extra_body")
+    if extra:
+        _deep_merge_payload(payload, extra)
+    return payload
+
+
+def _deep_merge_payload(base: dict[str, Any], extra: Mapping[str, Any]) -> None:
+    """Deep-merge ``compat.extra_body`` into the request payload (extra wins)."""
+    for key, value in extra.items():
+        if isinstance(value, Mapping) and isinstance(base.get(key), dict):
+            _deep_merge_payload(base[key], value)
+        else:
+            base[key] = copy.deepcopy(value)
+
+
+_DEFAULT_OPENAI_COMPAT: dict[str, Any] = {
+    "system_content": "string",
+    "response_format": "json_object",
+    "extra_body": {},
+}
 
 
 def _call_ollama(
@@ -879,6 +1092,7 @@ def _call_ollama(
     image_b64_list: list[str],
     max_tokens: int = 1024,
     tls: TLSPolicy | None = None,
+    timeout: float | None = 120.0,
 ) -> str:
     """Send a request to an Ollama API endpoint.
 
@@ -890,6 +1104,7 @@ def _call_ollama(
         image_b64_list: Base64-encoded image strings
         tls: Resolved TLS policy (``net.resolve_tls_policy``); None = secure default.
             Per-endpoint overrides (REQUIREMENTS.md § 24.4) are resolved by the caller.
+        timeout: Request timeout in seconds (``Endpoint.timeout_sec``); None = unlimited.
 
     Returns:
         Response text from the model
@@ -918,7 +1133,7 @@ def _call_ollama(
             headers={"Content-Type": "application/json"},
             method="POST",
         )
-        with open_url(req, timeout=120, tls=tls) as resp:
+        with open_url(req, timeout=timeout, tls=tls) as resp:
             result = json.loads(resp.read().decode("utf-8"))
             return result.get("message", {}).get("content", "")
     except Exception:
@@ -934,6 +1149,9 @@ def _call_openai(
     image_b64_list: list[str],
     max_tokens: int = 1024,
     tls: TLSPolicy | None = None,
+    timeout: float | None = 120.0,
+    compat: Mapping[str, Any] | None = None,
+    response_schema: Mapping[str, Any] | None = None,
 ) -> str:
     """Send a request to the OpenAI Vision API.
 
@@ -945,30 +1163,19 @@ def _call_openai(
         image_b64_list: Base64-encoded image strings
         tls: Resolved TLS policy (``net.resolve_tls_policy``); None = secure default.
             Per-endpoint overrides (REQUIREMENTS.md § 24.4) are resolved by the caller.
+        timeout: Request timeout in seconds (``Endpoint.timeout_sec``); None = unlimited.
+        compat: Effective request-shape knobs (``endpoints.resolve_compat``); None = the
+            long-standing string-system / json_object shape.
+        response_schema: JSON Schema sent when ``compat.response_format`` is ``json_schema``.
 
     Returns:
         Response text from the model
     """
     import json
 
-    content: list[dict[str, Any]] = [{"type": "text", "text": user_prompt}]
-    for b64 in image_b64_list:
-        content.append(
-            {
-                "type": "image_url",
-                "image_url": {"url": f"data:image/jpeg;base64,{b64}"},
-            }
-        )
-
-    payload = {
-        "model": model,
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": content},
-        ],
-        "max_tokens": max_tokens,
-        "response_format": {"type": "json_object"},
-    }
+    payload = _build_openai_payload(
+        model, system_prompt, user_prompt, image_b64_list, max_tokens, compat, response_schema
+    )
 
     try:
         import urllib.request
@@ -982,7 +1189,7 @@ def _call_openai(
             },
             method="POST",
         )
-        with open_url(req, timeout=120, tls=tls) as resp:
+        with open_url(req, timeout=timeout, tls=tls) as resp:
             result = json.loads(resp.read().decode("utf-8"))
             return result.get("choices", [{}])[0].get("message", {}).get("content", "")
     except Exception:
@@ -1000,20 +1207,28 @@ def _call_custom_api(
     allow_http: bool = False,
     max_tokens: int = 1024,
     tls: TLSPolicy | None = None,
+    timeout: float | None = 120.0,
+    compat: Mapping[str, Any] | None = None,
+    response_schema: Mapping[str, Any] | None = None,
 ) -> str:
-    """Send a request to a custom API endpoint.
+    """Send a request to a custom OpenAI-compatible endpoint (``api`` and ``llamacpp``).
 
-    Uses the OpenAI-compatible chat completions format.
+    Uses the OpenAI-compatible chat completions format; ``api_url`` is the full
+    chat-completions URL. Request-shape differences between servers are expressed through
+    ``compat`` (REQUIREMENTS.md § 24.5), not through more provider names.
 
     Args:
         api_key: API key for authentication
-        api_url: Custom API base URL
+        api_url: Full chat-completions URL
         model: Model name
         system_prompt: System message
         user_prompt: User message text
         image_b64_list: Base64-encoded image strings
         tls: Resolved TLS policy (``net.resolve_tls_policy``); None = secure default.
             Per-endpoint overrides (REQUIREMENTS.md § 24.4) are resolved by the caller.
+        timeout: Request timeout in seconds (``Endpoint.timeout_sec``); None = unlimited.
+        compat: Effective request-shape knobs; None = the string-system / json_object shape.
+        response_schema: JSON Schema sent when ``compat.response_format`` is ``json_schema``.
 
     Returns:
         Response text from the API
@@ -1026,7 +1241,7 @@ def _call_custom_api(
     # input). Still, require https except for loopback so a shared/untrusted
     # config/preset can't silently point frame uploads + credentials at an
     # arbitrary internal address over plaintext.
-    # analysis.vlm.allow_http opts out for e.g. a LAN inference box that only
+    # The endpoint's allow_http opts out for e.g. a LAN inference box that only
     # speaks plain HTTP; frames and the API key then travel unencrypted, which
     # is the user's call to make for their own network.
     parsed = urlparse(api_url)
@@ -1037,30 +1252,15 @@ def _call_custom_api(
     ):
         logger.warning(
             "Refusing non-https custom VLM API URL for non-loopback host: %s "
-            "(set analysis.vlm.allow_http: true in config.yaml to permit plain "
-            "HTTP, e.g. for a server on your own LAN)",
+            "(set allow_http: true on this endpoint in analysis.endpoints in config.yaml "
+            "to permit plain HTTP, e.g. for a server on your own LAN)",
             api_url,
         )
         return ""
 
-    content: list[dict[str, Any]] = [{"type": "text", "text": user_prompt}]
-    for b64 in image_b64_list:
-        content.append(
-            {
-                "type": "image_url",
-                "image_url": {"url": f"data:image/jpeg;base64,{b64}"},
-            }
-        )
-
-    payload = {
-        "model": model,
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": content},
-        ],
-        "max_tokens": max_tokens,
-        "response_format": {"type": "json_object"},
-    }
+    payload = _build_openai_payload(
+        model, system_prompt, user_prompt, image_b64_list, max_tokens, compat, response_schema
+    )
 
     try:
         import urllib.request
@@ -1075,12 +1275,76 @@ def _call_custom_api(
             headers=headers,
             method="POST",
         )
-        with open_url(req, timeout=120, tls=tls) as resp:
+        with open_url(req, timeout=timeout, tls=tls) as resp:
             result = json.loads(resp.read().decode("utf-8"))
             return result.get("choices", [{}])[0].get("message", {}).get("content", "")
     except Exception:
         logger.warning("Custom API VLM request to %s failed", api_url, exc_info=True)
         return ""
+
+
+def _call_provider_raw(
+    provider: str,
+    *,
+    model: str,
+    api_url: str,
+    api_key: str,
+    system_prompt: str,
+    user_prompt: str,
+    image_b64_list: list[str],
+    allow_http: bool = False,
+    max_tokens: int = 1024,
+    tls: TLSPolicy | None = None,
+    timeout: float | None = 120.0,
+    compat: Mapping[str, Any] | None = None,
+    response_schema: Mapping[str, Any] | None = None,
+) -> str | None:
+    """Route one request to the right provider function; None for an unknown provider.
+
+    The single place that knows the provider set, shared by the VLM dispatcher, the
+    coordinator and the crop check (previously each had its own if/elif chain).
+    """
+    provider = normalize_provider(provider)
+    if provider == "ollama":
+        return _call_ollama(
+            api_url or "http://localhost:11434",
+            model,
+            system_prompt,
+            user_prompt,
+            image_b64_list,
+            max_tokens=max_tokens,
+            tls=tls,
+            timeout=timeout,
+        )
+    if provider == "openai":
+        return _call_openai(
+            api_key,
+            model,
+            system_prompt,
+            user_prompt,
+            image_b64_list,
+            max_tokens=max_tokens,
+            tls=tls,
+            timeout=timeout,
+            compat=compat if compat is not None else resolve_compat(provider, None, "openai"),
+            response_schema=response_schema,
+        )
+    if provider in ("api", "llamacpp"):
+        return _call_custom_api(
+            api_key,
+            api_url,
+            model,
+            system_prompt,
+            user_prompt,
+            image_b64_list,
+            allow_http=allow_http,
+            max_tokens=max_tokens,
+            tls=tls,
+            timeout=timeout,
+            compat=compat if compat is not None else resolve_compat(provider, None, provider),
+            response_schema=response_schema,
+        )
+    return None
 
 
 def _dispatch_vlm(
@@ -1095,6 +1359,8 @@ def _dispatch_vlm(
     context: str = "",
     max_tokens: int = 1024,
     tls: TLSPolicy | None = None,
+    timeout: float | None = 120.0,
+    compat: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Shared provider dispatch for both whole-video and per-scene VLM analysis.
 
@@ -1103,31 +1369,61 @@ def _dispatch_vlm(
     is logged at WARNING and degrades to an empty result.
     """
     try:
-        if provider in ("local", "ollama"):
-            return _run_ollama_vlm(
-                frames, model, api_url, system_prompt, user_prompt, max_tokens=max_tokens, tls=tls
-            )
-        elif provider == "openai":
-            return _run_openai_vlm(
-                frames, api_key, model, system_prompt, user_prompt, max_tokens=max_tokens, tls=tls
-            )
-        elif provider == "api":
-            return _run_api_vlm(
-                frames,
-                api_key,
-                api_url,
-                model,
-                system_prompt,
-                user_prompt,
-                allow_http=allow_http,
-                max_tokens=max_tokens,
-                tls=tls,
-            )
-        else:
-            return {"summary": "", "tags": [], "objects": [], "rating": None}
+        return _run_vlm(
+            frames,
+            provider,
+            model,
+            api_url,
+            api_key,
+            system_prompt,
+            user_prompt,
+            allow_http=allow_http,
+            max_tokens=max_tokens,
+            tls=tls,
+            timeout=timeout,
+            compat=compat,
+        )
     except Exception:
         logger.warning("VLM analysis failed for %r (provider=%s)", context, provider, exc_info=True)
         return {"summary": "", "tags": [], "objects": [], "rating": None}
+
+
+def _run_vlm(
+    frames: list[str],
+    provider: str,
+    model: str,
+    api_url: str,
+    api_key: str,
+    system_prompt: str = _VLM_SYSTEM_PROMPT,
+    user_prompt: str = _VLM_USER_PROMPT,
+    allow_http: bool = False,
+    max_tokens: int = 1024,
+    tls: TLSPolicy | None = None,
+    timeout: float | None = 120.0,
+    compat: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Encode ``frames``, call ``provider`` and parse the VLM JSON response."""
+    image_b64 = _frames_to_base64(frames)
+    if not image_b64:
+        return {"summary": "", "tags": [], "objects": []}
+    response = _call_provider_raw(
+        provider,
+        model=model,
+        api_url=api_url,
+        api_key=api_key,
+        system_prompt=system_prompt,
+        user_prompt=user_prompt,
+        image_b64_list=image_b64,
+        allow_http=allow_http,
+        max_tokens=max_tokens,
+        tls=tls,
+        timeout=timeout,
+        compat=compat,
+        response_schema=_VLM_RESPONSE_SCHEMA,
+    )
+    if response is None:
+        return {"summary": "", "tags": [], "objects": [], "rating": None}
+    return _parse_vlm_response(response)
 
 
 def _run_ollama_vlm(
@@ -1138,23 +1434,21 @@ def _run_ollama_vlm(
     user_prompt: str = _VLM_USER_PROMPT,
     max_tokens: int = 1024,
     tls: TLSPolicy | None = None,
+    timeout: float | None = 120.0,
 ) -> dict[str, Any]:
     """Run analysis using Ollama."""
-    image_b64 = _frames_to_base64(frames)
-    if not image_b64:
-        return {"summary": "", "tags": [], "objects": []}
-
-    base_url = api_url or "http://localhost:11434"
-    response = _call_ollama(
-        base_url,
+    return _run_vlm(
+        frames,
+        "ollama",
         model,
+        api_url,
+        "",
         system_prompt,
         user_prompt,
-        image_b64,
         max_tokens=max_tokens,
         tls=tls,
+        timeout=timeout,
     )
-    return _parse_vlm_response(response)
 
 
 def _run_openai_vlm(
@@ -1165,16 +1459,23 @@ def _run_openai_vlm(
     user_prompt: str = _VLM_USER_PROMPT,
     max_tokens: int = 1024,
     tls: TLSPolicy | None = None,
+    timeout: float | None = 120.0,
+    compat: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Run analysis using OpenAI Vision API."""
-    image_b64 = _frames_to_base64(frames)
-    if not image_b64:
-        return {"summary": "", "tags": [], "objects": []}
-
-    response = _call_openai(
-        api_key, model, system_prompt, user_prompt, image_b64, max_tokens=max_tokens, tls=tls
+    return _run_vlm(
+        frames,
+        "openai",
+        model,
+        "",
+        api_key,
+        system_prompt,
+        user_prompt,
+        max_tokens=max_tokens,
+        tls=tls,
+        timeout=timeout,
+        compat=compat,
     )
-    return _parse_vlm_response(response)
 
 
 def _run_api_vlm(
@@ -1187,24 +1488,25 @@ def _run_api_vlm(
     allow_http: bool = False,
     max_tokens: int = 1024,
     tls: TLSPolicy | None = None,
+    timeout: float | None = 120.0,
+    compat: Mapping[str, Any] | None = None,
+    provider: str = "api",
 ) -> dict[str, Any]:
-    """Run analysis using a custom API endpoint (OpenAI-compatible)."""
-    image_b64 = _frames_to_base64(frames)
-    if not image_b64:
-        return {"summary": "", "tags": [], "objects": []}
-
-    response = _call_custom_api(
-        api_key,
-        api_url,
+    """Run analysis using a custom API endpoint (OpenAI-compatible; ``api`` / ``llamacpp``)."""
+    return _run_vlm(
+        frames,
+        provider,
         model,
+        api_url,
+        api_key,
         system_prompt,
         user_prompt,
-        image_b64,
         allow_http=allow_http,
         max_tokens=max_tokens,
         tls=tls,
+        timeout=timeout,
+        compat=compat,
     )
-    return _parse_vlm_response(response)
 
 
 # ─── Scene Detection ───────────────────────────────────────────────
@@ -1697,18 +1999,8 @@ def _parse_coordinator_response(response_text: str, num_scenes: int) -> dict[str
     response isn't the expected shape -- e.g. "drop" isn't a list, or contains an
     out-of-range index. Never raises.
     """
-    import json
-
-    text = response_text.strip()
-    text = re.sub(r"^```(?:json)?\s*\n?", "", text)
-    text = re.sub(r"\n?```\s*$", "", text).strip()
-
-    try:
-        data = json.loads(text)
-    except json.JSONDecodeError, TypeError:
-        return None
-
-    if not isinstance(data, dict):
+    data = _extract_json_dict(response_text)
+    if data is None:
         return None
 
     drop = data.get("drop", [])
@@ -1743,10 +2035,11 @@ def run_scene_coordinator(
     ``scene_summaries``: list of dicts with keys index/start_time/end_time/
     duration/summary/tags (see ``_build_coordinator_prompt``).
 
-    Config: ``analysis.llm`` (provider/model/api_key/api_url/allow_http) -- see
-    ``Config.DEFAULTS``. Reuses the same provider dispatch as per-frame VLM calls
-    (``_dispatch_vlm`` with an empty image list, i.e. a text-only request), so the
-    same allow_http/HTTPS gate applies to a non-loopback ``api_url``.
+    Config: the endpoint ``analysis.llm.endpoint`` selects from ``analysis.endpoints``
+    (REQUIREMENTS.md § 24.4) -- see ``Config.DEFAULTS``. Uses the same provider routing
+    as per-frame VLM calls (``_call_provider_raw`` with an empty image list, i.e. a
+    text-only request), so the same allow_http/HTTPS gate applies to a non-loopback
+    ``api_url``.
 
     Failure mode (R1.7 / the scene-drop spec's "fail open, never fail closed to
     drop everything"): on ANY failure -- request error, timeout, malformed/
@@ -1755,24 +2048,19 @@ def run_scene_coordinator(
     scene. This function never raises and never returns a "drop everything"
     result as a side effect of a parse failure.
     """
-    llm_config = config.get("analysis", "llm", default={})
-    provider = llm_config.get("provider", "ollama")
-    model = llm_config.get("model", "llama3")
-    api_url = llm_config.get("api_url", "")
-    api_key = llm_config.get("api_key", "")
-    allow_http = bool(llm_config.get("allow_http", False))
-    max_tokens = int(llm_config.get("max_tokens", 4096))
     try:
-        tls = resolve_tls_policy(config, purpose="llm")
+        ep = resolve_role_endpoint(config, "llm")
+        tls = resolve_tls_policy(config, ep.tls, purpose=ep.tls_purpose)
     except ValueError as e:
         # Fail open like every other coordinator failure (keep all scenes), but loudly.
-        logger.warning("Scene coordinator: invalid network.tls config (%s); keeping all scenes", e)
+        logger.warning("Scene coordinator: invalid endpoint/TLS config (%s); keeping all scenes", e)
         return {
             "drop": [],
             "reasons": {},
             "main_content_summary": "",
             "failed": True,
         }
+    provider = ep.provider
 
     if not scene_summaries:
         return {"drop": [], "reasons": {}, "main_content_summary": "", "failed": False}
@@ -1784,15 +2072,17 @@ def run_scene_coordinator(
     # which expects the summary/tags/objects/rating shape, not the coordinator's
     # own main_content_summary/drop/reasons shape (see _parse_coordinator_response).
     raw_text = _call_coordinator_provider(
-        provider,
-        model,
-        api_url,
-        api_key,
+        ep.provider,
+        ep.model,
+        ep.api_url,
+        ep.api_key,
         _COORDINATOR_SYSTEM_PROMPT,
         user_prompt,
-        allow_http,
-        max_tokens=max_tokens,
+        ep.allow_http,
+        max_tokens=ep.max_tokens,
         tls=tls,
+        timeout=ep.timeout_sec,
+        compat=ep.compat,
     )
     if raw_text is None:
         logger.warning(
@@ -1856,39 +2146,33 @@ def _call_coordinator_provider(
     allow_http: bool,
     max_tokens: int = 4096,
     tls: TLSPolicy | None = None,
+    timeout: float | None = 120.0,
+    compat: Mapping[str, Any] | None = None,
 ) -> str | None:
     """Call the raw (unparsed) text-completion provider for the coordinator pass.
 
     Returns the raw response text, or None on any failure (network error,
-    exception, refused non-HTTPS URL). Unlike ``_run_*_vlm``, this returns the
+    exception, refused non-HTTPS URL). Unlike ``_run_vlm``, this returns the
     provider's raw text instead of running it through ``_parse_vlm_response``
     (the coordinator has its own response shape/parser, see
     ``_parse_coordinator_response``).
     """
     try:
-        if provider in ("local", "ollama"):
-            base_url = api_url or "http://localhost:11434"
-            text = _call_ollama(
-                base_url, model, system_prompt, user_prompt, [], max_tokens=max_tokens, tls=tls
-            )
-        elif provider == "openai":
-            text = _call_openai(
-                api_key, model, system_prompt, user_prompt, [], max_tokens=max_tokens, tls=tls
-            )
-        elif provider == "api":
-            text = _call_custom_api(
-                api_key,
-                api_url,
-                model,
-                system_prompt,
-                user_prompt,
-                [],
-                allow_http=allow_http,
-                max_tokens=max_tokens,
-                tls=tls,
-            )
-        else:
-            return None
+        text = _call_provider_raw(
+            provider,
+            model=model,
+            api_url=api_url,
+            api_key=api_key,
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            image_b64_list=[],
+            allow_http=allow_http,
+            max_tokens=max_tokens,
+            tls=tls,
+            timeout=timeout,
+            compat=compat,
+            response_schema=_COORDINATOR_RESPONSE_SCHEMA,
+        )
     except Exception:
         logger.warning("Scene coordinator provider call raised", exc_info=True)
         return None
@@ -1924,27 +2208,19 @@ def _parse_crop_vlm_response(response_text: str) -> dict[str, Any] | None:
     instead of forcing a hard failure. Returns None only when neither parse
     path can extract a clear answer -- the caller treats that as fail-open.
     """
-    import json
-
-    original = response_text.strip()
+    original = _strip_think(response_text)
     if not original:
         return None
 
-    text = re.sub(r"^```(?:json)?\s*\n?", "", original)
-    text = re.sub(r"\n?```\s*$", "", text).strip()
-
-    try:
-        data = json.loads(text)
-        if isinstance(data, dict) and "content_outside" in data:
-            return {
-                "content_outside": bool(data.get("content_outside")),
-                "reason": str(data.get("reason", "")),
-            }
-    except json.JSONDecodeError, TypeError:
-        pass
+    data = _extract_json_dict(original)
+    if data is not None and "content_outside" in data:
+        return {
+            "content_outside": bool(data.get("content_outside")),
+            "reason": str(data.get("reason", "")),
+        }
 
     # Tolerant fallback: no valid/expected-shape JSON -- look for a clear
-    # yes/no signal near the start of the raw response.
+    # yes/no signal near the start of the (reasoning-stripped) response.
     lowered = original.lower()[:80]
     if re.search(r"\b(true|yes)\b", lowered):
         return {"content_outside": True, "reason": original[:300]}
@@ -1962,7 +2238,7 @@ def run_crop_vlm_check(
     proposed crop box (see ``CropStage._run_vlm_check`` in
     ``core/stages/crop.py``).
 
-    Uses ``analysis.vlm`` (provider/model/api_key/api_url/allow_http) --
+    Uses the endpoint ``analysis.vlm.endpoint`` selects (REQUIREMENTS.md § 24.4) --
     the same connection layer and HTTPS/allow_http gate as
     ``VideoAnalyzer.run_vlm_analysis``. This is an internal, fixed prompt
     pair (system + user) -- ``analysis.vlm.prompt_override``/
@@ -1974,17 +2250,13 @@ def run_crop_vlm_check(
     with the plain cropdetect result rather than block on VLM availability.
     Never raises.
     """
-    vlm_config = config.get("analysis", "vlm", default={})
-    provider = vlm_config.get("provider", "local")
-    model = vlm_config.get("model", "llava")
-    api_url = vlm_config.get("api_url", "")
-    api_key = vlm_config.get("api_key", "")
-    allow_http = bool(vlm_config.get("allow_http", False))
     try:
-        tls = resolve_tls_policy(config, purpose="crop-vlm")
+        ep = resolve_role_endpoint(config, "vlm")
+        tls = resolve_tls_policy(config, ep.tls, purpose=f"crop-vlm:{ep.name}")
     except ValueError as e:
-        logger.warning("Crop VLM check: invalid network.tls config (%s)", e)
+        logger.warning("Crop VLM check: invalid endpoint/TLS config (%s)", e)
         return {"checked": False, "content_outside": False, "reason": str(e), "failed": True}
+    provider = ep.provider
 
     images_b64 = _frames_to_base64([full_frame_path, boxed_frame_path])
     if len(images_b64) < 2:
@@ -1996,37 +2268,22 @@ def run_crop_vlm_check(
         }
 
     try:
-        if provider in ("local", "ollama"):
-            base_url = api_url or "http://localhost:11434"
-            raw = _call_ollama(
-                base_url,
-                model,
-                _CROP_VLM_SYSTEM_PROMPT,
-                _CROP_VLM_USER_PROMPT,
-                images_b64,
-                tls=tls,
-            )
-        elif provider == "openai":
-            raw = _call_openai(
-                api_key,
-                model,
-                _CROP_VLM_SYSTEM_PROMPT,
-                _CROP_VLM_USER_PROMPT,
-                images_b64,
-                tls=tls,
-            )
-        elif provider == "api":
-            raw = _call_custom_api(
-                api_key,
-                api_url,
-                model,
-                _CROP_VLM_SYSTEM_PROMPT,
-                _CROP_VLM_USER_PROMPT,
-                images_b64,
-                allow_http=allow_http,
-                tls=tls,
-            )
-        else:
+        raw = _call_provider_raw(
+            ep.provider,
+            model=ep.model,
+            api_url=ep.api_url,
+            api_key=ep.api_key,
+            system_prompt=_CROP_VLM_SYSTEM_PROMPT,
+            user_prompt=_CROP_VLM_USER_PROMPT,
+            image_b64_list=images_b64,
+            allow_http=ep.allow_http,
+            max_tokens=ep.max_tokens,
+            tls=tls,
+            timeout=ep.timeout_sec,
+            compat=ep.compat,
+            response_schema=_CROP_RESPONSE_SCHEMA,
+        )
+        if raw is None:
             raw = ""
     except Exception as e:
         logger.warning("Crop VLM check raised an exception (provider=%s)", provider, exc_info=True)

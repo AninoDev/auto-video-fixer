@@ -5,6 +5,36 @@ import subprocess
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def _isolate_user_dirs(tmp_path_factory, monkeypatch):
+    """Point the user's CONFIG and STATE directories at throwaway locations for EVERY test.
+
+    `Config()` with no path reads (and, since REQUIREMENTS.md § 24, may bootstrap or
+    schema-migrate IN PLACE) the real `~/.config/auto-video-fixer/config.yaml`. A test that
+    forgot to pass an explicit path must never be able to read, create, back up or rewrite the
+    developer's real config. State is isolated too so CLI tests don't write into (and prune)
+    the developer's real log directory. First-run bootstrap is additionally disabled by
+    default so tests see plain `Config.DEFAULTS`; the bootstrap tests re-enable it explicitly
+    against their own tmp dirs.
+
+    Deliberately NOT isolated: `XDG_DATA_HOME`. The opt-in real-model tests
+    (tests/unit/test_ai_wrappers.py, test_ncnn_backends.py) skip themselves when no cached
+    checkpoint exists, and the cache lives in the data dir -- redirecting it would silently
+    turn those into permanent skips on a developer machine that has the weights.
+    """
+    base = tmp_path_factory.mktemp("userdirs")
+    for var, sub in (
+        ("XDG_CONFIG_HOME", "config"),
+        ("XDG_STATE_HOME", "state"),
+        ("APPDATA", "appdata"),
+    ):
+        path = base / sub
+        path.mkdir()
+        monkeypatch.setenv(var, str(path))
+    monkeypatch.setenv("AVF_NO_CONFIG_BOOTSTRAP", "1")
+    monkeypatch.delenv("AVF_CONFIG", raising=False)
+
+
 @pytest.fixture
 def tmp_video_file(tmp_path):
     """Create a temporary test video file using FFmpeg."""
