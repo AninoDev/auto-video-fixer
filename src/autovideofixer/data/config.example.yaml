@@ -205,6 +205,15 @@ general:
   # message, non-zero exit) -- never a silent overwrite of one file by the other.
   log_suffix_clean: "-clean"
 
+  # How many RUNS of automatic per-run logs (in the platform state dir's logs/ folder, e.g.
+  # ~/.local/state/auto-video-fixer/logs on Linux) to keep; older runs are deleted at startup.
+  # A run's raw + clean files ("both" mode) count as ONE run, and only files named like AVF's
+  # own automatic logs (avf-YYYYMMDD-HHMMSS...) are ever deleted -- anything else you keep in
+  # that folder is left alone. null or 0 = keep every log forever. Bounded by default so a
+  # busy install can't fill its disk. Read from this file only (not from `process` --set /
+  # --config layers), since logging starts before those are applied. No effect with --log-file.
+  log_retention_runs: 50
+
   # docs/REQUIREMENTS.md § 12.5: governs ONLY the final `encode` stage's ffmpeg `-fps_mode`.
   # "cfr" (default) keeps the deliverable constant-framerate at the target rate -- the same
   # posture as before this feature, now explicit rather than relying on ffmpeg's own

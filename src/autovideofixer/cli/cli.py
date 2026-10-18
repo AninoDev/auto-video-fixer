@@ -24,6 +24,7 @@ from autovideofixer import __version__
 from autovideofixer.cli import config_tools
 from autovideofixer.cli.progress import ProgressReporter, resolve_show_progress
 from autovideofixer.config import (
+    DEFAULT_LOG_RETENTION_RUNS,
     VALID_COLOR_MODES,
     VALID_LOG_TYPES,
     Config,
@@ -31,8 +32,11 @@ from autovideofixer.config import (
     diff_from_defaults,
     get_config_dir,
     get_log_dir,
+    new_run_log_path,
     prune_old_logs,
     redact_secrets,
+    release_unused_run_log,
+    resolve_log_retention,
     sanitize_console_text,
 )
 from autovideofixer.config_migrations import CURRENT_CONFIG_VERSION, migrate_text
@@ -110,12 +114,6 @@ def _safe(value: object) -> str:
     never passed through this helper.
     """
     return sanitize_console_text(value)
-
-
-# Max automatic per-run log files retained under get_log_dir() (see
-# config.prune_old_logs()). Oldest-by-mtime files beyond this count are
-# deleted at startup, before the current run's log file is created.
-MAX_RETAINED_LOGS = 50
 
 
 # ─── Config cascade: --preset/--config layering + --set + CLI-flags layer ──
@@ -783,13 +781,22 @@ def main(
     # An explicit --log-file replaces the automatic state-dir log rather than
     # adding a second file: the run's canonical log lives wherever the user
     # pointed it, and it gets the same always-DEBUG treatment.
+    reserved_log: Path | None = None
     if log_file:
         auto_log_file = log_file
     else:
         log_dir = get_log_dir()
         log_dir.mkdir(parents=True, exist_ok=True)
-        prune_old_logs(log_dir, keep=MAX_RETAINED_LOGS)
-        auto_log_file = str(log_dir / f"avf-{datetime.now():%Y%m%d-%H%M%S}.log")
+        try:
+            keep_runs = resolve_log_retention(
+                config.get("general", "log_retention_runs", default=DEFAULT_LOG_RETENTION_RUNS)
+            )
+        except ValueError as e:
+            console.print(f"[red]{_safe(e)}[/red]")
+            sys.exit(1)
+        prune_old_logs(log_dir, keep_runs=keep_runs)
+        reserved_log = new_run_log_path(log_dir)
+        auto_log_file = str(reserved_log)
 
     try:
         opened_files = setup_logging(
@@ -803,8 +810,12 @@ def main(
             color=resolved_color,
         )
     except ValueError as e:
+        if reserved_log is not None:
+            release_unused_run_log(reserved_log, [])
         console.print(f"[red]{_safe(e)}[/red]")
         sys.exit(1)
+    if reserved_log is not None:
+        release_unused_run_log(reserved_log, opened_files)
 
     logger = get_logger("autovideofixer.cli")
 

@@ -50,7 +50,7 @@ draws an explicit VERIFIED / UNVERIFIED line instead of a flat done/not-done che
   measurement failures are reported as "not checked" rather than a fake 0.0.
 - **CLI**: `process`, `analyze`, `find-duplicates`, `presets-cmd`, `gpu-info`, `model-info`,
   `model-download`; global `--config`/`AVF_CONFIG`; automatic per-run DEBUG log file with
-  retention (newest 50) under the platform state dir; startup settings banner (redacted
+  retention (`general.log_retention_runs`, default 50 runs, null = unlimited) under the platform state dir; startup settings banner (redacted
   effective-config diff at INFO, full dump at DEBUG).
 - **Preset system**: 7 built-in presets (`max_quality`, `4k60`, `4k30`, `1080p60`,
   `size_reduction`, `remux_only`, `hdr_enhance`), recursive config merging (a preset no longer

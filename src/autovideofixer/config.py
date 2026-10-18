@@ -8,6 +8,7 @@ import os
 import re
 import shutil
 import sys
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -65,28 +66,105 @@ def get_log_dir() -> Path:
     return get_state_dir() / "logs"
 
 
-def prune_old_logs(log_dir: Path, keep: int = 50) -> None:
-    """Delete the oldest files in `log_dir` (by mtime) beyond `keep` newest.
+# Default for general.log_retention_runs. Kept bounded by default so a busy install
+# can't fill its disk with logs; set the key to null/0 for unlimited retention.
+DEFAULT_LOG_RETENTION_RUNS = 50
 
-    Simple retention for the automatic per-run log file: called once at CLI
-    startup, before the current run's log file is created, so it never
-    counts (or deletes) the file about to be written.
-    """
-    if not log_dir.is_dir():
-        return
-    try:
-        files = sorted(
-            (p for p in log_dir.iterdir() if p.is_file()),
-            key=lambda p: p.stat().st_mtime,
-            reverse=True,
+# One automatic per-run log = every file whose name starts with the same run stem:
+# "avf-YYYYMMDD-HHMMSS" plus an optional ".N" collision counter (see new_run_log_path),
+# followed by whatever general.log_type=both suffixes and extension setup_logging adds
+# ("avf-20261018-105406-clean.log", "avf-20261018-105406.2-raw.log", ...).
+_RUN_LOG_RE = re.compile(r"^(avf-\d{8}-\d{6}(?:\.\d+)?)(?=[-.])")
+
+
+def resolve_log_retention(value: Any) -> int | None:
+    """Validate ``general.log_retention_runs``: ``None``/``0`` -> unlimited (``None``),
+    a positive int -> that many runs. Anything else raises ``ValueError``."""
+    if value is None or value == 0:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError(
+            f"Invalid general.log_retention_runs: {value!r} "
+            "(must be a positive integer, or null/0 for unlimited)"
         )
+    return value
+
+
+def prune_old_logs(log_dir: Path, keep_runs: int | None = DEFAULT_LOG_RETENTION_RUNS) -> None:
+    """Delete automatic per-run logs beyond the ``keep_runs`` newest RUNS.
+
+    Called once at CLI startup, before the current run's log is created, so it
+    never counts (or deletes) the run about to start. ``keep_runs=None`` keeps
+    everything.
+
+    Counts runs, not files: since general.log_type=both, one run writes two files
+    (raw + clean), so the old "newest 50 files" rule silently kept only ~25 runs
+    (fewer still with extra files around). A run's age is its newest file's mtime.
+
+    Only files whose names match the automatic log pattern (``_RUN_LOG_RE``) are
+    ever considered -- anything else a user drops into the directory (notes,
+    archived logs under other names) is never deleted. The old rule deleted
+    every file in the directory.
+    """
+    if keep_runs is None or not log_dir.is_dir():
+        return
+    runs: dict[str, list[Path]] = {}
+    try:
+        for p in log_dir.iterdir():
+            m = _RUN_LOG_RE.match(p.name)
+            if m and p.is_file():
+                runs.setdefault(m.group(1), []).append(p)
+        newest = {stem: max(f.stat().st_mtime for f in files) for stem, files in runs.items()}
     except OSError:
         return
-    for stale in files[keep:]:
-        try:
-            stale.unlink()
-        except OSError:
-            pass
+    ordered = sorted(runs, key=lambda stem: newest[stem], reverse=True)
+    for stem in ordered[keep_runs:]:
+        for stale in runs[stem]:
+            try:
+                stale.unlink()
+            except OSError:
+                pass
+
+
+def new_run_log_path(log_dir: Path, now: datetime | None = None) -> Path:
+    """Reserve and return this run's automatic log path: ``avf-YYYYMMDD-HHMMSS.log``,
+    or ``avf-YYYYMMDD-HHMMSS.N.log`` when another run already used that second.
+
+    Without the counter, two runs starting in the same second (back-to-back
+    scripted runs, parallel invocations) wrote the same filename and the later
+    one overwrote the earlier one's log. Any existing file with the same run stem
+    counts as taken, including "both"-mode suffixed files.
+
+    The returned file is CREATED (empty, ``O_EXCL``) so the reservation is atomic:
+    a name check alone raced -- two concurrent runs both saw the name free before
+    either opened its log (observed with two parallel ``avf`` invocations). The
+    log handlers append to it; the caller removes it via
+    ``release_unused_run_log()`` if no handler ended up writing there (e.g.
+    ``log_type: none``, or a non-empty raw suffix in "both" mode).
+    """
+    stem = f"avf-{(now or datetime.now()):%Y%m%d-%H%M%S}"
+    candidate, n = stem, 1
+    while True:
+        if not (any(log_dir.glob(f"{candidate}.*")) or any(log_dir.glob(f"{candidate}-*"))):
+            path = log_dir / f"{candidate}.log"
+            try:
+                os.close(os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644))
+                return path
+            except FileExistsError:
+                pass  # lost the race to a concurrent run; try the next counter
+        n += 1
+        candidate = f"{stem}.{n}"
+
+
+def release_unused_run_log(path: Path, opened: list[str]) -> None:
+    """Remove the ``new_run_log_path()`` reservation if logging didn't use it."""
+    if str(path) in opened:
+        return
+    try:
+        if path.stat().st_size == 0:
+            path.unlink()
+    except OSError:
+        pass
 
 
 def get_config_path() -> Path:
@@ -94,12 +172,23 @@ def get_config_path() -> Path:
     return get_config_dir() / "config.yaml"
 
 
-_SECRET_KEY_MARKERS = ("api_key", "apikey", "token", "password", "secret")
+_SECRET_KEY_MARKERS = ("api_key", "apikey", "password", "secret")
 
 
 def _looks_like_secret_key(key: str) -> bool:
+    """Does a config key name look like it holds a credential?
+
+    ``token`` is matched as a whole ``_``/``-``/``.``-separated segment or as the
+    key's ending (``access_token``, ``hf_token``, ``authToken``), NOT as a
+    substring: a substring match flagged ``max_tokens`` (masked as ``***`` in the
+    startup config banner, and refused by ``--set``) and would flag the vision
+    budget keys like ``tokens_per_tile``. The other markers stay substrings --
+    nothing benign contains them.
+    """
     lowered = key.lower()
-    return any(marker in lowered for marker in _SECRET_KEY_MARKERS)
+    if any(marker in lowered for marker in _SECRET_KEY_MARKERS):
+        return True
+    return lowered.endswith("token") or "token" in re.split(r"[_.\-]", lowered)
 
 
 def redact_secrets(data: Any) -> Any:
@@ -455,6 +544,14 @@ class Config:
             # non-zero exit) -- never a silent overwrite of one file by the
             # other.
             "log_suffix_clean": "-clean",
+            # How many RUNS of automatic per-run logs (under the platform state
+            # dir's logs/) to keep; older runs are deleted at startup. A run's
+            # raw + clean files count as ONE run. Only files named like AVF's own
+            # automatic logs are ever deleted. null or 0 = keep everything. Bounded
+            # by default so a busy install can't fill its disk. Like log_type, this
+            # is read from the base config file only (logging is set up before
+            # `process` layers are applied). Has no effect with --log-file.
+            "log_retention_runs": DEFAULT_LOG_RETENTION_RUNS,
             # REQUIREMENTS.md § 12.5: governs ONLY the final `encode` stage's
             # ffmpeg `-fps_mode`. "cfr" (default) keeps the deliverable
             # constant-framerate at the target rate -- the same posture as

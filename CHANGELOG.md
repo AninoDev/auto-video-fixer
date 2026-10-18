@@ -8,6 +8,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- **Log retention deleted real-run logs too early.** It kept the newest 50 *files* (about 25 runs
+  with `log_type: both`, fewer with strays) and deleted *any* file in the log directory. It now
+  keeps `general.log_retention_runs` RUNS (default 50; `null`/`0` = unlimited), groups a run's
+  raw + clean files together, and only ever deletes files named like AVF's automatic logs.
+- Two runs starting in the same second wrote the same log filename, so the later run overwrote
+  the earlier run's log; the second now gets `avf-YYYYMMDD-HHMMSS.2.log`.
+- `max_tokens` (any key containing "token") was masked as `***` in the startup config banner and
+  refused by `--set` as a secret. `token` now only counts as a whole key segment or ending.
+- `avf process clip.mp4` with a bare relative filename crashed creating a temp path
+  (`os.makedirs('')`).
 - `avf model-info` truncated model names with an ellipsis at 80 columns (two models both showed as
   `RealESRGAN_x4...`); the Name column no longer truncates.
 

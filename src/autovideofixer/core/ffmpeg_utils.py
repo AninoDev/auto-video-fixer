@@ -689,7 +689,9 @@ def generate_temp_path(
     """
     import uuid
 
-    base = temp_dir or os.path.dirname(original_path) or base_dir
+    # A bare relative filename ("clip.mp4") has dirname "", and os.makedirs("")
+    # raises FileNotFoundError -- so resolve against the cwd instead of crashing.
+    base = temp_dir or os.path.dirname(original_path) or base_dir or os.getcwd()
     os.makedirs(base, exist_ok=True)
     return os.path.join(base, f".avf_{uuid.uuid4().hex[:8]}{suffix}{ext}")
 

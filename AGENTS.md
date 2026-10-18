@@ -1317,16 +1317,28 @@ stages means they never spend compute on pixels that would just be discarded dow
   (macOS/Windows fall back to the same base as the data dir, since neither platform has a
   distinct "state" convention). `get_log_dir()` = `<state_dir>/logs`.
 - **Automatic per-run DEBUG log file**: every CLI invocation writes a timestamped log file
-  (`avf-YYYYMMDD-HHMMSS.log`) to `get_log_dir()` at DEBUG level, independent of console
-  verbosity — always on, no flag needed. The exact path is printed/logged at startup. Retention:
-  newest 50 kept (`prune_old_logs()`, pruned at startup before the current run's file is
-  created); `--log-file PATH` *replaces* the automatic location for that run (same always-DEBUG
-  file logging, user-chosen path; no state-dir file is created).
+  (`avf-YYYYMMDD-HHMMSS.log`, or `avf-YYYYMMDD-HHMMSS.N.log` when another run already used that
+  second -- `config.new_run_log_path()`, which reserves the name atomically by creating the file
+  with `O_EXCL` because a name check alone raced between parallel invocations; the CLI removes the
+  empty reservation via `release_unused_run_log()` when no handler wrote there, e.g. `log_type:
+  none`; before the counter, same-second runs overwrote each other's log) to `get_log_dir()` at DEBUG level, independent of console verbosity — always on,
+  no flag needed. The exact path is printed/logged at startup. **Retention** is
+  `general.log_retention_runs` (default 50, `null`/`0` = unlimited), counted in **runs, not
+  files** (`config.prune_old_logs()`, at startup before the current run's file is created). A
+  run's raw + clean files ("both" mode) group by their shared `avf-<stamp>[.N]` stem, and a run's
+  age is its newest file's mtime. Only files matching that automatic-log pattern are ever deleted.
+  Why: the old rule kept the newest 50 *files* and deleted *any* file in the directory -- with
+  `log_type: both` that was ~25 runs, so a burst of test runs could push out logs of real runs.
+  Like `log_type`, the key is read from the base config only (logging starts before `process`
+  layers). `--log-file PATH` *replaces* the automatic location for that run (same always-DEBUG
+  file logging, user-chosen path; no state-dir file is created, nothing is pruned).
 - **Startup settings banner**: on every invocation, the CLI logs (`_log_effective_settings()` in
   `cli.py`) the version, full `sys.argv`, which config file is in use (default vs. explicit), and
   a redacted diff of effective config vs. `Config.DEFAULTS` at INFO; the full effective config
-  dump (also redacted) at DEBUG. Secret-looking keys (containing `api_key`/`apikey`/`token`/
-  `password`/`secret`, case-insensitive) are masked as `"***"` via `config.redact_secrets()`.
+  dump (also redacted) at DEBUG. Secret-looking keys (containing `api_key`/`apikey`/`password`/
+  `secret`, or with `token` as a whole `_`/`-`/`.` segment or the key's ending -- `access_token`,
+  `authToken` -- case-insensitive; never a substring, so `max_tokens`/`tokens_per_tile` are NOT
+  masked) are masked as `"***"` via `config.redact_secrets()`.
   Re-logged after `process`'s own preset/flag merging, since the group-level log only reflects
   what was loaded from disk.
 - **`--config PATH`** (global flag, before the subcommand) / **`AVF_CONFIG`** env var select an
