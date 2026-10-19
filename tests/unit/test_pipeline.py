@@ -1717,6 +1717,7 @@ class TestReportingFields:
             stabilize_tiers={},
             interpolated_scenes=[],
             vlm_sampling=[],
+            vlm_cross_check=[],
         )
         monkeypatch.setattr(
             "autovideofixer.core.scenes.run_scene_pipeline", lambda *a, **k: fake_scene_result

@@ -1405,6 +1405,9 @@ class Pipeline:
                     # § 25.4: frames/duplicates/size/tokens sent to the VLM per scene.
                     "vlm_sampling": list(scene_result.vlm_sampling),
                 }
+                if scene_result.vlm_cross_check:
+                    # § 27: each scene's legs + verdict (calls are also in jobs[].vlm_calls).
+                    scene_stats["vlm_cross_check"] = list(scene_result.vlm_cross_check)
                 for dropped in scene_result.dropped_scenes:
                     self.logger.warning(
                         "Scene mode: dropped scene #%s (t=%.1f-%.1fs): %s",

@@ -18,10 +18,13 @@ import cv2
 import numpy as np
 import pytest
 
+from autovideofixer.core import vlm_sampling as vs_module
 from autovideofixer.core.vlm_sampling import (
+    FFmpegFrameSource,
     SamplingConfig,
     VisionLimits,
     sample_vlm_frames,
+    sample_vlm_frames_multi,
 )
 
 pytestmark = [
@@ -401,3 +404,81 @@ def test_missing_or_garbage_file_returns_empty(tmp_path):
     junk = tmp_path / "junk.mp4"
     junk.write_bytes(b"not a video" * 100)
     assert _sample(junk).paths == []
+
+
+# --- § 27: several endpoints, one probe, one decode per frame -----------------------------
+
+
+def _cleanup(*sampled_list):
+    for s in sampled_list:
+        shutil.rmtree(s.tmp_dir, ignore_errors=True)
+
+
+@pytest.mark.parametrize("clip", ["dup", "vfr", "ts", "hd"])
+def test_multi_endpoint_sizes_and_frames_match_single_endpoint_runs(media, clip):
+    cfg = SamplingConfig(min_frames=4, max_frames=4, interval_sec=1.5)
+    visions = [VisionLimits(max_long_side_px=96), VisionLimits(max_long_side_px=192)]
+    multi = sample_vlm_frames_multi(media[clip], cfg, visions)
+    singles = [sample_vlm_frames(media[clip], cfg, v) for v in visions]
+    try:
+        for m, s, v in zip(multi, singles, visions, strict=True):
+            mi, si = _decode(m.paths), _decode(s.paths)
+            assert len(mi) == len(si) == 4
+            assert {(i.shape[1], i.shape[0]) for i in mi} == {(i.shape[1], i.shape[0]) for i in si}
+            assert max(mi[0].shape[:2]) == v.max_long_side_px
+            assert (m.report.width, m.report.height) == (s.report.width, s.report.height)
+            # the same instants are sampled: the shared decode is just a cheaper way to get them
+            assert [round(float(i.mean()), 0) for i in mi] == pytest.approx(
+                [round(float(i.mean()), 0) for i in si], abs=3.0
+            )
+    finally:
+        _cleanup(*multi, *singles)
+
+
+def test_multi_endpoint_decodes_each_frame_once_with_real_ffmpeg(media, monkeypatch):
+    instances = []
+
+    class Spy(FFmpegFrameSource):
+        def __init__(self, *a, **kw):
+            super().__init__(*a, **kw)
+            instances.append(self)
+
+    monkeypatch.setattr(vs_module, "FFmpegFrameSource", Spy)
+    cfg = SamplingConfig(min_frames=5, max_frames=5, interval_sec=1.0)
+    visions = [VisionLimits(max_long_side_px=320), VisionLimits(max_long_side_px=640)] * 2
+    multi = sample_vlm_frames_multi(media["hd"], cfg, visions)
+    try:
+        (source,) = instances
+        assert [len(m.paths) for m in multi] == [5, 5, 5, 5]
+        assert source.decodes == 5  # four endpoints, five distinct frames, five ffmpeg runs
+        sizes = [{(i.shape[1], i.shape[0]) for i in _decode(m.paths)} for m in multi]
+        assert sizes == [{(320, 180)}, {(640, 360)}, {(320, 180)}, {(640, 360)}]
+    finally:
+        _cleanup(*multi)
+
+
+def test_multi_endpoint_scene_range_and_rotation(media, tmp_path):
+    cfg = SamplingConfig(min_frames=3, max_frames=3, interval_sec=1.0)
+    visions = [VisionLimits(max_long_side_px=64), VisionLimits(max_long_side_px=128)]
+    multi = sample_vlm_frames_multi(media["hd"], cfg, visions, 10.0, 20.0)
+    try:
+        assert all(10.0 <= m.report.start_time and m.report.end_time <= 20.0 for m in multi)
+        assert [len(m.paths) for m in multi] == [3, 3]
+    finally:
+        _cleanup(*multi)
+    out = str(tmp_path / "rot.mp4")
+    r = subprocess.run(
+        ["ffmpeg", "-v", "error", "-y", "-display_rotation", "90", "-i", media["small"],
+         "-c", "copy", out],
+        capture_output=True,
+    )  # fmt: skip
+    if r.returncode != 0:
+        pytest.skip("ffmpeg lacks -display_rotation")
+    multi = sample_vlm_frames_multi(out, SamplingConfig(min_frames=1, max_frames=1), visions)
+    try:
+        for m in multi:
+            img = _decode(m.paths)[0]
+            assert img.shape[0] > img.shape[1]  # portrait after rotation, at each endpoint's size
+            assert (img.shape[1], img.shape[0]) == (m.report.width, m.report.height)
+    finally:
+        _cleanup(*multi)

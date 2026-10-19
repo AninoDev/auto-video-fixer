@@ -27,7 +27,7 @@ import re
 import shutil
 import subprocess
 import tempfile
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
@@ -50,6 +50,10 @@ MOTION_PROBE_FRAMES = 8
 MOTION_FULL_SCALE = 0.10
 # Duration saturation constant: d / (d + 30 s) (§ 25.3).
 DURATION_HALF_SATURATION_SEC = 30.0
+# Decoded-frame bytes the shared multi-endpoint cache may hold before it drops the oldest
+# images (their thumbnails stay; a later read re-decodes). Bounds the cross-check memory the
+# way freeing rejected frames bounds the single-endpoint path (§ 25.5, § 27.3).
+SHARED_CACHE_BUDGET_BYTES = 512 * 1024 * 1024
 
 
 # --------------------------------------------------------------------------------------
@@ -773,6 +777,8 @@ class FFmpegFrameSource:
         ffmpeg: str,
         lo: int = 0,
         hi: int | None = None,
+        *,
+        cache_budget_bytes: int | None = None,
     ):
         self.filepath = filepath
         self.timeline = timeline
@@ -782,6 +788,11 @@ class FFmpegFrameSource:
         self.target_size: tuple[int, int] | None = None
         self.decodes = 0
         self._cache: dict[tuple[int, tuple[int, int] | None], Candidate] = {}
+        # Shared mode (several endpoints read through ``ScaledView``): the cached candidate
+        # keeps its image until the byte budget is exceeded, then the oldest images are
+        # dropped and re-decoded if wanted again. ``None`` = the single-endpoint behaviour,
+        # where ``select_frames`` frees rejected candidates' images in place.
+        self.cache_budget_bytes = cache_budget_bytes
 
     def index_at(self, t: float) -> int:
         """Index of the frame on screen at ``t`` (last frame with time <= t), within range."""
@@ -791,12 +802,29 @@ class FFmpegFrameSource:
     def read(self, t: float) -> Candidate | None:
         k = self.index_at(t)
         cached = self._cache.get((k, self.target_size))
-        if cached is not None:
+        if cached is not None and (cached.image is not None or self.cache_budget_bytes is None):
             return cached
         cand = self._decode(k)
         if cand is not None:
             self._cache[(k, self.target_size)] = cand
+            self._enforce_budget(cand)
         return cand
+
+    def _enforce_budget(self, newest: Candidate) -> None:
+        if self.cache_budget_bytes is None:
+            return
+        total = sum(c.image.nbytes for c in self._cache.values() if c.image is not None)
+        for cand in self._cache.values():
+            if total <= self.cache_budget_bytes:
+                break
+            if cand is newest or cand.image is None:
+                continue
+            total -= cand.image.nbytes
+            cand.image = None
+
+    def clear(self) -> None:
+        """Drop every cached frame (the shared cache is freed once all JPEGs are written)."""
+        self._cache.clear()
 
     def _run(self, seek: float, w: int, h: int, *, fast: bool) -> tuple[bytes, float] | None:
         """One ffmpeg decode of the first frame at/after ``seek``; ``(bgr bytes, its time)``.
@@ -854,6 +882,42 @@ class FFmpegFrameSource:
         return Candidate(key=k, ts=times[k], thumb=thumb, image=frame)
 
 
+class ScaledView:
+    """One endpoint's window onto a shared :class:`FFmpegFrameSource` (§ 27.3).
+
+    The source decodes each frame once at the largest size any endpoint's plan needs; this view
+    hands the selection loop a *fresh* ``Candidate`` per read with the image downscaled
+    (``INTER_AREA``, never up) to this endpoint's own plan size. Fresh, so ``select_frames``
+    freeing a rejected candidate's image can't blank the cached frame another endpoint still
+    wants.
+    """
+
+    def __init__(self, source: FFmpegFrameSource, size: tuple[int, int]):
+        self.source = source
+        self.size = size
+
+    def read(self, t: float) -> Candidate | None:
+        import cv2
+
+        cand = self.source.read(t)
+        if cand is None or cand.image is None:
+            return None
+        image = cand.image
+        w, h = self.size
+        if image.shape[1] != w or image.shape[0] != h:
+            image = cv2.resize(image, (w, h), interpolation=cv2.INTER_AREA)
+        return Candidate(key=cand.key, ts=cand.ts, thumb=cand.thumb, image=image)
+
+
+def _empty_frames(
+    vision: VisionLimits, sampling: SamplingConfig, start_time: float
+) -> SampledFrames:
+    report = SamplingReport(
+        jpeg_quality=vision.jpeg_quality, balance=sampling.balance, start_time=start_time
+    )
+    return SampledFrames(paths=[], tmp_dir="", report=report)
+
+
 def sample_vlm_frames(
     filepath: str,
     sampling: SamplingConfig,
@@ -871,27 +935,53 @@ def sample_vlm_frames(
     ``tmp_dir`` once the provider call is done (the files must outlive this call).
     ``config`` (optional ``Config``) only selects the ffmpeg/ffprobe binaries.
     """
+    return sample_vlm_frames_multi(
+        filepath, sampling, [vision], start_time, end_time, prefix=prefix, config=config
+    )[0]
+
+
+def sample_vlm_frames_multi(
+    filepath: str,
+    sampling: SamplingConfig,
+    visions: Sequence[VisionLimits],
+    start_time: float = 0.0,
+    end_time: float | None = None,
+    *,
+    prefix: str = "avf_samples_",
+    config: Any = None,
+) -> list[SampledFrames]:
+    """:func:`sample_vlm_frames` for several endpoints at once (cross-check, § 27.3).
+
+    One probe, one frame source and one decode cache serve every entry of ``visions``; each
+    gets its own plan (frame count and size from its own limits), its own selection and its own
+    JPEGs (at its own quality, in its own temp dir) and report. With more than one entry the
+    source decodes each frame once at the largest size any plan needs and each endpoint's
+    :class:`ScaledView` downsizes it; a single entry behaves exactly like the original sampler.
+    Result order matches ``visions``; an endpoint whose sampling found nothing gets an empty
+    ``SampledFrames`` while the others are unaffected. The caller removes every ``tmp_dir``.
+    """
     import cv2
 
     from autovideofixer.core.ffmpeg_utils import get_ffmpeg_path, get_ffprobe_path
 
-    report = SamplingReport(
-        jpeg_quality=vision.jpeg_quality, balance=sampling.balance, start_time=start_time
-    )
-    empty = SampledFrames(paths=[], tmp_dir="", report=report)
+    def empties() -> list[SampledFrames]:
+        return [_empty_frames(v, sampling, start_time) for v in visions]
+
+    if not visions:
+        return []
     try:
         ffmpeg, ffprobe = get_ffmpeg_path(config), get_ffprobe_path(config)
     except FileNotFoundError:
         logger.warning("ffmpeg/ffprobe not found; cannot sample frames for the VLM")
-        return empty
+        return empties()
     if not os.path.isfile(filepath):
-        return empty
+        return empties()
     ranged = start_time > 0 or end_time is not None
     timeline = probe_timeline(
         filepath, ffprobe, start_time if ranged else None, end_time if ranged else None
     )
     if timeline is None:
-        return empty
+        return empties()
     times = timeline.times
     gaps = sorted(b - a for a, b in zip(times, times[1:], strict=False) if b > a)
     typical_gap = gaps[len(gaps) // 2] if gaps else 1.0 / 30.0
@@ -902,10 +992,12 @@ def sample_vlm_frames(
         total_end = timeline.duration
     start = max(0.0, start_time)
     end = total_end if end_time is None else min(end_time, total_end)
-    report.start_time, report.end_time = start, end
-    report.source_width, report.source_height = timeline.width, timeline.height
     if end - start <= 0:
-        return empty
+        no_range = empties()
+        for e in no_range:
+            e.report.start_time, e.report.end_time = start, end
+            e.report.source_width, e.report.source_height = timeline.width, timeline.height
+        return no_range
 
     # Frames visible during [start, end): the one on screen at `start` (a long VFR hold may
     # begin before the range) through the last one that starts before `end`. These are the
@@ -914,10 +1006,16 @@ def sample_vlm_frames(
     lo = min(max(bisect.bisect_right(times, start + 1e-6) - 1, 0), last)
     hi = min(max(bisect.bisect_left(times, end - 1e-6) - 1, lo), last)
     real_frames = hi - lo + 1
-    source = FFmpegFrameSource(filepath, timeline, ffmpeg, lo, hi)
+    shared = len(visions) > 1
+    if shared:
+        source = FFmpegFrameSource(
+            filepath, timeline, ffmpeg, lo, hi, cache_budget_bytes=SHARED_CACHE_BUDGET_BYTES
+        )
+    else:
+        source = FFmpegFrameSource(filepath, timeline, ffmpeg, lo, hi)
 
     motion: float | None = None
-    if sampling.balance == "auto" and vision.max_tiles_per_call is not None:
+    if sampling.balance == "auto" and any(v.max_tiles_per_call is not None for v in visions):
         # tiny decodes: the probe only needs 64-px thumbnails
         source.target_size = (
             THUMB_WIDTH,
@@ -925,19 +1023,59 @@ def sample_vlm_frames(
         )
         motion = motion_score(source, start, end)
 
-    plan = plan_sampling(
-        timeline.width, timeline.height, end - start, real_frames, sampling, vision, motion
-    )
-    source.target_size = (plan.width, plan.height)
-    sel = select_frames(
-        source,
-        start,
-        end,
-        plan.target_frames,
-        dedupe=sampling.dedupe_consecutive,
-        threshold=sampling.dedupe_threshold,
-        min_gap=typical_gap / 2,
-    )
+    plans = [
+        plan_sampling(
+            timeline.width, timeline.height, end - start, real_frames, sampling, v, motion
+        )
+        for v in visions
+    ]
+    if shared:
+        source.target_size = (max(p.width for p in plans), max(p.height for p in plans))
+
+    out: list[SampledFrames] = []
+    try:
+        for vision, plan in zip(visions, plans, strict=True):
+            if shared:
+                frames_from: FrameSource = ScaledView(source, (plan.width, plan.height))
+            else:
+                source.target_size = (plan.width, plan.height)
+                frames_from = source
+            sel = select_frames(
+                frames_from,
+                start,
+                end,
+                plan.target_frames,
+                dedupe=sampling.dedupe_consecutive,
+                threshold=sampling.dedupe_threshold,
+                min_gap=typical_gap / 2,
+            )
+            sampled = _write_frames(sel, plan, vision, sampling, prefix, start, end, timeline, cv2)
+            out.append(sampled)
+    except Exception:
+        for done in out:
+            shutil.rmtree(done.tmp_dir, ignore_errors=True)
+        raise
+    finally:
+        source.clear()
+    return out
+
+
+def _write_frames(
+    sel: Selection,
+    plan: SamplePlan,
+    vision: VisionLimits,
+    sampling: SamplingConfig,
+    prefix: str,
+    start: float,
+    end: float,
+    timeline: Timeline,
+    cv2: Any,
+) -> SampledFrames:
+    """JPEG-encode one endpoint's selected frames and fill in its report."""
+    empty = _empty_frames(vision, sampling, start)
+    report = empty.report
+    report.start_time, report.end_time = start, end
+    report.source_width, report.source_height = timeline.width, timeline.height
     if not sel.kept:
         return empty
 
@@ -970,4 +1108,7 @@ def sample_vlm_frames(
         report.notes.append(
             f"only {n} distinct frame(s) found for a target of {plan.target_frames}"
         )
+    # The images were only needed for the JPEGs; free them before the next endpoint's pass.
+    for cand in sel.kept:
+        cand.image = None
     return SampledFrames(paths=paths, tmp_dir=tmp_dir, report=report)

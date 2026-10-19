@@ -8,7 +8,10 @@ and duplicate/similar video detection via perceptual hashing.
 from __future__ import annotations
 
 import base64
+import concurrent.futures
+import contextvars
 import copy
+import functools
 import json
 import logging
 import os
@@ -18,9 +21,31 @@ import statistics
 import tempfile
 import time
 from dataclasses import dataclass, field
-from typing import Any, Callable, Mapping
+from typing import Any, Callable, Mapping, Sequence
 
 from autovideofixer.config import VALID_SYMLINKS_POLICIES, Config
+from autovideofixer.core.cross_check import (
+    JUDGE_SYSTEM_PROMPT,
+    PURPOSE_ARBITER,
+    PURPOSE_DESCRIBE,
+    PURPOSE_JUDGE,
+    PURPOSE_REFINE,
+    ROLE_ARBITER,
+    ROLE_DESCRIBE,
+    ROLE_JUDGE,
+    ROLE_PRIMARY,
+    ROLE_REFINE,
+    CrossCheckConfig,
+    CrossCheckOutcome,
+    JudgeVerdict,
+    Leg,
+    build_arbiter_system_prompt,
+    build_arbiter_user_prompt,
+    build_judge_schema,
+    build_judge_user_prompt,
+    is_usable,
+    parse_judge_verdict,
+)
 from autovideofixer.core.vlm_calls import (
     ERR_EMPTY,
     ERR_UNKNOWN_PROVIDER,
@@ -36,16 +61,29 @@ from autovideofixer.core.vlm_calls import (
     truncation_message,
 )
 from autovideofixer.core.vlm_outputs import (
+    CHANGES_KEY,
     OutputsConfig,
+    build_refine_schema,
+    build_refine_system_prompt,
+    build_refine_user_prompt,
     build_response_schema,
     build_system_prompt,
     build_user_prompt,
     parse_fields,
+    result_fields,
 )
-from autovideofixer.core.vlm_sampling import SamplingConfig, VisionLimits, sample_vlm_frames
+from autovideofixer.core.vlm_sampling import (
+    SampledFrames,
+    SamplingConfig,
+    VisionLimits,
+    sample_vlm_frames,
+    sample_vlm_frames_multi,
+)
 from autovideofixer.endpoints import (
+    Endpoint,
     normalize_provider,
     resolve_compat,
+    resolve_endpoint,
     resolve_role_endpoint,
 )
 from autovideofixer.net import TLSPolicy, open_url, resolve_tls_policy
@@ -264,8 +302,17 @@ class VideoAnalysis:
     # SamplingReport.to_dict() of the whole-video VLM call (REQUIREMENTS.md § 25.4); None
     # when VLM didn't run.
     vlm_sampling: dict[str, Any] | None = None
+    # § 27 cross-check block (mode, legs, verdict...) when analysis.cross_check is enabled.
+    cross_check: dict[str, Any] | None = None
     similar_files: list[str] = field(default_factory=list)
     metadata: dict[str, Any] = field(default_factory=dict)
+
+
+def _resolve_prompt_append(vlm_config: Mapping[str, Any], prompt_append: str | None) -> str:
+    """``prompt_append`` argument, else ``analysis.vlm.prompt_append`` ('' suppresses)."""
+    return (
+        prompt_append if prompt_append is not None else vlm_config.get("prompt_append", "")
+    ) or ""
 
 
 def _resolve_vlm_prompts(
@@ -283,9 +330,7 @@ def _resolve_vlm_prompts(
     generated prompt wholesale -- it must itself ask for every field it wants back.
     ``prompt_append`` is added after whichever user prompt is in force.
     """
-    append = (
-        prompt_append if prompt_append is not None else vlm_config.get("prompt_append", "")
-    ) or ""
+    append = _resolve_prompt_append(vlm_config, prompt_append)
     override = (
         prompt_override if prompt_override is not None else vlm_config.get("prompt_override", "")
     ) or ""
@@ -438,6 +483,12 @@ class VideoAnalyzer:
             analysis.vlm_extra = dict(vlm_result.get("extra") or {})
             if vlm_result.get("call"):
                 analysis.vlm_calls = [vlm_result["call"]]
+            if vlm_result.get("cross_check"):
+                # § 27: every leg's call (describe/refine/judge/arbiter), in leg order.
+                analysis.cross_check = vlm_result["cross_check"]
+                analysis.vlm_calls = [
+                    leg["call"] for leg in analysis.cross_check["legs"] if leg.get("call")
+                ]
             _report("vlm_done", "VLM analysis complete")
 
         _report("done", "Analysis complete")
@@ -666,6 +717,43 @@ class VideoAnalyzer:
                 progress_callback(phase, detail)
 
         vlm_config = self.config.get("analysis", "vlm", default={})
+        cross_check = CrossCheckConfig.from_config(self.config)
+        if cross_check.enabled:
+            sampling = SamplingConfig.from_mapping(
+                vlm_config.get("sampling"),
+                min_frames=min_sample_frames,
+                max_frames=max_sample_frames,
+                interval_sec=sample_interval_sec,
+            )
+            outputs = OutputsConfig.from_config(vlm_config)
+            system_prompt, user_prompt = _resolve_vlm_prompts(
+                vlm_config,
+                outputs,
+                prompt_append=prompt_append,
+                prompt_override=prompt_override,
+                system_prompt_override=system_prompt_override,
+            )
+            _report(
+                "vlm_sampling",
+                f"Sampling {sampling.min_frames}-{sampling.max_frames} frame(s) for the "
+                f"{len(cross_check.endpoints)}-endpoint VLM cross-check",
+            )
+            return _CrossCheckRun(
+                self.config,
+                cross_check,
+                sampling,
+                outputs,
+                system_prompt,
+                user_prompt,
+                prompt_append=_resolve_prompt_append(vlm_config, prompt_append),
+                purpose="video",
+                detail="",
+                context=filepath,
+                model=model,
+                api_url=api_url,
+                endpoint=endpoint,
+                progress=_report,
+            ).run(filepath, 0.0, None, prefix="avf_samples_")
         # Resolved up front so an unknown endpoint or a bad network.tls config is a clear
         # error before any frame extraction work (and not swallowed by _dispatch_vlm's
         # fail-soft except).
@@ -762,6 +850,39 @@ class VideoAnalyzer:
         rating (empty on any failure -- this method never raises).
         """
         vlm_config = self.config.get("analysis", "vlm", default={})
+        cross_check = CrossCheckConfig.from_config(self.config)
+        if cross_check.enabled:
+            if max(scene.duration, 0.0) <= 0:
+                return _empty_vlm_result()
+            sampling = SamplingConfig.from_mapping(
+                vlm_config.get("sampling"),
+                min_frames=min_sample_frames,
+                max_frames=max_sample_frames,
+                interval_sec=sample_interval_sec,
+            )
+            outputs = OutputsConfig.from_config(vlm_config)
+            system_prompt, user_prompt = _resolve_vlm_prompts(
+                vlm_config,
+                outputs,
+                prompt_append=prompt_append,
+                prompt_override=prompt_override,
+                system_prompt_override=system_prompt_override,
+            )
+            return _CrossCheckRun(
+                self.config,
+                cross_check,
+                sampling,
+                outputs,
+                system_prompt,
+                user_prompt,
+                prompt_append=_resolve_prompt_append(vlm_config, prompt_append),
+                purpose="scene",
+                detail=f"scene[{scene.start_time:.1f}-{scene.end_time:.1f}]",
+                context=f"{filepath} scene[{scene.start_time:.1f}-{scene.end_time:.1f}]",
+                model=model,
+                api_url=api_url,
+                endpoint=endpoint,
+            ).run(filepath, scene.start_time, scene.end_time, prefix="avf_scene_samples_")
         # Resolved up front so an unknown endpoint or a bad network.tls config is a clear
         # error before any frame extraction work (and not swallowed by _dispatch_vlm's
         # fail-soft except).
@@ -2329,6 +2450,408 @@ def _call_coordinator_provider(
         logger.debug("Scene coordinator provider call traceback", exc_info=True)
         return None
     return (text.text if text is not None else "") or None
+
+
+# ─── Multi-VLM cross-check (REQUIREMENTS.md § 27) ──────────────────
+
+
+def _sampling_dict(sampled: SampledFrames) -> dict[str, Any] | None:
+    return sampled.report.to_dict() if sampled.paths else None
+
+
+def _as_changes(value: Any) -> list[str]:
+    if isinstance(value, str):
+        return [value] if value.strip() else []
+    if isinstance(value, list):
+        return [str(v) for v in value if str(v).strip()]
+    return []
+
+
+class _CrossCheckRun:
+    """One cross-checked VLM analysis of one range (the whole video, or one scene).
+
+    Resolves every endpoint up front (a bad name/TLS config is a clear ``ValueError`` before any
+    frame work, like the single-endpoint path), samples frames for all of them in one pass
+    (``sample_vlm_frames_multi``: one probe, each frame decoded once), then runs the legs of the
+    configured mode. Nothing in :meth:`run` raises: a failed leg is one WARNING line (traceback at
+    DEBUG) and the result degrades to the best successful output, primary first.
+    """
+
+    def __init__(
+        self,
+        config: Config,
+        cc: CrossCheckConfig,
+        sampling: SamplingConfig,
+        outputs: OutputsConfig,
+        system_prompt: str,
+        user_prompt: str,
+        *,
+        prompt_append: str,
+        purpose: str,
+        detail: str,
+        context: str,
+        model: str | None,
+        api_url: str | None,
+        endpoint: str | None,
+        progress: ProgressCallback | None = None,
+    ):
+        self.config = config
+        self.cc = cc
+        self.sampling = sampling
+        self.outputs = outputs
+        self.system_prompt = system_prompt
+        self.user_prompt = user_prompt
+        self.prompt_append = prompt_append
+        self.purpose = purpose
+        self.detail = detail
+        self.context = context
+        self.progress = progress
+        # CLI --vlm-endpoint/--vlm-model/--vlm-url address the primary leg only.
+        names = list(cc.endpoints)
+        if endpoint:
+            names[0] = endpoint
+        self.eps: list[Endpoint] = [resolve_endpoint(config, n) for n in names]
+        self.eps[0] = self.eps[0].with_overrides(model=model, api_url=api_url)
+        self.arbiter = (
+            resolve_endpoint(config, cc.arbiter_endpoint) if cc.arbiter_endpoint else None
+        )
+        self.judge = resolve_endpoint(config, cc.judge_name(config)) if cc.mode == "judge" else None
+        self.tls: dict[str, TLSPolicy] = {}
+        for ep in [*self.eps, *(e for e in (self.arbiter, self.judge) if e is not None)]:
+            self.tls[ep.name] = resolve_tls_policy(config, ep.tls, purpose=ep.tls_purpose)
+
+    # -- helpers ------------------------------------------------------------------------
+
+    def _report(self, detail: str) -> None:
+        if self.progress is not None:
+            self.progress("vlm_request", detail)
+
+    def _skip(self, leg: Leg, reason: str) -> Leg:
+        leg.error = reason
+        logger.warning(
+            "Cross-check %s leg (endpoint=%s) failed: %s", leg.role, leg.endpoint, reason
+        )
+        return leg
+
+    # -- legs ---------------------------------------------------------------------------
+
+    def _describe(self, ep: Endpoint, role: str, purpose: str, sampled: SampledFrames) -> Leg:
+        """A normal, independent description (the primary, or any judge-mode endpoint)."""
+        leg = Leg(endpoint=ep.name, role=role, sampling=_sampling_dict(sampled))
+        if not sampled.paths:
+            return self._skip(leg, "no frames could be sampled")
+        result = _dispatch_vlm(
+            sampled.paths,
+            ep.provider,
+            ep.model,
+            ep.api_url,
+            ep.api_key,
+            self.system_prompt,
+            self.user_prompt,
+            allow_http=ep.allow_http,
+            max_tokens=ep.max_tokens,
+            tls=self.tls[ep.name],
+            timeout=ep.timeout_sec,
+            compat=ep.compat,
+            context=self.context,
+            outputs=self.outputs,
+            endpoint_name=ep.name,
+            purpose=purpose,
+            detail=self.detail,
+            est_vision_tokens=sampled.report.est_vision_tokens,
+        )
+        leg.call = result.pop("call", None)
+        leg.result = result
+        if leg.call is not None and not leg.call.get("success", True):
+            leg.error = str(leg.call.get("error_class") or "failed")  # already warned
+        elif not is_usable(result):
+            self._skip(leg, "the reply had no usable fields")
+        else:
+            leg.success = True
+        return leg
+
+    def _strict_vlm(
+        self,
+        ep: Endpoint,
+        role: str,
+        purpose: str,
+        sampled: SampledFrames,
+        system_prompt: str,
+        user_prompt: str,
+        schema: Mapping[str, Any],
+    ) -> Leg:
+        """A VLM leg whose reply must be a JSON object (refine, arbiter): prose is a failure,
+        not a summary, so it can't overwrite a good earlier answer."""
+        leg = Leg(endpoint=ep.name, role=role, sampling=_sampling_dict(sampled))
+        try:
+            image_b64 = _frames_to_base64(sampled.paths) if sampled.paths else []
+            if not image_b64:
+                return self._skip(leg, "no frames could be sampled")
+            response = _call_provider_raw(
+                ep.provider,
+                model=ep.model,
+                api_url=ep.api_url,
+                api_key=ep.api_key,
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                image_b64_list=image_b64,
+                allow_http=ep.allow_http,
+                max_tokens=ep.max_tokens,
+                tls=self.tls[ep.name],
+                timeout=ep.timeout_sec,
+                compat=ep.compat,
+                response_schema=schema,
+                endpoint_name=ep.name,
+                purpose=purpose,
+                detail=self.detail,
+                est_vision_tokens=sampled.report.est_vision_tokens,
+            )
+            if response is None:
+                leg.error = "unknown provider"  # already warned
+                return leg
+            leg.call = response.stats.to_dict()
+            if not response.stats.success:
+                leg.error = str(response.stats.error_class or "failed")  # already warned
+                return leg
+            data = _extract_json_dict(response.text) or _salvage_json_fields(response.text)
+            if data is None:
+                return self._skip(leg, "the reply was not a JSON object")
+            result = parse_fields(data, self.outputs.media_type_choices)
+            if role == ROLE_REFINE:
+                leg.changes = _as_changes(result["extra"].pop(CHANGES_KEY, None))
+            if not is_usable(result):
+                return self._skip(leg, "the reply had no usable fields")
+            leg.result = result
+            leg.success = True
+        except Exception as e:
+            self._skip(leg, classify_exception(e)[1])
+            logger.debug("Cross-check %s leg traceback (endpoint=%s)", role, ep.name, exc_info=True)
+        return leg
+
+    def _refine(self, ep: Endpoint, sampled: SampledFrames, previous: Leg) -> Leg:
+        assert previous.result is not None
+        user = build_refine_user_prompt(
+            self.outputs, result_fields(previous.result, self.outputs), previous.endpoint
+        )
+        if self.prompt_append:
+            user = f"{user}\n\n{self.prompt_append}"
+        return self._strict_vlm(
+            ep,
+            ROLE_REFINE,
+            PURPOSE_REFINE,
+            sampled,
+            build_refine_system_prompt(self.outputs),
+            user,
+            build_refine_schema(self.outputs),
+        )
+
+    def _judge_call(
+        self, analyses: Sequence[tuple[str, Mapping[str, Any]]]
+    ) -> tuple[Leg, JudgeVerdict | None]:
+        """Ask the judge LLM (text only) to compare the analyses; ``verdict`` None on failure."""
+        ep = self.judge
+        assert ep is not None
+        leg = Leg(endpoint=ep.name, role=ROLE_JUDGE)
+        verdict: JudgeVerdict | None = None
+        try:
+            response = _call_provider_raw(
+                ep.provider,
+                model=ep.model,
+                api_url=ep.api_url,
+                api_key=ep.api_key,
+                system_prompt=JUDGE_SYSTEM_PROMPT,
+                user_prompt=build_judge_user_prompt(analyses, self.outputs),
+                image_b64_list=[],
+                allow_http=ep.allow_http,
+                max_tokens=ep.max_tokens,
+                tls=self.tls[ep.name],
+                timeout=ep.timeout_sec,
+                compat=ep.compat,
+                response_schema=build_judge_schema(self.outputs),
+                endpoint_name=ep.name,
+                purpose=PURPOSE_JUDGE,
+                detail=self.detail,
+            )
+            if response is None:
+                leg.error = "unknown provider"
+            else:
+                leg.call = response.stats.to_dict()
+                if not response.stats.success:
+                    leg.error = str(response.stats.error_class or "failed")  # already warned
+                else:
+                    verdict = parse_judge_verdict(
+                        _extract_json_dict(response.text), self.outputs.media_type_choices
+                    )
+                    if verdict is None:
+                        self._skip(leg, "the verdict had no usable agreement score")
+        except Exception as e:
+            self._skip(leg, classify_exception(e)[1])
+            logger.debug("Cross-check judge traceback (endpoint=%s)", ep.name, exc_info=True)
+        if verdict is not None:
+            leg.success = True
+            leg.result = verdict.merged
+        return leg, verdict
+
+    # -- modes --------------------------------------------------------------------------
+
+    def _describe_all(self, sampled: list[SampledFrames]) -> list[Leg]:
+        """Judge mode: every endpoint describes on its own; concurrently up to ``max_parallel``.
+
+        Workers run under a copy of the calling context so ``collect_call_stats()`` blocks
+        (a ContextVar) still receive their calls, and results stay in endpoint order.
+        """
+        jobs = [
+            (
+                ep,
+                ROLE_PRIMARY if i == 0 else ROLE_DESCRIBE,
+                self.purpose if i == 0 else PURPOSE_DESCRIBE,
+                sampled[i],
+            )
+            for i, ep in enumerate(self.eps)
+        ]
+        self._report(
+            f"Sending frames to {len(jobs)} VLM endpoint(s) for the cross-check: "
+            + ", ".join(ep.name for ep, *_ in jobs)
+        )
+        workers = min(self.cc.max_parallel, len(jobs))
+        if workers <= 1:
+            return [self._describe(*job) for job in jobs]
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=workers, thread_name_prefix="avf-cross-check"
+        ) as pool:
+            futures = [
+                pool.submit(contextvars.copy_context().run, functools.partial(self._describe, *job))
+                for job in jobs
+            ]
+            return [f.result() for f in futures]
+
+    def _run_refine(self, sampled: list[SampledFrames]) -> CrossCheckOutcome:
+        outcome = CrossCheckOutcome("refine", [e.name for e in self.eps], [])
+        best: Leg | None = None
+        for i, ep in enumerate(self.eps):
+            self._report(f"Cross-check leg {i + 1}/{len(self.eps)}: endpoint={ep.name}")
+            if best is None:
+                # Nothing to verify yet (the primary, or everything before it failed).
+                role = ROLE_PRIMARY if i == 0 else ROLE_DESCRIBE
+                purpose = self.purpose if i == 0 else PURPOSE_DESCRIBE
+                leg = self._describe(ep, role, purpose, sampled[i])
+            else:
+                leg = self._refine(ep, sampled[i], best)
+            outcome.legs.append(leg)
+            if leg.success:
+                best = leg
+                outcome.final_leg, outcome.final_source = i, leg.endpoint
+        return outcome
+
+    def _run_judge(self, sampled: list[SampledFrames]) -> CrossCheckOutcome:
+        outcome = CrossCheckOutcome("judge", [e.name for e in self.eps], [])
+        outcome.legs = self._describe_all(sampled)
+        good = [i for i, leg in enumerate(outcome.legs) if leg.success]
+        if not good:
+            return outcome
+        fallback = good[0]  # the primary if it succeeded, else the first that did
+
+        def settle(index: int) -> None:
+            outcome.final_leg, outcome.final_source = index, outcome.legs[index].endpoint
+
+        settle(fallback)
+        if len(good) < 2:
+            logger.warning(
+                "Cross-check: only %d of %d describe leg(s) succeeded; nothing to compare, "
+                "keeping the %s output",
+                len(good),
+                len(self.eps),
+                outcome.legs[fallback].endpoint,
+            )
+            return outcome
+        analyses = [(outcome.legs[i].endpoint, outcome.legs[i].result or {}) for i in good]
+        judge_leg, verdict = self._judge_call(analyses)
+        outcome.legs.append(judge_leg)
+        if verdict is None:
+            return outcome
+        threshold = self.cc.agreement_threshold
+        outcome.agreement = verdict.agreement
+        outcome.conflicts = list(verdict.conflicts)
+        outcome.verdict = verdict.to_dict(threshold)
+        judge_index = len(outcome.legs) - 1
+        if verdict.agreement >= threshold:
+            if verdict.merged is not None:
+                settle(judge_index)
+            else:
+                judge_leg.success = False
+                self._skip(judge_leg, "the verdict accepted the analyses but had no merged output")
+            return outcome
+        if self.arbiter is not None:
+            outcome.arbiter_ran = True
+            arb = self._strict_vlm(
+                self.arbiter,
+                ROLE_ARBITER,
+                PURPOSE_ARBITER,
+                sampled[len(self.eps)],
+                build_arbiter_system_prompt(self.outputs),
+                build_arbiter_user_prompt(analyses, verdict.conflicts, self.outputs),
+                build_response_schema(self.outputs),
+            )
+            outcome.legs.append(arb)
+            if arb.success:
+                settle(len(outcome.legs) - 1)
+                return outcome
+        outcome.disagreement = True
+        return outcome
+
+    # -- entry point --------------------------------------------------------------------
+
+    def run(self, filepath: str, start: float, end: float | None, *, prefix: str) -> dict[str, Any]:
+        visions = [VisionLimits.from_mapping(e.vision) for e in self.eps]
+        if self.arbiter is not None:
+            visions.append(VisionLimits.from_mapping(self.arbiter.vision))
+        sampled = sample_vlm_frames_multi(
+            filepath, self.sampling, visions, start, end, prefix=prefix, config=self.config
+        )
+        try:
+            if not any(s.paths for s in sampled):
+                return _empty_vlm_result()
+            for ep, s in zip(
+                [*self.eps, *([self.arbiter] if self.arbiter else [])], sampled, strict=True
+            ):
+                logger.info("VLM frames for %s (%s): %s", self.context, ep.name, s.report.summary())
+            if self.cc.mode == "refine":
+                outcome = self._run_refine(sampled)
+            else:
+                outcome = self._run_judge(sampled)
+            return self._result(outcome, sampled[0])
+        finally:
+            for s in sampled:
+                shutil.rmtree(s.tmp_dir, ignore_errors=True)
+
+    def _result(self, outcome: CrossCheckOutcome, primary_frames: SampledFrames) -> dict[str, Any]:
+        final = outcome.legs[outcome.final_leg].result if outcome.final_leg is not None else None
+        result = copy.deepcopy(final) if final else _empty_vlm_result()
+        if outcome.legs and outcome.legs[0].call:
+            result["call"] = outcome.legs[0].call
+        if primary_frames.paths:
+            result["sampling"] = primary_frames.report.to_dict()
+        result["cross_check"] = outcome.to_dict()
+        if outcome.final_leg is None:
+            logger.warning("Cross-check (%s): every leg failed; no VLM result", outcome.mode)
+        else:
+            logger.info(
+                "Cross-check (%s) for %s: final from %s%s%s",
+                outcome.mode,
+                self.context,
+                outcome.final_source,
+                f", agreement {outcome.agreement:.2f}" if outcome.agreement is not None else "",
+                ", arbiter ran" if outcome.arbiter_ran else "",
+            )
+        if outcome.disagreement:
+            logger.warning(
+                "Cross-check: the endpoints disagree (agreement %.2f < %.2f) and no arbiter "
+                "settled it; keeping the %s output flagged disagreement",
+                outcome.agreement or 0.0,
+                self.cc.agreement_threshold,
+                outcome.final_source,
+            )
+        return result
 
 
 # ─── Auto-crop VLM assist (docs/REQUIREMENTS.md feature 3) ─────────

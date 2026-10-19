@@ -1721,6 +1721,36 @@ class Config:
                 # flag; config-only.
                 "system_prompt_override": "",
             },
+            # Multi-VLM cross-check (REQUIREMENTS.md § 27): several VLM endpoints look at the
+            # same frames (each at its own vision limits) and their answers are combined.
+            # Applies to whole-video and per-scene analysis (not the crop VLM check). Off by
+            # default: costs one extra model call per listed endpoint (plus judge/arbiter).
+            # `avf analyze --vlm-endpoint/--vlm-model/--vlm-url` replace the FIRST (primary)
+            # endpoint only. Validated at use time (core/cross_check.py).
+            "cross_check": {
+                "enabled": False,
+                # refine: each next endpoint verifies/corrects the previous one's JSON (the last
+                #   successful output wins; sequential).
+                # judge: every endpoint describes independently, then a text LLM compares them
+                #   and merges (see judge_endpoint / agreement_threshold / arbiter_endpoint).
+                "mode": "refine",
+                # Ordered VLM endpoint names (analysis.endpoints.<name>); the first is the
+                # primary. At least two when enabled.
+                "endpoints": [],
+                # judge mode: the text LLM that compares the outputs. null = the endpoint
+                # analysis.llm.endpoint selects.
+                "judge_endpoint": None,
+                # judge mode: optional VLM (typically a larger one) that sees the frames, all
+                # descriptions and the conflicts and writes the final when agreement is below
+                # the threshold. null = keep the primary's output, flagged `disagreement`.
+                "arbiter_endpoint": None,
+                # judge mode: agreement (0-1, as scored by the judge) at or above this accepts
+                # the judge's merged output.
+                "agreement_threshold": 0.75,
+                # judge mode: describe legs that may run at once. 1 = one at a time (a single
+                # local GPU serializes requests anyway); refine is always sequential.
+                "max_parallel": 1,
+            },
             "event_detection": {
                 "enabled": True,
                 # Frame-differencing sensitivity (mean fractional luma change between

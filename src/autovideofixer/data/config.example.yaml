@@ -1561,6 +1561,61 @@ analysis:
     # flag.
     system_prompt_override: ""
 
+  # Multi-VLM cross-check (REQUIREMENTS.md § 27): several VLM endpoints look at the same range
+  # (the whole video, or each scene) and their answers are combined into one result. Each
+  # endpoint gets frames planned for ITS OWN `vision` limits (the video is decoded once, shared).
+  # Not applied to the crop VLM check. Costs one extra model call per listed endpoint (plus the
+  # judge/arbiter), so it is off by default. Every call shows up in the call table, `--json` and
+  # the process report with its own purpose (video/scene for the primary, then
+  # cross_check:describe | refine | judge | arbiter). `avf analyze --vlm-endpoint/--vlm-model/
+  # --vlm-url` replace the FIRST (primary) endpoint only. Any leg that fails is skipped with a
+  # one-line warning and the result degrades to the best successful output, primary first.
+  cross_check:
+    enabled: false
+    # refine: the first endpoint describes; each next one gets its own frames plus the previous
+    #   JSON and must verify/correct it (reply = the normal fields + "changes"). The last
+    #   successful output wins. Sequential, N VLM calls.
+    # judge:  every endpoint describes independently, then a text LLM (judge_endpoint) compares
+    #   the JSON outputs and returns {agreement 0-1, conflicts, merged}. agreement >=
+    #   agreement_threshold accepts "merged"; below it the arbiter (if set) looks at the frames
+    #   again and writes the final, else the primary's output is kept flagged `disagreement`.
+    #   N VLM calls + 1 judge call (+ 1 arbiter call only on disagreement).
+    mode: refine
+    # Ordered VLM endpoint names from analysis.endpoints (first = primary). At least two when
+    # enabled; the same endpoint may be listed twice.
+    endpoints: []
+    # judge mode: the text LLM that compares the outputs (no images are sent to it). null = the
+    # endpoint `analysis.llm.endpoint` selects.
+    judge_endpoint: null
+    # judge mode: optional VLM (typically a larger one) that settles a disagreement. null = none.
+    arbiter_endpoint: null
+    # judge mode: judge agreement (0-1) at or above this accepts its merged output.
+    agreement_threshold: 0.75
+    # judge mode: describe calls that may be in flight at once. 1 = one at a time (a single local
+    # GPU serializes requests anyway, so >1 only helps with separate servers). Refine ignores it.
+    max_parallel: 1
+    #
+    # Example (documentation addresses): two VLMs with different image limits, a judge, and the
+    # bigger one also acting as arbiter. Under `analysis.endpoints:` add
+    #   small_vlm:
+    #     provider: llamacpp
+    #     model: small
+    #     api_url: "http://192.0.2.10:8080/v1/chat/completions"
+    #     allow_http: true
+    #     vision: {max_long_side_px: 672}
+    #   big_vlm:
+    #     provider: api
+    #     model: big
+    #     api_url: "https://example.com/v1/chat/completions"
+    #     api_key: "..."
+    #     vision: {max_long_side_px: 1536}
+    # and set here:
+    #   enabled: true
+    #   mode: judge
+    #   endpoints: [small_vlm, big_vlm]
+    #   judge_endpoint: default_llm
+    #   arbiter_endpoint: big_vlm
+
   event_detection:
     enabled: true
     # Scene-change sensitivity: consecutive frames are grayscaled, downscaled to

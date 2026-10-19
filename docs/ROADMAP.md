@@ -152,6 +152,15 @@ draws an explicit VERIFIED / UNVERIFIED line instead of a flat done/not-done che
   report; timeouts and other network failures are a one-line warning instead of a traceback.
   Revisit: streaming for time-to-first-token; `MOTION_FULL_SCALE` and `dedupe_threshold` can now
   be tuned against real call stats; P6 (cross-check) reuses `CallStats` for its legs.
+- **Multi-VLM cross-check** (REQUIREMENTS.md § 27, phase P6) — implemented 2026-10-19.
+  `analysis.cross_check` (`refine` chain or `judge` + optional arbiter) over any number of
+  endpoints, each with frames planned for its own `vision` limits from one probe and one decode
+  per frame (`sample_vlm_frames_multi`); every leg has its own `CallStats` purpose; fails open to
+  the best successful output; whole-video and per-scene; `cross_check` block in `avf analyze
+  --json`, the process report (`scene_stats.vlm_cross_check`), new CSV columns. Revisit: the judge's
+  score is uncalibrated (a threshold of 0.75 is a starting point, tune it against real runs); an
+  arbiter's frames are sampled up front even when the judge agrees; streaming/time-to-first-token
+  would also help judge latency; cross-check for the crop VLM check is out of scope (v1).
 - **True source cadence recovery & timestamp-safe pipeline** (`retime` stage, on by default —
   REQUIREMENTS.md § 12) — recovers a video's real content framerate when it was padded up to a
   higher encoded rate by duplicated frames (24fps published at 60fps, VFR captures transcoded to

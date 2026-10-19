@@ -1943,7 +1943,7 @@ chat context. Delivery is phased, one commit per phase, in the user-chosen order
 | P3 | § 24 | config schema versioning + migrations, first-run bootstrap, endpoint registry, per-endpoint timeout/TLS, llama.cpp provider | IMPLEMENTED 2026-10-18 |
 | P4 | § 25 | VLM frame sampling: min/max frames, consecutive-duplicate removal, tile budget, frame-count reporting | IMPLEMENTED 2026-10-18 |
 | P5 | § 26 | new structured output fields (media type, rating reasoning, detail level) + per-call timing/token stats | IMPLEMENTED 2026-10-18 |
-| P6 | § 27 | multi-VLM cross-check (`refine` and `judge` modes) | PLANNED |
+| P6 | § 27 | multi-VLM cross-check (`refine` and `judge` modes) | IMPLEMENTED 2026-10-19 |
 | P7 | § 28 | analysis profiles, reusable analysis module, `analyze` stage + example stages | PLANNED |
 
 Update the Status column (and the section headers) as each phase lands. P2's per-endpoint TLS
@@ -2668,8 +2668,9 @@ report under the job.
   about on the console with a `max_tokens` hint. Its complete `"key": value` pairs are salvaged
   (`_salvage_json_fields`: each value is `raw_decode`d, so a string/array cut mid-way is dropped,
   never half-kept). Before the coordinator review the raw JSON fragment became the summary
-  silently. Plain-text replies still become the summary. (5) P6's cross-check legs will need to
-  set `purpose` to their own value; the collector already carries them.
+  silently. Plain-text replies still become the summary. (5) P6's cross-check legs set `purpose` to
+  their own value (`cross_check:describe|refine|judge|arbiter`; the primary keeps `video`/`scene`)
+  -- done in § 27; the collector carried them unchanged.
 - **Tests**: `tests/unit/test_vlm_outputs.py` (prompt/schema for every outputs x detail
   combination incl. `rating_reasoning` last, validation errors, parsing/normalisation/extras),
   `tests/unit/test_vlm_calls.py` (Ollama / llama.cpp / OpenAI bodies incl. `timings` and
@@ -2684,7 +2685,7 @@ report under the job.
   `avf process --report-json` listed 3 scene calls + 1 coordinator call (and a `crop_check` call
   for a letterboxed second input); the timeout run printed one WARNING line per file.
 
-## 27. Multi-VLM cross-check (P6)
+## 27. Multi-VLM cross-check (P6) [IMPLEMENTED 2026-10-19]
 
 **[USER DECISION]** Both modes, selectable. Config `analysis.cross_check`: `enabled` (false),
 `mode` (`refine` | `judge`), `endpoints` (ordered VLM endpoint names; first = primary),
@@ -2703,6 +2704,138 @@ report under the job.
   never an empty result if any call succeeded. All intermediate outputs + the judge verdict go to
   JSON outputs; the table shows agreement and whether the arbiter ran.
 - Applies to whole-video and per-scene analysis. Not to the crop VLM check (v1).
+
+### 27.1 Implementation notes (2026-10-19)
+
+Delivered as specified; decisions where the spec was silent, deviations and findings:
+
+- **Modules**: `core/cross_check.py` (pure: `CrossCheckConfig`, prompts/schemas for judge and
+  arbiter, `parse_judge_verdict`, `Leg`, `CrossCheckOutcome`), `core/analysis.py`
+  (`_CrossCheckRun`: endpoint/TLS resolution, sampling, the four kinds of call, threads),
+  `core/vlm_outputs.py` (`result_fields`, `build_refine_system_prompt|user_prompt|schema`, from the
+  same `_field_parts` the describe prompt now uses; the describe prompt is byte-identical),
+  `core/vlm_sampling.py` (`sample_vlm_frames_multi`, `ScaledView`), `core/vlm_calls.py`
+  (`record_call` lock), `cli/cli.py`, `core/scenes.py` / `core/pipeline.py` (per-scene blocks into
+  `scene_stats.vlm_cross_check`). The pure/impure split exists because `analysis.py` owns the
+  provider plumbing and importing it from `cross_check.py` would be circular.
+- **Disabled = unchanged**: `CrossCheckConfig.from_config` is read first; `enabled: false` (or an
+  absent block) falls straight into the original code. Verified on the real path against a
+  checkout of the previous commit: identical `--json` (timings aside), identical stub request,
+  CSV identical in the old columns, no `cross_check` key. No `config_version` bump: new keys,
+  off by default, nothing moved (the § 26 precedent).
+- **Config validation**: the shape (`mode` enum, threshold in [0,1] and not a bool, `max_parallel`
+  int >= 1, `endpoints` a list of strings, optional names strings) is checked even when disabled;
+  endpoint *names* (and `judge_endpoint` -- only in judge mode -- and `arbiter_endpoint`) are
+  resolved only when enabled, each error naming `analysis.cross_check.<key>`; `enabled: true` with
+  fewer than two endpoints is an error. The same endpoint may be listed twice (a self-consistency
+  run). `avf analyze` validates up front (exit 2); API callers get a `ValueError` before any frame
+  work, like an unknown endpoint today. `judge_endpoint: null` falls back to
+  `analysis.llm.endpoint`.
+- **`refine`**: leg 1 is a normal describe (purpose `video`/`scene`). Each later leg gets the
+  *last successful* output as indented JSON (only the enabled fields, so a prompt can't be fed keys
+  the schema doesn't know) and the generated verify/correct prompt; `prompt_append` is appended to
+  it, `prompt_override` / `system_prompt_override` are NOT used by refine legs (they define the
+  describe task, not the verify task). The reply schema is the outputs schema plus a required
+  `changes` array; `changes` is taken out of `extra` and reported on the leg. If the primary failed,
+  the next endpoint does a plain describe (role `describe`, purpose `cross_check:describe`) and
+  the chain continues from there. Refine and arbiter replies must be a JSON object with at least
+  one non-empty field; prose, `{}` or an unparseable body fails the leg and cannot overwrite a good
+  earlier answer. (The describe path keeps its long-standing "prose becomes the summary" fallback.)
+- **`judge`**: describe legs use the normal prompts (so `prompt_override` applies). The judge call
+  is text-only (`image_b64_list=[]`) with a `json_schema` for `{agreement, conflicts, merged}`
+  (`merged` = the outputs schema), through the same `_call_provider_raw` as the coordinator
+  (`max_tokens` is the judge endpoint's). The arbiter gets `build_system_prompt` (same fields and
+  detail) behind a short brief, every successful description, the conflict list and its own frames.
+  Edge decisions: (a) with fewer than two successful describe legs there is nothing to compare,
+  the judge is not called and the survivor wins; (b) `agreement` is clamped to [0,1] (`85` ->
+  1.0; deliberately not interpreted as a percentage) and numeric strings are accepted, anything
+  else is a failed judge leg; (c) `>= threshold` with no usable `merged` fails the judge leg and
+  falls back to the primary; (d) a failed judge never triggers the arbiter (there are no
+  conflicts to hand it); (e) `arbiter_ran` means the call was made -- `final_source` shows whether
+  it produced the final -- and an arbiter failure falls back like "no arbiter" including
+  `disagreement: true`; (f) the judge's merged output counts as the judge leg's `result` and
+  `final_source` is the judge endpoint's name.
+- **Frames / shared decode**: `sample_vlm_frames_multi(filepath, sampling, visions, start, end)`
+  returns one `SampledFrames` per vision. One `probe_timeline`, one motion probe (if any endpoint
+  has a tile budget), one `plan_sampling` per vision; the source decodes each frame index once at
+  the largest planned size (accurate-seek, VFR and the MPEG-TS slow path are the P4 code,
+  unchanged) and a `ScaledView` per endpoint downsizes with `INTER_AREA` (never up) into a fresh
+  `Candidate`; JPEGs are written per endpoint at its own `jpeg_quality`, then the images are
+  dropped. A single vision uses the original path (no views, rejected frames freed in place), and
+  `sample_vlm_frames` is now a thin wrapper, so P4 behaviour is unchanged. Memory: the shared
+  cache keeps images for every probed candidate (kept and rejected) -- that is the cost of "decode
+  once" -- so it is bounded by `SHARED_CACHE_BUDGET_BYTES` (512 MiB; oldest images dropped and
+  re-decoded if wanted again, visible as `decodes` > distinct frames). The arbiter's frames are
+  planned and written up front with the others (so it shares the decode), even when the judge
+  agrees and they go unused; a lazily planned arbiter would have to re-decode if it needs a larger
+  size than the cache holds. Revisit if arbiter-less agreement is the common case and JPEG writing
+  shows in profiles.
+- **Fail open**: every leg is wrapped; a failed *call* is already one WARNING from
+  `_call_provider_raw` (not repeated), a leg-level failure (no frames, not JSON, no usable fields,
+  bad verdict) is one WARNING naming role and endpoint, tracebacks only at DEBUG. Fallback is
+  always "the first successful describe/refine output, primary preferred"; all calls failing gives
+  today's empty fields (plus the `cross_check` block showing why). If *no* endpoint could sample a
+  single frame the result is the plain empty result without a block (nothing was attempted).
+- **Result shape**: the normal fields are the final answer; `call` is the primary leg's call and
+  `sampling` the primary's report (as before). New `cross_check: {mode, endpoints, final_source,
+  final_leg, agreement, conflicts, arbiter_ran, disagreement, legs: [{endpoint, role, success,
+  result, call, changes?, sampling?, error?}], verdict}`; `verdict` is `{agreement, conflicts,
+  merged, threshold, accepted}` or null. `final_leg` (index into `legs`) was added so a repeated
+  endpoint name stays unambiguous. `VideoAnalysis.cross_check` carries the block and
+  `VideoAnalysis.vlm_calls` lists every leg's call in leg order. Scene mode: the block is in each
+  scene summary and lands in the report as `jobs[].scene_stats.vlm_cross_check[]` (with scene
+  index and times); the calls are in `jobs[].vlm_calls` through the collector (`detail` keeps
+  `scene[a-b]`).
+- **Threads**: judge-mode describe legs run in a `ThreadPoolExecutor(max_workers=min(max_parallel,
+  legs))`, each task under its own `contextvars.copy_context()`; `record_call` locks its appends;
+  results are gathered in endpoint order. Finding: the ContextVar is copied *by reference to the
+  same sink lists*, so the lock is what makes concurrent appends well-defined, not the copy.
+- **Output**: table rows *Cross-Check Mode*, *Cross-Check Agreement* (with threshold), *Arbiter
+  Ran*, *Cross-Check Result* (a DISAGREEMENT line), *Final From*, *Cross-Check Legs* (role,
+  endpoint, ok/FAILED, frames and size per leg); `--full` panels for the conflicts and each refine
+  leg's `changes`. CSV appended `cross_check_mode`, `cross_check_agreement`,
+  `cross_check_arbiter_ran`, `cross_check_final_source`, `cross_check_disagreement` (blank when
+  off); existing column order unchanged (pinned by a test). `--json` has the whole block.
+- **CLI overrides**: `--vlm-endpoint` replaces `endpoints[0]`, `--vlm-model` / `--vlm-url`
+  override that leg's model / URL; the other legs always use the config.
+- **Known limits / revisit**: (1) the judge's `agreement` is whatever number the model emits; it
+  is uncalibrated, so 0.75 is a starting point to tune against real runs (the `--json` verdict
+  makes that possible). (2) Judge-mode wall time is the sum of the describe calls at
+  `max_parallel: 1`; there is no streaming, so the judge/arbiter latency is also unsplit. (3) Refine
+  gives no way to say "the earlier answer was right" except `changes: []`; a model that silently
+  drops a field loses it from the final (the schema requires every field, which most servers
+  enforce only with `json_schema`). (4) The crop VLM check is not cross-checked (spec). (5)
+  Progress callbacks report one line per refine leg but only one line for a parallel describe
+  batch (they are not thread-safe).
+- **Tests**: `tests/unit/test_cross_check.py` (97 tests: config validation, disabled == unchanged,
+  both modes, the `==` threshold boundary, arbiter / no arbiter, every fail-open permutation,
+  garbage / clamped judge verdicts, purposes and the collector -- including `max_parallel: 3`
+  with a barrier that proves overlap -- scene detail, CLI overrides, the shared decode cache with
+  a synthetic `_run` counting one decode per frame index and the byte budget, console / CSV /
+  JSON / process-report output), plus three real-ffmpeg test functions in
+  `tests/integration/test_vlm_sampling_e2e.py` (multi == single per endpoint on CFR / VFR /
+  MPEG-TS / HD clips, exactly 5 ffmpeg runs for 4 endpoints x 5 frames, scene range and rotated
+  input). One existing test double was extended: `test_pipeline.py::test_scene_stats_stored_when_
+  scene_mode_runs` builds a fake scene result that now needs the new `vlm_cross_check` attribute.
+- **E2E** (isolated XDG dirs; a stdlib `http.server` stub on 127.0.0.1 serving five OpenAI-shaped
+  paths -- three VLMs with different `vision` limits (320 px / 480 px + `max_frames_per_call: 3`
+  + q70 / 640 px), a judge and an arbiter (400 px) -- that decodes every received JPEG and logs
+  size, prompt and schema; videos made with ffmpeg: 3 concatenated test patterns at 640x360,
+  the same with a 90 degree display rotation, and as MPEG-TS): `avf analyze --json --csv --full`
+  in refine mode sent 5x320x180, 3x480x270 and 5x640x360 frames, the second and third legs'
+  prompts carried the previous leg's JSON, final = third leg, calls `video` /
+  `cross_check:refine` x2, CSV `cross_check_mode=refine`. Judge mode: agreement 0.9 -> merged
+  (judge saw all three JSONs, no images, schema keys `agreement, conflicts, merged`); 0.3 without
+  arbiter -> primary's output, DISAGREEMENT row, WARNING line; 0.3 with arbiter -> arbiter got
+  5x400x225 frames, all three descriptions and the conflict list, final from the arbiter; one
+  VLM returning HTTP 500 -> one WARNING, judge saw the other two, final still produced; judge
+  returning `{"verdict": ...}` -> one WARNING, primary's output; primary 500 in refine on MPEG-TS
+  -> second endpoint described, third refined; middle 500 on the rotated file -> third refined
+  the first (frames 180x320 / 270x480 / 360x640, i.e. portrait). `avf process --scene-mode
+  --drop-non-content --enable-stage stabilize --report-json` on a 3-scene video: 3 scenes x 3
+  legs + 1 coordinator call in `jobs[].vlm_calls` (also with `max_parallel: 3` in judge mode:
+  16 calls, all captured from worker threads), per-scene blocks under `scene_stats.vlm_cross_check`,
+  output produced, exit 0, no traceback on any console.
 
 ## 28. Analysis profiles, reusable analysis module, analysis stages (P7)
 

@@ -16,6 +16,7 @@ the only "reasoning" such a model gets. A thinking model reasons first anyway.
 
 from __future__ import annotations
 
+import json
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -196,11 +197,8 @@ def _join(items: list[str]) -> str:
     return ", ".join(items[:-1]) + ", and " + items[-1]
 
 
-def build_system_prompt(outputs: OutputsConfig) -> str:
-    """Default system prompt for the enabled outputs and detail level.
-
-    With ``brief`` detail and no optional outputs this is byte-identical to the pre-§ 26 prompt.
-    """
+def _field_parts(outputs: OutputsConfig) -> list[str]:
+    """What each enabled field should contain, phrased for the prompt (one entry per key)."""
     d = outputs.detail
     parts = [_SUMMARY_BY_DETAIL[d], _TAGS_BY_DETAIL[d], _OBJECTS_BY_DETAIL[d]]
     if outputs.media_type:
@@ -212,6 +210,15 @@ def build_system_prompt(outputs: OutputsConfig) -> str:
     parts.append("an appropriate content rating (" + ", ".join(RATING_CHOICES) + ")")
     if outputs.rating_reasoning:
         parts.append("a short justification for the rating (1-2 sentences naming what drove it)")
+    return parts
+
+
+def build_system_prompt(outputs: OutputsConfig) -> str:
+    """Default system prompt for the enabled outputs and detail level.
+
+    With ``brief`` detail and no optional outputs this is byte-identical to the pre-§ 26 prompt.
+    """
+    parts = _field_parts(outputs)
     keys = ", ".join(f'"{k}"' for k in outputs.keys)
     text = (
         "You are a video analysis assistant. Analyze the provided frames from a video and "
@@ -250,6 +257,63 @@ def build_response_schema(outputs: OutputsConfig) -> dict[str, Any]:
     if outputs.rating_reasoning:
         props["rating_reasoning"] = {"type": "string"}
     return {"type": "object", "properties": props, "required": list(props)}
+
+
+# ─── Cross-check refine prompts (§ 27.2) ───────────────────────────
+#
+# Generated from the same field list as the describe prompt/schema above so the three cannot
+# drift: a refine reply is the normal schema plus ``changes``.
+
+CHANGES_KEY = "changes"
+
+
+def result_fields(result: Mapping[str, Any], outputs: OutputsConfig) -> dict[str, Any]:
+    """The enabled fields of a parsed result as the JSON object a model would have written
+    (what a later leg is shown): the keys of ``outputs.keys`` only, in generation order."""
+    values = {
+        "summary": result.get("summary", ""),
+        "tags": list(result.get("tags") or []),
+        "objects": list(result.get("objects") or []),
+        "media_type": result.get("media_type"),
+        "rating": result.get("rating"),
+        "rating_reasoning": result.get("rating_reasoning"),
+    }
+    return {k: values[k] for k in outputs.keys}
+
+
+def build_refine_system_prompt(outputs: OutputsConfig) -> str:
+    """System prompt for a refine leg: verify/correct a previous model's JSON against frames."""
+    keys = ", ".join(f'"{k}"' for k in (*outputs.keys, CHANGES_KEY))
+    return (
+        "You are a video analysis assistant reviewing another model's analysis of a video. "
+        "You are shown frames from the video and that model's JSON analysis. Check every field "
+        "against the frames: keep what is accurate, correct what is wrong or unsupported and "
+        "add what is missing. Return the corrected analysis, providing: "
+        f"{_join(_field_parts(outputs))}. "
+        f"Respond in valid JSON format with keys: {keys}. "
+        f'"{CHANGES_KEY}" is a list of short strings, one per correction you made (an empty '
+        "list if the analysis was already right)."
+    )
+
+
+def build_refine_user_prompt(
+    outputs: OutputsConfig, previous: Mapping[str, Any], previous_endpoint: str = ""
+) -> str:
+    """User prompt for a refine leg, embedding the previous leg's JSON verbatim."""
+    source = f" by {previous_endpoint}" if previous_endpoint else ""
+    return (
+        f"The analysis{source} of these video frames so far is:\n"
+        f"{json.dumps(dict(previous), ensure_ascii=False, indent=2)}\n\n"
+        "Verify it against the frames and return the corrected analysis as JSON."
+    )
+
+
+def build_refine_schema(outputs: OutputsConfig) -> dict[str, Any]:
+    """``build_response_schema`` plus a required ``changes`` array of strings."""
+    schema = build_response_schema(outputs)
+    schema["properties"][CHANGES_KEY] = {"type": "array", "items": {"type": "string"}}
+    schema["required"] = list(schema["properties"])
+    return schema
 
 
 # ─── Parsing ───────────────────────────────────────────────────────

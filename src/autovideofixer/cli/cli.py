@@ -43,6 +43,7 @@ from autovideofixer.config import (
 )
 from autovideofixer.config_migrations import CURRENT_CONFIG_VERSION, migrate_text
 from autovideofixer.core.analysis import is_video_file, scan_directory
+from autovideofixer.core.cross_check import CrossCheckConfig
 from autovideofixer.core.input_parsers import get_parser, list_parsers
 from autovideofixer.core.pipeline import Job, JobResult, Pipeline
 from autovideofixer.core.presets import get_preset, list_presets, load_preset
@@ -59,7 +60,7 @@ from autovideofixer.core.reporting import (
 from autovideofixer.core.vlm_calls import format_call_line, summarize_calls
 from autovideofixer.core.vlm_outputs import OutputsConfig
 from autovideofixer.core.vlm_sampling import SamplingConfig
-from autovideofixer.endpoints import all_endpoint_urls, resolve_role_endpoint
+from autovideofixer.endpoints import all_endpoint_urls, resolve_endpoint, resolve_role_endpoint
 from autovideofixer.logclean import get_pii_cleaner
 from autovideofixer.logger import build_console, get_logger, set_console_color, setup_logging
 
@@ -2145,6 +2146,12 @@ _ANALYZE_CSV_FIELDS = [
     "vlm_dropped_duplicates",
     "vlm_frame_size",
     "vlm_est_vision_tokens",
+    # § 27 cross-check (empty unless analysis.cross_check is enabled).
+    "cross_check_mode",
+    "cross_check_agreement",
+    "cross_check_arbiter_ran",
+    "cross_check_final_source",
+    "cross_check_disagreement",
 ]
 
 
@@ -2239,7 +2246,7 @@ def _analysis_to_json(analysis: "VideoAnalysis") -> dict[str, Any]:
     """Full structured result for one file (``avf analyze --json``): everything the table and
     CSV show, plus the sampling report and every call's stats, untruncated."""
     vlm_ran = bool(analysis.vlm_calls or analysis.vlm_sampling)
-    return {
+    doc = {
         "filepath": analysis.filepath,
         "filename": analysis.filename,
         "duration_sec": analysis.duration,
@@ -2274,6 +2281,10 @@ def _analysis_to_json(analysis: "VideoAnalysis") -> dict[str, Any]:
         "vlm_sampling": analysis.vlm_sampling,
         "vlm_calls": list(analysis.vlm_calls),
     }
+    if analysis.cross_check is not None:
+        # § 27: every leg's output + call and the judge's verdict, untruncated.
+        doc["cross_check"] = analysis.cross_check
+    return doc
 
 
 def _write_analysis_json(
@@ -2291,6 +2302,65 @@ def _write_analysis_json(
     with open(json_path, "w", encoding="utf-8") as f:
         json.dump(doc, f, indent=2, ensure_ascii=False, default=str)
         f.write("\n")
+
+
+def _cross_check_leg_line(leg: dict[str, Any]) -> str:
+    state = "ok" if leg.get("success") else f"FAILED ({leg.get('error') or 'error'})"
+    sampling = leg.get("sampling") or {}
+    frames = (
+        f" [{sampling.get('frames')} frame(s) {sampling.get('frame_size')}]"
+        if sampling.get("frame_size")
+        else ""
+    )
+    return f"{leg.get('role')} {leg.get('endpoint')}: {state}{frames}"
+
+
+def _add_cross_check_rows(table: Table, cc: dict[str, Any]) -> None:
+    """§ 27 rows of the analyze table: mode, agreement, arbiter, which endpoint wrote the final."""
+    table.add_row(
+        "Cross-Check Mode", Text(f"{cc.get('mode')} ({', '.join(cc.get('endpoints', []))})")
+    )
+    if cc.get("agreement") is not None:
+        verdict = cc.get("verdict") or {}
+        threshold = verdict.get("threshold")
+        note = "" if threshold is None else f" (threshold {threshold:g})"
+        table.add_row("Cross-Check Agreement", f"{cc['agreement']:.2f}{note}")
+    if cc.get("mode") == "judge":
+        table.add_row("Arbiter Ran", "yes" if cc.get("arbiter_ran") else "no")
+    if cc.get("disagreement"):
+        table.add_row(
+            "Cross-Check Result",
+            Text("DISAGREEMENT -- no arbiter settled it; showing the primary's output"),
+        )
+    table.add_row(
+        "Final From",
+        Text(str(cc["final_source"]) if cc.get("final_source") else "(every leg failed)"),
+    )
+    table.add_row(
+        "Cross-Check Legs",
+        Text("\n".join(_cross_check_leg_line(leg) for leg in cc.get("legs", []))),
+    )
+
+
+def _print_cross_check_details(cc: dict[str, Any]) -> None:
+    """``--full``: the judge's conflicts and what each refine leg changed."""
+    if cc.get("conflicts"):
+        console.print(
+            Panel(
+                Text(_safe("\n".join(f"- {c}" for c in cc["conflicts"]))),
+                title="Cross-Check Conflicts",
+                expand=True,
+            )
+        )
+    for leg in cc.get("legs", []):
+        if leg.get("changes"):
+            console.print(
+                Panel(
+                    Text(_safe("\n".join(f"- {c}" for c in leg["changes"]))),
+                    title=f"Changes by {_safe(leg.get('endpoint'))}",
+                    expand=True,
+                )
+            )
 
 
 def _print_analysis_result(analysis: "VideoAnalysis", *, full_output: bool) -> None:
@@ -2341,6 +2411,9 @@ def _print_analysis_result(analysis: "VideoAnalysis", *, full_output: bool) -> N
                 f"'{failed_call.get('endpoint')}' -- see the warning above"
             ),
         )
+    cc = analysis.cross_check
+    if cc:
+        _add_cross_check_rows(table, cc)
     sampling = analysis.vlm_sampling
     if sampling:
         table.add_row("VLM Frames Sent", str(sampling.get("frames", 0)))
@@ -2380,6 +2453,9 @@ def _print_analysis_result(analysis: "VideoAnalysis", *, full_output: bool) -> N
             )
         )
 
+    if full_output and analysis.cross_check:
+        _print_cross_check_details(analysis.cross_check)
+
     if analysis.scenes:
         console.print(f"\n[bold]Detected {analysis.total_scenes} Scene(s):[/bold]")
         for scene in analysis.scenes[:30]:
@@ -2406,6 +2482,7 @@ def _print_analysis_result(analysis: "VideoAnalysis", *, full_output: bool) -> N
 def _analysis_to_csv_row(analysis: "VideoAnalysis") -> dict[str, Any]:
     """Build one CSV row dict from a VideoAnalysis, matching the printed table's fields."""
     sampling = analysis.vlm_sampling or {}
+    cc = analysis.cross_check or {}
     totals = summarize_calls(analysis.vlm_calls)
     return {
         "filepath": analysis.filepath,
@@ -2438,6 +2515,11 @@ def _analysis_to_csv_row(analysis: "VideoAnalysis") -> dict[str, Any]:
         "vlm_est_vision_tokens": (
             "" if sampling.get("est_vision_tokens") is None else sampling["est_vision_tokens"]
         ),
+        "cross_check_mode": cc.get("mode", ""),
+        "cross_check_agreement": "" if cc.get("agreement") is None else cc["agreement"],
+        "cross_check_arbiter_ran": cc.get("arbiter_ran", "") if cc else "",
+        "cross_check_final_source": cc.get("final_source") or "",
+        "cross_check_disagreement": cc.get("disagreement", "") if cc else "",
     }
 
 
@@ -2965,7 +3047,12 @@ def analyze(
         or (vlm_flag is None and config.get("analysis", "vlm", "enabled", default=False))
     ):
         try:
-            resolve_role_endpoint(config, "vlm", vlm_endpoint)
+            if CrossCheckConfig.from_config(config).enabled:
+                # The cross-check lists its own endpoints; --vlm-endpoint replaces the primary.
+                if vlm_endpoint is not None:
+                    resolve_endpoint(config, vlm_endpoint)
+            else:
+                resolve_role_endpoint(config, "vlm", vlm_endpoint)
             SamplingConfig.from_mapping(
                 config.get("analysis", "vlm", "sampling", default={}),
                 min_frames=min_sample_frames,

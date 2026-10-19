@@ -8,6 +8,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Multi-VLM cross-check** (REQUIREMENTS.md § 27). `analysis.cross_check` (`enabled` false by
+  default, `mode` `refine` | `judge`, `endpoints`, `judge_endpoint`, `arbiter_endpoint`,
+  `agreement_threshold` 0.75, `max_parallel` 1) lets several VLM endpoints analyze the same video
+  or scene. `refine`: each next endpoint verifies/corrects the previous JSON (reply adds
+  `changes`); the last successful output wins. `judge`: every endpoint describes independently, a
+  text judge returns `{agreement, conflicts, merged}`; at or above the threshold the merged output
+  is the result, below it the arbiter VLM decides, or (no arbiter) the primary's output is kept
+  flagged `disagreement`. Each endpoint's frames are planned for its own `vision` limits from one
+  probe and one decode per frame. A failing leg degrades to the best successful output (primary
+  first) with a one-line warning. Every leg is its own call-stat row (`cross_check:describe`,
+  `:refine`, `:judge`, `:arbiter`; the primary keeps `video`/`scene`), judge-mode describe legs may
+  run concurrently (`max_parallel`). New `cross_check` block in `avf analyze --json` and in the
+  process report (`scene_stats.vlm_cross_check`), console rows in the analyze table, CSV columns
+  `cross_check_mode`, `cross_check_agreement`, `cross_check_arbiter_ran`,
+  `cross_check_final_source`, `cross_check_disagreement`. `--vlm-endpoint/--vlm-model/--vlm-url`
+  replace the primary endpoint only. No `config_version` bump (new, off-by-default keys).
 - **Structured VLM output fields** (REQUIREMENTS.md § 26.1). `analysis.vlm.outputs.media_type`
   (default on; one of `analysis.vlm.media_type_choices`, else `other`), `outputs.rating_reasoning`
   (default off; asked for last, after `rating`) and `analysis.vlm.detail`

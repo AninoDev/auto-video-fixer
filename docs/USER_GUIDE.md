@@ -340,7 +340,10 @@ avf analyze [FILEPATH] [OPTIONS]
   the frame-sampling report and the stats of every VLM call (see
   [Structured VLM output and call statistics](#structured-vlm-output-and-call-statistics))
 - `--csv PATH`: one row per file, including `media_type`, `rating_reasoning`, `vlm_extra` (JSON
-  text) and call totals (`vlm_calls`, `vlm_wall_sec`, `vlm_input_tokens`, `vlm_output_tokens`)
+  text) and call totals (`vlm_calls`, `vlm_wall_sec`, `vlm_input_tokens`, `vlm_output_tokens`);
+  with the cross-check on, also `cross_check_mode`, `cross_check_agreement`,
+  `cross_check_arbiter_ran`, `cross_check_final_source`, `cross_check_disagreement` (see
+  [Cross-checking with several VLMs](#cross-checking-with-several-vlms))
 - `--full`: print the complete summary, rating reasoning and extra fields in panels under the table
 - `-r, --recursive`: Scan directories recursively
 - `--symlinks [files_only|follow|skip]`: How directory scanning treats symlinks (default
@@ -947,7 +950,81 @@ Every model call (whole video, each scene, the crop check, the scene coordinator
 There is no time-to-first-token: AVF does not stream responses.
 
 In `avf process`, the `--report-json` file lists every call of a job under `jobs[].vlm_calls`
-(`purpose` is `scene`, `coordinator` or `crop_check`); add them up yourself, no totals are stored.
+(`purpose` is `scene`, `coordinator` or `crop_check`, plus the `cross_check:*` values below); add
+them up yourself, no totals are stored.
+
+#### Cross-checking with several VLMs
+
+One small model is quick but sometimes wrong. `analysis.cross_check` has several VLM endpoints look
+at the same video (or, in scene mode, each scene) and combines their answers. It is **off by
+default** and costs one extra model call per listed endpoint (plus the judge and, only on
+disagreement, the arbiter), so on a single local GPU the time is roughly the sum of the calls.
+It applies to `avf analyze --vlm` and to per-scene analysis (`--scene-mode --drop-non-content`),
+not to the crop check.
+
+```yaml
+analysis:
+  endpoints:
+    small_vlm:                  # fast, runs on the LAN box
+      provider: llamacpp
+      model: small-vision-model
+      api_url: "http://192.0.2.10:8080/v1/chat/completions"
+      allow_http: true
+      vision: {max_long_side_px: 672}
+    big_vlm:                    # slower, better, hosted
+      provider: api
+      model: big-vision-model
+      api_url: "https://example.com/v1/chat/completions"
+      api_key: "..."
+      vision: {max_long_side_px: 1536}
+  cross_check:
+    enabled: true
+    mode: judge                 # refine | judge
+    endpoints: [small_vlm, big_vlm]       # first = primary; at least two
+    judge_endpoint: default_llm           # text LLM; null = analysis.llm.endpoint
+    arbiter_endpoint: big_vlm             # optional; null = none
+    agreement_threshold: 0.75
+    max_parallel: 1
+```
+
+- **`mode: refine`** (N model calls, one after another): the primary describes the frames as
+  usual; each next endpoint is shown *its own* frames plus the previous JSON and must verify and
+  correct it, answering with the same fields plus `changes` (what it corrected). The last
+  successful answer wins. Cheapest way to let a stronger model fix a weaker one; the stronger
+  model should come last.
+- **`mode: judge`** (N describe calls, plus one judge call): every endpoint describes
+  independently, then the judge LLM (text only, it never sees images) reads all the JSON answers
+  and returns an `agreement` score from 0 to 1, a list of `conflicts` and a `merged` answer. If
+  `agreement >= agreement_threshold` the merged answer is the result. Below it, the
+  `arbiter_endpoint` (a VLM) looks at *its own* frames again together with all descriptions and
+  the conflicts and writes the final answer; with no arbiter the primary's answer is kept and the
+  result is flagged **disagreement**. Independent describers catch more than a chain does, but you
+  pay for the judge, and the score is only as good as your judge model.
+- **Frames**: each endpoint gets frames planned for its own `vision` limits (count, size, JPEG
+  quality), so a 672 px model and a 1536 px model both get what they can use. The video is probed
+  once and each needed frame is decoded once, then shrunk per endpoint.
+- **Failures never lose the result.** A leg that fails (timeout, HTTP error, an answer that is not
+  JSON, a judge score that makes no sense) is skipped with a one-line warning and the result falls
+  back to the best answer that did arrive, the primary's first. If the primary itself fails, the
+  next endpoint describes instead of refining. Only if every call fails is the result empty.
+- **`max_parallel`** (judge mode only): how many describe calls may be in flight at once. Leave it
+  at 1 for a single local GPU, which serializes requests anyway; raise it when the endpoints are
+  separate servers. Refine is always sequential.
+- **Command-line overrides** `--vlm-endpoint`, `--vlm-model` and `--vlm-url` replace the
+  *primary* (first) endpoint only; the other legs always use the configuration.
+
+What you see: `avf analyze` adds *Cross-Check Mode*, *Cross-Check Agreement* (judge mode, with the
+threshold), *Arbiter Ran*, *Final From* (the endpoint whose answer is shown; a judge's merged
+answer counts as the judge's), a *DISAGREEMENT* line when nothing settled a low score, and one line
+per leg with its frames and size. `--full` also prints the judge's conflicts and what each refine
+leg changed. The normal fields (summary, tags, rating, ...) are the final answer. `--json PATH`
+has the whole `cross_check` block per file: every leg's own output and call stats, the judge's
+verdict and the conflicts. The CSV gains `cross_check_mode`, `cross_check_agreement`,
+`cross_check_arbiter_ran`, `cross_check_final_source` and `cross_check_disagreement` (blank when
+the cross-check is off). Each leg is its own row in the call table with its own purpose: the
+primary keeps `video` / `scene`, the others are `cross_check:describe`, `cross_check:refine`,
+`cross_check:judge` and `cross_check:arbiter`. In scene mode the `--report-json` file adds each
+scene's block under `scene_stats.vlm_cross_check` and every call under `jobs[].vlm_calls`.
 
 #### VLM errors
 

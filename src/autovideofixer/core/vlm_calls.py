@@ -27,6 +27,7 @@ import contextlib
 import contextvars
 import json
 import socket
+import threading
 import urllib.error
 from collections.abc import Iterator, Mapping
 from dataclasses import asdict, dataclass, field
@@ -282,9 +283,16 @@ def collect_call_stats() -> Iterator[list[CallStats]]:
         _collectors.reset(token)
 
 
+# Cross-check legs may run in worker threads (§ 27.6). A worker started with
+# ``contextvars.copy_context().run`` sees the same sink lists, so appends from several threads
+# are serialised here.
+_record_lock = threading.Lock()
+
+
 def record_call(stats: CallStats) -> None:
-    for sink in _collectors.get():
-        sink.append(stats)
+    with _record_lock:
+        for sink in _collectors.get():
+            sink.append(stats)
 
 
 # ─── Formatting / totals ───────────────────────────────────────────

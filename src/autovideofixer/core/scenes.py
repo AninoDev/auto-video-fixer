@@ -60,6 +60,9 @@ class SceneModeResult:
     # § 25.4: per-scene VLM sampling reports ({"index", "start_time", "end_time", plus
     # SamplingReport.to_dict() fields}); empty unless scenes.drop_non_content ran the VLM.
     vlm_sampling: list[dict[str, Any]] = field(default_factory=list)
+    # § 27: per-scene cross-check blocks ({"index", "start_time", "end_time", plus the
+    # ``cross_check`` result block}); empty unless analysis.cross_check was enabled.
+    vlm_cross_check: list[dict[str, Any]] = field(default_factory=list)
 
 
 def _run_ffmpeg_ok(args: list[str], timeout: float | None = None) -> bool:
@@ -458,6 +461,8 @@ def _collect_scene_vlm_summaries(
                 # § 25.4: what was actually sent for this scene (frames, duplicates
                 # dropped, size, est. tiles/tokens); absent if sampling failed.
                 "sampling": vlm_result.get("sampling"),
+                # § 27 cross-check block (every leg's output + the verdict) when enabled.
+                "cross_check": vlm_result.get("cross_check"),
             }
         )
     return summaries
@@ -536,6 +541,7 @@ def run_scene_pipeline(
 
         dropped_info: list[dict[str, Any]] = []
         scene_vlm_sampling: list[dict[str, Any]] = []
+        scene_vlm_cross_check: list[dict[str, Any]] = []
         kept_scenes = list(enumerate(scenes))
 
         drop_non_content = config.get("scenes", "drop_non_content", default=False)
@@ -558,6 +564,16 @@ def run_scene_pipeline(
                     }
                     for sm in summaries
                     if isinstance(sm.get("sampling"), dict)
+                ]
+                scene_vlm_cross_check = [
+                    {
+                        "index": sm["index"],
+                        "start_time": sm["start_time"],
+                        "end_time": sm["end_time"],
+                        **sm["cross_check"],
+                    }
+                    for sm in summaries
+                    if isinstance(sm.get("cross_check"), dict)
                 ]
                 coordinator_result = run_scene_coordinator(summaries, config)
             except Exception:
@@ -759,6 +775,7 @@ def run_scene_pipeline(
             stabilize_tiers=tiers,
             interpolated_scenes=interpolated,
             vlm_sampling=scene_vlm_sampling,
+            vlm_cross_check=scene_vlm_cross_check,
         )
     except Exception:
         logger.warning(

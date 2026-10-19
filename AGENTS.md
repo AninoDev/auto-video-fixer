@@ -1442,6 +1442,46 @@ through `_extract_json_dict`: strip `<think>` blocks (also an unterminated leadi
 `</think>`), strip code fences, try pure JSON, else the first balanced top-level `{...}` that parses
 (string-aware brace matching), else the existing fallback (whole cleaned text = summary).
 
+### Multi-VLM cross-check (REQUIREMENTS.md § 27; `core/cross_check.py` + `analysis._CrossCheckRun`)
+
+`analysis.cross_check` (`enabled` false by default). `CrossCheckConfig.from_config(config)` is the
+validator (shape always, endpoint names only when `enabled`); both `run_vlm_analysis` and
+`run_vlm_analysis_for_scene` call it first and, when enabled, hand the whole range to
+`_CrossCheckRun(...).run(...)`. **The disabled path is the original code, untouched** -- a test pins
+that it makes the same call, returns the same keys and never reaches the multi sampler; keep it so.
+`cross_check.py` is the pure half (config, refine/judge/arbiter prompts + schemas, verdict parsing,
+the `cross_check` result block); the provider calls stay in `analysis.py` because they reuse
+`_call_provider_raw` / `_dispatch_vlm` (importing the other way round would be circular).
+Refine/judge/arbiter prompts and schemas are generated from `vlm_outputs` (`result_fields`,
+`build_refine_*`, `build_response_schema`) -- add a field there, not in a leg.
+
+Gotchas:
+- **Threads and the ContextVar**: `collect_call_stats()` does not cross into a pool worker. Judge-mode
+  describe legs run with `pool.submit(contextvars.copy_context().run, ...)` -- one *fresh* copy per
+  task (a `Context` cannot be entered by two threads at once) -- so the workers' `record_call`s still
+  reach the enclosing collector, and `record_call` takes a lock around the appends. Legs/results are
+  collected in endpoint order, not completion order. Anything new that calls a model from a worker
+  thread must do the same. Progress callbacks and logging stay on the calling thread.
+- **Shared decode cache** (`vlm_sampling.sample_vlm_frames_multi`): one probe, one `FFmpegFrameSource`
+  for all endpoints (+ the arbiter, whose frames are planned up front too). It decodes each frame
+  *once at the largest size any plan needs* and each endpoint's `ScaledView` hands the selection loop a
+  fresh `Candidate` downscaled with `INTER_AREA` -- fresh because `select_frames` frees a rejected
+  candidate's image in place, which would blank the cached frame another endpoint still wants. The
+  cache is byte-bounded (`SHARED_CACHE_BUDGET_BYTES`, oldest images dropped and re-decoded on demand
+  -- `decodes` > distinct frames means the budget bit) and freed when the JPEGs are written. With a
+  single vision `sample_vlm_frames` is the same code on the original path (no views, rejected frames
+  freed in place). Never decode per endpoint; the motion probe is shared too.
+- **Strict legs**: refine and arbiter replies must be a JSON object. Unlike the describe path (where
+  prose becomes the summary), prose or an all-empty object fails the leg, otherwise a rambling
+  verifier would overwrite a good earlier answer. A judge verdict without a usable `agreement` is a
+  failed judge leg; `agreement` is clamped to [0,1] (85 means 1.0, not 85%).
+- **Purposes**: primary leg keeps `video`/`scene`; others `cross_check:describe|refine|judge|arbiter`
+  (constants in `cross_check.py`). With `cross_check` in the result, `VideoAnalysis.vlm_calls` is
+  built from the legs (`legs[].call`), not from `result["call"]` (the primary's call, kept for
+  compatibility); the process report gets them through the collector.
+- **CLI overrides** (`--vlm-endpoint/-model/-url`) apply to the primary only; `avf analyze` skips
+  resolving `analysis.vlm.endpoint` when the cross-check is enabled.
+
 ### Config cascade
 
 `avf process` builds its effective config as an ordered stack of layers, each deep-merged
