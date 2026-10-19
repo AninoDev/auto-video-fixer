@@ -9,16 +9,39 @@ from __future__ import annotations
 
 import base64
 import copy
+import json
 import logging
 import os
 import re
 import shutil
 import statistics
 import tempfile
+import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Mapping
 
 from autovideofixer.config import VALID_SYMLINKS_POLICIES, Config
+from autovideofixer.core.vlm_calls import (
+    ERR_EMPTY,
+    ERR_UNKNOWN_PROVIDER,
+    ERR_URL_REFUSED,
+    CallStats,
+    ProviderResponse,
+    apply_ollama_usage,
+    apply_openai_usage,
+    classify_exception,
+    failure_message,
+    format_call_line,
+    record_call,
+    truncation_message,
+)
+from autovideofixer.core.vlm_outputs import (
+    OutputsConfig,
+    build_response_schema,
+    build_system_prompt,
+    build_user_prompt,
+    parse_fields,
+)
 from autovideofixer.core.vlm_sampling import SamplingConfig, VisionLimits, sample_vlm_frames
 from autovideofixer.endpoints import (
     normalize_provider,
@@ -61,7 +84,9 @@ VIDEO_EXTENSIONS: set[str] = {
 # Supported image frame extensions (for still image analysis)
 IMAGE_EXTENSIONS: set[str] = {".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".webp"}
 
-# VLM prompt for video analysis
+# Pre-§26 default prompt text (brief, no optional outputs). The live default is generated from
+# analysis.vlm.outputs / detail by vlm_outputs.build_system_prompt(); kept for the low-level
+# _run_* helpers and as the byte-compat reference in the tests.
 _VLM_SYSTEM_PROMPT = (
     "You are a video analysis assistant. Analyze the provided frames from a video "
     "and provide: a brief summary of the content (1-2 sentences), relevant tags "
@@ -227,11 +252,53 @@ class VideoAnalysis:
     vlm_tags: list[str] = field(default_factory=list)
     vlm_objects: list[str] = field(default_factory=list)
     content_rating: str | None = None
+    # § 26.1 structured outputs. media_type is one of analysis.vlm.media_type_choices (or
+    # "other"); rating_reasoning only when analysis.vlm.outputs.rating_reasoning is on;
+    # vlm_extra holds any other keys the model returned (plus media_type_raw when the model's
+    # wording was mapped onto a listed choice).
+    media_type: str | None = None
+    rating_reasoning: str | None = None
+    vlm_extra: dict[str, Any] = field(default_factory=dict)
+    # § 26.2 CallStats.to_dict() of every VLM call made for this file.
+    vlm_calls: list[dict[str, Any]] = field(default_factory=list)
     # SamplingReport.to_dict() of the whole-video VLM call (REQUIREMENTS.md § 25.4); None
     # when VLM didn't run.
     vlm_sampling: dict[str, Any] | None = None
     similar_files: list[str] = field(default_factory=list)
     metadata: dict[str, Any] = field(default_factory=dict)
+
+
+def _resolve_vlm_prompts(
+    vlm_config: Mapping[str, Any],
+    outputs: OutputsConfig,
+    *,
+    prompt_append: str | None,
+    prompt_override: str | None,
+    system_prompt_override: str | None,
+) -> tuple[str, str]:
+    """System and user prompt for a VLM call.
+
+    The defaults are generated from the enabled outputs and detail level
+    (REQUIREMENTS.md § 26.1). A non-empty override (argument, else config) replaces the
+    generated prompt wholesale -- it must itself ask for every field it wants back.
+    ``prompt_append`` is added after whichever user prompt is in force.
+    """
+    append = (
+        prompt_append if prompt_append is not None else vlm_config.get("prompt_append", "")
+    ) or ""
+    override = (
+        prompt_override if prompt_override is not None else vlm_config.get("prompt_override", "")
+    ) or ""
+    system_override = (
+        system_prompt_override
+        if system_prompt_override is not None
+        else vlm_config.get("system_prompt_override", "")
+    ) or ""
+    system_prompt = system_override or build_system_prompt(outputs)
+    user_prompt = override or build_user_prompt(outputs)
+    if append:
+        user_prompt = f"{user_prompt}\n\n{append}"
+    return system_prompt, user_prompt
 
 
 class VideoAnalyzer:
@@ -366,6 +433,11 @@ class VideoAnalyzer:
             analysis.vlm_tags = vlm_result.get("tags", [])
             analysis.vlm_objects = vlm_result.get("objects", [])
             analysis.content_rating = vlm_result.get("rating")
+            analysis.media_type = vlm_result.get("media_type")
+            analysis.rating_reasoning = vlm_result.get("rating_reasoning")
+            analysis.vlm_extra = dict(vlm_result.get("extra") or {})
+            if vlm_result.get("call"):
+                analysis.vlm_calls = [vlm_result["call"]]
             _report("vlm_done", "VLM analysis complete")
 
         _report("done", "Analysis complete")
@@ -609,24 +681,14 @@ class VideoAnalyzer:
         )
         vision = VisionLimits.from_mapping(ep.vision)
 
-        resolved_append = (
-            prompt_append if prompt_append is not None else vlm_config.get("prompt_append", "")
-        ) or ""
-        resolved_override = (
-            prompt_override
-            if prompt_override is not None
-            else vlm_config.get("prompt_override", "")
-        ) or ""
-        resolved_system_override = (
-            system_prompt_override
-            if system_prompt_override is not None
-            else vlm_config.get("system_prompt_override", "")
-        ) or ""
-
-        system_prompt = resolved_system_override or _VLM_SYSTEM_PROMPT
-        user_prompt = resolved_override or _VLM_USER_PROMPT
-        if resolved_append:
-            user_prompt = f"{user_prompt}\n\n{resolved_append}"
+        outputs = OutputsConfig.from_config(vlm_config)
+        system_prompt, user_prompt = _resolve_vlm_prompts(
+            vlm_config,
+            outputs,
+            prompt_append=prompt_append,
+            prompt_override=prompt_override,
+            system_prompt_override=system_prompt_override,
+        )
 
         _report(
             "vlm_sampling",
@@ -635,7 +697,7 @@ class VideoAnalyzer:
         sampled = sample_vlm_frames(filepath, sampling, vision, config=self.config)
         report = sampled.report
         if not sampled.paths:
-            return {"summary": "", "tags": [], "objects": []}
+            return _empty_vlm_result()
 
         # All sample frames live in one temp dir created by sample_vlm_frames; it must
         # be cleaned up here, after the provider has read the frames into base64, not
@@ -662,6 +724,10 @@ class VideoAnalyzer:
                 timeout=ep.timeout_sec,
                 compat=ep.compat,
                 context=filepath,
+                outputs=outputs,
+                endpoint_name=ep.name,
+                purpose="video",
+                est_vision_tokens=report.est_vision_tokens,
             )
             result["sampling"] = report.to_dict()
             return result
@@ -712,25 +778,16 @@ class VideoAnalyzer:
         vision = VisionLimits.from_mapping(ep.vision)
 
         if max(scene.duration, 0.0) <= 0:
-            return {"summary": "", "tags": [], "objects": [], "rating": None}
+            return _empty_vlm_result()
 
-        resolved_append = (
-            prompt_append if prompt_append is not None else vlm_config.get("prompt_append", "")
-        ) or ""
-        resolved_override = (
-            prompt_override
-            if prompt_override is not None
-            else vlm_config.get("prompt_override", "")
-        ) or ""
-        resolved_system_override = (
-            system_prompt_override
-            if system_prompt_override is not None
-            else vlm_config.get("system_prompt_override", "")
-        ) or ""
-        system_prompt = resolved_system_override or _VLM_SYSTEM_PROMPT
-        user_prompt = resolved_override or _VLM_USER_PROMPT
-        if resolved_append:
-            user_prompt = f"{user_prompt}\n\n{resolved_append}"
+        outputs = OutputsConfig.from_config(vlm_config)
+        system_prompt, user_prompt = _resolve_vlm_prompts(
+            vlm_config,
+            outputs,
+            prompt_append=prompt_append,
+            prompt_override=prompt_override,
+            system_prompt_override=system_prompt_override,
+        )
 
         sampled = sample_vlm_frames(
             filepath,
@@ -742,7 +799,7 @@ class VideoAnalyzer:
             config=self.config,
         )
         if not sampled.paths:
-            return {"summary": "", "tags": [], "objects": [], "rating": None}
+            return _empty_vlm_result()
 
         report = sampled.report
         scene_ctx = f"{filepath} scene[{scene.start_time:.1f}-{scene.end_time:.1f}]"
@@ -762,6 +819,11 @@ class VideoAnalyzer:
                 timeout=ep.timeout_sec,
                 compat=ep.compat,
                 context=scene_ctx,
+                outputs=outputs,
+                endpoint_name=ep.name,
+                purpose="scene",
+                detail=f"scene[{scene.start_time:.1f}-{scene.end_time:.1f}]",
+                est_vision_tokens=report.est_vision_tokens,
             )
             result["sampling"] = report.to_dict()
             return result
@@ -979,44 +1041,67 @@ def _extract_json_dict(response_text: str) -> dict[str, Any] | None:
     return None
 
 
-def _parse_vlm_response(response_text: str) -> dict[str, Any]:
-    """Parse a VLM JSON response into analysis results."""
+def _parse_vlm_response(
+    response_text: str, media_type_choices: tuple[str, ...] | None = None
+) -> dict[str, Any]:
+    """Parse a VLM JSON response into analysis results (REQUIREMENTS.md § 26.1).
+
+    Keys: summary, tags, objects, rating, media_type (normalised to ``media_type_choices``,
+    else ``other``), rating_reasoning and ``extra`` (every other key the model returned).
+    """
     data = _extract_json_dict(response_text)
     if data is not None:
-        return {
-            "summary": data.get("summary", ""),
-            "tags": [t.strip() for t in data.get("tags", "").split(",") if t.strip()]
-            if isinstance(data.get("tags"), str)
-            else data.get("tags", []),
-            "objects": [o.strip() for o in data.get("objects", "").split(",") if o.strip()]
-            if isinstance(data.get("objects"), str)
-            else data.get("objects", []),
-            "rating": data.get("rating"),
-        }
+        if media_type_choices is None:
+            return parse_fields(data)
+        return parse_fields(data, media_type_choices)
+    # A reply cut off at max_tokens is an unterminated object: keep the fields that did
+    # arrive complete rather than dumping the raw JSON fragment into the summary.
+    salvaged = _salvage_json_fields(response_text)
+    if salvaged:
+        if media_type_choices is None:
+            return parse_fields(salvaged)
+        return parse_fields(salvaged, media_type_choices)
     # Fallback: no recoverable JSON object -- treat the response (minus any reasoning
     # block, which is never a summary) as the summary, so a truncated/malformed fenced
     # response still degrades to real content instead of an empty string.
-    return {
-        "summary": _strip_think(response_text),
-        "tags": [],
-        "objects": [],
-        "rating": None,
-    }
+    result = _empty_vlm_result()
+    result["summary"] = _strip_think(response_text)
+    return result
+
+
+_JSON_KEY_RE = re.compile(r'"([A-Za-z_][A-Za-z0-9_]*)"\s*:\s*')
+
+
+def _salvage_json_fields(response_text: str) -> dict[str, Any] | None:
+    """Complete ``"key": value`` pairs from an unterminated JSON object, or None.
+
+    Only applies when the (think-stripped, fence-stripped) text starts like a JSON object; each
+    value is decoded with ``raw_decode`` so a string or array cut off mid-way is dropped, not
+    guessed at. Nested objects' keys are skipped by resuming after each decoded value.
+    """
+    text = _strip_code_fences(_strip_think(response_text)).strip()
+    if not text.startswith("{"):
+        return None
+    decoder = json.JSONDecoder()
+    out: dict[str, Any] = {}
+    pos = 1
+    while True:
+        m = _JSON_KEY_RE.search(text, pos)
+        if m is None:
+            break
+        try:
+            value, end = decoder.raw_decode(text, m.end())
+        except ValueError:
+            break  # the cut-off point: nothing after it is complete
+        out.setdefault(m.group(1), value)
+        pos = end
+    return out or None
 
 
 # JSON Schemas sent when compat.response_format is "json_schema" (§ 24.5). One per response
-# shape the OpenAI-shaped providers are asked for. P5 (§ 26) extends the VLM one with the new
-# output fields -- keep it in step with _parse_vlm_response and the default system prompt.
-_VLM_RESPONSE_SCHEMA: dict[str, Any] = {
-    "type": "object",
-    "properties": {
-        "summary": {"type": "string"},
-        "tags": {"anyOf": [{"type": "array", "items": {"type": "string"}}, {"type": "string"}]},
-        "objects": {"anyOf": [{"type": "array", "items": {"type": "string"}}, {"type": "string"}]},
-        "rating": {"type": "string", "enum": ["G", "PG", "PG-13", "R"]},
-    },
-    "required": ["summary", "tags", "objects", "rating"],
-}
+# shape the OpenAI-shaped providers are asked for. The live VLM schema is generated per call from
+# the enabled outputs (vlm_outputs.build_response_schema); this constant is the pre-§26 shape.
+_VLM_RESPONSE_SCHEMA: dict[str, Any] = build_response_schema(OutputsConfig(media_type=False))
 
 _COORDINATOR_RESPONSE_SCHEMA: dict[str, Any] = {
     "type": "object",
@@ -1106,6 +1191,46 @@ _DEFAULT_OPENAI_COMPAT: dict[str, Any] = {
 }
 
 
+def _new_stats(provider: str, model: str, images: int) -> CallStats:
+    return CallStats(provider=provider, model=model, images=images)
+
+
+def _failed_response(
+    provider: str, model: str, images: int, started: float, exc: BaseException, what: str
+) -> ProviderResponse:
+    """Turn a request exception into an empty ProviderResponse whose stats carry the error class.
+
+    Logged at DEBUG *with* the traceback (it lands in the always-on DEBUG file log); the
+    one-line, console-visible WARNING is emitted by ``_call_provider_raw``, which knows the
+    endpoint name and timeout to put in the message.
+    """
+    error_class, message = classify_exception(exc)
+    logger.debug("%s request failed (%s)", what, error_class, exc_info=True)
+    stats = _new_stats(provider, model, images)
+    stats.wall_sec = time.monotonic() - started
+    stats.success = False
+    stats.error_class = error_class
+    stats.error = message
+    return ProviderResponse("", stats)
+
+
+def _finish_response(stats: CallStats, text: str, started: float) -> ProviderResponse:
+    stats.wall_sec = time.monotonic() - started
+    if not text:
+        stats.success = False
+        stats.error_class = ERR_EMPTY
+        stats.error = "the model returned an empty reply"
+    return ProviderResponse(text, stats)
+
+
+def _openai_text(result: Any) -> str:
+    """``choices[0].message.content`` of an OpenAI-shaped body ('' when absent/null)."""
+    if not isinstance(result, dict):
+        raise TypeError("response body is not a JSON object")
+    content = result.get("choices", [{}])[0].get("message", {}).get("content", "")
+    return content if isinstance(content, str) else ""
+
+
 def _call_ollama(
     api_url: str,
     model: str,
@@ -1115,7 +1240,7 @@ def _call_ollama(
     max_tokens: int = 1024,
     tls: TLSPolicy | None = None,
     timeout: float | None = 120.0,
-) -> str:
+) -> ProviderResponse:
     """Send a request to an Ollama API endpoint.
 
     Args:
@@ -1129,7 +1254,8 @@ def _call_ollama(
         timeout: Request timeout in seconds (``Endpoint.timeout_sec``); None = unlimited.
 
     Returns:
-        Response text from the model
+        ``ProviderResponse``: the model's text ('' on failure) and the call's ``CallStats``
+        (Ollama's ``prompt_eval_count`` / ``eval_count`` / ``*_duration`` fields). Never raises.
     """
     import json
 
@@ -1146,6 +1272,7 @@ def _call_ollama(
         "options": {"num_predict": max_tokens},
     }
 
+    started = time.monotonic()
     try:
         import urllib.request
 
@@ -1157,10 +1284,13 @@ def _call_ollama(
         )
         with open_url(req, timeout=timeout, tls=tls) as resp:
             result = json.loads(resp.read().decode("utf-8"))
-            return result.get("message", {}).get("content", "")
-    except Exception:
-        logger.warning("Ollama VLM request to %s failed", api_url, exc_info=True)
-        return ""
+        wall = time.monotonic() - started
+        stats = _new_stats("ollama", model, len(image_b64_list))
+        apply_ollama_usage(stats, result, wall)
+        content = result.get("message", {}).get("content", "")
+        return _finish_response(stats, content if isinstance(content, str) else "", started)
+    except Exception as e:
+        return _failed_response("ollama", model, len(image_b64_list), started, e, "Ollama VLM")
 
 
 def _call_openai(
@@ -1174,7 +1304,7 @@ def _call_openai(
     timeout: float | None = 120.0,
     compat: Mapping[str, Any] | None = None,
     response_schema: Mapping[str, Any] | None = None,
-) -> str:
+) -> ProviderResponse:
     """Send a request to the OpenAI Vision API.
 
     Args:
@@ -1191,7 +1321,7 @@ def _call_openai(
         response_schema: JSON Schema sent when ``compat.response_format`` is ``json_schema``.
 
     Returns:
-        Response text from the model
+        ``ProviderResponse`` (text + ``CallStats`` from ``usage``); never raises.
     """
     import json
 
@@ -1199,6 +1329,7 @@ def _call_openai(
         model, system_prompt, user_prompt, image_b64_list, max_tokens, compat, response_schema
     )
 
+    started = time.monotonic()
     try:
         import urllib.request
 
@@ -1213,10 +1344,11 @@ def _call_openai(
         )
         with open_url(req, timeout=timeout, tls=tls) as resp:
             result = json.loads(resp.read().decode("utf-8"))
-            return result.get("choices", [{}])[0].get("message", {}).get("content", "")
-    except Exception:
-        logger.warning("OpenAI VLM request failed (model=%s)", model, exc_info=True)
-        return ""
+        stats = _new_stats("openai", model, len(image_b64_list))
+        apply_openai_usage(stats, result, time.monotonic() - started)
+        return _finish_response(stats, _openai_text(result), started)
+    except Exception as e:
+        return _failed_response("openai", model, len(image_b64_list), started, e, "OpenAI VLM")
 
 
 def _call_custom_api(
@@ -1232,7 +1364,8 @@ def _call_custom_api(
     timeout: float | None = 120.0,
     compat: Mapping[str, Any] | None = None,
     response_schema: Mapping[str, Any] | None = None,
-) -> str:
+    provider: str = "api",
+) -> ProviderResponse:
     """Send a request to a custom OpenAI-compatible endpoint (``api`` and ``llamacpp``).
 
     Uses the OpenAI-compatible chat completions format; ``api_url`` is the full
@@ -1251,9 +1384,11 @@ def _call_custom_api(
         timeout: Request timeout in seconds (``Endpoint.timeout_sec``); None = unlimited.
         compat: Effective request-shape knobs; None = the string-system / json_object shape.
         response_schema: JSON Schema sent when ``compat.response_format`` is ``json_schema``.
+        provider: Name recorded in the call stats (``api`` or ``llamacpp``).
 
     Returns:
-        Response text from the API
+        ``ProviderResponse`` (text + ``CallStats`` from ``usage`` and, for llama.cpp,
+        ``timings``); never raises.
     """
     import json
     from urllib.parse import urlparse
@@ -1278,12 +1413,17 @@ def _call_custom_api(
             "to permit plain HTTP, e.g. for a server on your own LAN)",
             api_url,
         )
-        return ""
+        stats = _new_stats(provider, model, len(image_b64_list))
+        stats.success = False
+        stats.error_class = ERR_URL_REFUSED
+        stats.error = "non-https api_url for a non-loopback host (set allow_http to permit it)"
+        return ProviderResponse("", stats)
 
     payload = _build_openai_payload(
         model, system_prompt, user_prompt, image_b64_list, max_tokens, compat, response_schema
     )
 
+    started = time.monotonic()
     try:
         import urllib.request
 
@@ -1299,10 +1439,11 @@ def _call_custom_api(
         )
         with open_url(req, timeout=timeout, tls=tls) as resp:
             result = json.loads(resp.read().decode("utf-8"))
-            return result.get("choices", [{}])[0].get("message", {}).get("content", "")
-    except Exception:
-        logger.warning("Custom API VLM request to %s failed", api_url, exc_info=True)
-        return ""
+        stats = _new_stats(provider, model, len(image_b64_list))
+        apply_openai_usage(stats, result, time.monotonic() - started)
+        return _finish_response(stats, _openai_text(result), started)
+    except Exception as e:
+        return _failed_response(provider, model, len(image_b64_list), started, e, "Custom API VLM")
 
 
 def _call_provider_raw(
@@ -1320,15 +1461,24 @@ def _call_provider_raw(
     timeout: float | None = 120.0,
     compat: Mapping[str, Any] | None = None,
     response_schema: Mapping[str, Any] | None = None,
-) -> str | None:
+    endpoint_name: str = "",
+    purpose: str = "",
+    detail: str = "",
+    est_vision_tokens: int | None = None,
+) -> ProviderResponse | None:
     """Route one request to the right provider function; None for an unknown provider.
 
     The single place that knows the provider set, shared by the VLM dispatcher, the
-    coordinator and the crop check (previously each had its own if/elif chain).
+    coordinator and the crop check (previously each had its own if/elif chain). It is also
+    the single place every call's ``CallStats`` is finalised (endpoint/purpose/vision-token
+    estimate stamped on), recorded for any enclosing ``collect_call_stats()`` and logged: INFO
+    per call, DEBUG for the raw usage the server sent, and a one-line WARNING naming the
+    endpoint for a failed call (the traceback itself is DEBUG-only; § 26.3).
     """
     provider = normalize_provider(provider)
+    response: ProviderResponse
     if provider == "ollama":
-        return _call_ollama(
+        response = _call_ollama(
             api_url or "http://localhost:11434",
             model,
             system_prompt,
@@ -1338,8 +1488,8 @@ def _call_provider_raw(
             tls=tls,
             timeout=timeout,
         )
-    if provider == "openai":
-        return _call_openai(
+    elif provider == "openai":
+        response = _call_openai(
             api_key,
             model,
             system_prompt,
@@ -1351,8 +1501,8 @@ def _call_provider_raw(
             compat=compat if compat is not None else resolve_compat(provider, None, "openai"),
             response_schema=response_schema,
         )
-    if provider in ("api", "llamacpp"):
-        return _call_custom_api(
+    elif provider in ("api", "llamacpp"):
+        response = _call_custom_api(
             api_key,
             api_url,
             model,
@@ -1365,8 +1515,43 @@ def _call_provider_raw(
             timeout=timeout,
             compat=compat if compat is not None else resolve_compat(provider, None, provider),
             response_schema=response_schema,
+            provider=provider,
         )
-    return None
+    else:
+        stats = CallStats(provider=provider, model=model, images=len(image_b64_list))
+        stats.success = False
+        stats.error_class = ERR_UNKNOWN_PROVIDER
+        stats.error = f"unknown provider {provider!r}"
+        stats.endpoint, stats.purpose, stats.detail = endpoint_name, purpose, detail
+        record_call(stats)
+        logger.warning("%s", failure_message(stats, timeout))
+        return None
+
+    stats = response.stats
+    stats.endpoint, stats.purpose, stats.detail = endpoint_name, purpose, detail
+    stats.est_vision_tokens = est_vision_tokens
+    record_call(stats)
+    if stats.raw:
+        logger.debug("VLM call raw usage (%s %s): %s", purpose or "call", endpoint_name, stats.raw)
+    if stats.success:
+        logger.info("%s", format_call_line(stats))
+        if stats.truncated:
+            logger.warning("%s", truncation_message(stats, max_tokens))
+    else:
+        logger.warning("%s", failure_message(stats, timeout))
+    return response
+
+
+def _empty_vlm_result() -> dict[str, Any]:
+    return {
+        "summary": "",
+        "tags": [],
+        "objects": [],
+        "rating": None,
+        "media_type": None,
+        "rating_reasoning": None,
+        "extra": {},
+    }
 
 
 def _dispatch_vlm(
@@ -1383,12 +1568,19 @@ def _dispatch_vlm(
     tls: TLSPolicy | None = None,
     timeout: float | None = 120.0,
     compat: Mapping[str, Any] | None = None,
+    outputs: OutputsConfig | None = None,
+    endpoint_name: str = "",
+    purpose: str = "video",
+    detail: str = "",
+    est_vision_tokens: int | None = None,
 ) -> dict[str, Any]:
     """Shared provider dispatch for both whole-video and per-scene VLM analysis.
 
     Extracted out of ``run_vlm_analysis`` so ``run_vlm_analysis_for_scene`` doesn't
     duplicate the provider routing/error handling. Never raises -- any exception
-    is logged at WARNING and degrades to an empty result.
+    is logged (one line at WARNING, traceback at DEBUG) and degrades to an empty result.
+    The result carries ``"call"``: the call's ``CallStats.to_dict()`` (absent only when no
+    frame could be encoded and so no request was made).
     """
     try:
         return _run_vlm(
@@ -1404,10 +1596,35 @@ def _dispatch_vlm(
             tls=tls,
             timeout=timeout,
             compat=compat,
+            outputs=outputs,
+            endpoint_name=endpoint_name,
+            purpose=purpose,
+            detail=detail,
+            est_vision_tokens=est_vision_tokens,
         )
-    except Exception:
-        logger.warning("VLM analysis failed for %r (provider=%s)", context, provider, exc_info=True)
-        return {"summary": "", "tags": [], "objects": [], "rating": None}
+    except Exception as e:
+        # Not reached by request failures (the provider functions turn those into a failed
+        # ProviderResponse); this is a bug/unexpected-shape backstop. Still never a console
+        # traceback: that is what the DEBUG file log is for.
+        error_class, message = classify_exception(e)
+        stats = CallStats(
+            endpoint=endpoint_name,
+            provider=normalize_provider(provider),
+            model=model,
+            purpose=purpose,
+            detail=detail,
+            images=len(frames),
+            est_vision_tokens=est_vision_tokens,
+            success=False,
+            error_class=error_class,
+            error=message,
+        )
+        record_call(stats)
+        logger.warning("VLM analysis failed for %r (provider=%s): %s", context, provider, message)
+        logger.debug("VLM analysis traceback for %r", context, exc_info=True)
+        result = _empty_vlm_result()
+        result["call"] = stats.to_dict()
+        return result
 
 
 def _run_vlm(
@@ -1423,11 +1640,17 @@ def _run_vlm(
     tls: TLSPolicy | None = None,
     timeout: float | None = 120.0,
     compat: Mapping[str, Any] | None = None,
+    outputs: OutputsConfig | None = None,
+    endpoint_name: str = "",
+    purpose: str = "video",
+    detail: str = "",
+    est_vision_tokens: int | None = None,
 ) -> dict[str, Any]:
     """Encode ``frames``, call ``provider`` and parse the VLM JSON response."""
+    outputs = outputs if outputs is not None else OutputsConfig()
     image_b64 = _frames_to_base64(frames)
     if not image_b64:
-        return {"summary": "", "tags": [], "objects": []}
+        return _empty_vlm_result()
     response = _call_provider_raw(
         provider,
         model=model,
@@ -1441,11 +1664,17 @@ def _run_vlm(
         tls=tls,
         timeout=timeout,
         compat=compat,
-        response_schema=_VLM_RESPONSE_SCHEMA,
+        response_schema=build_response_schema(outputs),
+        endpoint_name=endpoint_name,
+        purpose=purpose,
+        detail=detail,
+        est_vision_tokens=est_vision_tokens,
     )
     if response is None:
-        return {"summary": "", "tags": [], "objects": [], "rating": None}
-    return _parse_vlm_response(response)
+        return _empty_vlm_result()
+    result = _parse_vlm_response(response.text, outputs.media_type_choices)
+    result["call"] = response.stats.to_dict()
+    return result
 
 
 def _run_ollama_vlm(
@@ -2000,6 +2229,7 @@ def run_scene_coordinator(
         tls=tls,
         timeout=ep.timeout_sec,
         compat=ep.compat,
+        endpoint_name=ep.name,
     )
     if raw_text is None:
         logger.warning(
@@ -2065,12 +2295,14 @@ def _call_coordinator_provider(
     tls: TLSPolicy | None = None,
     timeout: float | None = 120.0,
     compat: Mapping[str, Any] | None = None,
+    endpoint_name: str = "",
 ) -> str | None:
     """Call the raw (unparsed) text-completion provider for the coordinator pass.
 
     Returns the raw response text, or None on any failure (network error,
-    exception, refused non-HTTPS URL). Unlike ``_run_vlm``, this returns the
-    provider's raw text instead of running it through ``_parse_vlm_response``
+    exception, refused non-HTTPS URL). The call's ``CallStats`` (purpose ``coordinator``) is
+    recorded by ``_call_provider_raw`` whether or not it succeeded. Unlike ``_run_vlm``, this
+    returns the provider's raw text instead of running it through ``_parse_vlm_response``
     (the coordinator has its own response shape/parser, see
     ``_parse_coordinator_response``).
     """
@@ -2089,11 +2321,14 @@ def _call_coordinator_provider(
             timeout=timeout,
             compat=compat,
             response_schema=_COORDINATOR_RESPONSE_SCHEMA,
+            endpoint_name=endpoint_name,
+            purpose="coordinator",
         )
-    except Exception:
-        logger.warning("Scene coordinator provider call raised", exc_info=True)
+    except Exception as e:
+        logger.warning("Scene coordinator provider call raised: %s", classify_exception(e)[1])
+        logger.debug("Scene coordinator provider call traceback", exc_info=True)
         return None
-    return text or None
+    return (text.text if text is not None else "") or None
 
 
 # ─── Auto-crop VLM assist (docs/REQUIREMENTS.md feature 3) ─────────
@@ -2199,14 +2434,20 @@ def run_crop_vlm_check(
             timeout=ep.timeout_sec,
             compat=ep.compat,
             response_schema=_CROP_RESPONSE_SCHEMA,
+            endpoint_name=ep.name,
+            purpose="crop_check",
         )
-        if raw is None:
-            raw = ""
+        raw_text = raw.text if raw is not None else ""
     except Exception as e:
-        logger.warning("Crop VLM check raised an exception (provider=%s)", provider, exc_info=True)
+        logger.warning(
+            "Crop VLM check raised an exception (provider=%s): %s",
+            provider,
+            classify_exception(e)[1],
+        )
+        logger.debug("Crop VLM check traceback", exc_info=True)
         return {"checked": False, "content_outside": False, "reason": str(e), "failed": True}
 
-    if not raw:
+    if not raw_text:
         return {
             "checked": False,
             "content_outside": False,
@@ -2214,9 +2455,9 @@ def run_crop_vlm_check(
             "failed": True,
         }
 
-    parsed = _parse_crop_vlm_response(raw)
+    parsed = _parse_crop_vlm_response(raw_text)
     if parsed is None:
-        logger.warning("Crop VLM response could not be parsed; raw=%.500r", raw)
+        logger.warning("Crop VLM response could not be parsed; raw=%.500r", raw_text)
         return {
             "checked": False,
             "content_outside": False,

@@ -380,7 +380,7 @@ class TestProviderCall:
             "user",
             ["aGVsbG8="],
             tls=policy,
-        )
+        ).text
 
     def test_default_fails_closed(self, ports):
         assert self._call(ports["self_signed"], None) == ""

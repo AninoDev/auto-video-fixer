@@ -6,6 +6,7 @@ import contextlib
 import copy
 import csv
 import hashlib
+import json
 import logging
 import os
 import shutil
@@ -19,6 +20,7 @@ import yaml
 from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
+from rich.text import Text
 
 from autovideofixer import __version__
 from autovideofixer.cli import config_tools
@@ -54,6 +56,8 @@ from autovideofixer.core.reporting import (
     stage_table_rows,
     write_json_report,
 )
+from autovideofixer.core.vlm_calls import format_call_line, summarize_calls
+from autovideofixer.core.vlm_outputs import OutputsConfig
 from autovideofixer.core.vlm_sampling import SamplingConfig
 from autovideofixer.endpoints import all_endpoint_urls, resolve_role_endpoint
 from autovideofixer.logclean import get_pii_cleaner
@@ -2126,6 +2130,16 @@ _ANALYZE_CSV_FIELDS = [
     "vlm_tags",
     "vlm_objects",
     "content_rating",
+    # § 26.1 structured outputs (media_type is one of analysis.vlm.media_type_choices or
+    # "other"; vlm_extra is a JSON object string of any other keys the model returned).
+    "media_type",
+    "rating_reasoning",
+    "vlm_extra",
+    # § 26.2 totals over this file's VLM calls (empty when the VLM didn't run).
+    "vlm_calls",
+    "vlm_wall_sec",
+    "vlm_input_tokens",
+    "vlm_output_tokens",
     # § 25.4: what was actually sent to the VLM (empty when VLM didn't run).
     "vlm_frames",
     "vlm_dropped_duplicates",
@@ -2143,6 +2157,140 @@ def _scene_boundaries_str(analysis: "VideoAnalysis") -> str:
     0.5 placeholder rather than a real cut score, since nothing ends it.
     """
     return ";".join(f"t={s.end_time:.1f}s@{s.confidence:.3f}" for s in analysis.scenes)
+
+
+def _preview(text: str) -> str:
+    if len(text) > _VLM_SUMMARY_PREVIEW_LEN:
+        return text[:_VLM_SUMMARY_PREVIEW_LEN].rstrip() + " [...] (use --full for full text)"
+    return text
+
+
+def _extra_text(extra: dict[str, Any], indent: int | None = None) -> str:
+    """Compact (or indented) JSON text of ``vlm_extra`` for the table / --full panel."""
+    return json.dumps(extra, ensure_ascii=False, indent=indent, default=str)
+
+
+# Below this console width the per-call table (10 columns) would wrap into unreadable
+# fragments, so it degrades to one text line per call (the same line the INFO log carries).
+_CALL_TABLE_MIN_WIDTH = 110
+
+
+def _print_call_stats(calls: list[dict[str, Any]], *, title: str) -> None:
+    """Per-file VLM call table (REQUIREMENTS.md § 26.2); one text line per call when the
+    console is too narrow (or not a terminal-width one) for the table."""
+    if not calls:
+        return
+    if console.width < _CALL_TABLE_MIN_WIDTH:
+        console.print(f"\n[bold]{title}[/bold]")
+        for call in calls:
+            console.print(Text("  " + format_call_line(call)))
+        return
+
+    def tok(v: Any) -> str:
+        return "?" if v is None else str(v)
+
+    def rate(c: dict[str, Any], key: str) -> str:
+        v = c.get(key)
+        if v is None:
+            return "?"
+        return f"{v:.1f}" + ("~" if key == "gen_tps" and c.get("tps_estimated") else "")
+
+    table = Table(title=title)
+    for col in ("Purpose", "Endpoint", "Model"):
+        table.add_column(col, overflow="fold")
+    for col in ("Wall s", "In tok", "Out tok", "Prompt t/s", "Gen t/s", "Images", "Est vis tok"):
+        table.add_column(col, justify="right")
+    table.add_column("Status")
+    for c in calls:
+        out = tok(c.get("output_tokens"))
+        if c.get("reasoning_tokens"):
+            out += f" ({c['reasoning_tokens']} reasoning)"
+        table.add_row(
+            Text(f"{c.get('purpose', '')} {c.get('detail', '')}".strip()),
+            Text(str(c.get("endpoint", ""))),
+            Text(str(c.get("model", ""))),
+            f"{c.get('wall_sec', 0.0):.2f}",
+            tok(c.get("input_tokens")),
+            out,
+            rate(c, "prompt_tps"),
+            rate(c, "gen_tps"),
+            str(c.get("images", 0)),
+            tok(c.get("est_vision_tokens")),
+            "ok" if c.get("success", True) else f"FAILED: {c.get('error_class')}",
+        )
+    console.print(table)
+
+
+def _print_call_totals(calls: list[dict[str, Any]]) -> None:
+    """Run totals over every VLM call of an ``avf analyze`` run."""
+    if not calls:
+        return
+    t = summarize_calls(calls)
+    reasoning = f", reasoning {t['reasoning_tokens']}" if t["reasoning_tokens"] else ""
+    console.print(
+        f"\n[bold]VLM call totals:[/bold] {t['calls']} call(s) "
+        f"({t['succeeded']} ok, {t['failed']} failed), {t['wall_sec']:.2f}s wall, "
+        f"tokens in {t['input_tokens']} / out {t['output_tokens']}{reasoning} / "
+        f"total {t['total_tokens']}, {t['images']} image(s)"
+    )
+
+
+def _analysis_to_json(analysis: "VideoAnalysis") -> dict[str, Any]:
+    """Full structured result for one file (``avf analyze --json``): everything the table and
+    CSV show, plus the sampling report and every call's stats, untruncated."""
+    vlm_ran = bool(analysis.vlm_calls or analysis.vlm_sampling)
+    return {
+        "filepath": analysis.filepath,
+        "filename": analysis.filename,
+        "duration_sec": analysis.duration,
+        "resolution": list(analysis.resolution),
+        "framerate_fps": analysis.framerate,
+        "video_codec": analysis.video_codec,
+        "has_video": analysis.has_video,
+        "has_audio": analysis.has_audio,
+        "hdr": analysis.is_hdr,
+        "scenes_detected": analysis.total_scenes,
+        "scenes": [
+            {
+                "start_time": sc.start_time,
+                "end_time": sc.end_time,
+                "event_type": sc.event_type,
+                "confidence": sc.confidence,
+                "description": sc.description,
+            }
+            for sc in analysis.scenes
+        ],
+        "vlm": {
+            "summary": analysis.vlm_summary,
+            "tags": list(analysis.vlm_tags),
+            "objects": list(analysis.vlm_objects),
+            "media_type": analysis.media_type,
+            "rating": analysis.content_rating,
+            "rating_reasoning": analysis.rating_reasoning,
+            "extra": dict(analysis.vlm_extra),
+        }
+        if vlm_ran
+        else None,
+        "vlm_sampling": analysis.vlm_sampling,
+        "vlm_calls": list(analysis.vlm_calls),
+    }
+
+
+def _write_analysis_json(
+    json_path: str, analyses: list["VideoAnalysis"], failed_files: list[str]
+) -> None:
+    """Write the ``avf analyze --json`` document. Overwrites ``json_path``."""
+    doc = {
+        "avf_version": __version__,
+        "files": [_analysis_to_json(a) for a in analyses],
+        "failed_files": list(failed_files),
+    }
+    out_dir = os.path.dirname(json_path)
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
+    with open(json_path, "w", encoding="utf-8") as f:
+        json.dump(doc, f, indent=2, ensure_ascii=False, default=str)
+        f.write("\n")
 
 
 def _print_analysis_result(analysis: "VideoAnalysis", *, full_output: bool) -> None:
@@ -2173,8 +2321,26 @@ def _print_analysis_result(analysis: "VideoAnalysis", *, full_output: bool) -> N
         table.add_row("Tags", _safe(", ".join(analysis.vlm_tags)))
     if analysis.vlm_objects:
         table.add_row("Objects", _safe(", ".join(analysis.vlm_objects)))
+    if analysis.media_type:
+        raw = analysis.vlm_extra.get("media_type_raw")
+        shown = f"{analysis.media_type} (model said: {raw})" if raw else analysis.media_type
+        table.add_row("Media Type", Text(_safe(shown)))
     if analysis.content_rating:
         table.add_row("Content Rating", _safe(analysis.content_rating))
+    if analysis.rating_reasoning:
+        table.add_row("Rating Reasoning", Text(_safe(_preview(analysis.rating_reasoning))))
+    extra = {k: v for k, v in analysis.vlm_extra.items() if k != "media_type_raw"}
+    if extra:
+        table.add_row("VLM Extra", Text(_safe(_preview(_extra_text(extra)))))
+    failed_call = next((c for c in analysis.vlm_calls if not c.get("success", True)), None)
+    if failed_call is not None:
+        table.add_row(
+            "VLM Status",
+            Text(
+                f"FAILED ({failed_call.get('error_class')}) on endpoint "
+                f"'{failed_call.get('endpoint')}' -- see the warning above"
+            ),
+        )
     sampling = analysis.vlm_sampling
     if sampling:
         table.add_row("VLM Frames Sent", str(sampling.get("frames", 0)))
@@ -2192,8 +2358,24 @@ def _print_analysis_result(analysis: "VideoAnalysis", *, full_output: bool) -> N
     if full_output and analysis.vlm_summary:
         console.print(
             Panel(
-                _safe(analysis.vlm_summary),
+                Text(_safe(analysis.vlm_summary)),
                 title=f"Full VLM Summary: {_safe(analysis.filename)}",
+                expand=True,
+            )
+        )
+    if full_output and analysis.rating_reasoning:
+        console.print(
+            Panel(
+                Text(_safe(analysis.rating_reasoning)),
+                title=f"Rating Reasoning ({_safe(analysis.content_rating or '?')})",
+                expand=True,
+            )
+        )
+    if full_output and analysis.vlm_extra:
+        console.print(
+            Panel(
+                Text(_safe(_extra_text(analysis.vlm_extra, indent=2))),
+                title="VLM Extra Fields",
                 expand=True,
             )
         )
@@ -2224,6 +2406,7 @@ def _print_analysis_result(analysis: "VideoAnalysis", *, full_output: bool) -> N
 def _analysis_to_csv_row(analysis: "VideoAnalysis") -> dict[str, Any]:
     """Build one CSV row dict from a VideoAnalysis, matching the printed table's fields."""
     sampling = analysis.vlm_sampling or {}
+    totals = summarize_calls(analysis.vlm_calls)
     return {
         "filepath": analysis.filepath,
         "filename": analysis.filename,
@@ -2240,6 +2423,15 @@ def _analysis_to_csv_row(analysis: "VideoAnalysis") -> dict[str, Any]:
         "vlm_tags": ";".join(analysis.vlm_tags),
         "vlm_objects": ";".join(analysis.vlm_objects),
         "content_rating": analysis.content_rating or "",
+        "media_type": analysis.media_type or "",
+        "rating_reasoning": analysis.rating_reasoning or "",
+        "vlm_extra": json.dumps(analysis.vlm_extra, ensure_ascii=False, default=str)
+        if analysis.vlm_extra
+        else "",
+        "vlm_calls": totals["calls"] if analysis.vlm_calls else "",
+        "vlm_wall_sec": totals["wall_sec"] if analysis.vlm_calls else "",
+        "vlm_input_tokens": totals["input_tokens"] if analysis.vlm_calls else "",
+        "vlm_output_tokens": totals["output_tokens"] if analysis.vlm_calls else "",
         "vlm_frames": sampling.get("frames", ""),
         "vlm_dropped_duplicates": sampling.get("dropped_duplicates", ""),
         "vlm_frame_size": sampling.get("frame_size", ""),
@@ -2654,6 +2846,16 @@ def config_migrate(input_path: str, output: str | None, backup: bool, force: boo
     "the header would drift as fields change.",
 )
 @click.option(
+    "--json",
+    "json_path",
+    type=click.Path(),
+    default=None,
+    help="Write the full structured results to this JSON file: one entry per analyzed "
+    "video with every field the table shows (untruncated), the VLM frame-sampling report "
+    "and the stats of every VLM call (endpoint, model, wall time, input/output/reasoning "
+    "tokens, tokens/s, images, success or error class). Overwrites the file.",
+)
+@click.option(
     "--prompt-append",
     "prompt_append",
     default=None,
@@ -2732,6 +2934,7 @@ def analyze(
     min_scene_duration: float | None,
     full_output: bool,
     csv_path: str | None,
+    json_path: str | None,
     prompt_append: str | None,
     prompt_override: str | None,
     max_sample_frames: int | None,
@@ -2769,9 +2972,17 @@ def analyze(
                 max_frames=max_sample_frames,
                 interval_sec=sample_interval,
             )
+            OutputsConfig.from_config(config.get("analysis", "vlm", default={}))
         except ValueError as e:
             console.print(f"[red]{_safe(e)}[/red]")
             sys.exit(2)
+    report_call_stats = config.get("analysis", "report_call_stats", default=True)
+    if not isinstance(report_call_stats, bool):
+        console.print(
+            f"[red]Invalid analysis.report_call_stats {_safe(report_call_stats)!r}: "
+            "must be true or false[/red]"
+        )
+        sys.exit(2)
 
     symlinks_policy = (
         symlinks
@@ -2794,6 +3005,8 @@ def analyze(
     console.print(f"Found {len(input_files)} video file(s)")
 
     csv_rows: list[dict[str, Any]] = []
+    analyses: list[VideoAnalysis] = []
+    all_calls: list[dict[str, Any]] = []
     failed_files: list[str] = []
 
     for idx, filepath in enumerate(input_files, start=1):
@@ -2862,12 +3075,16 @@ def analyze(
         if analysis.vlm_summary or analysis.vlm_tags or analysis.vlm_objects:
             logger.info(
                 "VLM analysis for %s -- summary: %s | tags: %s | objects: %s | rating: %s"
+                " | media type: %s | rating reasoning: %s | extra: %s"
                 " | frames sent: %s | duplicates dropped: %s | frame size: %s | est tokens: %s",
                 filepath,
                 analysis.vlm_summary or "",
                 ", ".join(analysis.vlm_tags),
                 ", ".join(analysis.vlm_objects),
                 analysis.content_rating or "",
+                analysis.media_type or "",
+                analysis.rating_reasoning or "",
+                _extra_text(analysis.vlm_extra) if analysis.vlm_extra else "",
                 (analysis.vlm_sampling or {}).get("frames", "?"),
                 (analysis.vlm_sampling or {}).get("dropped_duplicates", "?"),
                 (analysis.vlm_sampling or {}).get("frame_size") or "?",
@@ -2875,6 +3092,10 @@ def analyze(
             )
 
         _print_analysis_result(analysis, full_output=full_output)
+        if report_call_stats:
+            _print_call_stats(analysis.vlm_calls, title="VLM Calls")
+        analyses.append(analysis)
+        all_calls.extend(analysis.vlm_calls)
 
         if csv_path:
             csv_rows.append(_analysis_to_csv_row(analysis))
@@ -2903,9 +3124,16 @@ def analyze(
                 else:
                     console.print("\n[yellow]No clips could be extracted.[/yellow]")
 
+    if report_call_stats:
+        _print_call_totals(all_calls)
+
     if csv_path:
         _write_analysis_csv(csv_path, csv_rows)
         console.print(f"\n[green]Wrote {len(csv_rows)} row(s) to {csv_path}[/green]")
+
+    if json_path:
+        _write_analysis_json(json_path, analyses, failed_files)
+        console.print(f"\n[green]Wrote {len(analyses)} result(s) to {json_path}[/green]")
 
     if failed_files:
         console.print(

@@ -137,7 +137,7 @@ draws an explicit VERIFIED / UNVERIFIED line instead of a flat done/not-done che
   backed up and rewritten; explicit configs in memory), first-run bootstrap, `avf config migrate`,
   `analysis.endpoints` with per-endpoint timeout/TLS/compat, `llamacpp` provider, `<think>`/prose
   tolerant response parsing. Frame-size limits for llama.cpp landed in P4 (`vision:`);
-  revisit: `json_schema` gains the new fields in P5; comments above moved keys are not carried over by the
+  `json_schema` gained the new fields in P5; revisit: comments above moved keys are not carried over by the
   migration.
 - **VLM frame sampling** (REQUIREMENTS.md § 25, phase P4) — implemented 2026-10-18. Shared
   planner/sampler: min/max frames, timestamp-accurate VFR seeking via ffprobe+ffmpeg, consecutive-
@@ -145,6 +145,13 @@ draws an explicit VERIFIED / UNVERIFIED line instead of a flat done/not-done che
   with a tile/token budget and frames-vs-resolution balancing, frame-count/size/token reporting in
   `avf analyze` and scene mode. Revisit: per-frame ffmpeg processes if sampling time shows up in
   scene-heavy runs; `MOTION_FULL_SCALE` for `balance: auto` once P5 call stats exist.
+- **Structured VLM outputs and per-call stats** (REQUIREMENTS.md § 26, phase P5) — implemented
+  2026-10-18. `media_type`, `rating_reasoning`, `detail` levels with prompts/schema generated from
+  one field list; `CallStats`/`ProviderResponse` for every VLM/LLM call (video, scene, crop check,
+  coordinator); `avf analyze --json`, call tables/totals, `jobs[].vlm_calls` in the process
+  report; timeouts and other network failures are a one-line warning instead of a traceback.
+  Revisit: streaming for time-to-first-token; `MOTION_FULL_SCALE` and `dedupe_threshold` can now
+  be tuned against real call stats; P6 (cross-check) reuses `CallStats` for its legs.
 - **True source cadence recovery & timestamp-safe pipeline** (`retime` stage, on by default —
   REQUIREMENTS.md § 12) — recovers a video's real content framerate when it was padded up to a
   higher encoded rate by duplicated frames (24fps published at 60fps, VFR captures transcoded to

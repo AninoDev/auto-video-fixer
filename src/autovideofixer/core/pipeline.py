@@ -218,6 +218,10 @@ class JobResult:
     # float, "ratio": float}. Empty when duration_guard="off", or when no
     # stage tripped it.
     duration_guard_warnings: list[dict[str, Any]] = field(default_factory=list)
+    # REQUIREMENTS.md § 26.2: CallStats.to_dict() of every VLM/LLM call made while this job ran
+    # (scene VLM calls, the scene coordinator, the crop VLM check), in call order. Empty when
+    # the job made none. Totals are derivable from this list and deliberately not stored.
+    vlm_calls: list[dict[str, Any]] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         if self.outcome:
@@ -1156,6 +1160,24 @@ class Pipeline:
         return _ExistingOutputDecision(terminal=None, reprocessed_mismatch=True)
 
     def execute_job(
+        self,
+        job: Job,
+        progress_callback: Callable[[Job, float, str], None] | None = None,
+    ) -> JobResult:
+        """Execute a single job through all determined stages.
+
+        Wraps ``_execute_job`` so every VLM/LLM call made during the job (scene VLM,
+        coordinator, crop check) lands in ``JobResult.vlm_calls`` (REQUIREMENTS.md § 26.2),
+        whatever return path the job takes.
+        """
+        from autovideofixer.core.vlm_calls import collect_call_stats
+
+        with collect_call_stats() as calls:
+            result = self._execute_job(job, progress_callback=progress_callback)
+        result.vlm_calls = [c.to_dict() for c in calls]
+        return result
+
+    def _execute_job(
         self,
         job: Job,
         progress_callback: Callable[[Job, float, str], None] | None = None,

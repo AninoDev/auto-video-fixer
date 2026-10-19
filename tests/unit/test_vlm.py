@@ -11,8 +11,6 @@ import pytest
 
 from autovideofixer.config import Config
 from autovideofixer.core.analysis import (
-    _VLM_SYSTEM_PROMPT,
-    _VLM_USER_PROMPT,
     VideoAnalyzer,
     _call_custom_api,
     _call_ollama,
@@ -22,6 +20,7 @@ from autovideofixer.core.analysis import (
     _parse_vlm_response,
     run_crop_vlm_check,
 )
+from autovideofixer.core.vlm_outputs import OutputsConfig, build_system_prompt, build_user_prompt
 from autovideofixer.core.vlm_sampling import (
     SampledFrames,
     SamplingConfig,
@@ -193,16 +192,18 @@ class TestOllamaIntegration:
             "user prompt",
             ["base64data"],
         )
-        assert "test" in result
+        assert "test" in result.text
+        assert result.stats.success and result.stats.provider == "ollama"
 
     @patch("autovideofixer.core.analysis.open_url")
     def test_call_ollama_failure(self, mock_urlopen):
-        """Test Ollama API call failure returns empty string."""
+        """Test Ollama API call failure returns an empty reply with a failed CallStats."""
         import urllib.error
 
         mock_urlopen.side_effect = urllib.error.URLError("Connection refused")
         result = _call_ollama("http://localhost:11434", "llava", "system", "user", ["data"])
-        assert result == ""
+        assert result.text == ""
+        assert not result.stats.success and result.stats.error_class == "connection"
 
 
 class TestOpenAIIntegration:
@@ -220,7 +221,7 @@ class TestOpenAIIntegration:
         mock_urlopen.return_value = mock_resp
 
         result = _call_openai("sk-test-key", "gpt-4o", "system", "user", ["base64data"])
-        assert "test video" in result
+        assert "test video" in result.text
 
     @patch("autovideofixer.core.analysis.open_url")
     def test_call_openai_failure(self, mock_urlopen):
@@ -229,7 +230,8 @@ class TestOpenAIIntegration:
 
         mock_urlopen.side_effect = urllib.error.URLError("Auth failed")
         result = _call_openai("sk-bad", "gpt-4o", "sys", "usr", ["data"])
-        assert result == ""
+        assert result.text == ""
+        assert not result.stats.success
 
 
 class TestCustomAPI:
@@ -249,7 +251,7 @@ class TestCustomAPI:
         result = _call_custom_api(
             "api-key", "http://localhost:8080/v1/chat", "model", "system", "user", ["data"]
         )
-        assert "custom" in result
+        assert "custom" in result.text
 
     @patch("autovideofixer.core.analysis.open_url")
     def test_call_custom_api_no_key(self, mock_urlopen):
@@ -262,7 +264,7 @@ class TestCustomAPI:
         mock_urlopen.return_value = mock_resp
 
         result = _call_custom_api("", "http://localhost:8080/v1/chat", "model", "sys", "usr", [])
-        assert "ok" in result
+        assert "ok" in result.text
         # Verify the request was made without Authorization header
         call_args = mock_urlopen.call_args
         req = call_args[0][0]
@@ -274,7 +276,8 @@ class TestCustomAPI:
         result = _call_custom_api(
             "key", "http://192.0.2.10:8080/v1/chat", "model", "sys", "usr", ["data"]
         )
-        assert result == ""
+        assert result.text == ""
+        assert result.stats.error_class == "url_refused"
         mock_urlopen.assert_not_called()
 
     @patch("autovideofixer.core.analysis.open_url")
@@ -297,7 +300,7 @@ class TestCustomAPI:
             ["data"],
             allow_http=True,
         )
-        assert "lan" in result
+        assert "lan" in result.text
 
     @patch("autovideofixer.core.analysis.open_url")
     def test_https_never_needs_override(self, mock_urlopen):
@@ -313,7 +316,7 @@ class TestCustomAPI:
         result = _call_custom_api(
             "key", "https://192.0.2.10:8080/v1/chat", "model", "sys", "usr", ["data"]
         )
-        assert "sec" in result
+        assert "sec" in result.text
 
 
 class TestPromptCustomization:
@@ -361,10 +364,11 @@ class TestPromptCustomization:
         analyzer.run_vlm_analysis("fake.mp4")
 
         sent = self._sent_user_prompt(mock_urlopen)
-        assert _VLM_USER_PROMPT in sent
+        default_prompt = build_user_prompt(OutputsConfig())
+        assert default_prompt in sent
         assert "these are trail camera clips" in sent
         # The appended text comes after the default prompt.
-        assert sent.index(_VLM_USER_PROMPT) < sent.index("these are trail camera clips")
+        assert sent.index(default_prompt) < sent.index("these are trail camera clips")
 
     @patch("autovideofixer.core.analysis.open_url")
     @patch("autovideofixer.core.analysis.sample_vlm_frames")
@@ -381,7 +385,7 @@ class TestPromptCustomization:
 
         sent = self._sent_user_prompt(mock_urlopen)
         assert sent == "custom prompt only"
-        assert _VLM_USER_PROMPT not in sent
+        assert build_user_prompt(OutputsConfig()) not in sent
 
     @patch("autovideofixer.core.analysis.open_url")
     @patch("autovideofixer.core.analysis.sample_vlm_frames")
@@ -446,8 +450,11 @@ class TestPromptCustomization:
         analyzer = self._analyzer({"provider": "ollama"})
         analyzer.run_vlm_analysis("fake.mp4")
 
-        assert self._sent_user_prompt(mock_urlopen) == _VLM_USER_PROMPT
-        assert self._sent_system_prompt(mock_urlopen) == _VLM_SYSTEM_PROMPT
+        # Defaults are generated from analysis.vlm.outputs / detail (§ 26.1): media_type is on
+        # by default, so the prompt is the legacy text plus the media type.
+        assert self._sent_user_prompt(mock_urlopen) == build_user_prompt(OutputsConfig())
+        assert self._sent_system_prompt(mock_urlopen) == build_system_prompt(OutputsConfig())
+        assert "media_type" in self._sent_system_prompt(mock_urlopen)
 
     def test_non_json_override_response_degrades_to_plain_summary(self):
         """An override that changes the requested output format away from JSON still

@@ -335,14 +335,26 @@ avf analyze [FILEPATH] [OPTIONS]
 - `--min-sample-frames N`, `--max-sample-frames N`, `--sample-interval SECONDS`: how many frames
   are sent to the VLM (see [How many frames are sent](#how-many-frames-are-sent-and-how-big)); the
   result shows frames sent, duplicates dropped, frame size and estimated tokens
+- `--json PATH`: write every result untruncated as structured JSON: per file the video facts, the
+  scenes, the VLM fields (summary, tags, objects, media type, rating, rating reasoning, extra keys),
+  the frame-sampling report and the stats of every VLM call (see
+  [Structured VLM output and call statistics](#structured-vlm-output-and-call-statistics))
+- `--csv PATH`: one row per file, including `media_type`, `rating_reasoning`, `vlm_extra` (JSON
+  text) and call totals (`vlm_calls`, `vlm_wall_sec`, `vlm_input_tokens`, `vlm_output_tokens`)
+- `--full`: print the complete summary, rating reasoning and extra fields in panels under the table
 - `-r, --recursive`: Scan directories recursively
 - `--symlinks [files_only|follow|skip]`: How directory scanning treats symlinks (default
   `files_only`). See [Symlinks When Scanning Directories](#symlinks-when-scanning-directories).
 
 **Example:**
 ```bash
-avf analyze video.mp4 --vlm
+avf analyze video.mp4 --vlm --json result.json
 ```
+
+A file whose VLM call fails (timeout, server down, HTTP error, garbage reply) prints a one-line
+warning naming the endpoint and the cause, shows *VLM Status: FAILED* in its table, and the run
+carries on with the next file; the full traceback is only in the log file. See
+[VLM errors](#vlm-errors).
 
 ### Find Duplicates Command
 
@@ -885,6 +897,67 @@ analysis:
 - Per run: `avf analyze --min-sample-frames N --max-sample-frames N --sample-interval SECONDS`.
 - Repeats that survived heavy compression (very low bitrate) may need `dedupe_threshold: 0.004`;
   `0` drops only frames that decode identically.
+
+#### Structured VLM output and call statistics
+
+`analysis.vlm.outputs` chooses which fields the **default prompt** asks for, and the JSON schema
+sent with `compat.response_format: json_schema` is generated from the same list:
+
+```yaml
+analysis:
+  report_call_stats: true        # per-call table + totals in `avf analyze` (default)
+  vlm:
+    outputs:
+      media_type: true           # default on
+      rating_reasoning: false    # default off; asked for LAST, after the rating
+    media_type_choices: [real_footage, 3d_rendered, 2d_digital, hand_drawn, ai_generated,
+                         screen_capture, mixed, other]
+    detail: brief                # brief | standard | detailed | exhaustive
+```
+
+- **`media_type`** is one of `media_type_choices`. The reply is matched ignoring case and
+  spacing ("3D Rendered" becomes `3d_rendered`); anything else is stored as `other`, with the
+  model's own wording kept in the extra fields as `media_type_raw`.
+- **`rating_reasoning`** is the model's justification for the rating. It is requested after
+  `rating` so a model that does not think first still describes the content before judging it.
+- **`detail`** scales the summary: `brief` (1-2 sentences, the long-standing behaviour), `standard`
+  (3-5), `detailed` (a paragraph: characters, actions, setting, camera work, style), `exhaustive`
+  (several paragraphs). Higher levels generate more tokens; raise the endpoint's `max_tokens` with
+  them. A reply cut off at `max_tokens` prints a warning naming the endpoint's `max_tokens`, is
+  marked `truncated` in the call stats, and keeps only the fields that arrived complete.
+- **Extra fields**: any other key a model returns (a custom `prompt_override` can ask for more) is
+  kept as `vlm_extra` and shown in the table, `--full`, CSV and JSON.
+- **Overrides replace the generated prompt wholesale.** With `prompt_override` or
+  `system_prompt_override` set, the `outputs`/`detail` switches no longer add anything to the
+  prompt: your text must ask for every field you want back (`summary`, `tags`, `objects`,
+  `media_type`, `rating`, `rating_reasoning`). The `json_schema` still follows the switches.
+
+Every model call (whole video, each scene, the crop check, the scene coordinator) is timed.
+`avf analyze` prints a table per file and run totals (turn the table off with
+`analysis.report_call_stats: false`; the numbers are always in the log and in `--json`):
+
+| Column | Meaning |
+|---|---|
+| Wall s | total time of the request as AVF saw it |
+| In / Out tok | prompt and generated tokens as the server counted them (`?` = not reported); reasoning tokens are shown in brackets when the server separates them |
+| Prompt / Gen t/s | tokens per second. Exact for **Ollama** and **llama.cpp** (the server reports its own timings). For OpenAI-style servers it is output tokens divided by wall time, shown with `~`: it includes prompt processing and network time, so it reads low |
+| Images, Est vis tok | frames sent, and the estimated vision tokens when the endpoint declares a tile size |
+| Status | `ok` or `FAILED: <class>` (`timeout`, `connection`, `http_500`, `bad_json`, ...) |
+
+There is no time-to-first-token: AVF does not stream responses.
+
+In `avf process`, the `--report-json` file lists every call of a job under `jobs[].vlm_calls`
+(`purpose` is `scene`, `coordinator` or `crop_check`); add them up yourself, no totals are stored.
+
+#### VLM errors
+
+A failing request is reported as one line, for example `video call to endpoint 'slow' (model m)
+failed: timed out after 2s. Hint: raise analysis.endpoints.slow.timeout_sec ...`. A **timeout**
+means the server did not answer within the endpoint's `timeout_sec`: raise it (big vision models on
+many frames can need 600 s or more) or lower the frame count. **connection** means nothing is
+listening at `api_url`; **http_NNN** is the server's own error (check its log; 401/403 is the
+`api_key`); **bad_json** usually means `api_url` points at the wrong path. The log file (kept at
+DEBUG) holds the full traceback.
 
 ### Config versioning, migration and first run
 

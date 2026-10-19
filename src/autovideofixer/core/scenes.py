@@ -446,6 +446,15 @@ def _collect_scene_vlm_summaries(
                 "duration": scene.duration,
                 "summary": vlm_result.get("summary", ""),
                 "tags": vlm_result.get("tags", []),
+                # § 26.1 structured fields for this scene (the coordinator prompt only uses
+                # summary/tags; these are for callers and logs).
+                "objects": vlm_result.get("objects", []),
+                "media_type": vlm_result.get("media_type"),
+                "rating": vlm_result.get("rating"),
+                "rating_reasoning": vlm_result.get("rating_reasoning"),
+                "extra": vlm_result.get("extra") or {},
+                # § 26.2 this scene's CallStats.to_dict() (also in JobResult.vlm_calls).
+                "call": vlm_result.get("call"),
                 # § 25.4: what was actually sent for this scene (frames, duplicates
                 # dropped, size, est. tiles/tokens); absent if sampling failed.
                 "sampling": vlm_result.get("sampling"),

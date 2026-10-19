@@ -294,6 +294,9 @@ def job_to_json(jr: "JobResult") -> dict[str, Any]:
         "input_info": redact_secrets(jr.input_info),
         "output_info": redact_secrets(jr.output_info),
         "scene_stats": jr.scene_stats,
+        # REQUIREMENTS.md § 26.2: one CallStats record per VLM/LLM call made for this job
+        # (purpose = scene | coordinator | crop_check). No totals: derivable from the list.
+        "vlm_calls": list(jr.vlm_calls),
         # REQUIREMENTS.md § 19.2: job-level summary of every duration-guard
         # mismatch (warn and fail mode both populate this); the per-stage
         # `cadence_mismatch`/`duration_guard_mismatch` fields (§ 19.1/19.2)

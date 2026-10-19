@@ -1942,7 +1942,7 @@ chat context. Delivery is phased, one commit per phase, in the user-chosen order
 | P2 | § 23 | network/TLS policy applied to every network path | IMPLEMENTED 2026-10-18 |
 | P3 | § 24 | config schema versioning + migrations, first-run bootstrap, endpoint registry, per-endpoint timeout/TLS, llama.cpp provider | IMPLEMENTED 2026-10-18 |
 | P4 | § 25 | VLM frame sampling: min/max frames, consecutive-duplicate removal, tile budget, frame-count reporting | IMPLEMENTED 2026-10-18 |
-| P5 | § 26 | new structured output fields (media type, rating reasoning, detail level) + per-call timing/token stats | PLANNED |
+| P5 | § 26 | new structured output fields (media type, rating reasoning, detail level) + per-call timing/token stats | IMPLEMENTED 2026-10-18 |
 | P6 | § 27 | multi-VLM cross-check (`refine` and `judge` modes) | PLANNED |
 | P7 | § 28 | analysis profiles, reusable analysis module, `analyze` stage + example stages | PLANNED |
 
@@ -2547,7 +2547,7 @@ Delivered as specified except where listed under "Deviations / interpretations".
   revisit fix above), and
   the JSON report's `scene_stats.vlm_sampling` matched all three.
 
-## 26. Structured output fields + per-call timing/token stats (P5)
+## 26. Structured output fields + per-call timing/token stats (P5) [IMPLEMENTED 2026-10-18]
 
 ### 26.1 New output fields
 
@@ -2584,6 +2584,105 @@ Reporting: always logged (INFO per call, DEBUG raw usage); `analysis.report_call
 true) prints a per-file call table + run totals in `avf analyze`; new `avf analyze --json PATH`
 writes full structured results including every call; process mode adds stats to the § 6.6 JSON run
 report under the job.
+
+### 26.3 Implementation notes (2026-10-18)
+
+- **Modules**: `core/vlm_outputs.py` (`OutputsConfig` validation, `build_system_prompt` /
+  `build_user_prompt` / `build_response_schema` from one field list, `parse_fields`,
+  `normalize_media_type`) and `core/vlm_calls.py` (`CallStats`, `ProviderResponse`, usage
+  extraction, error classes, the `collect_call_stats()` / `record_call()` collector, formatting
+  and totals). `core/analysis.py` wires them; field order is fixed
+  `summary, tags, objects, media_type, rating, rating_reasoning` for prompt, schema and the JSON
+  key list the prompt asks for. With `detail: brief` and `outputs.media_type: false` the generated
+  prompts are byte-identical to the pre-P5 constants (`_VLM_SYSTEM_PROMPT` / `_VLM_USER_PROMPT`,
+  kept as the reference and pinned by a test). **Default behaviour does change in one way**:
+  `media_type` is on by default, so the default prompt now also asks for it (the spec's default).
+- **Config** (new keys only, `config_version` stays 2: nothing moved or changed meaning, and a
+  config that lacks the keys simply gets the defaults): `analysis.vlm.outputs.{media_type,
+  rating_reasoning}`, `analysis.vlm.media_type_choices`, `analysis.vlm.detail`,
+  `analysis.report_call_stats`. Validation is at use time with errors naming the key
+  (`OutputsConfig.from_config`); `avf analyze` also checks it up front (exit 2) like the endpoint
+  name. `other` is always accepted as a media type even if the user drops it from the list
+  (it is the fallback), and is appended to the schema enum if absent.
+- **Parsing**: `media_type` is matched after lower-casing and collapsing non-alphanumerics to `_`
+  ("3D Rendered" -> `3d_rendered`); no match -> `other`. The model's original wording is kept in
+  `vlm_extra["media_type_raw"]` only when it differs from the stored value. `vlm_extra` is every
+  key the model returned that is not one of the six known fields. The fields are parsed whether or
+  not the corresponding output is enabled, so a `prompt_override` that asks for them works.
+- **Per-scene results** (`scenes._collect_scene_vlm_summaries`) carry `objects`, `media_type`,
+  `rating`, `rating_reasoning`, `extra` and `call` next to the existing `summary`/`tags`; the
+  coordinator prompt is deliberately unchanged (still summary + tags).
+- **Where a call is recorded**: only `_call_provider_raw`. It stamps endpoint name, purpose
+  (`video` | `scene` | `crop_check` | `coordinator`), a `detail` such as `scene[5.0-9.0]` (never the
+  file path), and `est_vision_tokens` (from the P4 `SamplingReport`, for the whole call) onto the
+  provider function's stats, then calls `record_call`, logs INFO (the call line), DEBUG (raw
+  `usage`/`timings`/Ollama counters) and, for a failure, one WARNING. `_dispatch_vlm` returns the
+  call's `to_dict()` as `result["call"]` and also records a failed `CallStats` if something outside
+  the request path raised. The coordinator and crop check keep returning their parsed dicts; their
+  stats reach reports through the collector.
+- **Collector**: a ContextVar stack, so every enclosing `collect_call_stats()` block sees a call. `Pipeline.execute_job` is now a thin wrapper that collects around `_execute_job` and
+  sets `JobResult.vlm_calls` on every return path, early terminals included. A ContextVar does not
+  cross into a `ThreadPoolExecutor` worker: no VLM call currently happens inside one (scene-mode
+  VLM calls are sequential in the job's thread; the pool only runs ffmpeg), but a future caller that
+  does must wrap `collect_call_stats()` inside the worker.
+- **Report shape**: `jobs[].vlm_calls` is a flat list in call order (the scene-mode `scene_stats`
+  block is not duplicated into: scene and coordinator calls are recognised by `purpose` and
+  `detail`). No totals are stored (§ 6.6 non-redundancy); `avf analyze` prints totals and the JSON
+  carries the list per file.
+- **`avf analyze --json PATH`**: `{"avf_version", "files": [per file: media facts, scenes,
+  "vlm": {summary, tags, objects, media_type, rating, rating_reasoning, extra} | null,
+  "vlm_sampling", "vlm_calls"], "failed_files": [...]}`. New CSV columns `media_type`,
+  `rating_reasoning`, `vlm_extra` (JSON text), `vlm_calls`, `vlm_wall_sec`, `vlm_input_tokens`,
+  `vlm_output_tokens` (blank when the VLM did not run). Console: rows *Media Type* (with "model
+  said: ..." when normalised), *Rating Reasoning*, *VLM Extra*, *VLM Status* (only on failure); with
+  `--full` extra panels. Free text goes through `rich.text.Text`, not markup (a model reply like
+  `[shaded]` was otherwise swallowed). The call table needs >= 110 columns; narrower consoles (and
+  piped output, whose width is 80) get one text line per call (the INFO log line) instead.
+- **Stats sources, as implemented**: Ollama exact (`prompt_eval_count`, `eval_count`,
+  `prompt_eval_duration`, `eval_duration` in ns); OpenAI-shaped bodies: tokens from `usage`
+  (falling back to `timings.prompt_n`/`predicted_n`), reasoning tokens from
+  `usage.completion_tokens_details.reasoning_tokens`, tokens/s from `timings.*_per_second` (or
+  `*_n / *_ms`), otherwise `gen_tps = output_tokens / wall` with `tps_estimated: true` and no prompt
+  rate. A server that reports nothing yields `None` fields, never zeros. `timings.prompt_n` counts
+  only uncached prompt tokens, which is why `usage.prompt_tokens` wins for the token count.
+  Estimated gen tok/s includes prompt processing and network time, so it under-reads.
+- **The timeout traceback bug (root cause and fix)**: the provider functions caught every
+  exception with `logger.warning(..., exc_info=True)`. The console handler is a `RichHandler`
+  with Rich tracebacks, so a plain read timeout (`TimeoutError` from `socket.recv_into`) printed a
+  multi-screen boxed traceback per file even though the analysis correctly continued. Reproduced
+  with a stub that sleeps past `timeout_sec: 2`. Now: provider functions catch, classify
+  (`classify_exception`: `timeout`, `connection`, `http_<code>`, `bad_json`, `bad_response`,
+  `empty_response`, `url_refused`, `unknown_provider`, else the exception class name) and log the
+  traceback at DEBUG; `_call_provider_raw` emits one WARNING naming the endpoint (never the URL) with
+  a per-class hint. The same change covers `_dispatch_vlm`'s backstop, the coordinator and the crop
+  check. Verified for timeout (llama.cpp and Ollama shapes), connection refused, HTTP 500 and a
+  non-JSON 200 body.
+- **Known limits / revisit**: (1) no time-to-first-token: needs `stream: true` and SSE/NDJSON
+  parsing in all three providers; the wall time is therefore prompt + generation together.
+  (2) A failed `avf analyze` VLM call still exits 0 (the file was analysed, just without VLM data);
+  the table shows *VLM Status: FAILED* and `--json` has the error class. Revisit if scripts need a
+  non-zero exit. (3) Estimated tokens/s for OpenAI-style servers is a lower bound. (4) The
+  `detail` levels cost more output tokens; they do not raise `max_tokens` themselves. A reply cut
+  off at the limit is detected from the server's `finish_reason` / Ollama `done_reason` ==
+  `length` (`CallStats.finish_reason`, `.truncated`; "TRUNCATED" in the call line) and warned
+  about on the console with a `max_tokens` hint. Its complete `"key": value` pairs are salvaged
+  (`_salvage_json_fields`: each value is `raw_decode`d, so a string/array cut mid-way is dropped,
+  never half-kept). Before the coordinator review the raw JSON fragment became the summary
+  silently. Plain-text replies still become the summary. (5) P6's cross-check legs will need to
+  set `purpose` to their own value; the collector already carries them.
+- **Tests**: `tests/unit/test_vlm_outputs.py` (prompt/schema for every outputs x detail
+  combination incl. `rating_reasoning` last, validation errors, parsing/normalisation/extras),
+  `tests/unit/test_vlm_calls.py` (Ollama / llama.cpp / OpenAI bodies incl. `timings` and
+  `reasoning_tokens`, partial/missing usage, error classes, collector, real-socket timeout /
+  refused / 500 / malformed-JSON runs asserting no traceback at WARNING+, coordinator and crop
+  recording, CSV/JSON/console at three widths, `--json`, `report_call_stats`).
+- **E2E** (isolated XDG dirs, local stub on 127.0.0.1 serving llama.cpp `usage`+`timings`, Ollama
+  `/api/chat` counters and OpenAI-style `usage` with `reasoning_tokens`, returning
+  `media_type: "3D Rendered"`, `rating_reasoning` and an extra key): `avf analyze --json --csv
+  --full` printed and wrote the stub's exact numbers for all three; the received `json_schema`
+  request listed `summary, tags, objects, media_type, rating, rating_reasoning`; scene-mode
+  `avf process --report-json` listed 3 scene calls + 1 coordinator call (and a `crop_check` call
+  for a letterboxed second input); the timeout run printed one WARNING line per file.
 
 ## 27. Multi-VLM cross-check (P6)
 

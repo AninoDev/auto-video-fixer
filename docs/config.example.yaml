@@ -1426,6 +1426,15 @@ analysis:
   llm:
     endpoint: default_llm
 
+  # Print a per-call table (endpoint, model, wall time, input/output/reasoning tokens, tokens/s,
+  # images, status) and run totals in `avf analyze`. Always logged regardless (one INFO line per
+  # call, raw server usage at DEBUG), and always written by `avf analyze --json PATH` and the
+  # `avf process` JSON report (jobs[].vlm_calls); this switch only controls the console table.
+  # Tokens/s is exact for Ollama and llama.cpp (the server reports its own timings); for plain
+  # OpenAI-style servers it is output tokens / wall time, shown with "~", because those servers
+  # report no timings. There is no time-to-first-token (no streaming).
+  report_call_stats: true
+
   vlm:
     # Master switch for VLM (Vision Language Model) content analysis. Off by default -- costs
     # API calls / requires a model server. The "api" provider has been run end-to-end against a
@@ -1436,6 +1445,45 @@ analysis:
     # Which analysis.endpoints entry the VLM uses (whole-video, per-scene and the crop VLM
     # check). Also settable per-run with `avf analyze --vlm-endpoint NAME`.
     endpoint: default_vlm
+
+    # Which structured fields the DEFAULT prompt asks the model for; the json_schema
+    # response_format (endpoint compat.response_format: json_schema) is built from the same
+    # list, so prompt and schema cannot disagree. summary / tags / objects / rating are always
+    # requested. If you set prompt_override / system_prompt_override these are NOT added for
+    # you -- an override replaces the generated prompt wholesale and must ask for the fields
+    # itself (the schema still follows these switches).
+    outputs:
+      # What kind of footage it is, one of media_type_choices below. Useful for filtering
+      # (e.g. skip upscaling hand-drawn animation) and costs about 5 output tokens.
+      media_type: true
+      # A short justification for the rating, written AFTER the rating (the last JSON key).
+      # Order matters: a non-thinking model only "reasons" by what it has already written, so
+      # it describes the content first, then rates, then explains. Off by default (extra
+      # tokens).
+      rating_reasoning: false
+
+    # Allowed media_type values. The reply is matched case/spacing-insensitively ("3D
+    # Rendered" -> 3d_rendered); anything else is stored as "other" and the model's own wording
+    # is kept in vlm_extra.media_type_raw. Add your own (e.g. "trail_cam"); "other" is always
+    # accepted even if you drop it from the list.
+    media_type_choices:
+      - real_footage
+      - 3d_rendered
+      - 2d_digital
+      - hand_drawn
+      - ai_generated
+      - screen_capture
+      - mixed
+      - other
+
+    # How much the default prompt asks the summary to cover.
+    #   brief      -- 1-2 sentences (the long-standing behaviour; cheapest and fastest).
+    #   standard   -- 3-5 sentences: main subjects, what happens, where.
+    #   detailed   -- a paragraph: characters, actions, setting, camera work, rendering style.
+    #   exhaustive -- several paragraphs: everything above plus lighting, colour, on-screen text.
+    # Higher levels generate more tokens; raise the endpoint's max_tokens with them (a reply cut
+    # off mid-JSON falls back to being treated as the summary).
+    detail: brief
 
     # Frame sampling for EVERY VLM call: the whole video (`avf analyze`) and each scene (scene
     # mode with scenes.drop_non_content). One planner/sampler serves both (REQUIREMENTS.md
@@ -1483,8 +1531,11 @@ analysis:
       min_long_side_px: 336
 
     # --- Prompt customization ---
-    # The default prompts ask the model to return JSON with keys "summary", "tags",
-    # "objects", "rating" (see _VLM_SYSTEM_PROMPT/_VLM_USER_PROMPT in core/analysis.py).
+    # The default prompts are generated from `outputs` and `detail` above and ask the model to
+    # return JSON with keys "summary", "tags", "objects", "media_type", "rating" (and
+    # "rating_reasoning" last, when enabled); see core/vlm_outputs.py. An override replaces
+    # the generated prompt, so it must request the fields you want itself. Any extra key a
+    # model returns is kept in the result as vlm_extra.
     # _parse_vlm_response() falls back to treating a non-JSON response as the summary
     # (tags/objects empty, rating null), so an override that changes the requested
     # output format degrades gracefully -- you'll still get a summary, just no

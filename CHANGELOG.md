@@ -8,6 +8,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Structured VLM output fields** (REQUIREMENTS.md § 26.1). `analysis.vlm.outputs.media_type`
+  (default on; one of `analysis.vlm.media_type_choices`, else `other`), `outputs.rating_reasoning`
+  (default off; asked for last, after `rating`) and `analysis.vlm.detail`
+  (`brief` default | `standard` | `detailed` | `exhaustive`). The default prompts and the
+  `json_schema` `response_format` are generated from the same field list; `prompt_override` /
+  `system_prompt_override` still replace the prompt wholesale and must ask for the fields
+  themselves. Results gain `media_type`, `rating_reasoning` and `vlm_extra` (any other keys the
+  model returned) in the `avf analyze` table, `--full`, CSV and JSON, and in per-scene results.
+- **Truncated VLM replies are detected** (`finish_reason`/`done_reason` `length`): a console
+  warning with a `max_tokens` hint, `truncated` in the call stats, and the fields that arrived
+  complete are kept instead of the raw JSON fragment becoming the summary.
+- **Per-call VLM/LLM statistics** (§ 26.2). Every call (whole video, scene, crop check, scene
+  coordinator, failed ones included) records endpoint, provider, model, purpose, wall time,
+  input/output/total/reasoning tokens, prompt and generation tokens/s (exact for Ollama and
+  llama.cpp; estimated for OpenAI-style servers), images, estimated vision tokens and the error
+  class. Logged per call (INFO; raw server usage at DEBUG), printed by `avf analyze` as a table with
+  run totals (`analysis.report_call_stats`, default true), written by the new
+  `avf analyze --json PATH`, and added to the `avf process` JSON run report as `jobs[].vlm_calls`.
+  New CSV columns `media_type`, `rating_reasoning`, `vlm_extra`, `vlm_calls`, `vlm_wall_sec`,
+  `vlm_input_tokens`, `vlm_output_tokens`.
 - **VLM frame sampling overhaul** (REQUIREMENTS.md § 25). One planner/sampler for whole-video
   and per-scene VLM calls: frame count from duration/interval clamped to the new
   `analysis.vlm.sampling.min_frames`/`max_frames` (never more than the distinct real frames, never
@@ -26,6 +46,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `avf analyze --min-sample-frames`.
 
 ### Changed
+- The default VLM prompt now also asks for `media_type` (`analysis.vlm.outputs.media_type: false`
+  restores the old prompt exactly). Provider functions (`_call_ollama`, `_call_openai`,
+  `_call_custom_api`, `_call_provider_raw`) return a `ProviderResponse(text, stats)` instead of a
+  string.
 - Default VLM call now sends at least 4 frames (was: as few as 1 for short clips); set
   `analysis.vlm.sampling.min_frames: 1` for the old behaviour. Scene-mode calls follow the same
   rule instead of the old `N = min(max, ceil(duration/interval))`.
@@ -33,6 +57,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (needs ffmpeg/ffprobe, which AVF requires anyway).
 
 ### Fixed
+- **A VLM request that timed out (or failed to connect, got HTTP 500, or a non-JSON reply) printed
+  a full Python traceback on the console.** It is now one WARNING line naming the endpoint and the
+  cause (for a timeout: the limit and a hint to raise `analysis.endpoints.<name>.timeout_sec`);
+  the traceback is only in the DEBUG log file. The failure is recorded in the call stats with its
+  error class, the analysis continues with the next file, and `avf analyze` shows *VLM Status:
+  FAILED* in the table. The crop check and the scene coordinator behave the same.
 - **Log retention deleted real-run logs too early.** It kept the newest 50 *files* (about 25 runs
   with `log_type: both`, fewer with strays) and deleted *any* file in the log directory. It now
   keeps `general.log_retention_runs` RUNS (default 50; `null`/`0` = unlimited), groups a run's

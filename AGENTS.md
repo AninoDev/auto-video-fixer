@@ -1429,7 +1429,14 @@ check). `llamacpp` and `api` share `_call_custom_api` (api_url = full chat-compl
 `response_format` `json_object|json_schema|none`, `extra_body` (deep-merged into the payload).
 Provider defaults: `openai`/`api` -> `string`/`json_object` (unchanged), `llamacpp` -> `parts`/`none`
 (`endpoints._COMPAT_DEFAULTS`). `json_schema` sends the schema for the current fields
-(`_VLM_RESPONSE_SCHEMA`; coordinator/crop have their own) -- **P5 extends `_VLM_RESPONSE_SCHEMA`**.
+(coordinator/crop have their own constant schemas; the VLM schema is generated per call from
+`analysis.vlm.outputs` by `core/vlm_outputs.build_response_schema`, `_VLM_RESPONSE_SCHEMA` is only
+the pre-§26 shape). **Gotcha (§ 26)**: provider functions return `ProviderResponse(text, stats)`,
+not a string; a request failure is a *failed* `CallStats` (never an exception) and is logged as ONE
+WARNING line by `_call_provider_raw` -- keep tracebacks at DEBUG (`logger.debug(..., exc_info=True)`),
+never `logger.warning(..., exc_info=True)`, or the console prints a Rich traceback. Calls reach
+`JobResult.vlm_calls` / `VideoAnalysis.vlm_calls` through `vlm_calls.collect_call_stats()`
+(a ContextVar: it does not cross into a new thread/pool worker, so wrap inside the worker).
 All parsers (`_parse_vlm_response`, `_parse_coordinator_response`, `_parse_crop_vlm_response`) go
 through `_extract_json_dict`: strip `<think>` blocks (also an unterminated leading one and a stray
 `</think>`), strip code fences, try pure JSON, else the first balanced top-level `{...}` that parses

@@ -1650,9 +1650,35 @@ class Config:
                 },
             },
             "llm": {"endpoint": "default_llm"},
+            # Print a per-call table (time, tokens, tokens/s, images, status) and run totals
+            # in `avf analyze`. The same figures are always logged (INFO per call) and
+            # always written by `avf analyze --json` / the process JSON report; this only
+            # controls the console table (§ 26.2).
+            "report_call_stats": True,
             "vlm": {
                 "enabled": False,
                 "endpoint": "default_vlm",
+                # Which structured fields the default prompt asks the model for, and the
+                # json_schema response_format is built from (§ 26.1). summary/tags/objects/
+                # rating are always requested. rating_reasoning is emitted LAST, after
+                # rating, so a non-thinking model has seen the content before it justifies.
+                "outputs": {"media_type": True, "rating_reasoning": False},
+                # Allowed media_type values; a reply outside the list is stored as "other"
+                # (the original wording is kept in vlm_extra.media_type_raw).
+                "media_type_choices": [
+                    "real_footage",
+                    "3d_rendered",
+                    "2d_digital",
+                    "hand_drawn",
+                    "ai_generated",
+                    "screen_capture",
+                    "mixed",
+                    "other",
+                ],
+                # How much the default prompt asks the summary to cover:
+                # brief | standard | detailed | exhaustive. Higher levels cost output tokens
+                # and time -- raise the endpoint's max_tokens with them.
+                "detail": "brief",
                 # Frame sampling for every VLM call (whole video and per scene);
                 # REQUIREMENTS.md § 25.1/25.2. Validated at use time
                 # (vlm_sampling.SamplingConfig.from_mapping).
@@ -1686,8 +1712,10 @@ class Config:
                 # `prompt_append` (if set) is still appended after this. Also settable
                 # per-run via `avf analyze --prompt-override`. WARNING: the default
                 # prompt instructs the model to return JSON with summary/tags/objects/
-                # rating -- an override that changes the requested output format will
-                # break that JSON parsing (see _parse_vlm_response's fallback below).
+                # rating (+ media_type / rating_reasoning when enabled in `outputs`) -- an
+                # override REPLACES the generated prompt, so it must ask for every field
+                # itself; one that changes the output format breaks the JSON parsing (see
+                # _parse_vlm_response's fallback below).
                 "prompt_override": "",
                 # Replaces the default system prompt entirely when non-empty. No CLI
                 # flag; config-only.

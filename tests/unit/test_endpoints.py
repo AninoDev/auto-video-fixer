@@ -140,9 +140,11 @@ class TestResponseParsing:
     def test_fenced(self):
         assert an._parse_vlm_response('```json\n{"summary": "f"}\n```')["summary"] == "f"
 
-    def test_truncated_falls_back_to_text(self):
+    def test_truncated_keeps_complete_fields(self):
+        # P5 review: a reply cut off at max_tokens keeps the fields that arrived whole instead
+        # of the raw fragment becoming the summary; the half-written list is dropped.
         r = an._parse_vlm_response('{"summary": "abc", "tags": [')
-        assert r["summary"].startswith('{"summary"') and r["tags"] == []
+        assert r["summary"] == "abc" and r["tags"] == []
 
     def test_plain_text(self):
         assert an._parse_vlm_response("just words")["summary"] == "just words"
@@ -210,6 +212,12 @@ def frame(tmp_path):
     return str(p)
 
 
+def _resp(text):
+    from autovideofixer.core.vlm_calls import CallStats, ProviderResponse
+
+    return ProviderResponse(text, CallStats(provider="x", model="m"))
+
+
 LLAMA_REPLY = {
     "choices": [
         {
@@ -257,12 +265,17 @@ class TestRealNetworkStub:
         assert "response_format" not in body
         assert body["cache_prompt"] is True and body["model"] == "qwen"
         assert body["messages"][1]["content"][1]["image_url"]["url"].startswith("data:image/jpeg")
+        call = out.pop("call")
         assert out == {
             "summary": "a cat",
             "tags": ["cat", "pet"],
             "objects": ["cat"],
             "rating": "G",
+            "media_type": None,
+            "rating_reasoning": None,
+            "extra": {},
         }
+        assert call["success"] and call["provider"] == "llamacpp" and call["images"] == 1
 
     def test_per_endpoint_timeout_enforced(self, tmp_path, frame, caplog):
         stub = _Stub(LLAMA_REPLY, delay=2.0)
@@ -380,13 +393,13 @@ class TestConsumersUseEndpoint:
         f.write_bytes(b"x")
         with patch(
             "autovideofixer.core.analysis._call_provider_raw",
-            return_value='{"content_outside": true, "reason": "r"}',
+            return_value=_resp('{"content_outside": true, "reason": "r"}'),
         ) as call:
             an.run_crop_vlm_check(str(f), str(f), cfg)
             kw = call.call_args[1]
             assert kw["timeout"] == 9.0 and kw["tls"].mode == "insecure"
             assert kw["tls"].label == "crop-vlm:c"
-            call.return_value = '{"main_content_summary": "", "drop": [], "reasons": {}}'
+            call.return_value = _resp('{"main_content_summary": "", "drop": [], "reasons": {}}')
             an.run_scene_coordinator(
                 [{"index": 0, "start_time": 0, "end_time": 1, "duration": 1}], cfg
             )
