@@ -1716,6 +1716,7 @@ class TestReportingFields:
             dropped_scenes=[{"index": 2, "start_time": 1.0, "end_time": 2.0, "reason": "dupe"}],
             stabilize_tiers={},
             interpolated_scenes=[],
+            vlm_sampling=[],
         )
         monkeypatch.setattr(
             "autovideofixer.core.scenes.run_scene_pipeline", lambda *a, **k: fake_scene_result
@@ -1728,6 +1729,7 @@ class TestReportingFields:
             "kept": 4,
             "dropped": 1,
             "dropped_detail": [{"index": 2, "start_time": 1.0, "end_time": 2.0, "reason": "dupe"}],
+            "vlm_sampling": [],  # § 25.4: per-scene VLM frame reports (none: VLM didn't run)
         }
 
 

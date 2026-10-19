@@ -1380,6 +1380,8 @@ class Pipeline:
                     "kept": scene_result.kept_scenes,
                     "dropped": len(scene_result.dropped_scenes),
                     "dropped_detail": list(scene_result.dropped_scenes),
+                    # § 25.4: frames/duplicates/size/tokens sent to the VLM per scene.
+                    "vlm_sampling": list(scene_result.vlm_sampling),
                 }
                 for dropped in scene_result.dropped_scenes:
                     self.logger.warning(

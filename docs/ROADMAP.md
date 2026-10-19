@@ -136,9 +136,15 @@ draws an explicit VERIFIED / UNVERIFIED line instead of a flat done/not-done che
   implemented 2026-10-18. `config_version` + comment-preserving migrations (default-path file
   backed up and rewritten; explicit configs in memory), first-run bootstrap, `avf config migrate`,
   `analysis.endpoints` with per-endpoint timeout/TLS/compat, `llamacpp` provider, `<think>`/prose
-  tolerant response parsing. Revisit: frame-size limits for llama.cpp land in P4 (`vision:`);
-  `json_schema` gains the new fields in P5; comments above moved keys are not carried over by the
+  tolerant response parsing. Frame-size limits for llama.cpp landed in P4 (`vision:`);
+  revisit: `json_schema` gains the new fields in P5; comments above moved keys are not carried over by the
   migration.
+- **VLM frame sampling** (REQUIREMENTS.md § 25, phase P4) — implemented 2026-10-18. Shared
+  planner/sampler: min/max frames, timestamp-accurate VFR seeking via ffprobe+ffmpeg, consecutive-
+  duplicate removal with refill (threshold calibrated on real encodes), endpoint `vision:` limits
+  with a tile/token budget and frames-vs-resolution balancing, frame-count/size/token reporting in
+  `avf analyze` and scene mode. Revisit: per-frame ffmpeg processes if sampling time shows up in
+  scene-heavy runs; `MOTION_FULL_SCALE` for `balance: auto` once P5 call stats exist.
 - **True source cadence recovery & timestamp-safe pipeline** (`retime` stage, on by default —
   REQUIREMENTS.md § 12) — recovers a video's real content framerate when it was padded up to a
   higher encoded rate by duplicated frames (24fps published at 60fps, VFR captures transcoded to

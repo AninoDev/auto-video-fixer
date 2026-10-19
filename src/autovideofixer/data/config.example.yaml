@@ -1349,8 +1349,26 @@ analysis:
       # Responses are cleaned for every provider before parsing: <think>...</think> blocks and
       # code fences are stripped, and the first balanced {...} object is extracted from prose.
       compat: {}
-      # Model image limits / tile model (frame-size limiting arrives with the VLM sampling work,
-      # REQUIREMENTS.md § 25.3); {} = none.
+      # What the model server can digest (REQUIREMENTS.md § 25.3). Sampled frames are only ever
+      # DOWNSCALED to fit (aspect kept, INTER_AREA), never enlarged. All keys optional;
+      # null / absent = no limit. Pixel caps apply even without a tile size.
+      #   max_long_side_px     -- cap on the longer edge (e.g. 720 for llama.cpp setups that
+      #                           resize anyway, so no bandwidth is wasted on pixels).
+      #   max_megapixels       -- cap on width*height in millions of pixels.
+      #   tile_width/tile_height -- the model's vision tile size in pixels (set both). Enables
+      #                           the tile maths: tiles = ceil(W/tile_width)*ceil(H/tile_height)
+      #                           (models pad each edge up to a whole tile), estimated vision
+      #                           tokens = tiles * tokens_per_tile. Shown by `avf analyze`.
+      #   tokens_per_tile      -- what one tile costs in the model's context (default 1, i.e. just
+      #                           count tiles; set your model's real per-tile cost).
+      #   max_tiles_per_frame  -- per-image tile cap (shrinks frames to fit). Needs a tile size.
+      #   max_tiles_per_call   -- total tiles across all images in one request; the planner
+      #                           trades frame count against resolution to fit (see
+      #                           sampling.balance). Needs a tile size.
+      #   max_frames_per_call  -- most images the server accepts per request.
+      #   jpeg_quality         -- JPEG quality 1-100 of the frames sent (default 90).
+      # Example: vision: {max_long_side_px: 720, tile_width: 448, tile_height: 448,
+      #                   max_tiles_per_call: 24}
       vision: {}
     # Coordinating text-LLM used only when scenes.drop_non_content is true. Reviews ALL per-scene
     # VLM summaries together and returns which scene indices (if any) should be dropped. Can be
@@ -1374,16 +1392,17 @@ analysis:
     # This mirrors a known-working hand-patched setup: system message as content parts, no
     # response_format, and a 10-minute timeout (large vision models are slow on big prompts).
     # Select it with `analysis.vlm.endpoint: llamacpp_lan` or `avf analyze --vlm-endpoint
-    # llamacpp_lan`. NOTE: limiting the size of the frames sent (that setup downscaled frames
-    # to 720 px on the long side) is not configurable yet -- it arrives with the VLM sampling
-    # work under `vision:` (REQUIREMENTS.md § 25.3), e.g. `vision: {max_long_side_px: 720}`.
+    # llamacpp_lan`. `vision.max_long_side_px: 720` reproduces that setup's frame downscaling
+    # (720 px on the long side); see the `vision:` documentation above for tile budgets.
     #   llamacpp_lan:
     #     provider: llamacpp
     #     model: your-vision-model
-    #     api_url: "http://10.0.1.4:8080/v1/chat/completions"
+    #     api_url: "http://192.0.2.10:8080/v1/chat/completions"
     #     allow_http: true              # plain HTTP to a non-loopback LAN host (see above)
     #     timeout_sec: 600
     #     max_tokens: 1024
+    #     vision:
+    #       max_long_side_px: 720
     #     compat:
     #       system_content: parts       # (llamacpp default)
     #       response_format: none       # (llamacpp default)
@@ -1418,14 +1437,50 @@ analysis:
     # check). Also settable per-run with `avf analyze --vlm-endpoint NAME`.
     endpoint: default_vlm
 
-    # Frame sampling (REQUIREMENTS.md § 25 extends this block).
+    # Frame sampling for EVERY VLM call: the whole video (`avf analyze`) and each scene (scene
+    # mode with scenes.drop_non_content). One planner/sampler serves both (REQUIREMENTS.md
+    # § 25). `avf analyze` prints how many frames were sent, how many duplicates were dropped,
+    # the frame size and (when the endpoint declares a tile size) the estimated vision tokens.
     sampling:
-      # Max number of frames sampled from the video and sent to the VLM per analysis call. Also
-      # settable per-run with `avf analyze --max-sample-frames INT`.
+      # Fewest frames sent per call. A short or low-motion range still gets this many (temporal
+      # context matters more than sharpness), unless the range has fewer distinct real frames
+      # (a 3-frame clip sends 3, never padded copies) or the endpoint's limits forbid it. Also
+      # settable per-run with `avf analyze --min-sample-frames INT`.
+      min_frames: 4
+      # Most frames sent per call. Frames-per-call = ceil(duration / interval_sec), clamped to
+      # [min_frames, max_frames], then to the endpoint's vision.max_frames_per_call. Also
+      # settable per-run with `avf analyze --max-sample-frames INT` (lowers min_frames to match
+      # if smaller).
       max_frames: 8
-      # Seconds between sampled frames (see _extract_sample_frames() in core/analysis.py). Also
+      # Target seconds of video per sampled frame; sets the frame count above. Frames sit at the
+      # centres of equal segments (not on the first frame, which is often the cut itself) and
+      # are found by timestamp, so variable-frame-rate input samples the right moments. Also
       # settable per-run with `avf analyze --sample-interval FLOAT`.
       interval_sec: 10.0
+      # Drop a sampled frame that looks the same as the previous kept one (variable-frame-rate,
+      # retimed or static content repeats frames; sending copies wastes tokens and context),
+      # then refill the count from the widest gap between kept frames. A genuinely static clip
+      # may end below min_frames. A -> B -> A is kept: only back-to-back repeats are useless.
+      dedupe_consecutive: true
+      # "Same as" = mean absolute luma difference on a 64-px-wide grayscale thumbnail, 0-1 (0.002
+      # = 0.2% average brightness change). Measured on real encodes (REQUIREMENTS.md § 25.5):
+      # repeated frames after lossy encoding score <= 0.0016 (x264 crf 18-38, HEVC, VP9), while
+      # content sampled a second apart scores >= 0.015. Raise to ~0.004 for very low-bitrate
+      # sources whose repeats are mangled by compression; lower to 0 to drop only identical
+      # thumbnails.
+      dedupe_threshold: 0.002
+      # How to spend a per-call tile budget (the endpoint's vision.max_tiles_per_call), i.e.
+      # more-but-smaller frames vs fewer-but-larger ones. No effect without that budget.
+      #   auto     -- a cheap motion probe plus clip length decide: long / high-motion ranges
+      #               get more, smaller frames; short / static ones fewer, larger.
+      #   temporal -- always prefer more frames (down to min_long_side_px).
+      #   spatial  -- always prefer larger frames (the plain frame count above).
+      #   fixed    -- keep the plain frame count and only shrink the resolution to fit.
+      balance: auto
+      # Smallest long side the balancer shrinks frames to in order to fit more of them. It goes
+      # lower (never below 64 px) only when needed to still send min_frames; below 64 px frames
+      # are dropped instead.
+      min_long_side_px: 336
 
     # --- Prompt customization ---
     # The default prompts ask the model to return JSON with keys "summary", "tags",

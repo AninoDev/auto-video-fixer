@@ -135,12 +135,76 @@ def resolve_compat(provider: str, raw: Any, where: str) -> dict[str, Any]:
     return compat
 
 
+VISION_DEFAULTS: dict[str, Any] = {
+    "max_long_side_px": None,
+    "max_megapixels": None,
+    "tile_width": None,
+    "tile_height": None,
+    "tokens_per_tile": 1,
+    "max_tiles_per_frame": None,
+    "max_tiles_per_call": None,
+    "max_frames_per_call": None,
+    "jpeg_quality": 90,
+}
+_VISION_INT_KEYS = (
+    "max_long_side_px",
+    "tile_width",
+    "tile_height",
+    "max_tiles_per_frame",
+    "max_tiles_per_call",
+    "max_frames_per_call",
+)
+
+
+def resolve_vision(raw: Any, where: str) -> dict[str, Any]:
+    """Validated ``vision`` block (§ 25.3) with every key present (``None`` = no limit).
+
+    Raises ``ValueError`` naming the endpoint (``where``) and key. Integers must be positive
+    ints, ``max_megapixels``/``tokens_per_tile`` positive numbers, ``jpeg_quality`` 1-100. A
+    tile size needs both ``tile_width`` and ``tile_height``, and the tile budgets
+    (``max_tiles_per_*``) need a tile size.
+    """
+    entry = _as_mapping(raw, f"{where}.vision")
+    unknown = sorted(set(entry) - set(VISION_DEFAULTS))
+    if unknown:
+        raise ValueError(
+            f"Unknown key(s) in {where}.vision: {', '.join(map(str, unknown))} "
+            f"(valid: {', '.join(VISION_DEFAULTS)})"
+        )
+    out = dict(VISION_DEFAULTS)
+    for key, value in entry.items():
+        if value is None:
+            continue
+        label = f"{where}.vision.{key}"
+        is_num = isinstance(value, (int, float)) and not isinstance(value, bool)
+        if key in _VISION_INT_KEYS:
+            if not (isinstance(value, int) and not isinstance(value, bool)) or value <= 0:
+                raise ValueError(f"Invalid {label} {value!r}: must be a positive integer")
+        elif key in ("max_megapixels", "tokens_per_tile"):
+            if not is_num or not (value > 0) or value == float("inf"):
+                raise ValueError(f"Invalid {label} {value!r}: must be a positive number")
+        elif key == "jpeg_quality" and (
+            not (isinstance(value, int) and not isinstance(value, bool)) or not 1 <= value <= 100
+        ):
+            raise ValueError(f"Invalid {label} {value!r}: must be an integer from 1 to 100")
+        out[key] = value
+    if (out["tile_width"] is None) != (out["tile_height"] is None):
+        raise ValueError(f"{where}.vision: tile_width and tile_height must be set together")
+    for key in ("max_tiles_per_frame", "max_tiles_per_call"):
+        if out[key] is not None and out["tile_width"] is None:
+            raise ValueError(
+                f"{where}.vision.{key} needs tile_width and tile_height (tiles are counted "
+                "in units of that size)"
+            )
+    return out
+
+
 def resolve_endpoint(config: Any, name: str) -> Endpoint:
     """Resolve ``analysis.endpoints.<name>`` to a validated ``Endpoint``.
 
     ``config`` may be a ``Config`` or a plain nested dict. Raises ``ValueError`` with a
     message naming the available endpoints when ``name`` is unknown, and on an invalid
-    provider / timeout / ``compat`` value.
+    provider / timeout / ``compat`` / ``vision`` value.
     """
     endpoints = _cfg_get(config, "analysis", "endpoints")
     if not isinstance(endpoints, Mapping):
@@ -177,7 +241,7 @@ def resolve_endpoint(config: Any, name: str) -> Endpoint:
         max_tokens=max_tokens,
         tls=_as_mapping(raw.get("tls"), f"{where}.tls"),
         compat=resolve_compat(provider, raw.get("compat"), where),
-        vision=_as_mapping(raw.get("vision"), f"{where}.vision"),
+        vision=resolve_vision(raw.get("vision"), where),
     )
 
 

@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **VLM frame sampling overhaul** (REQUIREMENTS.md § 25). One planner/sampler for whole-video
+  and per-scene VLM calls: frame count from duration/interval clamped to the new
+  `analysis.vlm.sampling.min_frames`/`max_frames` (never more than the distinct real frames, never
+  padded with copies), positions at segment centres found by real frame timestamps (correct for
+  variable-frame-rate input; OpenCV's time seek was measured seconds off on VFR), consecutive
+  duplicate frames dropped (`dedupe_consecutive`, `dedupe_threshold`, calibrated on real encodes)
+  and refilled from the widest gap. New endpoint `vision:` limits (`max_long_side_px`,
+  `max_megapixels`, `tile_width`/`tile_height`, `tokens_per_tile`, `max_tiles_per_frame`,
+  `max_tiles_per_call`, `max_frames_per_call`, `jpeg_quality`) downscale frames (never upscale) and
+  trade frame count against resolution (`sampling.balance`, `min_long_side_px`). JPEG quality is
+  now configurable (was fixed at 85).
+- `avf analyze` reports what was sent to the VLM: frames, duplicates dropped, frame size and
+  (with a tile size) estimated tiles/vision tokens, in the console, the INFO log and new CSV columns
+  `vlm_frames`, `vlm_dropped_duplicates`, `vlm_frame_size`, `vlm_est_vision_tokens`; scene mode logs
+  it per scene and adds `scene_stats.vlm_sampling` to the JSON run report.
+- `avf analyze --min-sample-frames`.
+
+### Changed
+- Default VLM call now sends at least 4 frames (was: as few as 1 for short clips); set
+  `analysis.vlm.sampling.min_frames: 1` for the old behaviour. Scene-mode calls follow the same
+  rule instead of the old `N = min(max, ceil(duration/interval))`.
+- VLM frames are extracted with ffprobe timestamps + `ffmpeg -ss` instead of `cv2.VideoCapture`
+  (needs ffmpeg/ffprobe, which AVF requires anyway).
+
 ### Fixed
 - **Log retention deleted real-run logs too early.** It kept the newest 50 *files* (about 25 runs
   with `log_type: both`, fewer with strays) and deleted *any* file in the log directory. It now

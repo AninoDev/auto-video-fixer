@@ -28,7 +28,7 @@ import os
 import shutil
 import tempfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from autovideofixer.ai.torch_utils import get_gpu_inference_semaphore
@@ -57,6 +57,9 @@ class SceneModeResult:
     dropped_scenes: list[dict[str, Any]]
     stabilize_tiers: dict[int, str]  # scene_index -> "skip"|"normal"|"aggressive"
     interpolated_scenes: list[int]
+    # § 25.4: per-scene VLM sampling reports ({"index", "start_time", "end_time", plus
+    # SamplingReport.to_dict() fields}); empty unless scenes.drop_non_content ran the VLM.
+    vlm_sampling: list[dict[str, Any]] = field(default_factory=list)
 
 
 def _run_ffmpeg_ok(args: list[str], timeout: float | None = None) -> bool:
@@ -443,6 +446,9 @@ def _collect_scene_vlm_summaries(
                 "duration": scene.duration,
                 "summary": vlm_result.get("summary", ""),
                 "tags": vlm_result.get("tags", []),
+                # § 25.4: what was actually sent for this scene (frames, duplicates
+                # dropped, size, est. tiles/tokens); absent if sampling failed.
+                "sampling": vlm_result.get("sampling"),
             }
         )
     return summaries
@@ -520,6 +526,7 @@ def run_scene_pipeline(
             return None
 
         dropped_info: list[dict[str, Any]] = []
+        scene_vlm_sampling: list[dict[str, Any]] = []
         kept_scenes = list(enumerate(scenes))
 
         drop_non_content = config.get("scenes", "drop_non_content", default=False)
@@ -533,6 +540,16 @@ def run_scene_pipeline(
         elif drop_non_content:
             try:
                 summaries = _collect_scene_vlm_summaries(input_path, scenes, config)
+                scene_vlm_sampling = [
+                    {
+                        "index": sm["index"],
+                        "start_time": sm["start_time"],
+                        "end_time": sm["end_time"],
+                        **sm["sampling"],
+                    }
+                    for sm in summaries
+                    if isinstance(sm.get("sampling"), dict)
+                ]
                 coordinator_result = run_scene_coordinator(summaries, config)
             except Exception:
                 logger.warning(
@@ -732,6 +749,7 @@ def run_scene_pipeline(
             dropped_scenes=dropped_info,
             stabilize_tiers=tiers,
             interpolated_scenes=interpolated,
+            vlm_sampling=scene_vlm_sampling,
         )
     except Exception:
         logger.warning(

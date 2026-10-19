@@ -1941,7 +1941,7 @@ chat context. Delivery is phased, one commit per phase, in the user-chosen order
 | P1 | § 22 | crop on by default; `normalize_codecs` stage; container-safety audit | IMPLEMENTED 2026-10-17 |
 | P2 | § 23 | network/TLS policy applied to every network path | IMPLEMENTED 2026-10-18 |
 | P3 | § 24 | config schema versioning + migrations, first-run bootstrap, endpoint registry, per-endpoint timeout/TLS, llama.cpp provider | IMPLEMENTED 2026-10-18 |
-| P4 | § 25 | VLM frame sampling: min/max frames, consecutive-duplicate removal, tile budget, frame-count reporting | PLANNED |
+| P4 | § 25 | VLM frame sampling: min/max frames, consecutive-duplicate removal, tile budget, frame-count reporting | IMPLEMENTED 2026-10-18 |
 | P5 | § 26 | new structured output fields (media type, rating reasoning, detail level) + per-call timing/token stats | PLANNED |
 | P6 | § 27 | multi-VLM cross-check (`refine` and `judge` modes) | PLANNED |
 | P7 | § 28 | analysis profiles, reusable analysis module, `analyze` stage + example stages | PLANNED |
@@ -2354,7 +2354,7 @@ Delivered as specified; decisions, deviations and findings:
   config dir was bootstrapped (and not with `AVF_NO_CONFIG_BOOTSTRAP=1`); `avf process` ran with
   `normalize_codecs` and `crop` in the stage table.
 
-## 25. VLM frame sampling: min/max frames, duplicate removal, tile budget (P4)
+## 25. VLM frame sampling: min/max frames, duplicate removal, tile budget (P4) [IMPLEMENTED 2026-10-18]
 
 One shared planner/sampler serves whole-video (`run_vlm_analysis`) and per-scene
 (`run_vlm_analysis_for_scene`) calls — "the range" below is the video or the scene.
@@ -2415,6 +2415,137 @@ llama.cpp setup used 720 px long side — use that in the example config's llama
 dropped, frame size, estimated tiles/vision tokens. Same in the CSV (`vlm_frames`,
 `vlm_dropped_duplicates`, `vlm_frame_size`, `vlm_est_vision_tokens`), the INFO log, scene-mode
 logs, and JSON reports.
+
+### 25.5 Implementation notes (2026-10-18)
+
+Delivered as specified except where listed under "Deviations / interpretations".
+
+- **Modules**: `core/vlm_sampling.py` holds everything. Pure planning (`base_frame_count`,
+  `segment_centres`, `tiles_for`, `pixel_cap_scale`, `fit_scale`, `temporal_preference`,
+  `plan_sampling`), pure selection (`select_frames` over any object with `read(t)`, `thumb_diff`,
+  `motion_score`), and I/O (`probe_timeline`, `FFmpegFrameSource`, `sample_vlm_frames`). Value
+  objects: `SamplingConfig` / `VisionLimits` (validated), `SamplePlan`, `SamplingReport`,
+  `SampledFrames`. `VideoAnalyzer.run_vlm_analysis` and `run_vlm_analysis_for_scene` are thin
+  callers; `_extract_sample_frames`, `_extract_sample_frames_range` and `_vlm_sampling_config` are
+  gone. `endpoints.resolve_vision()` validates the endpoint `vision` block (unknown keys, types,
+  tile size needed by `max_tiles_per_*`), each error naming `analysis.endpoints.<name>.vision.<key>`.
+- **`n_lo` / `n_hi` interpretation** (the spec's wording is ambiguous): `n_lo` = the § 25.1 count
+  (after `max_frames_per_call` and the real-frame cap); `n_hi` = the most frames that fit
+  `max_tiles_per_call` with every frame at `min_long_side_px` (itself capped by `max_frames`,
+  `max_frames_per_call` and the real-frame count); `n = round(n_lo + p * (n_hi - n_lo))`; then the
+  largest scale for which `n * tiles(scale) <= max_tiles_per_call` (and `max_tiles_per_frame`).
+  If `n_hi < n_lo` (the budget can't hold `n_lo` frames even at `min_long_side_px`) `n` is
+  `max(n_hi, min_frames)` -- `min_frames` outranks `min_long_side_px`, frames shrink below it. If a
+  frame still can't fit at the 64 px floor, frames are dropped one at a time. The pixel caps and
+  `max_tiles_per_frame` apply even when no `max_tiles_per_call` is set. `max_tiles_per_call`
+  without a tile size is rejected when the endpoint is resolved.
+- **`balance: auto`**: `p = (m + d / (d + 30 s)) / 2`, `m` = mean absolute difference between
+  adjacent thumbnails of 8 evenly spaced tiny (64 px wide) frames of the range, divided by
+  `MOTION_FULL_SCALE` = 0.10 and capped at 1 (unknown -> 0.5). The probe only runs when
+  `balance: auto` and `max_tiles_per_call` is set, so it costs nothing otherwise.
+- **Seeking -- deviation from "prefer `CAP_PROP_POS_MSEC`"**: measured on a genuine VFR file
+  (5 frames, holds of 0.2 / 3.0 / 0.1 / 2.0 / 1.7 s; average 0.91 fps), OpenCV's
+  `set(CAP_PROP_POS_MSEC, t)` converts `t` to a frame *number* with the average fps and returns the
+  first frame at or after that time: t = 1.0 s returned the right frame, but t = 3.0 s returned the
+  frame shown at 3.32 s, and t = 5.0 s the frame shown at 7.0 s -- seconds off, wrong picture. So
+  the I/O no longer uses `cv2.VideoCapture` for seeking at all: `ffprobe` lists every video packet
+  timestamp (no decoding; relative to the container `start_time`, the clock `-ss` uses), the frame
+  "on screen at t" is the last frame with timestamp <= t, and `ffmpeg -ss <that timestamp>
+  -frames:v 1` decodes it (accurate seek; `showinfo` reports the timestamp really decoded and it is
+  checked against the plan). The timeline index is the decoded-frame identity, so "never send the
+  same frame twice" is exact, not heuristic. Costs: one ffprobe per range (whole-video listing of a
+  very long file reads its index/packets; scene calls use `-read_intervals`) and one short ffmpeg
+  process per extracted frame, at most `4 * target` per range. Formats without a seek index
+  (MPEG-TS with long GOPs) make the fast `-ss` return nothing, so it falls back to decoding from
+  the start and selecting the frame in the filter graph (slow, correct). Rotation metadata is
+  applied (`width`/`height` swapped), resizing is `scale=...:flags=area` in ffmpeg (INTER_AREA
+  equivalent) on the decoded frame, JPEG encoding is `cv2.imwrite` at `vision.jpeg_quality`.
+- **Real frames in a range**: frames visible during `[start, end)` -- the one on screen at `start`
+  (a long VFR hold can begin before a scene) through the last that starts before `end` -- exact
+  because the timeline is exact (the old plan was an estimate from `CAP_PROP_FRAME_COUNT`).
+  Range end = container duration when available, else last timestamp + median frame gap.
+- **Refill**: probes are all requested positions (including dropped ones) plus the range edges; the
+  next candidate is the midpoint of the widest gap between *probes* (so a dropped midpoint splits
+  its gap and the search always makes progress), compared against both KEPT neighbours. It stops
+  at the target, when no gap is wider than half a typical frame gap, or after `4 * target`
+  attempts (initial positions count). Positions resolving to an already-seen frame are skipped
+  but NOT counted in `dropped_duplicates` (they are sampler revisits at frame granularity, not
+  repeated frames in the video; counting them over-reported duplicates on short clips -- fixed in
+  coordinator review). `dedupe_consecutive: false` still never sends a decoded frame twice.
+  A rejected candidate's full-size image is released immediately (the frame source caches
+  candidates; keeping rejected 4K frames would cost ~25 MB each).
+- **Coordinator e2e (2026-10-18)**, same stub: 60 s static 3840x2160 clip, no vision caps -> 1 frame
+  of 3840x2160 sent, 23 duplicates dropped (the 4x6 attempt cap), peak child RSS 393 MB; 40 s
+  1280x720 MPEG-TS (GOP 250, x264) -> 6 frames 720x405; MP4 with a 90 degree display matrix -> 6
+  frames 405x720 (rotation honoured); console, CSV and stub agreed on every run.
+- **Per-run overrides**: `avf analyze --min-sample-frames/--max-sample-frames/--sample-interval`
+  (and the matching `analyze()` / `run_vlm_analysis*` kwargs). A `--max-sample-frames` below the
+  configured `min_frames` lowers `min_frames` to match; an explicitly conflicting pair is a usage
+  error (exit 2). Invalid sampling config / vision values raise `ValueError` naming the key before
+  any frame work. `config_version` stays 2: only new keys were added, defaults merge in.
+- **Reporting (§ 25.4)**: `run_vlm_analysis*` results carry `"sampling"` (`SamplingReport.to_dict()`:
+  `frames`, `dropped_duplicates`, `frame_size`, `tiles_per_frame`, `est_tiles`, `est_vision_tokens`,
+  `target_frames`, `attempts`, `balance`, `temporal_pref`, `notes`, ...). `avf analyze` shows
+  "VLM Frames Sent / Duplicates Dropped / Frame Size / Est. Tiles / Tokens" (the tile row only
+  when a tile size is configured), the INFO line gains the same figures, and the CSV gains
+  `vlm_frames`, `vlm_dropped_duplicates`, `vlm_frame_size`, `vlm_est_vision_tokens` (blank when
+  the VLM didn't run / no tile size). `avf analyze` itself only calls the VLM for the whole video;
+  per-scene sampling happens in scene mode (`scenes.drop_non_content`), where each scene logs
+  `VLM frames for <file> scene[a-b]: ...` and the figures land in the process JSON report under
+  `scene_stats.vlm_sampling` (a list, one entry per scene with `index`, times and the report).
+  `est_vision_tokens` is for the *whole call* (frames x tiles x `tokens_per_tile`).
+- **Calibration of `dedupe_threshold`** (method: synthetic lavfi sources, 640x360, decoded with
+  OpenCV, grayscale 64-px-wide INTER_AREA thumbnails, `thumb_diff` as in the code). Genuine
+  duplicates were made by generating at 5 fps and duplicating to 30 fps (`fps=30`), then encoding
+  lossily so the copies are NOT bit-identical; diffs of copy-vs-previous-copy ("dup") were
+  separated from diffs across a real change ("change"):
+
+  | source / encode | dup max | dup p99 | change min |
+  |---|---|---|---|
+  | testsrc2, x264 crf 18 / 28 / 38 | 0.00002 / 0.00006 / 0.00028 | .00002 / .00005 / .00024 | 0.0165-0.0169 |
+  | testsrc2 + static noise, x264 crf 28 | 0.00013 | 0.00013 | 0.0191 |
+  | mandelbrot zoom, x264 crf 28 | 0.00061 | 0.00056 | 0.0021 |
+  | mandelbrot, HEVC crf 30 | 0.00158 | 0.00150 | 0.00089 |
+  | mandelbrot, VP9 crf 40 | 0.00101 | 0.00040 | 0.0027 |
+  | life (cellular automaton), x264 crf 28 | 0.00128 | 0.00122 | 0.0027 |
+  | mandelbrot, x264 crf 45 / 80 kbit/s | 0.00287 / 0.00241 | 0.0010 / 0.0023 | 0.0008 / 0.0004 |
+
+  Content that is genuinely different but slow, adjacent frames at 30 fps: testsrc2 0.006-0.013,
+  fresh temporal noise on identical frames 0.0024-0.038 (noise alone scores ~0.0025), mandelbrot
+  0.0024-0.006, life 0.003-0.021, slow pans 0.00006-0.03 (testsrc2's own animation floors the
+  minimum). The frames actually compared by the sampler are seconds apart, and at a 1 s lag every
+  one of those clips scored >= 0.015 (testsrc2 0.019, slow pan 0.015-0.13, noise 0.021, life 0.030,
+  mandelbrot 0.071, cellauto 0.090). Result: normal encodes put repeats at <= 0.0016, genuinely
+  different content a second apart is >= 0.015, nine times higher. **The default stays 0.002**: it
+  clears every normal encode (x264 to crf 38, HEVC, VP9), sits below noise-on-static (0.0024) and
+  mandelbrot-adjacent change, and false drops cost the user's top concern (temporal context) more
+  than a redundant frame does. Only extreme compression (crf 45, 80 kbit/s) exceeds it
+  (<= 0.0029); `dedupe_threshold: 0.004` is the documented remedy for such sources. Adjacent-frame
+  overlap (slow content vs. heavy compression) is irrelevant for the sampler but would matter if
+  this threshold were reused for frame-by-frame dedupe.
+- **Known limits / revisit**: (1) `est_vision_tokens` is only as good as the configured
+  `tile_*`/`tokens_per_tile`; models that resize internally or use dynamic tiling are not
+  modelled. (2) One ffmpeg process per frame: very slow storage or huge 4K HEVC GOPs make a
+  scene-heavy run spend noticeable time sampling; a persistent decoder / batch `select` would be
+  the fix if that shows up. (3) Anamorphic (non-square pixel) sources are sampled at coded size.
+  (4) A range shorter than one frame gap uses the single on-screen frame. (5) HDR
+  sources are converted to 8-bit BGR without tone mapping (same as before). (6) Motion
+  normalisation `MOTION_FULL_SCALE` (0.10) is a judgement call from the lag-1 s numbers above
+  (typical content 0.02-0.09); revisit with real footage and the call stats of P5.
+- **Tests**: `tests/unit/test_vlm_sampling.py` (planner, balance modes, priorities, floor, caps,
+  selection with a fake source incl. A A A B / A B A / attempt cap / config + vision validation),
+  `tests/unit/test_vlm_sampling_reporting.py` (plumbing, CSV, console, cleanup),
+  `tests/integration/test_vlm_sampling_e2e.py` (real ffmpeg: duplicate CFR, VFR picture identity,
+  3-frame and 1-frame clips, static clip, scene ranges, resolution/tile/JPEG caps decoded from the
+  written files, MPEG-TS fallback, rotation).
+- **E2E** (isolated XDG dirs, local stub OpenAI-compatible server on 127.0.0.1 recording each
+  request's decoded images; endpoint `vision: {max_long_side_px: 720, tile_width: 448,
+  tile_height: 448, max_tiles_per_call: 24}`): `avf analyze` on a 60 s 1280x720 clip -> stub received
+  7 images of 720x405; console, INFO line and CSV said 7 frames / 0 dropped / 720x405 / 14 tiles /
+  14 tokens. `avf process` scene mode (3 scenes, `scenes.drop_non_content`) -> stub received 5, 7
+  and 1 images (the last scene a static test card: 1 distinct frame; its duplicate count was taken before the
+  revisit fix above), and
+  the JSON report's `scene_stats.vlm_sampling` matched all three.
 
 ## 26. Structured output fields + per-call timing/token stats (P5)
 

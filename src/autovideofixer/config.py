@@ -1653,9 +1653,29 @@ class Config:
             "vlm": {
                 "enabled": False,
                 "endpoint": "default_vlm",
+                # Frame sampling for every VLM call (whole video and per scene);
+                # REQUIREMENTS.md § 25.1/25.2. Validated at use time
+                # (vlm_sampling.SamplingConfig.from_mapping).
                 "sampling": {
+                    # Floor / ceiling on frames per call. The count is ceil(duration /
+                    # interval_sec) clamped to [min_frames, max_frames], then to the
+                    # endpoint's vision.max_frames_per_call and to the number of real
+                    # frames (a 3-frame clip sends 3, never padded duplicates).
+                    "min_frames": 4,
                     "max_frames": 8,
                     "interval_sec": 10.0,
+                    # Drop a sampled frame that matches the previous KEPT one (VFR /
+                    # retimed / static content) and refill from the widest time gap.
+                    "dedupe_consecutive": True,
+                    # Mean abs luma difference on a 64-px grayscale thumbnail (0-1);
+                    # at or below this = duplicate. See § 25.5 for the calibration.
+                    "dedupe_threshold": 0.002,
+                    # Frames-vs-resolution trade under vision.max_tiles_per_call:
+                    # auto | temporal | spatial | fixed.
+                    "balance": "auto",
+                    # Resolution is only reduced below this long side to keep
+                    # min_frames; absolute floor 64 px.
+                    "min_long_side_px": 336,
                 },
                 # Extra text appended to the default (or overridden) user prompt when
                 # non-empty, e.g. job-specific context like "these are wildlife clips

@@ -13,6 +13,7 @@ from click.testing import CliRunner
 from autovideofixer.cli.cli import main
 from autovideofixer.config import Config
 from autovideofixer.core import analysis as an
+from autovideofixer.core.vlm_sampling import SampledFrames, SamplingReport
 from autovideofixer.endpoints import all_endpoint_urls, resolve_endpoint, resolve_role_endpoint
 
 
@@ -193,6 +194,15 @@ class _Stub:
         self.server.server_close()
 
 
+def _sampled(paths):
+    """A ``SampledFrames`` as the sampler would return it (files stay put: tmp_dir is empty)."""
+    return SampledFrames(
+        paths=[str(p) for p in paths],
+        tmp_dir="",
+        report=SamplingReport(frames=len(paths), width=1, height=1),
+    )
+
+
 @pytest.fixture
 def frame(tmp_path):
     p = tmp_path / "f.jpg"
@@ -314,10 +324,10 @@ class TestConsumersUseEndpoint:
         cfg.set("mine", "analysis", "vlm", "endpoint")
         return cfg
 
-    @patch("autovideofixer.core.analysis._extract_sample_frames")
+    @patch("autovideofixer.core.analysis.sample_vlm_frames")
     @patch("autovideofixer.core.analysis._dispatch_vlm")
     def test_whole_video(self, disp, extract, tmp_path, frame):
-        extract.return_value = [frame]
+        extract.return_value = _sampled([frame])
         disp.return_value = {}
         cfg = self._analyzer_cfg(
             tmp_path, model="mm", timeout_sec=77, api_url="http://127.0.0.1:1/x"
@@ -327,27 +337,27 @@ class TestConsumersUseEndpoint:
         assert args[1:4] == ("llamacpp", "mm", "http://127.0.0.1:1/x")
         assert kw["timeout"] == 77.0 and kw["compat"]["system_content"] == "parts"
 
-    @patch("autovideofixer.core.analysis._extract_sample_frames")
+    @patch("autovideofixer.core.analysis.sample_vlm_frames")
     @patch("autovideofixer.core.analysis._dispatch_vlm")
     def test_override_and_explicit_endpoint(self, disp, extract, tmp_path, frame):
-        extract.return_value = [frame]
+        extract.return_value = _sampled([frame])
         disp.return_value = {}
         cfg = self._analyzer_cfg(tmp_path, model="mm")
         an.VideoAnalyzer(cfg).run_vlm_analysis("v.mp4", endpoint="default_vlm", model="zzz")
         assert disp.call_args[0][1:3] == ("ollama", "zzz")
 
     def test_unknown_endpoint_raises_before_extraction(self, tmp_path):
-        with patch("autovideofixer.core.analysis._extract_sample_frames") as ex:
+        with patch("autovideofixer.core.analysis.sample_vlm_frames") as ex:
             with pytest.raises(ValueError, match="Unknown analysis endpoint"):
                 an.VideoAnalyzer(Config(tmp_path / "n.yaml")).run_vlm_analysis(
                     "v.mp4", endpoint="x"
                 )
             ex.assert_not_called()
 
-    @patch("autovideofixer.core.analysis._extract_sample_frames_range")
+    @patch("autovideofixer.core.analysis.sample_vlm_frames")
     @patch("autovideofixer.core.analysis._dispatch_vlm")
     def test_per_scene(self, disp, extract, tmp_path, frame):
-        extract.return_value = [frame]
+        extract.return_value = _sampled([frame])
         disp.return_value = {}
         cfg = self._analyzer_cfg(tmp_path, timeout_sec=5)
         scene = an.SceneEvent(start_time=0.0, end_time=4.0, event_type="x")
@@ -387,7 +397,7 @@ class TestConsumersUseEndpoint:
         cfg = self._analyzer_cfg(tmp_path)
         cfg.set({"mode": "untrusted_ca"}, "analysis", "endpoints", "mine", "tls")
         with (
-            patch("autovideofixer.core.analysis._extract_sample_frames", return_value=[frame]),
+            patch("autovideofixer.core.analysis.sample_vlm_frames", return_value=_sampled([frame])),
             patch("autovideofixer.core.analysis._dispatch_vlm", return_value={}) as disp,
         ):
             an.VideoAnalyzer(cfg).run_vlm_analysis("v.mp4")

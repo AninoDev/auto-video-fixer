@@ -19,6 +19,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Mapping
 
 from autovideofixer.config import VALID_SYMLINKS_POLICIES, Config
+from autovideofixer.core.vlm_sampling import SamplingConfig, VisionLimits, sample_vlm_frames
 from autovideofixer.endpoints import (
     normalize_provider,
     resolve_compat,
@@ -226,6 +227,9 @@ class VideoAnalysis:
     vlm_tags: list[str] = field(default_factory=list)
     vlm_objects: list[str] = field(default_factory=list)
     content_rating: str | None = None
+    # SamplingReport.to_dict() of the whole-video VLM call (REQUIREMENTS.md § 25.4); None
+    # when VLM didn't run.
+    vlm_sampling: dict[str, Any] | None = None
     similar_files: list[str] = field(default_factory=list)
     metadata: dict[str, Any] = field(default_factory=dict)
 
@@ -253,6 +257,7 @@ class VideoAnalyzer:
         vlm_model: str | None = None,
         vlm_api_url: str | None = None,
         vlm_endpoint: str | None = None,
+        min_sample_frames: int | None = None,
     ) -> VideoAnalysis:
         """Perform full analysis on a video file.
 
@@ -278,6 +283,8 @@ class VideoAnalyzer:
                 a live status line on slow videos. See ``ProgressCallback``.
             max_sample_frames: VLM sample-frame count override (None = use
                 ``analysis.vlm.sampling.max_frames``). See ``run_vlm_analysis``.
+            min_sample_frames: VLM minimum sample-frame override (None = use
+                ``analysis.vlm.sampling.min_frames``).
             sample_interval_sec: VLM frame-sampling interval override in
                 seconds (None = use ``analysis.vlm.sampling.interval_sec``).
             vlm_model: VLM model name override for this run (None = the selected
@@ -348,11 +355,13 @@ class VideoAnalyzer:
                 system_prompt_override=system_prompt_override,
                 progress_callback=progress_callback,
                 max_sample_frames=max_sample_frames,
+                min_sample_frames=min_sample_frames,
                 sample_interval_sec=sample_interval_sec,
                 model=vlm_model,
                 api_url=vlm_api_url,
                 endpoint=vlm_endpoint,
             )
+            analysis.vlm_sampling = vlm_result.get("sampling")
             analysis.vlm_summary = vlm_result.get("summary")
             analysis.vlm_tags = vlm_result.get("tags", [])
             analysis.vlm_objects = vlm_result.get("objects", [])
@@ -530,11 +539,14 @@ class VideoAnalyzer:
         model: str | None = None,
         api_url: str | None = None,
         endpoint: str | None = None,
+        min_sample_frames: int | None = None,
     ) -> dict[str, Any]:
         """Run VLM (Vision Language Model) analysis on video content.
 
-        Samples frames at intervals and sends them to a configured VLM
-        provider for content analysis.
+        Samples frames (REQUIREMENTS.md § 25: count from duration/interval clamped to
+        min/max, consecutive duplicates removed and refilled, downscaled to the
+        endpoint's ``vision`` limits) and sends them to a configured VLM provider for
+        content analysis.
 
         Args:
             filepath: Path to the video file
@@ -557,6 +569,8 @@ class VideoAnalyzer:
             max_sample_frames: Max frames sampled and sent to the provider
                 (None = use ``analysis.vlm.sampling.max_frames``, default 8).
                 Also settable per-run via ``avf analyze --max-sample-frames``.
+            min_sample_frames: Min frames (None = ``analysis.vlm.sampling.min_frames``,
+                default 4); lowered to ``max_sample_frames`` when that is smaller.
             model: Model name override for this run (None = the selected
                 endpoint's ``model``). Also settable via ``avf analyze --vlm-model``.
             api_url: Provider base/endpoint URL override for this run (None = the
@@ -570,7 +584,9 @@ class VideoAnalyzer:
                 unknown name raises ``ValueError`` before any frame extraction.
 
         Returns:
-            Dict with keys: summary, tags, objects, rating
+            Dict with keys: summary, tags, objects, rating, and ``sampling`` (the
+            ``SamplingReport.to_dict()`` of what was sent: frames, dropped duplicates,
+            frame size, estimated tiles/tokens).
         """
 
         def _report(phase: str, detail: str = "") -> None:
@@ -585,11 +601,13 @@ class VideoAnalyzer:
             model=model, api_url=api_url
         )
         tls = resolve_tls_policy(self.config, ep.tls, purpose=ep.tls_purpose)
-        cfg_max_frames, cfg_interval = _vlm_sampling_config(vlm_config)
-        max_frames = max_sample_frames if max_sample_frames is not None else cfg_max_frames
-        sample_interval_sec = (
-            sample_interval_sec if sample_interval_sec is not None else cfg_interval
+        sampling = SamplingConfig.from_mapping(
+            vlm_config.get("sampling"),
+            min_frames=min_sample_frames,
+            max_frames=max_sample_frames,
+            interval_sec=sample_interval_sec,
         )
+        vision = VisionLimits.from_mapping(ep.vision)
 
         resolved_append = (
             prompt_append if prompt_append is not None else vlm_config.get("prompt_append", "")
@@ -610,24 +628,28 @@ class VideoAnalyzer:
         if resolved_append:
             user_prompt = f"{user_prompt}\n\n{resolved_append}"
 
-        _report("vlm_sampling", f"Extracting up to {max_frames} sample frame(s)")
-        frames = _extract_sample_frames(filepath, sample_interval_sec, max_frames=max_frames)
-        if not frames:
+        _report(
+            "vlm_sampling",
+            f"Sampling {sampling.min_frames}-{sampling.max_frames} frame(s) for the VLM",
+        )
+        sampled = sample_vlm_frames(filepath, sampling, vision, config=self.config)
+        report = sampled.report
+        if not sampled.paths:
             return {"summary": "", "tags": [], "objects": []}
 
-        # All sample frames live in one temp dir created by _extract_sample_frames;
-        # it must be cleaned up here, after the provider has read the frames into
-        # base64, not inside _extract_sample_frames itself (which would delete the
-        # files before they're ever read).
-        tmp_dir = os.path.dirname(frames[0])
+        # All sample frames live in one temp dir created by sample_vlm_frames; it must
+        # be cleaned up here, after the provider has read the frames into base64, not
+        # inside the sampler itself (which would delete the files before they're read).
         try:
+            logger.info("VLM frames for %s: %s", filepath, report.summary())
+            _report("vlm_sampled", report.summary())
             _report(
                 "vlm_request",
-                f"Sending {len(frames)} frame(s) to {ep.provider} VLM provider "
+                f"Sending {len(sampled.paths)} frame(s) to {ep.provider} VLM provider "
                 f"(endpoint={ep.name}, model={ep.model})",
             )
-            return _dispatch_vlm(
-                frames,
+            result = _dispatch_vlm(
+                sampled.paths,
                 ep.provider,
                 ep.model,
                 ep.api_url,
@@ -641,8 +663,10 @@ class VideoAnalyzer:
                 compat=ep.compat,
                 context=filepath,
             )
+            result["sampling"] = report.to_dict()
+            return result
         finally:
-            shutil.rmtree(tmp_dir, ignore_errors=True)
+            shutil.rmtree(sampled.tmp_dir, ignore_errors=True)
 
     def run_vlm_analysis_for_scene(
         self,
@@ -656,13 +680,14 @@ class VideoAnalyzer:
         model: str | None = None,
         api_url: str | None = None,
         endpoint: str | None = None,
+        min_sample_frames: int | None = None,
     ) -> dict[str, Any]:
         """Run VLM analysis over only the frames within one scene's time range.
 
-        Used by scene-based processing (see core/scenes.py): samples fewer frames
-        for short scenes -- ``N = min(max_sample_frames, ceil(scene_duration /
-        sample_interval_sec))``, floored at 1 for any non-empty scene -- rather than
-        always sending ``max_sample_frames`` regardless of how short the scene is.
+        Used by scene-based processing (see core/scenes.py). Uses the same planner and
+        sampler as ``run_vlm_analysis`` (REQUIREMENTS.md § 25) with the scene as "the
+        range", so a short scene gets fewer frames (never fewer than its distinct real
+        frames, never more than ``max_frames``).
         Shares the same provider config/dispatch as ``run_vlm_analysis`` (VLM
         connection layer, HTTPS/allow_http gate, prompt handling); only the frame
         sampling is scene-scoped.
@@ -670,8 +695,6 @@ class VideoAnalyzer:
         Returns the same dict shape as ``run_vlm_analysis``: summary/tags/objects/
         rating (empty on any failure -- this method never raises).
         """
-        import math
-
         vlm_config = self.config.get("analysis", "vlm", default={})
         # Resolved up front so an unknown endpoint or a bad network.tls config is a clear
         # error before any frame extraction work (and not swallowed by _dispatch_vlm's
@@ -680,14 +703,16 @@ class VideoAnalyzer:
             model=model, api_url=api_url
         )
         tls = resolve_tls_policy(self.config, ep.tls, purpose=ep.tls_purpose)
-        cfg_max_frames, cfg_interval = _vlm_sampling_config(vlm_config)
-        max_frames_cfg = max_sample_frames if max_sample_frames is not None else cfg_max_frames
-        interval = sample_interval_sec if sample_interval_sec is not None else cfg_interval
+        sampling = SamplingConfig.from_mapping(
+            vlm_config.get("sampling"),
+            min_frames=min_sample_frames,
+            max_frames=max_sample_frames,
+            interval_sec=sample_interval_sec,
+        )
+        vision = VisionLimits.from_mapping(ep.vision)
 
-        duration = max(scene.duration, 0.0)
-        if duration <= 0:
+        if max(scene.duration, 0.0) <= 0:
             return {"summary": "", "tags": [], "objects": [], "rating": None}
-        scene_max_frames = max(1, min(max_frames_cfg, math.ceil(duration / max(interval, 0.1))))
 
         resolved_append = (
             prompt_append if prompt_append is not None else vlm_config.get("prompt_append", "")
@@ -707,16 +732,24 @@ class VideoAnalyzer:
         if resolved_append:
             user_prompt = f"{user_prompt}\n\n{resolved_append}"
 
-        frames = _extract_sample_frames_range(
-            filepath, scene.start_time, scene.end_time, interval, max_frames=scene_max_frames
+        sampled = sample_vlm_frames(
+            filepath,
+            sampling,
+            vision,
+            scene.start_time,
+            scene.end_time,
+            prefix="avf_scene_samples_",
+            config=self.config,
         )
-        if not frames:
+        if not sampled.paths:
             return {"summary": "", "tags": [], "objects": [], "rating": None}
 
-        tmp_dir = os.path.dirname(frames[0])
+        report = sampled.report
+        scene_ctx = f"{filepath} scene[{scene.start_time:.1f}-{scene.end_time:.1f}]"
         try:
-            return _dispatch_vlm(
-                frames,
+            logger.info("VLM frames for %s: %s", scene_ctx, report.summary())
+            result = _dispatch_vlm(
+                sampled.paths,
                 ep.provider,
                 ep.model,
                 ep.api_url,
@@ -728,10 +761,12 @@ class VideoAnalyzer:
                 tls=tls,
                 timeout=ep.timeout_sec,
                 compat=ep.compat,
-                context=f"{filepath} scene[{scene.start_time:.1f}-{scene.end_time:.1f}]",
+                context=scene_ctx,
             )
+            result["sampling"] = report.to_dict()
+            return result
         finally:
-            shutil.rmtree(tmp_dir, ignore_errors=True)
+            shutil.rmtree(sampled.tmp_dir, ignore_errors=True)
 
     def find_similar(
         self,
@@ -835,19 +870,6 @@ class VideoAnalyzer:
 
 
 # ─── VLM Providers ─────────────────────────────────────────────────
-
-
-def _vlm_sampling_config(vlm_config: Mapping[str, Any]) -> tuple[int, float]:
-    """``(max_frames, interval_sec)`` from ``analysis.vlm.sampling`` (v2 schema).
-
-    P4 (REQUIREMENTS.md § 25) replaces the sampler itself; P3 only moved the keys
-    (``max_sample_frames`` -> ``sampling.max_frames``, ``sample_interval_sec`` ->
-    ``sampling.interval_sec``), behaviour unchanged.
-    """
-    sampling = vlm_config.get("sampling")
-    if not isinstance(sampling, Mapping):
-        sampling = {}
-    return int(sampling.get("max_frames", 8)), float(sampling.get("interval_sec", 10.0))
 
 
 def _frames_to_base64(frame_paths: list[str]) -> list[str]:
@@ -1852,111 +1874,6 @@ def _classify_events(
 
 
 # ─── Frame Extraction ──────────────────────────────────────────────
-
-
-def _extract_sample_frames(
-    filepath: str,
-    interval_sec: float,
-    max_frames: int = 20,
-) -> list[str]:
-    """Extract evenly-spaced sample frames from a video.
-
-    Samples frames at regular intervals to provide representative
-    visual content for VLM analysis.
-
-    Args:
-        filepath: Path to the video file
-        interval_sec: Seconds between samples
-        max_frames: Maximum number of frames to extract
-
-    Returns:
-        List of paths to extracted frame images
-    """
-    import cv2
-
-    cap = cv2.VideoCapture(filepath)
-    if not cap.isOpened():
-        return []
-
-    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
-    frame_interval = max(1, int(fps * interval_sec))
-    frames: list[str] = []
-    frame_idx = 0
-
-    tmp_dir = tempfile.mkdtemp(prefix="avf_samples_")
-
-    try:
-        while len(frames) < max_frames:
-            cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
-            ret, frame = cap.read()
-            if not ret:
-                break
-
-            frame_path = os.path.join(tmp_dir, f"frame_{frame_idx:06d}.jpg")
-            cv2.imwrite(frame_path, frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
-            frames.append(frame_path)
-
-            frame_idx += frame_interval
-    finally:
-        cap.release()
-
-    return frames
-
-
-def _extract_sample_frames_range(
-    filepath: str,
-    start_time: float,
-    end_time: float,
-    interval_sec: float,
-    max_frames: int = 8,
-) -> list[str]:
-    """Extract evenly-spaced sample frames from within [start_time, end_time).
-
-    Same mechanics as ``_extract_sample_frames`` (frames written as JPEGs to a
-    fresh temp dir, caller is responsible for cleanup) but scoped to a scene's
-    time range instead of the whole file -- used by per-scene VLM sampling.
-    Always samples at least one frame (the scene's start) if the range is
-    non-empty and the video can be opened, even if ``interval_sec`` alone would
-    have produced zero samples for a very short scene.
-    """
-    import cv2
-
-    cap = cv2.VideoCapture(filepath)
-    if not cap.isOpened():
-        return []
-
-    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
-    duration = max(end_time - start_time, 0.0)
-    if duration <= 0 or max_frames <= 0:
-        cap.release()
-        return []
-
-    # Evenly space `max_frames` samples across the scene (at least 1), rather
-    # than stepping by interval_sec from the start -- for a short scene,
-    # interval_sec-stepping could land every sample on (near) the same frame.
-    n_samples = max(1, min(max_frames, int(duration / max(interval_sec, 0.1)) + 1))
-    if n_samples == 1:
-        sample_times = [start_time + duration / 2.0]
-    else:
-        step = duration / n_samples
-        sample_times = [start_time + i * step for i in range(n_samples)]
-
-    tmp_dir = tempfile.mkdtemp(prefix="avf_scene_samples_")
-    frames: list[str] = []
-    try:
-        for i, t in enumerate(sample_times):
-            frame_idx = int(t * fps)
-            cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
-            ret, frame = cap.read()
-            if not ret:
-                continue
-            frame_path = os.path.join(tmp_dir, f"frame_{i:04d}.jpg")
-            cv2.imwrite(frame_path, frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
-            frames.append(frame_path)
-    finally:
-        cap.release()
-
-    return frames
 
 
 # ─── Scene Content Coordinator (drop non-content scenes) ───────────

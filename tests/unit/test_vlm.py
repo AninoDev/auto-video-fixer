@@ -2,6 +2,7 @@
 
 import json
 import os
+import shutil
 import tempfile
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -16,12 +17,27 @@ from autovideofixer.core.analysis import (
     _call_custom_api,
     _call_ollama,
     _call_openai,
-    _extract_sample_frames,
     _frames_to_base64,
     _parse_crop_vlm_response,
     _parse_vlm_response,
     run_crop_vlm_check,
 )
+from autovideofixer.core.vlm_sampling import (
+    SampledFrames,
+    SamplingConfig,
+    SamplingReport,
+    VisionLimits,
+    sample_vlm_frames,
+)
+
+
+def _sampled(paths):
+    """A ``SampledFrames`` as the sampler would return it (files stay put: tmp_dir is empty)."""
+    return SampledFrames(
+        paths=[str(p) for p in paths],
+        tmp_dir="",
+        report=SamplingReport(frames=len(paths), width=1, height=1),
+    )
 
 
 def _apply_vlm_overrides(config: Config, overrides: dict) -> None:
@@ -133,22 +149,27 @@ class TestFramesToBase64:
         assert result == []
 
 
-class TestExtractSampleFrames:
-    """Test frame extraction from video."""
+class TestSampleVlmFrames:
+    """Frame extraction from video (detailed coverage: tests/unit/test_vlm_sampling.py)."""
 
     def test_extract_from_nonexistent_video(self):
         """Test extraction from a nonexistent file."""
-        frames = _extract_sample_frames("/nonexistent/video.mp4", 10.0)
-        assert frames == []
+        sampled = sample_vlm_frames("/nonexistent/video.mp4", SamplingConfig(), VisionLimits())
+        assert sampled.paths == []
 
     @pytest.mark.integration
     def test_extract_from_real_video(self, tmp_video_file):
         """Test extracting frames from a real video."""
-        frames = _extract_sample_frames(tmp_video_file, interval_sec=1.0, max_frames=5)
-        assert len(frames) > 0
-        for f in frames:
-            assert os.path.isfile(f)
-            assert f.endswith(".jpg")
+        sampled = sample_vlm_frames(
+            tmp_video_file, SamplingConfig(interval_sec=1.0, max_frames=5), VisionLimits()
+        )
+        try:
+            assert len(sampled.paths) > 0
+            for f in sampled.paths:
+                assert os.path.isfile(f)
+                assert f.endswith(".jpg")
+        finally:
+            shutil.rmtree(sampled.tmp_dir, ignore_errors=True)
 
 
 class TestOllamaIntegration:
@@ -251,7 +272,7 @@ class TestCustomAPI:
     def test_plain_http_non_loopback_refused_by_default(self, mock_urlopen):
         """Plain HTTP to a non-loopback host is refused unless allow_http is set."""
         result = _call_custom_api(
-            "key", "http://10.0.1.4:8080/v1/chat", "model", "sys", "usr", ["data"]
+            "key", "http://192.0.2.10:8080/v1/chat", "model", "sys", "usr", ["data"]
         )
         assert result == ""
         mock_urlopen.assert_not_called()
@@ -269,7 +290,7 @@ class TestCustomAPI:
 
         result = _call_custom_api(
             "key",
-            "http://10.0.1.4:8080/v1/chat",
+            "http://192.0.2.10:8080/v1/chat",
             "model",
             "sys",
             "usr",
@@ -290,7 +311,7 @@ class TestCustomAPI:
         mock_urlopen.return_value = mock_resp
 
         result = _call_custom_api(
-            "key", "https://10.0.1.4:8080/v1/chat", "model", "sys", "usr", ["data"]
+            "key", "https://192.0.2.10:8080/v1/chat", "model", "sys", "usr", ["data"]
         )
         assert "sec" in result
 
@@ -327,11 +348,11 @@ class TestPromptCustomization:
         return payload["messages"][0]["content"]
 
     @patch("autovideofixer.core.analysis.open_url")
-    @patch("autovideofixer.core.analysis._extract_sample_frames")
+    @patch("autovideofixer.core.analysis.sample_vlm_frames")
     def test_prompt_append_from_config_extends_default(self, mock_frames, mock_urlopen, tmp_path):
         frame = tmp_path / "frame.jpg"
         frame.write_bytes(b"fake")
-        mock_frames.return_value = [str(frame)]
+        mock_frames.return_value = _sampled([str(frame)])
         self._mock_ollama_response(mock_urlopen, '{"summary": "ok"}')
 
         analyzer = self._analyzer(
@@ -346,13 +367,13 @@ class TestPromptCustomization:
         assert sent.index(_VLM_USER_PROMPT) < sent.index("these are trail camera clips")
 
     @patch("autovideofixer.core.analysis.open_url")
-    @patch("autovideofixer.core.analysis._extract_sample_frames")
+    @patch("autovideofixer.core.analysis.sample_vlm_frames")
     def test_prompt_override_from_config_replaces_default(
         self, mock_frames, mock_urlopen, tmp_path
     ):
         frame = tmp_path / "frame.jpg"
         frame.write_bytes(b"fake")
-        mock_frames.return_value = [str(frame)]
+        mock_frames.return_value = _sampled([str(frame)])
         self._mock_ollama_response(mock_urlopen, '{"summary": "ok"}')
 
         analyzer = self._analyzer({"provider": "ollama", "prompt_override": "custom prompt only"})
@@ -363,11 +384,11 @@ class TestPromptCustomization:
         assert _VLM_USER_PROMPT not in sent
 
     @patch("autovideofixer.core.analysis.open_url")
-    @patch("autovideofixer.core.analysis._extract_sample_frames")
+    @patch("autovideofixer.core.analysis.sample_vlm_frames")
     def test_prompt_append_still_applies_after_override(self, mock_frames, mock_urlopen, tmp_path):
         frame = tmp_path / "frame.jpg"
         frame.write_bytes(b"fake")
-        mock_frames.return_value = [str(frame)]
+        mock_frames.return_value = _sampled([str(frame)])
         self._mock_ollama_response(mock_urlopen, '{"summary": "ok"}')
 
         analyzer = self._analyzer(
@@ -383,11 +404,11 @@ class TestPromptCustomization:
         assert sent == "custom prompt only\n\nplus this context"
 
     @patch("autovideofixer.core.analysis.open_url")
-    @patch("autovideofixer.core.analysis._extract_sample_frames")
+    @patch("autovideofixer.core.analysis.sample_vlm_frames")
     def test_system_prompt_override_from_config(self, mock_frames, mock_urlopen, tmp_path):
         frame = tmp_path / "frame.jpg"
         frame.write_bytes(b"fake")
-        mock_frames.return_value = [str(frame)]
+        mock_frames.return_value = _sampled([str(frame)])
         self._mock_ollama_response(mock_urlopen, '{"summary": "ok"}')
 
         analyzer = self._analyzer(
@@ -398,7 +419,7 @@ class TestPromptCustomization:
         assert self._sent_system_prompt(mock_urlopen) == "you are a wildlife expert"
 
     @patch("autovideofixer.core.analysis.open_url")
-    @patch("autovideofixer.core.analysis._extract_sample_frames")
+    @patch("autovideofixer.core.analysis.sample_vlm_frames")
     def test_explicit_arg_beats_config_value(self, mock_frames, mock_urlopen, tmp_path):
         """The equivalent of a CLI flag (an explicit run_vlm_analysis() kwarg) wins
         over the config value -- this is what --prompt-override/--prompt-append map
@@ -406,7 +427,7 @@ class TestPromptCustomization:
         in tests/unit/test_cli.py for the CLI-level wiring)."""
         frame = tmp_path / "frame.jpg"
         frame.write_bytes(b"fake")
-        mock_frames.return_value = [str(frame)]
+        mock_frames.return_value = _sampled([str(frame)])
         self._mock_ollama_response(mock_urlopen, '{"summary": "ok"}')
 
         analyzer = self._analyzer({"provider": "ollama", "prompt_override": "from config"})
@@ -415,11 +436,11 @@ class TestPromptCustomization:
         assert self._sent_user_prompt(mock_urlopen) == "from explicit arg"
 
     @patch("autovideofixer.core.analysis.open_url")
-    @patch("autovideofixer.core.analysis._extract_sample_frames")
+    @patch("autovideofixer.core.analysis.sample_vlm_frames")
     def test_no_customization_uses_defaults(self, mock_frames, mock_urlopen, tmp_path):
         frame = tmp_path / "frame.jpg"
         frame.write_bytes(b"fake")
-        mock_frames.return_value = [str(frame)]
+        mock_frames.return_value = _sampled([str(frame)])
         self._mock_ollama_response(mock_urlopen, '{"summary": "ok"}')
 
         analyzer = self._analyzer({"provider": "ollama"})

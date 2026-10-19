@@ -332,6 +332,9 @@ avf analyze [FILEPATH] [OPTIONS]
 
 **Options:**
 - `--vlm`: Run VLM content analysis (requires configuration)
+- `--min-sample-frames N`, `--max-sample-frames N`, `--sample-interval SECONDS`: how many frames
+  are sent to the VLM (see [How many frames are sent](#how-many-frames-are-sent-and-how-big)); the
+  result shows frames sent, duplicates dropped, frame size and estimated tokens
 - `-r, --recursive`: Scan directories recursively
 - `--symlinks [files_only|follow|skip]`: How directory scanning treats symlinks (default
   `files_only`). See [Symlinks When Scanning Directories](#symlinks-when-scanning-directories).
@@ -811,7 +814,7 @@ analysis:
     llamacpp_lan:
       provider: llamacpp
       model: your-vision-model
-      api_url: "http://10.0.1.4:8080/v1/chat/completions"
+      api_url: "http://192.0.2.10:8080/v1/chat/completions"
       allow_http: true       # plain HTTP to a non-loopback LAN host
       timeout_sec: 600       # big vision models are slow
       compat:
@@ -823,8 +826,65 @@ analysis:
 `llamacpp` sends the system message as content parts and no `response_format` (what llama.cpp's
 chat templates need); override with `compat.system_content` (`string|parts`) and
 `compat.response_format` (`json_object|json_schema|none`). Reasoning models' `<think>` blocks and
-chatter around the JSON are stripped automatically. Limiting frame size for the model arrives with
-the upcoming VLM sampling work (`vision:`).
+chatter around the JSON are stripped automatically.
+
+#### How many frames are sent, and how big
+
+The same sampler serves `avf analyze` (whole video) and scene mode (`scenes.drop_non_content`, one
+call per scene). For each video or scene ("the range"):
+
+1. **Count**: `ceil(duration / interval_sec)`, clamped to `[min_frames, max_frames]` (defaults
+   4 and 8, interval 10 s), then to the endpoint's `vision.max_frames_per_call`. A clip with fewer
+   distinct frames than that sends only those (a 3-frame clip sends 3; copies are never added).
+2. **Positions**: the centre of each of that many equal slices of the range, found by timestamp,
+   so variable-frame-rate files sample the right moments.
+3. **Duplicates**: a frame that looks the same as the previous kept one
+   (`dedupe_consecutive`, `dedupe_threshold`) is dropped and the count is refilled from the widest
+   gap between the kept frames. A -> B -> A is kept; a genuinely static clip may send fewer than
+   `min_frames`.
+4. **Size**: frames are only ever shrunk to the endpoint's `vision` limits (never enlarged) and
+   sent as JPEG at `vision.jpeg_quality` (default 90).
+
+`avf analyze` prints what was sent: *VLM Frames Sent*, *Duplicates Dropped*, *Frame Size* and, if
+the endpoint has a tile size, *Est. Tiles / Tokens* (also in the log and as `vlm_*` CSV columns;
+scene mode logs it per scene and adds it to the `--report-json` under `scene_stats.vlm_sampling`).
+
+**Telling AVF what your model can digest** (`analysis.endpoints.<name>.vision`, all optional):
+
+```yaml
+analysis:
+  endpoints:
+    llamacpp_lan:
+      provider: llamacpp
+      # ...
+      vision:
+        max_long_side_px: 720     # shrink frames to 720 px on the long side (llama.cpp setups)
+        tile_width: 448           # the model's vision tile size; enables the token estimate
+        tile_height: 448
+        max_tiles_per_call: 24    # total image tiles the server/context allows per request
+        max_frames_per_call: 8
+        jpeg_quality: 90
+  vlm:
+    sampling:
+      min_frames: 4
+      max_frames: 8
+      balance: auto               # auto | temporal | spatial | fixed
+```
+
+- `max_long_side_px` / `max_megapixels` cap the picture size; they work without any tile info.
+- With `tile_width`/`tile_height`, a frame costs `ceil(W/tile_w) * ceil(H/tile_h)` tiles (models pad
+  each edge up to whole tiles) and `tokens_per_tile` tokens each; `max_tiles_per_frame` and
+  `max_tiles_per_call` (needs a tile size) then shrink frames, or trade frames for size, to fit.
+- **`balance`** decides that trade when `max_tiles_per_call` is set: `temporal` favours more,
+  smaller frames (never below `min_long_side_px`, default 336, unless needed to still send
+  `min_frames`; never below 64 px), `spatial` favours fewer, larger ones, `fixed` keeps the plain
+  frame count and only shrinks the picture, `auto` looks at how much the video moves and how long
+  it is (long, busy ranges get more, smaller frames).
+- If hard limits conflict, the order is: `max_tiles_per_call` / `max_frames_per_call` first, then
+  `min_frames`, then `min_long_side_px`.
+- Per run: `avf analyze --min-sample-frames N --max-sample-frames N --sample-interval SECONDS`.
+- Repeats that survived heavy compression (very low bitrate) may need `dedupe_threshold: 0.004`;
+  `0` drops only frames that decode identically.
 
 ### Config versioning, migration and first run
 

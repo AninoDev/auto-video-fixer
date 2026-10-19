@@ -186,7 +186,7 @@ Tasks:
 - [x] Implement Ollama integration (`_run_ollama_vlm`, `_call_ollama`)
 - [x] Implement OpenAI Vision integration (`_run_openai_vlm`, `_call_openai`)
 - [x] Add custom API support (`_run_api_vlm`, `_call_custom_api`)
-- [x] Create frame extraction utility (`_extract_sample_frames`, `_frames_to_base64`)
+- [x] Create frame extraction utility (now `core/vlm_sampling.py`'s `sample_vlm_frames`, REQUIREMENTS.md § 25; `_frames_to_base64`)
 - [x] Implement analysis pipeline (`run_vlm_analysis`, `_parse_vlm_response`)
 - [x] Write VLM tests (test_vlm.py - 22 tests)
 

@@ -54,6 +54,7 @@ from autovideofixer.core.reporting import (
     stage_table_rows,
     write_json_report,
 )
+from autovideofixer.core.vlm_sampling import SamplingConfig
 from autovideofixer.endpoints import all_endpoint_urls, resolve_role_endpoint
 from autovideofixer.logclean import get_pii_cleaner
 from autovideofixer.logger import build_console, get_logger, set_console_color, setup_logging
@@ -2125,6 +2126,11 @@ _ANALYZE_CSV_FIELDS = [
     "vlm_tags",
     "vlm_objects",
     "content_rating",
+    # § 25.4: what was actually sent to the VLM (empty when VLM didn't run).
+    "vlm_frames",
+    "vlm_dropped_duplicates",
+    "vlm_frame_size",
+    "vlm_est_vision_tokens",
 ]
 
 
@@ -2169,6 +2175,17 @@ def _print_analysis_result(analysis: "VideoAnalysis", *, full_output: bool) -> N
         table.add_row("Objects", _safe(", ".join(analysis.vlm_objects)))
     if analysis.content_rating:
         table.add_row("Content Rating", _safe(analysis.content_rating))
+    sampling = analysis.vlm_sampling
+    if sampling:
+        table.add_row("VLM Frames Sent", str(sampling.get("frames", 0)))
+        table.add_row("VLM Duplicates Dropped", str(sampling.get("dropped_duplicates", 0)))
+        if sampling.get("frame_size"):
+            table.add_row("VLM Frame Size", str(sampling["frame_size"]))
+        if sampling.get("est_tiles") is not None:
+            table.add_row(
+                "VLM Est. Tiles / Tokens",
+                f"{sampling['est_tiles']} / {sampling.get('est_vision_tokens')}",
+            )
 
     console.print(table)
 
@@ -2206,6 +2223,7 @@ def _print_analysis_result(analysis: "VideoAnalysis", *, full_output: bool) -> N
 
 def _analysis_to_csv_row(analysis: "VideoAnalysis") -> dict[str, Any]:
     """Build one CSV row dict from a VideoAnalysis, matching the printed table's fields."""
+    sampling = analysis.vlm_sampling or {}
     return {
         "filepath": analysis.filepath,
         "filename": analysis.filename,
@@ -2222,6 +2240,12 @@ def _analysis_to_csv_row(analysis: "VideoAnalysis") -> dict[str, Any]:
         "vlm_tags": ";".join(analysis.vlm_tags),
         "vlm_objects": ";".join(analysis.vlm_objects),
         "content_rating": analysis.content_rating or "",
+        "vlm_frames": sampling.get("frames", ""),
+        "vlm_dropped_duplicates": sampling.get("dropped_duplicates", ""),
+        "vlm_frame_size": sampling.get("frame_size", ""),
+        "vlm_est_vision_tokens": (
+            "" if sampling.get("est_vision_tokens") is None else sampling["est_vision_tokens"]
+        ),
     }
 
 
@@ -2650,7 +2674,17 @@ def config_migrate(input_path: str, output: str | None, backup: bool, force: boo
     type=int,
     default=None,
     help="Max frames sampled from the video and sent to the VLM provider for this run "
-    "(overrides analysis.vlm.sampling.max_frames in config; default 8).",
+    "(overrides analysis.vlm.sampling.max_frames in config; default 8). Also bounded by the "
+    "endpoint's vision.max_frames_per_call / max_tiles_per_call.",
+)
+@click.option(
+    "--min-sample-frames",
+    "min_sample_frames",
+    type=int,
+    default=None,
+    help="Min frames sent to the VLM for this run (overrides analysis.vlm.sampling.min_frames; "
+    "default 4). Lowered to --max-sample-frames if that is smaller. A clip with fewer distinct "
+    "frames still sends only those.",
 )
 @click.option(
     "--sample-interval",
@@ -2701,6 +2735,7 @@ def analyze(
     prompt_append: str | None,
     prompt_override: str | None,
     max_sample_frames: int | None,
+    min_sample_frames: int | None,
     sample_interval: float | None,
     vlm_model: str | None,
     vlm_url: str | None,
@@ -2728,6 +2763,12 @@ def analyze(
     ):
         try:
             resolve_role_endpoint(config, "vlm", vlm_endpoint)
+            SamplingConfig.from_mapping(
+                config.get("analysis", "vlm", "sampling", default={}),
+                min_frames=min_sample_frames,
+                max_frames=max_sample_frames,
+                interval_sec=sample_interval,
+            )
         except ValueError as e:
             console.print(f"[red]{_safe(e)}[/red]")
             sys.exit(2)
@@ -2788,6 +2829,7 @@ def analyze(
                     scene_threshold=scene_threshold,
                     min_scene_duration=min_scene_duration,
                     max_sample_frames=max_sample_frames,
+                    min_sample_frames=min_sample_frames,
                     sample_interval_sec=sample_interval,
                     vlm_model=vlm_model,
                     vlm_api_url=vlm_url,
@@ -2819,12 +2861,17 @@ def analyze(
         # shows up in a --verbose/--log-level INFO console without needing --full.
         if analysis.vlm_summary or analysis.vlm_tags or analysis.vlm_objects:
             logger.info(
-                "VLM analysis for %s -- summary: %s | tags: %s | objects: %s | rating: %s",
+                "VLM analysis for %s -- summary: %s | tags: %s | objects: %s | rating: %s"
+                " | frames sent: %s | duplicates dropped: %s | frame size: %s | est tokens: %s",
                 filepath,
                 analysis.vlm_summary or "",
                 ", ".join(analysis.vlm_tags),
                 ", ".join(analysis.vlm_objects),
                 analysis.content_rating or "",
+                (analysis.vlm_sampling or {}).get("frames", "?"),
+                (analysis.vlm_sampling or {}).get("dropped_duplicates", "?"),
+                (analysis.vlm_sampling or {}).get("frame_size") or "?",
+                (analysis.vlm_sampling or {}).get("est_vision_tokens", "n/a"),
             )
 
         _print_analysis_result(analysis, full_output=full_output)

@@ -1783,6 +1783,13 @@ are defined before their chunked loops in all four stages, `os` is imported at t
 denoise chunked paths all correctly reference the frame lists they build. Kept here only as a
 historical note in case of regression — do not assume these still need fixing.
 
+Pitfall -- **seeking by time on variable-frame-rate video** (REQUIREMENTS.md § 25.5): neither
+`frame_index = t * fps` nor OpenCV's `CAP_PROP_POS_MSEC` is reliable on VFR input (OpenCV maps the
+time to a frame number with the *average* fps; measured seconds off inside long holds). The VLM
+sampler (`core/vlm_sampling.py`) takes real frame timestamps from `ffprobe` and decodes with
+`ffmpeg -ss`; reuse that (`probe_timeline` / `FFmpegFrameSource`) instead of `cv2.VideoCapture.set`
+anywhere a specific moment of a possibly-VFR file must be picked.
+
 Remaining lint/style notes (still current):
 - **ruff I001** on `deblock.py` imports: blank line between `from __future__` and the stdlib imports is expected by the sort rule.
 - **ruff E501** line length is 100. Several stage files (stabilize, interpolate, upscale, cli) exceed it with long f-strings; plan around this.
@@ -2301,7 +2308,9 @@ failed.
 - `--csv PATH`: Write one row per analyzed video (filepath, filename, duration, resolution,
   framerate, codec, has_video/has_audio/hdr, scenes_detected, `scene_boundaries` (see below), and
   — when VLM ran — the FULL untruncated summary, `;`-joined tags/objects, and content_rating) to
-  a UTF-8 CSV. Overwrites `PATH` if it exists; does not append across runs.
+  a UTF-8 CSV (plus `vlm_frames`, `vlm_dropped_duplicates`, `vlm_frame_size`,
+  `vlm_est_vision_tokens`: what was actually sent to the VLM, § 25.4). Overwrites `PATH` if it
+  exists; does not append across runs.
 - `--prompt-append TEXT`: Extra text appended to the VLM user prompt for this run (overrides
   `analysis.vlm.prompt_append`) -- e.g. job-specific context like "these are trail-camera clips".
 - `--prompt-override TEXT`: Replace the VLM user prompt entirely for this run (overrides
@@ -2311,6 +2320,7 @@ failed.
   rating) instead of erroring. There's no CLI flag for the system prompt -- use
   `analysis.vlm.system_prompt_override` in config.
 - `--max-sample-frames INT`: Override `analysis.vlm.sampling.max_frames` (default 8) for this run.
+- `--min-sample-frames INT`: Override `analysis.vlm.sampling.min_frames` (default 4) for this run.
 - `--sample-interval FLOAT`: Override `analysis.vlm.sampling.interval_sec` (default 10.0) for this
   run. (Prior to this flag being added, `sample_interval_sec` in config was never actually read
   -- `run_vlm_analysis()` hardcoded 10.0 -- so this also fixes a dead config key.)
