@@ -46,6 +46,7 @@ DEFAULT_STAGE_ORDER: list[str] = [
     "normalize_codecs",
     "deinterlace",
     "crop",
+    "analyze",
     "downscale",
     "deblock",
     "stabilize",
@@ -56,6 +57,8 @@ DEFAULT_STAGE_ORDER: list[str] = [
     "normalize_audio",
     "speed",
     "hdr",
+    "scene_subtitles",
+    "analysis_sidecar",
     "encode",
 ]
 
@@ -507,6 +510,13 @@ class Pipeline:
         if crop_config.get("enabled", True):
             stages.append("crop")
 
+        # Analysis stages (REQUIREMENTS.md § 28) -- opt-in, off by default;
+        # pipeline.default_order places them (analyze after crop, the two writers just
+        # before encode).
+        for analysis_stage in ("analyze", "scene_subtitles", "analysis_sidecar"):
+            if self.config.get("stages", analysis_stage, "enabled", default=False):
+                stages.append(analysis_stage)
+
         # Downscale -- opt-in, off by default (see Config.DEFAULTS["stages"]["downscale"]
         # and docs/REQUIREMENTS.md § 7). pipeline.default_order places it right after
         # "crop" regardless of insertion order here.
@@ -544,6 +554,12 @@ class Pipeline:
         "true_framerate",
         "cadence",
         "is_vfr",
+        # § 28: published by the analysis stages / injected by execute_job().
+        "analysis",
+        "analysis_time_scale",
+        "final_output_path",
+        "planned_stages",
+        "soft_subtitle_codec",
     )
 
     def _reprobe_input_info(
@@ -1348,6 +1364,15 @@ class Pipeline:
             job.stage_overrides.setdefault("remux", {}).setdefault("target_format", target_format)
         current_path = job.input_path
         stage_results: dict[str, StageResult] = {}
+        # § 28: where the deliverable will land, for stages that write beside it (the intermediate
+        # `output_path` they are handed is a temp file), and the job's shared analysis cache.
+        input_info["final_output_path"] = job.output_path
+        # The job's stage names in run order, so `analyze` can include what a later
+        # consumer needs (per-scene results for `scene_subtitles`) in its one analysis.
+        input_info["planned_stages"] = [e.name for e in stage_entries]
+        from autovideofixer.core.analysis_service import AnalysisCache
+
+        analysis_cache = AnalysisCache()
         errors: list[str] = []
         start_time = __import__("time").time()
         scene_stats: dict[str, Any] | None = None
@@ -1490,6 +1515,7 @@ class Pipeline:
                         continue
                     if explicit_stage_request or entry.forced is True:
                         stage._force_enabled = True
+                    stage.analysis_cache = analysis_cache
 
                     # Check if stage should run
                     should_run, reason = stage.should_run(input_info)
@@ -1629,6 +1655,16 @@ class Pipeline:
                                 # whatever regularity the input had, so their
                                 # is_vfr must be left untouched.
                                 input_info["is_vfr"] = False
+                        if result.status == StageStatus.COMPLETED and result.metadata.get(
+                            "time_scale"
+                        ):
+                            # § 28.6: a stage that rescales the timeline (speed) reports the
+                            # factor output-seconds-per-input-second; analysis timestamps are
+                            # mapped through the product (analysis_service.map_time()).
+                            if "analysis_time_scale" in input_info:
+                                input_info["analysis_time_scale"] *= float(
+                                    result.metadata["time_scale"]
+                                )
                         if result.output_path:
                             if result.output_path != current_path:
                                 # This stage produced a NEW file -- re-probe so any
@@ -1724,6 +1760,8 @@ class Pipeline:
         # job.output_path is just a rename, not a content change). Reuse it
         # rather than spending a second ffprobe process on the same file.
         output_info: dict[str, Any] = dict(input_info) if final_output_path else {}
+        # The analysis is published under input_info; do not duplicate it in the report.
+        output_info.pop("analysis", None)
 
         # REQUIREMENTS.md § 19.2: collect every stage occurrence
         # _check_duration_guard() flagged (warn AND fail mode both record
@@ -1909,7 +1947,15 @@ class Pipeline:
         keep = keep or set()
         for name, result in stage_results.items():
             if result.status in (StageStatus.COMPLETED, StageStatus.FAILED) and result.output_path:
-                if result.output_path != job.output_path and result.output_path not in keep:
+                # Never the job's own source: a stage that passes its input through must
+                # not get the user's original deleted as if it were an intermediate.
+                # Compared by resolved path, so a relative or symlinked spelling of the
+                # source is caught too.
+                if (
+                    result.output_path != job.output_path
+                    and os.path.realpath(result.output_path) != os.path.realpath(job.input_path)
+                    and result.output_path not in keep
+                ):
                     if os.path.exists(result.output_path):
                         try:
                             os.remove(result.output_path)

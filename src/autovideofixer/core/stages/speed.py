@@ -304,6 +304,9 @@ class SpeedStage(BaseStage):
                 # setpts/atempo, no AI path) -- uniform provenance.
                 "method": "traditional",
                 "speed_factor": speed,
+                # § 28.6: output seconds per input second (setpts=PTS/speed); the pipeline
+                # multiplies input_info["analysis_time_scale"] by it.
+                "time_scale": 1.0 / speed,
                 # Audio filter actually used -- may differ from the configured
                 # stages.speed.audio_method when a fallback kicked in (see
                 # _resolve_audio_filter).

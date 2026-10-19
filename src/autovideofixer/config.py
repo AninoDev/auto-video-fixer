@@ -744,6 +744,7 @@ class Config:
                 "normalize_codecs",
                 "deinterlace",
                 "crop",
+                "analyze",
                 "downscale",
                 "deblock",
                 "stabilize",
@@ -754,16 +755,18 @@ class Config:
                 "normalize_audio",
                 "speed",
                 "hdr",
+                "scene_subtitles",
+                "analysis_sidecar",
                 "encode",
             ],
-            # Must stay >= len(default_order) above (16) since a full default run
+            # Must stay >= len(default_order) above (19) since a full default run
             # legitimately uses every stage; this only guards against pathological
             # --stage/default_order repetition, not normal preset/auto-determined
             # pipelines. Counts resolved OCCURRENCES, not unique stage names -- a
             # stage repeated via default_order counts once per repetition. Kept at
             # len(default_order) + 2 (two repeats of headroom): bump it whenever a
             # stage is added to default_order.
-            "max_stages": 18,
+            "max_stages": 21,
             "skip_stage_on_error": True,
             # Default timeout (seconds) for a stage's MAIN ffmpeg processing/mux
             # pass(es) -- see BaseStage.stage_timeout() in core/stages/base.py.
@@ -1079,6 +1082,51 @@ class Config:
                 # a downscale and a subsequent upscale on the same target
                 # box always agree on dimensions.
                 "enabled": False,
+            },
+            # --- Analysis stages (REQUIREMENTS.md § 28). All three are OFF by default and
+            # fail open: a failing analysis never fails the job. `profile`/`scope` null =
+            # inherit stages.analyze.* (and, for scene_subtitles, a per-scene scope).
+            "analyze": {
+                # Runs the analysis module (core/analysis_service.py) on the stage's input
+                # and publishes the result as input_info["analysis"] (job report +
+                # later stages). Placed after crop, before downscale: sees the final
+                # framing, before any heavy stage. No output file.
+                "enabled": False,
+                "profile": None,  # analysis profile name (analysis.profiles / built-ins)
+                "scope": None,  # video | scenes | both; null = the profile/analysis.vlm.scope
+            },
+            "analysis_sidecar": {
+                # Writes <final output><suffix> (the analysis as JSON) beside the final
+                # output. Reference implementation of a stage that consumes the analysis.
+                "enabled": False,
+                "suffix": ".avf-analysis.json",
+                # true: run the analysis module itself (shared per-job cache) when the
+                # `analyze` stage did not run; false: skip with a WARNING instead.
+                "analyze_if_missing": True,
+                "profile": None,
+                "scope": None,
+            },
+            "scene_subtitles": {
+                # SRT of the per-scene VLM descriptions. Needs per-scene descriptions:
+                # analysis scope `scenes` or `both`.
+                "enabled": False,
+                # sidecar: <final output stem>.srt | soft: muxed text track (mov_text in
+                # MP4, srt in MKV; other containers degrade to sidecar) | burn: drawn onto
+                # the picture with the `subtitles` filter (re-encodes; needs libass,
+                # degrades to soft when missing).
+                "mode": "sidecar",
+                "suffix": ".srt",  # sidecar mode: appended to the final output's stem
+                "language": "eng",  # soft mode: stream language tag
+                "max_chars": 200,  # a cue's text is cut at this many characters
+                "wrap_chars": 42,  # cue lines are wrapped at this width
+                "min_cue_sec": 0.5,  # shorter scenes get no cue
+                # burn mode
+                "style": "Fontsize=16,Outline=1,MarginV=24",  # libass force_style
+                "crf": 16,
+                "preset": "medium",
+                "analyze_if_missing": True,
+                "profile": None,
+                "scope": None,  # null = stages.analyze.scope, else `scenes`
             },
             "interpolate": {
                 "enabled": True,
@@ -1650,6 +1698,11 @@ class Config:
                 },
             },
             "llm": {"endpoint": "default_llm"},
+            # Named, partial `analysis` configs (REQUIREMENTS.md § 28): `avf analyze --profile
+            # NAME` / stages.analyze.profile deep-merge one onto `analysis`. Built-ins:
+            # quick, standard, thorough (core/analysis_profiles.py); a profile here with a
+            # built-in's name is merged ON TOP of the built-in.
+            "profiles": {},
             # Print a per-call table (time, tokens, tokens/s, images, status) and run totals
             # in `avf analyze`. The same figures are always logged (INFO per call) and
             # always written by `avf analyze --json` / the process JSON report; this only
@@ -1679,6 +1732,9 @@ class Config:
                 # brief | standard | detailed | exhaustive. Higher levels cost output tokens
                 # and time -- raise the endpoint's max_tokens with them.
                 "detail": "brief",
+                # What gets described (§ 28): video = one call over the whole video (today's
+                # behaviour) | scenes = one call per detected scene | both.
+                "scope": "video",
                 # Frame sampling for every VLM call (whole video and per scene);
                 # REQUIREMENTS.md § 25.1/25.2. Validated at use time
                 # (vlm_sampling.SamplingConfig.from_mapping).
@@ -2085,6 +2141,22 @@ class Config:
             self._sources,
             redact_secrets(layer),
         )
+
+    def with_layer(self, layer: dict[str, Any], source_label: str) -> "Config":
+        """Return an independent copy of this Config with ``layer`` folded on top.
+
+        Same merge semantics as ``apply_layer`` (it is ``apply_layer`` on the copy); the
+        original is untouched, and the copy never writes to the config file (its
+        pending-save flag is cleared). Used for per-call overlays such as an analysis
+        profile (REQUIREMENTS.md § 28).
+        """
+        clone = copy.copy(self)
+        clone._data = copy.deepcopy(self._data)
+        clone._sources = list(self._sources)
+        clone._notices = []
+        clone._save_pending = False
+        clone.apply_layer(layer, source_label)
+        return clone
 
     @property
     def sources(self) -> list[str]:

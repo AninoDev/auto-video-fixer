@@ -1,5 +1,7 @@
 """Auto Video Fixer - Core processing stages package."""
 
+from autovideofixer.core.stages.analysis_sidecar import AnalysisSidecarStage
+from autovideofixer.core.stages.analyze import AnalyzeStage
 from autovideofixer.core.stages.base import BaseStage, StageResult, StageStatus, register_stage
 from autovideofixer.core.stages.crop import CropStage
 from autovideofixer.core.stages.deblock import DeblockStage
@@ -14,6 +16,7 @@ from autovideofixer.core.stages.normalize_audio import NormalizeAudioStage, Norm
 from autovideofixer.core.stages.normalize_codecs import NormalizeCodecsStage
 from autovideofixer.core.stages.remux import RemuxStage
 from autovideofixer.core.stages.retime import RetimeStage
+from autovideofixer.core.stages.scene_subtitles import SceneSubtitlesStage
 from autovideofixer.core.stages.speed import SpeedStage
 from autovideofixer.core.stages.stabilize import StabilizeStage
 from autovideofixer.core.stages.upscale import UpscaleStage
@@ -36,6 +39,9 @@ register_stage(EncodeStage)
 register_stage(RemuxStage)
 register_stage(SpeedStage)
 register_stage(HDRStage)
+register_stage(AnalyzeStage)
+register_stage(AnalysisSidecarStage)
+register_stage(SceneSubtitlesStage)
 
 __all__ = [
     "BaseStage",
@@ -58,4 +64,7 @@ __all__ = [
     "RemuxStage",
     "SpeedStage",
     "HDRStage",
+    "AnalyzeStage",
+    "AnalysisSidecarStage",
+    "SceneSubtitlesStage",
 ]

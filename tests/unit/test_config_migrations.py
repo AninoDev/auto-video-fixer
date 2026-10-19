@@ -80,7 +80,7 @@ class TestMigrationItems:
     )
     def test_default_order_insert(self, order, expected):
         doc = {"pipeline": {"default_order": list(order)}}
-        cm.migrate(doc)
+        cm.migrate(doc, target=2)  # the v1 -> v2 item; v2 -> v3 is tested separately
         assert doc["pipeline"]["default_order"] == expected
 
     def test_absent_default_order_stays_absent(self):
@@ -129,7 +129,7 @@ class TestMigrationItems:
         snapshot = yaml.safe_dump(doc)
         assert cm.migrate(doc) == []
         assert yaml.safe_dump(doc) == snapshot
-        assert doc["config_version"] == 2
+        assert doc["config_version"] == 3
 
     def test_newer_version_untouched(self):
         doc = {"config_version": 9, "stages": {"crop": {"enabled": False}}}
@@ -147,13 +147,13 @@ class TestTextRoundTrip:
         plain = yaml.safe_load(V1_COMMENTED)
         cm.migrate(plain)
         assert data == plain
-        assert data["config_version"] == 2
+        assert data["config_version"] == 3
         assert data["pipeline"]["default_order"][2] == "normalize_codecs"
 
     def test_second_pass_is_noop(self):
         once, _, _ = cm.migrate_text(V1_COMMENTED)
         twice, old, notes = cm.migrate_text(once)
-        assert (twice, old, notes) == (once, 2, [])
+        assert (twice, old, notes) == (once, 3, [])
 
     def test_empty_text_untouched(self):
         assert cm.migrate_text("# only a comment\n") == ("# only a comment\n", 1, [])
@@ -202,7 +202,7 @@ class TestLoadPolicy:
         backups = list(p.parent.glob("config.yaml.bak-v1-*"))
         assert len(backups) == 1
         assert backups[0].read_text() == V1_COMMENTED
-        assert yaml.safe_load(p.read_text())["config_version"] == 2
+        assert yaml.safe_load(p.read_text())["config_version"] == 3
         assert "# keep mkv" in p.read_text()
         assert cfg.get("analysis", "endpoints", "default_vlm", "api_url") == "http://127.0.0.1:2"
         assert cfg.get("stages", "crop", "enabled") is True
@@ -258,8 +258,8 @@ class TestBootstrap:
             cfg = Config()
         p = get_config_path()
         assert p.exists()
-        assert yaml.safe_load(p.read_text())["config_version"] == 2
-        assert cfg.get("config_version") == 2
+        assert yaml.safe_load(p.read_text())["config_version"] == 3
+        assert cfg.get("config_version") == 3
         assert any("First run" in r.message for r in caplog.records)
         assert not list(p.parent.glob("*.bak-*"))
         mtime = p.stat().st_mtime_ns
@@ -308,7 +308,7 @@ class TestConfigMigrateCli:
         r = CliRunner().invoke(main, ["config", "migrate", str(p)])
         assert r.exit_code == 0, r.output
         assert len(list(tmp_path.glob("c.yaml.bak-v1-*"))) == 1
-        assert yaml.safe_load(p.read_text())["config_version"] == 2
+        assert yaml.safe_load(p.read_text())["config_version"] == 3
         assert "# keep mkv" in p.read_text()
         r2 = CliRunner().invoke(main, ["config", "migrate", str(p)])
         assert r2.exit_code == 0
@@ -328,7 +328,7 @@ class TestConfigMigrateCli:
         r = CliRunner().invoke(main, ["config", "migrate", str(p), "-o", str(out)])
         assert r.exit_code == 0
         assert p.read_text() == V1_COMMENTED
-        assert yaml.safe_load(out.read_text())["config_version"] == 2
+        assert yaml.safe_load(out.read_text())["config_version"] == 3
         r2 = CliRunner().invoke(main, ["config", "migrate", str(p), "-o", str(out)])
         assert r2.exit_code == 1  # refuses to clobber without --force
 
@@ -340,7 +340,7 @@ class TestConfigMigrateCli:
         data = yaml.safe_load(r.stdout)
         assert data["analysis"]["endpoints"]["default_vlm"]["model"] == "llava"
         assert data["analysis"]["vlm"]["sampling"]["max_frames"] == 3
-        assert data["config_version"] == 2
+        assert data["config_version"] == 3
 
     def test_upgrade_keeps_custom_endpoints(self, tmp_path):
         p = tmp_path / "c.yaml"
@@ -359,4 +359,4 @@ class TestConfigMigrateCli:
     def test_dump_has_version(self):
         r = CliRunner().invoke(main, ["config", "dump"])
         assert r.exit_code == 0
-        assert yaml.safe_load(r.stdout)["config_version"] == 2
+        assert yaml.safe_load(r.stdout)["config_version"] == 3

@@ -43,7 +43,6 @@ from autovideofixer.config import (
 )
 from autovideofixer.config_migrations import CURRENT_CONFIG_VERSION, migrate_text
 from autovideofixer.core.analysis import is_video_file, scan_directory
-from autovideofixer.core.cross_check import CrossCheckConfig
 from autovideofixer.core.input_parsers import get_parser, list_parsers
 from autovideofixer.core.pipeline import Job, JobResult, Pipeline
 from autovideofixer.core.presets import get_preset, list_presets, load_preset
@@ -58,9 +57,7 @@ from autovideofixer.core.reporting import (
     write_json_report,
 )
 from autovideofixer.core.vlm_calls import format_call_line, summarize_calls
-from autovideofixer.core.vlm_outputs import OutputsConfig
-from autovideofixer.core.vlm_sampling import SamplingConfig
-from autovideofixer.endpoints import all_endpoint_urls, resolve_endpoint, resolve_role_endpoint
+from autovideofixer.endpoints import all_endpoint_urls
 from autovideofixer.logclean import get_pii_cleaner
 from autovideofixer.logger import build_console, get_logger, set_console_color, setup_logging
 
@@ -1942,6 +1939,7 @@ def process(
     # fan-out dict key matches the exact string `add_job` will later store
     # as the representative job's `output_path`).
     pipeline = Pipeline(config)
+    _validate_analysis_stages(config)
     resolved_inputs, fanout = _plan_resolved_inputs(resolved_inputs, pipeline, console)
 
     if not resolved_inputs:
@@ -2152,7 +2150,33 @@ _ANALYZE_CSV_FIELDS = [
     "cross_check_arbiter_ran",
     "cross_check_final_source",
     "cross_check_disagreement",
+    # § 28: the profile applied, what was described, and the per-scene VLM results as JSON
+    # text (empty unless analysis.vlm.scope included scenes).
+    "analysis_profile",
+    "analysis_scope",
+    "scene_vlm",
 ]
+
+
+def _validate_analysis_stages(config: Config) -> None:
+    """Exit 2 on an unusable profile/scope for an enabled analysis stage (REQUIREMENTS.md § 28).
+
+    Checked once up front: the stages themselves fail open (one WARNING, SKIPPED), which would
+    otherwise turn a typo in ``stages.analyze.profile`` into a silently missing analysis.
+    """
+    from autovideofixer.core.analysis_service import resolve_analysis_config, validate_vlm_setup
+
+    for name in ("analyze", "analysis_sidecar", "scene_subtitles"):
+        cfg = config.get("stages", name, default={}) or {}
+        if not cfg.get("enabled", False):
+            continue
+        profile = cfg.get("profile") or config.get("stages", "analyze", "profile", default=None)
+        scope = cfg.get("scope") or config.get("stages", "analyze", "scope", default=None)
+        try:
+            validate_vlm_setup(resolve_analysis_config(config, profile), scope=scope)
+        except ValueError as e:
+            console.print(f"[red]stages.{name}: {_safe(e)}[/red]")
+            sys.exit(2)
 
 
 def _scene_boundaries_str(analysis: "VideoAnalysis") -> str:
@@ -2243,48 +2267,11 @@ def _print_call_totals(calls: list[dict[str, Any]]) -> None:
 
 
 def _analysis_to_json(analysis: "VideoAnalysis") -> dict[str, Any]:
-    """Full structured result for one file (``avf analyze --json``): everything the table and
-    CSV show, plus the sampling report and every call's stats, untruncated."""
-    vlm_ran = bool(analysis.vlm_calls or analysis.vlm_sampling)
-    doc = {
-        "filepath": analysis.filepath,
-        "filename": analysis.filename,
-        "duration_sec": analysis.duration,
-        "resolution": list(analysis.resolution),
-        "framerate_fps": analysis.framerate,
-        "video_codec": analysis.video_codec,
-        "has_video": analysis.has_video,
-        "has_audio": analysis.has_audio,
-        "hdr": analysis.is_hdr,
-        "scenes_detected": analysis.total_scenes,
-        "scenes": [
-            {
-                "start_time": sc.start_time,
-                "end_time": sc.end_time,
-                "event_type": sc.event_type,
-                "confidence": sc.confidence,
-                "description": sc.description,
-            }
-            for sc in analysis.scenes
-        ],
-        "vlm": {
-            "summary": analysis.vlm_summary,
-            "tags": list(analysis.vlm_tags),
-            "objects": list(analysis.vlm_objects),
-            "media_type": analysis.media_type,
-            "rating": analysis.content_rating,
-            "rating_reasoning": analysis.rating_reasoning,
-            "extra": dict(analysis.vlm_extra),
-        }
-        if vlm_ran
-        else None,
-        "vlm_sampling": analysis.vlm_sampling,
-        "vlm_calls": list(analysis.vlm_calls),
-    }
-    if analysis.cross_check is not None:
-        # § 27: every leg's output + call and the judge's verdict, untruncated.
-        doc["cross_check"] = analysis.cross_check
-    return doc
+    """Full structured result for one file (``avf analyze --json``); see
+    ``analysis_service.analysis_to_dict``."""
+    from autovideofixer.core.analysis_service import analysis_to_dict
+
+    return analysis_to_dict(analysis)
 
 
 def _write_analysis_json(
@@ -2363,6 +2350,24 @@ def _print_cross_check_details(cc: dict[str, Any]) -> None:
             )
 
 
+def _scene_vlm_panel_text(rec: dict[str, Any]) -> str:
+    """Full text of one scene's VLM result for the ``--full`` panel."""
+    lines = [str(rec.get("summary") or "(no description)")]
+    if rec.get("tags"):
+        lines.append("Tags: " + ", ".join(rec["tags"]))
+    if rec.get("objects"):
+        lines.append("Objects: " + ", ".join(rec["objects"]))
+    if rec.get("media_type"):
+        lines.append(f"Media type: {rec['media_type']}")
+    if rec.get("rating"):
+        lines.append(f"Rating: {rec['rating']}")
+    if rec.get("rating_reasoning"):
+        lines.append(f"Rating reasoning: {rec['rating_reasoning']}")
+    if rec.get("extra"):
+        lines.append("Extra: " + _extra_text(rec["extra"]))
+    return "\n".join(lines)
+
+
 def _print_analysis_result(analysis: "VideoAnalysis", *, full_output: bool) -> None:
     """Print the Rich table (and, with --full, a full-text panel) for one analysis."""
     table = Table(title="Video Analysis")
@@ -2379,6 +2384,10 @@ def _print_analysis_result(analysis: "VideoAnalysis", *, full_output: bool) -> N
     table.add_row("Has Audio", str(analysis.has_audio))
     table.add_row("HDR", str(analysis.is_hdr))
     table.add_row("Scenes Detected", str(analysis.total_scenes))
+    if analysis.profile:
+        table.add_row("Analysis Profile", _safe(analysis.profile))
+    if analysis.scope != "video":
+        table.add_row("VLM Scope", analysis.scope)
 
     if analysis.vlm_summary:
         summary = analysis.vlm_summary
@@ -2456,10 +2465,24 @@ def _print_analysis_result(analysis: "VideoAnalysis", *, full_output: bool) -> N
     if full_output and analysis.cross_check:
         _print_cross_check_details(analysis.cross_check)
 
+    if full_output:
+        for rec in analysis.scene_vlm:
+            console.print(
+                Panel(
+                    Text(_safe(_scene_vlm_panel_text(rec))),
+                    title=f"Scene {rec['index'] + 1} VLM "
+                    f"({rec['start_time']:.1f}s - {rec['end_time']:.1f}s)",
+                    expand=True,
+                )
+            )
+
     if analysis.scenes:
         console.print(f"\n[bold]Detected {analysis.total_scenes} Scene(s):[/bold]")
         for scene in analysis.scenes[:30]:
-            desc = f" - {_safe(scene.description)}" if scene.description else ""
+            scene_text: str | None = scene.description
+            if scene_text and analysis.scene_vlm and not full_output:
+                scene_text = _preview(scene_text)
+            desc = f" - {_safe(scene_text)}" if scene_text else ""
             # Boundary confidence (the frame-differencing diff_score that ended
             # this scene) only in --full -- keeps the default view uncluttered;
             # see _scene_boundaries_str()'s docstring for what it means and the
@@ -2477,6 +2500,25 @@ def _print_analysis_result(analysis: "VideoAnalysis", *, full_output: bool) -> N
                 f"({scene.duration:.1f}s){desc}{score}",
                 markup=False,
             )
+
+
+def _scene_vlm_json(analysis: "VideoAnalysis") -> str:
+    """Per-scene VLM results as compact JSON text for the CSV (calls/sampling omitted: they
+    are in --json and the VLM totals columns)."""
+    keys = ("summary", "tags", "objects", "media_type", "rating", "rating_reasoning", "extra")
+    return json.dumps(
+        [
+            {
+                "index": r["index"],
+                "start_time": r["start_time"],
+                "end_time": r["end_time"],
+                **{k: r.get(k) for k in keys},
+            }
+            for r in analysis.scene_vlm
+        ],
+        ensure_ascii=False,
+        default=str,
+    )
 
 
 def _analysis_to_csv_row(analysis: "VideoAnalysis") -> dict[str, Any]:
@@ -2520,6 +2562,9 @@ def _analysis_to_csv_row(analysis: "VideoAnalysis") -> dict[str, Any]:
         "cross_check_arbiter_ran": cc.get("arbiter_ran", "") if cc else "",
         "cross_check_final_source": cc.get("final_source") or "",
         "cross_check_disagreement": cc.get("disagreement", "") if cc else "",
+        "analysis_profile": analysis.profile or "",
+        "analysis_scope": analysis.scope,
+        "scene_vlm": _scene_vlm_json(analysis) if analysis.scene_vlm else "",
     }
 
 
@@ -3002,6 +3047,25 @@ def config_migrate(input_path: str, output: str | None, backup: bool, force: boo
     "config value (the endpoint's allow_http permits plain HTTP for e.g. a LAN box) -- "
     "there is no flag for allow_http or api_key; set those in config.yaml only.",
 )
+@click.option(
+    "--profile",
+    "profile",
+    default=None,
+    help="Analysis profile to layer onto `analysis` for this run: quick | standard | "
+    "thorough, or a name from analysis.profiles (REQUIREMENTS.md § 28). Explicit flags "
+    "(--scope, --max-sample-frames, --vlm-endpoint ...) still win over the profile. "
+    "Unknown names are an error (exit 2) listing the available ones.",
+)
+@click.option(
+    "--scope",
+    "scope",
+    type=click.Choice(["video", "scenes", "both"]),
+    default=None,
+    help="What the VLM describes (overrides analysis.vlm.scope and the profile): video = one "
+    "call over the whole video (default), scenes = one call per detected scene, both. "
+    "Per-scene results are shown in the scene list (--full: one panel each), --json and "
+    "the CSV's scene_vlm column. Needs the VLM (--vlm).",
+)
 @click.pass_context
 def analyze(
     ctx: click.Context,
@@ -3025,6 +3089,8 @@ def analyze(
     vlm_model: str | None,
     vlm_url: str | None,
     vlm_endpoint: str | None,
+    profile: str | None,
+    scope: str | None,
 ) -> None:
     """Analyze video file(s) for properties, events, and content.
 
@@ -3037,32 +3103,27 @@ def analyze(
     logger = get_logger("autovideofixer.cli")
 
     from autovideofixer.core.analysis import VideoAnalyzer
+    from autovideofixer.core.analysis_service import resolve_analysis_config, validate_vlm_setup
 
+    # The profile is layered onto a COPY of the config; every later read (VLM, cross-check,
+    # sampling, scope) sees the effective analysis config. Explicit flags are call arguments
+    # and so still win. Unknown profile / bad analysis config is a usage error: fail once, up
+    # front, instead of once per file.
+    try:
+        config = resolve_analysis_config(config, profile)
+        validate_vlm_setup(
+            config,
+            vlm_flag=vlm_flag,
+            vlm_endpoint=vlm_endpoint,
+            min_frames=min_sample_frames,
+            max_frames=max_sample_frames,
+            interval_sec=sample_interval,
+            scope=scope,
+        )
+    except ValueError as e:
+        console.print(f"[red]{_safe(e)}[/red]")
+        sys.exit(2)
     analyzer = VideoAnalyzer(config)
-
-    # An unknown endpoint name is a usage error: fail once, up front, instead of once per file.
-    if (
-        vlm_endpoint is not None
-        or vlm_flag
-        or (vlm_flag is None and config.get("analysis", "vlm", "enabled", default=False))
-    ):
-        try:
-            if CrossCheckConfig.from_config(config).enabled:
-                # The cross-check lists its own endpoints; --vlm-endpoint replaces the primary.
-                if vlm_endpoint is not None:
-                    resolve_endpoint(config, vlm_endpoint)
-            else:
-                resolve_role_endpoint(config, "vlm", vlm_endpoint)
-            SamplingConfig.from_mapping(
-                config.get("analysis", "vlm", "sampling", default={}),
-                min_frames=min_sample_frames,
-                max_frames=max_sample_frames,
-                interval_sec=sample_interval,
-            )
-            OutputsConfig.from_config(config.get("analysis", "vlm", default={}))
-        except ValueError as e:
-            console.print(f"[red]{_safe(e)}[/red]")
-            sys.exit(2)
     report_call_stats = config.get("analysis", "report_call_stats", default=True)
     if not isinstance(report_call_stats, bool):
         console.print(
@@ -3134,7 +3195,9 @@ def analyze(
                     vlm_model=vlm_model,
                     vlm_api_url=vlm_url,
                     vlm_endpoint=vlm_endpoint,
+                    scope=scope,
                 )
+                analysis.profile = profile
 
                 # analyze() doesn't take a classify_events param, so re-run event
                 # detection directly with classification enabled when --classify

@@ -33,7 +33,7 @@ from typing import Any, Callable
 from ruamel.yaml import YAML
 from ruamel.yaml.comments import CommentedMap
 
-CURRENT_CONFIG_VERSION = 2
+CURRENT_CONFIG_VERSION = 3
 
 # v1 stored the connection fields directly on analysis.vlm / analysis.llm; v2 moves them
 # into analysis.endpoints.<name> (REQUIREMENTS.md § 24.4).
@@ -243,8 +243,89 @@ def _migrate_v1_to_v2(doc: MutableMapping[str, Any], notes: list[str]) -> None:
     shape_migrate_analysis(doc, notes)
 
 
+# --------------------------------------------------------------------------------------
+# v2 -> v3 (REQUIREMENTS.md § 28.9): the analysis stages
+# --------------------------------------------------------------------------------------
+
+_V2_DEFAULT_MAX_STAGES = 18
+_V3_DEFAULT_MAX_STAGES = 21
+
+
+def _insert_analysis_stages(doc: MutableMapping[str, Any], notes: list[str]) -> None:
+    """Insert ``analyze`` / ``scene_subtitles`` / ``analysis_sidecar`` into a pinned order.
+
+    A bootstrapped config pins ``pipeline.default_order``; without this the new stages (off by
+    default, but enabled with ``--enable-stage``) would be appended AFTER ``encode``'s slot
+    by the "requested but never mentioned" rule and run at the wrong place. Each is inserted
+    at its built-in position relative to an anchor the user's list already has -- ``analyze``
+    after the last ``crop``, the other two before the last ``encode`` (in that order) -- and
+    skipped, with a note, when the anchor is missing. Existing entries are never moved, so a
+    custom order stays custom. A stage already present is left alone. ``max_stages`` is
+    raised from the old default (18) to the new one (21), or to the list length if the
+    user's own value would now reject a full run.
+    """
+    pipeline = _get_map(doc, "pipeline")
+    if pipeline is None:
+        return
+    order = pipeline.get("default_order")
+    if not isinstance(order, list):
+        return
+    changed = False
+
+    def names() -> list[str | None]:
+        return [_entry_stage_name(e) for e in order]
+
+    def last_index(name: str) -> int | None:
+        found = [i for i, n in enumerate(names()) if n == name]
+        return found[-1] if found else None
+
+    if "analyze" not in names():
+        idx = last_index("crop")
+        if idx is None:
+            notes.append(
+                "pipeline.default_order: no 'crop' entry, so 'analyze' was not inserted "
+                "(add it where you want the analysis to run to use stages.analyze)"
+            )
+        else:
+            order.insert(idx + 1, "analyze")
+            notes.append("pipeline.default_order: inserted 'analyze' after 'crop'")
+            changed = True
+    for stage in ("scene_subtitles", "analysis_sidecar"):
+        if stage in names():
+            continue
+        idx = last_index("encode")
+        if idx is None:
+            notes.append(
+                f"pipeline.default_order: no 'encode' entry, so {stage!r} was not inserted"
+            )
+            continue
+        order.insert(idx, stage)
+        notes.append(f"pipeline.default_order: inserted {stage!r} before 'encode'")
+        changed = True
+    if not changed:
+        return
+    max_stages = pipeline.get("max_stages")
+    if isinstance(max_stages, int) and not isinstance(max_stages, bool):
+        if max_stages == _V2_DEFAULT_MAX_STAGES:
+            pipeline["max_stages"] = _V3_DEFAULT_MAX_STAGES
+            notes.append(
+                f"pipeline.max_stages: {_V2_DEFAULT_MAX_STAGES} -> {_V3_DEFAULT_MAX_STAGES} "
+                "(three stages were added to the default order)"
+            )
+        elif max_stages < len(order):
+            pipeline["max_stages"] = len(order)
+            notes.append(
+                f"pipeline.max_stages: {max_stages} -> {len(order)} (the order has "
+                f"{len(order)} entries now)"
+            )
+
+
+def _migrate_v2_to_v3(doc: MutableMapping[str, Any], notes: list[str]) -> None:
+    _insert_analysis_stages(doc, notes)
+
+
 # Ordered registry: key = the version a migration upgrades FROM.
-MIGRATIONS: dict[int, Migration] = {1: _migrate_v1_to_v2}
+MIGRATIONS: dict[int, Migration] = {1: _migrate_v1_to_v2, 2: _migrate_v2_to_v3}
 
 
 def _stamp_version(doc: MutableMapping[str, Any], version: int) -> None:

@@ -151,6 +151,13 @@ class EncodeStage(BaseStage):
             output_timing = self.config.get("general", "output_timing", default="cfr")
             args.extend(timing_output_args(output_timing))
 
+            # § 28.5: a `scene_subtitles` soft track is muxed with the codec the FINAL
+            # container wants (mov_text in MP4, srt in MKV); without this ffmpeg would
+            # default MKV to ASS. Only set when that stage added the track.
+            sub_codec = (kwargs.get("input_info") or {}).get("soft_subtitle_codec")
+            if sub_codec:
+                args.extend(["-c:s", sub_codec])
+
             # REQUIREMENTS.md § 12.5: a CFR deliverable must be constant at the
             # stream's TRUE cadence, not at whatever nominal rate the container
             # still advertises. `-fps_mode cfr` alone conforms to the container

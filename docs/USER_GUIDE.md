@@ -344,7 +344,11 @@ avf analyze [FILEPATH] [OPTIONS]
   with the cross-check on, also `cross_check_mode`, `cross_check_agreement`,
   `cross_check_arbiter_ran`, `cross_check_final_source`, `cross_check_disagreement` (see
   [Cross-checking with several VLMs](#cross-checking-with-several-vlms))
+- `--profile NAME`: apply an analysis profile (`quick`, `standard`, `thorough`, or one of your own)
+  for this run; `--scope video|scenes|both`: what the VLM describes. See
+  [Analysis profiles, scope and the analysis stages](#analysis-profiles-scope-and-the-analysis-stages)
 - `--full`: print the complete summary, rating reasoning and extra fields in panels under the table
+  (and one panel per scene when the scope includes scenes)
 - `-r, --recursive`: Scan directories recursively
 - `--symlinks [files_only|follow|skip]`: How directory scanning treats symlinks (default
   `files_only`). See [Symlinks When Scanning Directories](#symlinks-when-scanning-directories).
@@ -358,6 +362,65 @@ A file whose VLM call fails (timeout, server down, HTTP error, garbage reply) pr
 warning naming the endpoint and the cause, shows *VLM Status: FAILED* in its table, and the run
 carries on with the next file; the full traceback is only in the log file. See
 [VLM errors](#vlm-errors).
+
+### Analysis profiles, scope and the analysis stages
+
+**Profiles.** A profile is a named, partial `analysis` configuration you can switch on per run:
+
+```bash
+avf analyze clip.mp4 --vlm --profile quick       # brief text, 2-4 frames per call
+avf analyze clip.mp4 --vlm --profile thorough    # detailed text, whole video + every scene
+```
+
+`quick` = brief text from 2-4 frames; `standard` = today's defaults; `thorough` = `detailed` text,
+scope `both`, media type and the rating's reasoning, 6-12 frames, and the multi-VLM cross-check
+*if* `analysis.cross_check.endpoints` lists at least two endpoints that validate (otherwise it stays
+off). Profiles say how the analysis runs, not whether -- keep using `--vlm` / `analysis.vlm.enabled`.
+Your own go under `analysis.profiles`; a profile with a built-in's name is merged **on top of** that
+built-in:
+
+```yaml
+analysis:
+  profiles:
+    scenes_only:
+      vlm: {scope: scenes, detail: standard}
+    quick:                      # keep quick, but allow 3 frames
+      vlm: {sampling: {max_frames: 3}}
+```
+
+A profile is layered onto `analysis` exactly like a preset layer (mappings merge, scalars and lists
+replace). Flags such as `--max-sample-frames` or `--scope` still win over it. An unknown name stops
+the run (exit 2) and lists the available ones.
+
+**Scope.** `analysis.vlm.scope` (or `--scope`): `video` (default, one call over the whole video),
+`scenes` (one call per detected scene) or `both`. Per-scene descriptions appear in the scene list
+(`--full` shows a panel per scene), in `--json` (`scenes[].vlm`) and in the CSV `scene_vlm` column;
+their calls are in the call table and totals. A long video with many scenes means many calls.
+
+**Stages for `avf process`** (all off by default; a failing or unreachable VLM never fails the job):
+
+| Stage | What it does |
+|---|---|
+| `analyze` | runs the analysis after `crop` and puts it in the `--report-json` record (`jobs[].input_info.analysis`), where later stages find it |
+| `analysis_sidecar` | writes `<output>.avf-analysis.json` beside the final output |
+| `scene_subtitles` | writes the per-scene descriptions as subtitles: `mode: sidecar` (`<output>.srt`), `soft` (a text track inside the file: `mov_text` in MP4, `srt` in MKV; other containers fall back to a sidecar) or `burn` (drawn onto the picture; needs ffmpeg with libass, else falls back to `soft`; costs one extra encode) |
+
+```bash
+avf process clip.mp4 -o out/ --enable-stage analyze --enable-stage scene_subtitles \
+    --set stages.analyze.profile=thorough --set stages.scene_subtitles.mode=soft \
+    --report-json report.json
+```
+
+`scene_subtitles` needs per-scene descriptions, i.e. the VLM on and a scope of `scenes` or `both`
+(`thorough` has it); without them it skips with a warning. If `analyze` is not enabled, the two
+writers run the analysis themselves (set `stages.<name>.analyze_if_missing: false` to skip instead);
+when `scene_subtitles` runs later in the same job and `stages.analyze.scope` is not set, `analyze`
+uses scope `both` so one analysis serves both (an explicit `stages.analyze.scope: video` is kept,
+and the subtitles then analyse per scene themselves, on the later, possibly sped-up file).
+Sidecar files are never overwritten unless `general.overwrite` is true. Times follow `speed`: with a
+speed factor of 2 a scene that lasted 4 s in the analysed video becomes a 2 s cue. Settings:
+`stages.analyze`, `stages.analysis_sidecar`, `stages.scene_subtitles` in the
+[example config](config.example.yaml).
 
 ### Find Duplicates Command
 
@@ -1041,7 +1104,7 @@ DEBUG) holds the full traceback.
 Your `config.yaml` carries a `config_version`. When AVF is upgraded and your default-path config
 is older, the first run **backs it up** (`config.yaml.bak-v1-YYYYMMDD-HHMMSS`, same folder),
 rewrites it in place with comments preserved, and prints a WARNING listing every change (crop is
-turned on, `normalize_codecs` added to a pinned stage order, VLM/LLM settings moved into
+turned on, `normalize_codecs` and the analysis stages added to a pinned stage order, VLM/LLM settings moved into
 `analysis.endpoints`, sampling keys renamed). Configs passed with `--config`/`AVF_CONFIG` are only
 migrated in memory -- run `avf config migrate PATH` (or `-o NEW.yaml`) to update the file. With no
 config at all, the first run creates one from the commented example (set

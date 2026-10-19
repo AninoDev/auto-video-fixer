@@ -1944,7 +1944,7 @@ chat context. Delivery is phased, one commit per phase, in the user-chosen order
 | P4 | § 25 | VLM frame sampling: min/max frames, consecutive-duplicate removal, tile budget, frame-count reporting | IMPLEMENTED 2026-10-18 |
 | P5 | § 26 | new structured output fields (media type, rating reasoning, detail level) + per-call timing/token stats | IMPLEMENTED 2026-10-18 |
 | P6 | § 27 | multi-VLM cross-check (`refine` and `judge` modes) | IMPLEMENTED 2026-10-19 |
-| P7 | § 28 | analysis profiles, reusable analysis module, `analyze` stage + example stages | PLANNED |
+| P7 | § 28 | analysis profiles, reusable analysis module, `analyze` stage + example stages | IMPLEMENTED 2026-10-19 |
 
 Update the Status column (and the section headers) as each phase lands. P2's per-endpoint TLS
 override needs P3's endpoint registry — P2 ships the global policy plus the plumbing
@@ -2837,7 +2837,7 @@ Delivered as specified; decisions where the spec was silent, deviations and find
   16 calls, all captured from worker threads), per-scene blocks under `scene_stats.vlm_cross_check`,
   output produced, exit 0, no traceback on any console.
 
-## 28. Analysis profiles, reusable analysis module, analysis stages (P7)
+## 28. Analysis profiles, reusable analysis module, analysis stages (P7) [IMPLEMENTED 2026-10-19]
 
 - **Profiles**: `analysis.profiles: {name: <partial analysis config>}` plus built-ins `quick`
   (brief, 2–4 frames), `standard`, `thorough` (detailed, scenes scope, media type, rating
@@ -2862,3 +2862,184 @@ Delivered as specified; decisions where the spec was silent, deviations and find
   real timestamps; `speed` (runs later) changes them — subtitle/sidecar writers must map times
   through the speed factor. Document and test.
 - External (out-of-package) stage plugins are out of scope; noted for revisit.
+
+### 28.1 Implementation notes (2026-10-19)
+
+Delivered as specified; decisions where the spec was silent, deviations, findings:
+
+- **Files**: `core/analysis_profiles.py` (built-ins, resolution, `apply_profile`),
+  `core/analysis_service.py` (facade, `AnalysisResult`, `AnalysisCache`, `analysis_to_dict`,
+  `validate_vlm_setup`, `obtain_analysis`, `map_time`), `core/stages/analyze.py`,
+  `core/stages/analysis_sidecar.py`, `core/stages/scene_subtitles.py`, `core/analysis.py`
+  (`VideoAnalyzer.analyze(scope=)`, `describe_scenes`, `scene_vlm_record`, `VideoAnalysis.scope/
+  profile/scene_vlm`), `config.py` (`Config.with_layer`, defaults), `config_migrations.py` (v3),
+  `core/pipeline.py`, `core/stages/encode.py` / `speed.py` / `base.py`, `cli/cli.py`.
+- **Profiles**. `analysis.profiles` (open mapping, `{}` by default). Built-ins: `quick` = `detail:
+  brief`, sampling 2-4 frames; `standard` = `{}` (a true no-op); `thorough` = `detail: detailed`,
+  `scope: both`, `outputs.media_type` + `rating_reasoning` on, sampling 6-12 frames. *Why
+  `detailed`, not `exhaustive`*: exhaustive roughly doubles the output tokens again and truncates at
+  the default endpoint `max_tokens` (1024); a user profile can raise it. *Why `both`, not
+  `scenes`*: the whole-video overview fills the table/CSV summary row and the per-scene results
+  fill the subtitles; cost is n + 1 calls. Cross-check is added to `thorough` only when
+  `analysis.cross_check.endpoints` lists >= 2 names AND a trial config with `enabled: true` passes
+  `CrossCheckConfig.from_config` (so a typo'd endpoint, or a judge mode without a judge endpoint,
+  leaves it off with an INFO line instead of failing the run). A user profile named like a built-in
+  is deep-merged ON TOP of it (set one key of `quick`, keep the rest); give it a new name to
+  replace it. Profiles do not set `analysis.vlm.enabled` (they say how, not whether). A profile's
+  top-level keys must be real `analysis` keys (typos are an error, `profiles` itself excluded);
+  contents then go through the normal validation (`validate_vlm_setup`). Layering: `Config.
+  with_layer({"analysis": profile}, "analysis-profile:NAME")` = `apply_layer` on a *copy*, i.e.
+  exactly the preset semantics (mappings recurse, scalars and lists replace, a scalar may not
+  clobber a mapping); the profile wins over the config file and over `--preset`/`--config`/`--set`
+  layers for the keys it sets. Explicit CLI flags are call arguments, so they win over the profile.
+  Unknown name -> `UnknownProfileError` listing the available names; `avf analyze` exits 2 up front.
+- **Scope**. `analysis.vlm.scope` = `video` (default; the original code path, byte-identical JSON,
+  CSV old columns and stub requests -- checked before/after, see E2E) | `scenes` | `both`;
+  `avf analyze --scope` wins. Per-scene calls go through `run_vlm_analysis_for_scene` (cross-check
+  applies per scene because that method already does); `describe_scenes` runs them in order and puts
+  each scene's summary into `SceneEvent.description`. `scenes` needs scene detection, so it runs it
+  even when `analysis.event_detection.enabled` is false (an explicit `--no-events` -> WARNING and no
+  scene calls); scope != `video` with the VLM off -> one WARNING. **Fail-fast**: if the whole-video
+  call of a `both` run, or a scene call, fails with `connection` / `timeout` / `url_refused`, the
+  remaining scene calls are skipped with one WARNING (each would otherwise wait out the same
+  timeout and print its own warning). Output: *Analysis Profile* / *VLM Scope* table rows, the scene
+  list shows each description (previewed; `--full` prints a panel per scene), `--json` gains
+  `scenes[].vlm` plus top-level `scope`/`profile` (only when scope != `video` or a profile is used),
+  CSV appends `analysis_profile`, `analysis_scope`, `scene_vlm` (JSON text; old columns untouched,
+  pinned by test). Scene calls are in `vlm_calls`, the call table and the totals.
+- **Module / cache**. `analyze_video(path, config, *, profile=None, scope=None, cache=None,
+  progress_callback=None, overrides=None) -> AnalysisResult`; `overrides` = the `VideoAnalyzer.
+  analyze` keyword overrides (`OVERRIDE_KEYS`). Cache key = (realpath, size, mtime_ns, sha256[:16]
+  of the effective `analysis` section + profile + scope + overrides). *Per-run* = **per job**:
+  `Pipeline._execute_job` creates one `AnalysisCache` and sets `stage.analysis_cache` on every
+  stage instance; no module-level cache (it would outlive the files it describes and could serve
+  one job's analysis to another). `AnalysisCache` is thread-safe (lock + a lock per key, so
+  concurrent callers compute once -- tested with 6 threads) which also covers
+  `max_concurrent_jobs > 1`: jobs run whole in a worker thread, each with its own cache and its own
+  call-stats collector. A hit returns a copy flagged `cached=True` sharing the same `VideoAnalysis`
+  (treat it as read-only) and records no new VLM calls. Failures are not cached. `avf analyze` is
+  **not** refactored onto `analyze_video`: it needs the live status line, `--classify` and `--clip`
+  on the same `VideoAnalyzer`, and the facade would only add a wrapper. It shares the pieces
+  instead: `resolve_analysis_config` + `validate_vlm_setup` (the up-front checks moved out of the
+  command) and `analysis_to_dict` (the old `_analysis_to_json`), so profile handling, validation
+  and the JSON document each exist once.
+- **`analyze` stage**. `stages.analyze.{enabled false, profile, scope}`; `produces_output = False`;
+  `default_order`: after `crop`, before `downscale`. Publishes `input_info["analysis"]`
+  (`AnalysisResult.to_dict()`) and `input_info["analysis_time_scale"] = 1.0`; both are carried across
+  re-probes (`_INJECTED_INPUT_INFO_KEYS`) and land in `--report-json` `jobs[].input_info` (removed
+  from `output_info` to avoid a duplicate). Calls reach `jobs[].vlm_calls` through the P5 collector
+  (the job's own thread). Fail-open: an exception is one WARNING (traceback at DEBUG) and a SKIPPED
+  stage; a down VLM just leaves the VLM fields empty. `avf process` validates an enabled analysis
+  stage's profile/scope once up front (exit 2) so a typo is not a silently missing analysis.
+- **Example stages**. Both are off by default and `default_order` puts them just before `encode`
+  (`... hdr, scene_subtitles, analysis_sidecar, encode`). *Why there*: `encode` is always last and
+  the files handed to earlier stages are temp files, so the writers learn the deliverable's path
+  from `input_info["final_output_path"]` (injected by the pipeline, carried across re-probes);
+  after `speed` (text must not be sped up) and `hdr` (burn onto tone-mapped pixels). Cost of
+  writing before `encode` rather than after it: a sidecar exists even if `encode` then fails (a
+  post-encode phase would need `is_last`/final-path logic in the stage loop; revisit if it
+  matters).
+  - **Analysis source** (decided, documented, tested): `obtain_analysis` uses `input_info["analysis"]`
+    when `analyze` ran (for `scene_subtitles` only if it has per-scene results: an `analyze` run
+    with scope `video` falls through, so enabling `analyze` never silently disables the
+    subtitles). To avoid that second pass, `execute_job` publishes `input_info["planned_stages"]`
+    and `analyze` with no `stages.analyze.scope` uses `both` when `scene_subtitles` runs later
+    (found in review: re-analysing after `speed` 2x merged 2 s scenes under
+    `min_scene_duration_sec` and gave wrong cues; analysing before `speed` and mapping through
+    `analysis_time_scale` gave the right 0-2/2-4/4-6 s cues); else, with `stages.<name>.analyze_if_missing` (default true), runs the module
+    itself on its input through the job cache (`profile`/`scope` from the stage, else
+    `stages.analyze.*`; `scene_subtitles` upgrades `video` to `scenes`); else (false) or on failure
+    one WARNING and SKIPPED. Two writers running back to back with the same settings share one
+    analysis through the cache.
+  - **`analysis_sidecar`**: `<final output><suffix>` (default `.avf-analysis.json`), atomic write
+    (`.avf-tmp` + `os.replace`). Overwrite policy = `general.overwrite`: an existing sidecar with
+    `overwrite: false` is not replaced (WARNING, SKIPPED); with `true` it is. Content: schema
+    version, AVF version, UTC time, output name, `timeline.analysis_time_scale`, the analysis with
+    the internal temp path/filename removed and `output_start_time`/`output_end_time` per scene.
+    `--dry-run` of `avf process` only lists files (no stage runs), so nothing is written there.
+  - **`scene_subtitles`**: cues from `scenes[].vlm.summary` (scenes without one, or shorter than
+    `min_cue_sec` after mapping, get none; text stripped of `{}<>`, truncated at `max_chars`,
+    wrapped at `wrap_chars`). `sidecar`: `<output stem><suffix>` (default `.srt`), same overwrite
+    rule. `soft`: stream copy (`-map 0:v -map 0:a? -map 1:0 -c copy -c:s srt`) into the MKV temp,
+    then `encode` re-muxes with `-c:s mov_text` (MP4/M4V/MOV) or `srt` (MKV) -- the stage publishes
+    `input_info["soft_subtitle_codec"]` and `encode` honours it; without the hint ffmpeg would
+    default MKV to ASS. Existing subtitle streams are not carried (default selection would pick one
+    anyway). Other containers (WebM...) degrade to `sidecar` with a WARNING. `burn`: `subtitles`
+    filter, libx264 at `crf` 16 / `preset`, `-c:a copy`, `-sn`, `-fps_mode passthrough` (VFR safe);
+    an extra lossy generation by design (revisit: fold into `encode`'s filter chain). `has_filter(
+    "subtitles")` is checked at run time; missing libass -> `soft` with a WARNING (and from there
+    `sidecar` for an unsuitable container). The SRT scratch dir lives under `general.temp_dir` (else
+    next to the temp output) and is removed afterwards.
+  - **Filter-graph path escaping**: `escape_filter_value` applies the two levels in order -- option
+    syntax (`\ ' : =`) then filtergraph syntax (`\ ' [ ] , ;`) -- and is exercised for real with a
+    temp dir named `we ird: 'dir' [x],y=z;w` (burn drew the text).
+  - **Passthrough bug found and fixed while testing**: `sidecar` mode first returned `output_path =
+    input_path` (to dodge "COMPLETED without output_path"). The pipeline's temp cleanup removes every
+    recorded `output_path` that is not the final output -- including the job's *source file*, which
+    was deleted. Now the stage returns no path and sets `self.produces_output = False` on that
+    instance, and `_cleanup_temp_files` never removes `job.input_path` (regression tests for both).
+- **Timeline**. Analysis times refer to the analysed intermediate. `retime` keeps real timestamps
+  (it only drops duplicate frames), `interpolate` keeps the duration (the duration guard enforces
+  it for every `preserves_duration` stage), so only `speed` rescales time. A stage that does reports
+  `metadata["time_scale"]` (output seconds per input second; `speed`: `1 / factor`) and the pipeline
+  multiplies `input_info["analysis_time_scale"]` by it; `map_time(t, input_info)` applies it, cues
+  are clamped to the current file's duration. Verified with a real run (`speed` factor 2 after
+  `analyze`: scenes 0-4/4-8/8-12 s -> cues 0-2/2-4/4-5.98 s in a 6.03 s output; also in the
+  sidecar's `output_*` fields). An analysis made *after* `speed` has scale 1.0 (it sees the sped-up
+  file).
+- **Stage order / config trap (checked)**: the first-run bootstrap copies the example config with
+  `pipeline.default_order` and `max_stages: 18` **active**, so a bootstrapped user would never get
+  the new stages in place (unlisted requested stages are appended after the list's last entry, before
+  `encode`'s forced last slot -- i.e. in the wrong order) and a full run would exceed the cap. Solved
+  with a **v2 -> v3 migration** (`CURRENT_CONFIG_VERSION = 3`): inserts `analyze` after the last
+  `crop`, `scene_subtitles` + `analysis_sidecar` before the last `encode` -- only relative to
+  anchors the list already has, existing entries never move, mapping-form entries count, a stage
+  already listed is left alone, a missing anchor gives a note instead of an insert; `max_stages` 18
+  -> 21 (or raised to the list length if a custom cap is now too small, left alone if big enough).
+  Absent `default_order` stays absent. Both example configs carry `config_version: 3` and the new
+  keys. Verified on the real previous example config (backup, in-place rewrite, comments kept,
+  "Effective settings: all defaults").
+- **GUI**: `gui/main_window.py` neither lists stages nor exposes analysis options (it only shows
+  the current stage name), so nothing changed there.
+- **Existing tests changed** (they pinned the old version/columns): `test_config_migrations.py`
+  (`config_version` asserts 2 -> 3, the `default_order` insertion test now migrates `target=2`
+  because it tests the v1 -> v2 item, a second-pass tuple), `test_cross_check.py::
+  test_csv_columns_are_appended_and_order_is_stable` (the three § 28 columns are appended after
+  the five cross-check ones), and one literal in `test_test_isolation.py`
+  (`config_version == 2` -> `3`, not isolation logic).
+- **Known limits / revisit**: (1) out-of-package stage plugins are out of scope (a plugin entry
+  point could register stages and hand them the cache the same way). (2) A sidecar/SRT can exist
+  without its output if `encode` fails afterwards. (3) After a `general.existing_mismatched: rename`
+  reprocess the old output's sidecar stays at the old name and blocks the new one (`overwrite:
+  false`): rename companions with the output if this bites. (4) `burn` is an extra generation. (5)
+  A video with hundreds of scenes means hundreds of calls under `scenes`/`both`; there is no
+  `max_scenes` valve yet. (6) A soft-subtitle MKV temp re-encoded by `encode` drops about three
+  trailing frames of a VFR clip (144 -> 141): reproduced without any subtitle (a plain `-c copy`
+  MKV re-encoded), so it is pre-existing and not caused by this stage -- the stream-copy step itself
+  keeps 144. (7) Per-scene calls are sequential. (8) `thorough`'s cross-check trial validates names
+  but not reachability.
+- **Tests**: `tests/unit/test_analysis_service.py` (profiles incl. layering vs presets / user
+  override / unknown / bad keys / cross-check gating, scope video-unchanged / scenes / both /
+  fail-fast, facade, cache hit / miss on config, scope, profile, mtime, size, realpath, threads,
+  `obtain_analysis`, `avf analyze --profile/--scope` end to end with fakes), `tests/unit/
+  test_analysis_stages.py` (cues, SRT, escaping, the three stages incl. degrade paths and clobber
+  rules, source-never-deleted, stage order, v2 -> v3 migration in memory / comment-preserving text /
+  default-path load), `tests/integration/test_analysis_stages_e2e.py` (real ffmpeg: sidecar,
+  soft MP4/MKV, WebM degrade, burn with a hostile temp path and a frame diff, speed 2 cue times vs
+  duration, analysis after speed, VLM down).
+- **E2E** (isolated XDG dirs; `127.0.0.1` stub speaking llama.cpp's chat-completions shape,
+  returning numbered descriptions and logging requests; a 12 s clip of three distinct patterns made
+  with ffmpeg): `avf analyze --profile quick --scope both --full --json --csv` -> 4 calls (video +
+  3 scenes), 2 images per call as the profile says, per-scene panels, `scenes[].vlm` in JSON, CSV
+  `scene_vlm`; `--profile thorough` -> 6 images per call, media type, rating reasoning, scope both;
+  `--profile nope` -> message listing `quick, standard, thorough`, exit 2. Default-scope
+  before/after against the previous commit: identical `--json` (timings aside), identical stub
+  requests, identical old CSV columns. `avf process --stage analyze --stage scene_subtitles --stage
+  analysis_sidecar --stage encode --set stages.analyze.scope=scenes --report-json`: SRT + sidecar
+  beside the output, one analysis shared by both writers (3 calls in `jobs[].vlm_calls`),
+  `input_info.analysis` present, `output_info` without it. Soft MP4 -> `mov_text` (language `eng`),
+  soft MKV -> `subrip`, video stream `h264` in both; burn MP4/MKV -> no subtitle stream, frame at 5
+  s shows the scene-2 text drawn over the colour bars. VFR clip (144 frames): burn with `output_timing:
+  vfr` kept 144. Speed 2: 6.03 s output, SRT 0-2 / 2-4 / 4-5.98 s. Stub stopped: exit 0, output +
+  sidecar written, three WARNING lines (one failed call, one "skipping the 3 per-scene call(s)", one
+  "no per-scene descriptions"), no traceback; `jobs[].vlm_calls` lists the failed call.

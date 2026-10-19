@@ -161,6 +161,16 @@ draws an explicit VERIFIED / UNVERIFIED line instead of a flat done/not-done che
   score is uncalibrated (a threshold of 0.75 is a starting point, tune it against real runs); an
   arbiter's frames are sampled up front even when the judge agrees; streaming/time-to-first-token
   would also help judge latency; cross-check for the crop VLM check is out of scope (v1).
+- **Analysis profiles, reusable analysis module, analysis stages** (REQUIREMENTS.md § 28, phase P7)
+  — implemented 2026-10-19. `analysis.profiles` + built-in `quick` / `standard` / `thorough`
+  (`avf analyze --profile`, `stages.analyze.profile`), `analysis.vlm.scope` (`video` | `scenes` |
+  `both`, `avf analyze --scope`), `core/analysis_service.py` (`analyze_video()` facade, per-job
+  thread-safe cache), and three off-by-default stages: `analyze` (publishes `input_info["analysis"]`
+  into the report), `analysis_sidecar` (JSON beside the output) and `scene_subtitles` (SRT as sidecar,
+  soft track or burned in). Speed-aware timestamp mapping (`analysis_time_scale`), `config_version`
+  3 migration for pinned `pipeline.default_order`. Revisit: out-of-package stage plugins; folding the
+  burn-in into `encode` (one generation fewer); a `max_scenes` valve for long videos; companion files
+  following a renamed (mismatched) output; sidecars written after `encode` instead of before it.
 - **True source cadence recovery & timestamp-safe pipeline** (`retime` stage, on by default —
   REQUIREMENTS.md § 12) — recovers a video's real content framerate when it was padded up to a
   higher encoded rate by duplicated frames (24fps published at 60fps, VFR captures transcoded to

@@ -304,8 +304,64 @@ class VideoAnalysis:
     vlm_sampling: dict[str, Any] | None = None
     # § 27 cross-check block (mode, legs, verdict...) when analysis.cross_check is enabled.
     cross_check: dict[str, Any] | None = None
+    # § 28: what was described ("video" | "scenes" | "both"), the profile applied (None =
+    # none) and, when scenes were described, one record per scene (see ``scene_vlm_record``).
+    scope: str = "video"
+    profile: str | None = None
+    scene_vlm: list[dict[str, Any]] = field(default_factory=list)
     similar_files: list[str] = field(default_factory=list)
     metadata: dict[str, Any] = field(default_factory=dict)
+
+
+VALID_VLM_SCOPES = ("video", "scenes", "both")
+
+
+def validate_vlm_scope(scope: Any) -> str:
+    """``scope`` as a string, or ``ValueError`` naming ``analysis.vlm.scope`` (§ 28)."""
+    if scope not in VALID_VLM_SCOPES:
+        raise ValueError(
+            f"Invalid analysis.vlm.scope {scope!r}: must be one of {', '.join(VALID_VLM_SCOPES)}"
+        )
+    return str(scope)
+
+
+_ENDPOINT_DOWN_CLASSES = ("connection", "timeout", "url_refused")
+
+
+def _endpoint_down(record: dict[str, Any]) -> bool:
+    """Did this scene's call fail the way an unreachable/stalled server does?"""
+    call = record.get("call") or {}
+    return call.get("success") is False and call.get("error_class") in _ENDPOINT_DOWN_CLASSES
+
+
+def scene_vlm_record(index: int, scene: "SceneEvent", vlm_result: dict[str, Any]) -> dict[str, Any]:
+    """One scene's VLM result as the dict shared by scene mode and ``analysis.vlm.scope``.
+
+    ``summary``/``tags`` feed the coordinator prompt; the rest is for callers, logs and the
+    JSON/CSV outputs.
+    """
+    return {
+        "index": index,
+        "start_time": scene.start_time,
+        "end_time": scene.end_time,
+        "duration": scene.duration,
+        "summary": vlm_result.get("summary", ""),
+        "tags": vlm_result.get("tags", []),
+        # § 26.1 structured fields for this scene (the coordinator prompt only uses
+        # summary/tags; these are for callers and logs).
+        "objects": vlm_result.get("objects", []),
+        "media_type": vlm_result.get("media_type"),
+        "rating": vlm_result.get("rating"),
+        "rating_reasoning": vlm_result.get("rating_reasoning"),
+        "extra": vlm_result.get("extra") or {},
+        # § 26.2 this scene's CallStats.to_dict() (also in JobResult.vlm_calls).
+        "call": vlm_result.get("call"),
+        # § 25.4: what was actually sent for this scene (frames, duplicates
+        # dropped, size, est. tiles/tokens); absent if sampling failed.
+        "sampling": vlm_result.get("sampling"),
+        # § 27 cross-check block (every leg's output + the verdict) when enabled.
+        "cross_check": vlm_result.get("cross_check"),
+    }
 
 
 def _resolve_prompt_append(vlm_config: Mapping[str, Any], prompt_append: str | None) -> str:
@@ -370,6 +426,7 @@ class VideoAnalyzer:
         vlm_api_url: str | None = None,
         vlm_endpoint: str | None = None,
         min_sample_frames: int | None = None,
+        scope: str | None = None,
     ) -> VideoAnalysis:
         """Perform full analysis on a video file.
 
@@ -407,6 +464,11 @@ class VideoAnalyzer:
             vlm_endpoint: Name of the ``analysis.endpoints`` entry to use (None = the
                 one ``analysis.vlm.endpoint`` selects). ``vlm_model``/``vlm_api_url``
                 override that entry's fields.
+            scope: What the VLM describes (None = ``analysis.vlm.scope``): ``video`` (one
+                call over the whole video, the default), ``scenes`` (one call per
+                detected scene, via ``run_vlm_analysis_for_scene``) or ``both``
+                (REQUIREMENTS.md § 28). Per-scene results land in ``scene_vlm`` and each
+                scene's ``description``; their calls are appended to ``vlm_calls``.
 
         Returns:
             VideoAnalysis with all detected information
@@ -418,6 +480,31 @@ class VideoAnalyzer:
 
         if filepath in self._analysis_cache:
             return self._analysis_cache[filepath]
+
+        scope = validate_vlm_scope(
+            scope
+            if scope is not None
+            else self.config.get("analysis", "vlm", "scope", default="video")
+        )
+        vlm_on = bool(
+            include_vlm
+            if include_vlm is not None
+            else self.config.get("analysis", "vlm", "enabled", default=False)
+        )
+        want_scene_vlm = vlm_on and scope in ("scenes", "both")
+        if want_scene_vlm and include_events is False:
+            logger.warning(
+                "analysis.vlm.scope=%s needs scene detection but it is disabled for this run; "
+                "no per-scene descriptions will be made",
+                scope,
+            )
+            want_scene_vlm = False
+        if scope != "video" and not vlm_on:
+            logger.warning(
+                "analysis.vlm.scope=%s has nothing to describe: the VLM is disabled "
+                "(analysis.vlm.enabled / --vlm)",
+                scope,
+            )
 
         from autovideofixer.core.ffmpeg_utils import probe
 
@@ -440,7 +527,7 @@ class VideoAnalyzer:
             video_codec=info.video_stream.codec_name if info.video_stream else "",
         )
 
-        if (
+        if want_scene_vlm or (
             include_events
             if include_events is not None
             else self.config.get("analysis", "event_detection", "enabled", default=True)
@@ -455,11 +542,8 @@ class VideoAnalyzer:
             analysis.total_scenes = len(analysis.scenes)
             _report("scenes_done", f"{analysis.total_scenes} scene(s) detected")
 
-        if (
-            include_vlm
-            if include_vlm is not None
-            else self.config.get("analysis", "vlm", "enabled", default=False)
-        ):
+        analysis.scope = scope
+        if vlm_on and scope in ("video", "both"):
             vlm_result = self.run_vlm_analysis(
                 filepath,
                 prompt_append=prompt_append,
@@ -490,6 +574,44 @@ class VideoAnalyzer:
                     leg["call"] for leg in analysis.cross_check["legs"] if leg.get("call")
                 ]
             _report("vlm_done", "VLM analysis complete")
+
+        if (
+            want_scene_vlm
+            and analysis.scenes
+            and analysis.vlm_calls
+            and _endpoint_down({"call": analysis.vlm_calls[0]})
+        ):
+            logger.warning(
+                "VLM endpoint unreachable (%s) for the whole-video call; skipping the %d "
+                "per-scene call(s)",
+                analysis.vlm_calls[0].get("error_class"),
+                len(analysis.scenes),
+            )
+            want_scene_vlm = False
+        if want_scene_vlm and analysis.scenes:
+            analysis.scene_vlm = self.describe_scenes(
+                filepath,
+                analysis.scenes,
+                prompt_append=prompt_append,
+                prompt_override=prompt_override,
+                system_prompt_override=system_prompt_override,
+                progress_callback=progress_callback,
+                max_sample_frames=max_sample_frames,
+                min_sample_frames=min_sample_frames,
+                sample_interval_sec=sample_interval_sec,
+                model=vlm_model,
+                api_url=vlm_api_url,
+                endpoint=vlm_endpoint,
+            )
+            for record in analysis.scene_vlm:
+                call_block = record.get("cross_check")
+                if call_block:
+                    analysis.vlm_calls.extend(
+                        leg["call"] for leg in call_block["legs"] if leg.get("call")
+                    )
+                elif record.get("call"):
+                    analysis.vlm_calls.append(record["call"])
+            _report("vlm_done", f"VLM analysis of {len(analysis.scene_vlm)} scene(s) complete")
 
         _report("done", "Analysis complete")
         self._analysis_cache[filepath] = analysis
@@ -950,6 +1072,43 @@ class VideoAnalyzer:
             return result
         finally:
             shutil.rmtree(sampled.tmp_dir, ignore_errors=True)
+
+    def describe_scenes(
+        self,
+        filepath: str,
+        scenes: list["SceneEvent"],
+        progress_callback: ProgressCallback | None = None,
+        **vlm_kwargs: Any,
+    ) -> list[dict[str, Any]]:
+        """Run the per-scene VLM over ``scenes`` in order (``analysis.vlm.scope``, § 28).
+
+        Returns one ``scene_vlm_record`` per scene and fills each ``SceneEvent.description``
+        with its summary when there is one. ``vlm_kwargs`` are ``run_vlm_analysis_for_scene``'s
+        overrides (prompt_*, sampling, model/api_url/endpoint). A bad endpoint/config raises
+        ``ValueError`` from the first call, like the whole-video path.
+        """
+        records: list[dict[str, Any]] = []
+        for idx, scene in enumerate(scenes):
+            if records and _endpoint_down(records[-1]):
+                # The server is not answering (refused / timed out): the remaining scenes
+                # would each wait out the same timeout. One warning, then stop.
+                logger.warning(
+                    "VLM endpoint unreachable (%s); skipping the remaining %d scene(s)",
+                    (records[-1].get("call") or {}).get("error_class"),
+                    len(scenes) - idx,
+                )
+                break
+            if progress_callback is not None:
+                progress_callback(
+                    "vlm_scene",
+                    f"Scene {idx + 1}/{len(scenes)} ({scene.start_time:.1f}-{scene.end_time:.1f}s)",
+                )
+            result = self.run_vlm_analysis_for_scene(filepath, scene, **vlm_kwargs)
+            record = scene_vlm_record(idx, scene, result)
+            if record["summary"]:
+                scene.description = record["summary"]
+            records.append(record)
+        return records
 
     def find_similar(
         self,

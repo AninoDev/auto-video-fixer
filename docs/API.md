@@ -480,6 +480,29 @@ print(f"Duration: {analysis.duration}")
 print(f"Scenes: {analysis.total_scenes}")
 ```
 
+### Analysis service, profiles and scope
+
+```python
+from autovideofixer.core.analysis_service import AnalysisCache, analyze_video, map_time
+
+cache = AnalysisCache()                          # optional; thread-safe; share it between calls
+result = analyze_video(
+    "video.mp4", config,
+    profile="thorough",                          # built-in quick | standard | thorough, or analysis.profiles
+    scope="both",                                # video | scenes | both (default: analysis.vlm.scope)
+    cache=cache,
+)
+result.to_dict()          # JSON-serialisable; scenes[].vlm.summary per scene when scope includes scenes
+result.analysis           # the VideoAnalysis; result.cached is True on a cache hit
+map_time(4.0, {"analysis_time_scale": 0.5})      # -> 2.0: analysis time on the output's timeline
+```
+
+`ValueError` (`UnknownProfileError` for a bad profile name) before any work for an invalid
+profile/scope/endpoint/cross-check config. `autovideofixer.core.analysis_profiles.apply_profile(
+config, name)` returns a copy of the Config with the profile layered onto `analysis`
+(`Config.with_layer`). Stages use `obtain_analysis(...)`; see `docs/DEVELOPER.md`, "Writing a stage
+that uses analysis", and REQUIREMENTS.md § 28.
+
 ### VideoAnalysis
 
 ```python

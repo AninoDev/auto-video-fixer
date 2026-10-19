@@ -25,4 +25,4 @@ def test_log_dir_is_isolated():
 def test_bootstrap_disabled_by_default_in_tests():
     cfg = Config()
     assert not get_config_path().exists()
-    assert cfg.get("config_version") == 2
+    assert cfg.get("config_version") == 3

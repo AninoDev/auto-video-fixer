@@ -106,6 +106,9 @@ class BaseStage(ABC):
         # lists are unaffected: they never set this, so is_enabled() keeps honoring
         # the config flag exactly as before.
         self._force_enabled = False
+        # Set by Pipeline.execute_job(): the job's shared AnalysisCache (§ 28), so stages that
+        # call analysis_service.analyze_video() share one analysis. None = no caching.
+        self.analysis_cache: Any = None
 
     @property
     def logger(self):

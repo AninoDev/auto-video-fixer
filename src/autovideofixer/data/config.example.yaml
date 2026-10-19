@@ -63,7 +63,7 @@
 # backed up to config.yaml.bak-v<old>-<timestamp> and rewritten in place (comments kept); a config
 # passed explicitly (--config / AVF_CONFIG) is migrated in memory only -- run `avf config migrate
 # PATH` to update the file. Don't edit this number by hand.
-config_version: 2
+config_version: 3
 
 general:
   # Directory for auto-generated output filenames ({stem}_enhanced{ext}). null = same
@@ -436,12 +436,15 @@ pipeline:
   # downstream stage (crop bounds, scene detection, RIFE interpolation) benefits from seeing
   # progressive frames, and comb artefacts actively corrupt motion-based analysis. Off by
   # default -- see stages.deinterlace.enabled below for why. See core/stages/deinterlace.py.
+  # analyze (after crop) and scene_subtitles / analysis_sidecar (just before encode) are the
+  # opt-in analysis stages of docs/REQUIREMENTS.md § 28 -- see stages.analyze below.
   default_order:
     - detect
     - retime
     - normalize_codecs
     - deinterlace
     - crop
+    - analyze
     - downscale
     - deblock
     - stabilize
@@ -452,6 +455,8 @@ pipeline:
     - normalize_audio
     - speed
     - hdr
+    - scene_subtitles
+    - analysis_sidecar
     - encode
 
   # Example (commented out) of the mapping entry form -- forces "deblock" to run a second
@@ -462,6 +467,7 @@ pipeline:
   #     - normalize_codecs
   #     - deinterlace
   #     - crop
+  #     - analyze
   #     - downscale
   #     - deblock
   #     - stabilize
@@ -472,6 +478,8 @@ pipeline:
   #     - normalize_audio
   #     - speed
   #     - hdr
+  #     - scene_subtitles
+  #     - analysis_sidecar
   #     - stage: deblock
   #       enabled: true
   #       config:
@@ -489,6 +497,7 @@ pipeline:
   #     - normalize_codecs
   #     - deinterlace
   #     - crop
+  #     - analyze
   #     - downscale
   #     - deblock
   #     - stabilize
@@ -499,17 +508,19 @@ pipeline:
   #     - normalize_audio
   #     - speed
   #     - hdr
+  #     - scene_subtitles
+  #     - analysis_sidecar
   #     - stage: encode
   #       config:
   #         timeout: 1200
 
   # Safety cap on how many stage OCCURRENCES a single job may run (guards against
   # pathological --stage/default_order repetition, not normal preset/auto-determined
-  # pipelines -- must stay >= 16, the length of a full default run; kept at that + 2 for two
+  # pipelines -- must stay >= 19, the length of a full default run; kept at that + 2 for two
   # repeats of headroom). A stage repeated via default_order counts once per repetition.
   # Exceeding this fails the job outright rather than silently truncating (which could drop
   # the always-last "encode" stage).
-  max_stages: 18
+  max_stages: 21
 
   # Whether a stage that FAILS aborts the whole job (false) or is skipped, continuing the
   # pipeline with the last successfully-produced intermediate as input to the next stage
@@ -780,6 +791,51 @@ stages:
     # upscale on the same target box always agree on dimensions. Overridden per-run by
     # `avf process --downscale`/`--no-downscale`.
     enabled: false
+
+  # --- Analysis stages (docs/REQUIREMENTS.md § 28). All off by default and fail open: a failing
+  # or unreachable VLM never fails the job. They share one analysis per job (core/
+  # analysis_service.py): `analyze` publishes it as input_info["analysis"] (also in the
+  # --report-json job record); the two writers use it, or run the analysis themselves when
+  # `analyze` did not run (analyze_if_missing). `profile` / `scope` null = inherit
+  # stages.analyze.*. Enable with e.g. `--enable-stage analyze --enable-stage scene_subtitles
+  # --set stages.analyze.scope=scenes --set analysis.vlm.enabled=true`. Per-scene descriptions
+  # (what scene_subtitles needs) require analysis.vlm.enabled and a scope of scenes or both.
+  analyze:
+    # Runs the analysis on the stage's input (after crop, before downscale) and publishes it.
+    enabled: false
+    profile: null  # analysis profile name (built-in quick|standard|thorough or analysis.profiles)
+    scope: null    # video | scenes | both; null = the profile's / analysis.vlm.scope
+
+  analysis_sidecar:
+    # Writes <final output><suffix> -- the analysis as JSON, with scene times also mapped onto
+    # the output's timeline (speed). Not overwritten unless general.overwrite is true.
+    enabled: false
+    suffix: ".avf-analysis.json"
+    analyze_if_missing: true  # false = skip with a WARNING when `analyze` did not run
+    profile: null
+    scope: null
+
+  scene_subtitles:
+    # SRT of the per-scene descriptions. mode:
+    #   sidecar -- <final output stem><suffix> beside the deliverable.
+    #   soft    -- a muxed text track (mov_text in MP4/M4V/MOV, srt in MKV; stream copy, no extra
+    #              re-encode). Other containers (WebM...) degrade to sidecar with a WARNING.
+    #   burn    -- drawn onto the picture with ffmpeg's `subtitles` filter (libass). Re-encodes
+    #              once (libx264 at crf/preset) before encode; degrades to soft with a WARNING if
+    #              this ffmpeg build has no `subtitles` filter.
+    enabled: false
+    mode: sidecar
+    suffix: ".srt"        # sidecar mode: appended to the final output's stem
+    language: eng         # soft mode: language tag of the track
+    max_chars: 200        # a cue's text is cut at this many characters
+    wrap_chars: 42        # cue lines wrap at this width
+    min_cue_sec: 0.5      # scenes shorter than this (on the output's timeline) get no cue
+    style: "Fontsize=16,Outline=1,MarginV=24"  # burn mode: libass force_style
+    crf: 16               # burn mode
+    preset: medium        # burn mode
+    analyze_if_missing: true
+    profile: null
+    scope: null           # null = stages.analyze.scope, upgraded from video to scenes
 
   interpolate:
     enabled: true
@@ -1426,6 +1482,25 @@ analysis:
   llm:
     endpoint: default_llm
 
+  # Analysis profiles (docs/REQUIREMENTS.md § 28): named, PARTIAL `analysis` configs. Select one
+  # with `avf analyze --profile NAME` or stages.analyze.profile; it is deep-merged onto `analysis`
+  # like a preset (mappings recurse, scalars and lists replace) and explicit CLI flags still win.
+  # Built-ins: quick (brief, 2-4 frames), standard (today's defaults), thorough (detailed text,
+  # scope both, media type + rating reasoning, 6-12 frames; cross-check on only when
+  # analysis.cross_check.endpoints lists >= 2 endpoints that validate). Profiles shape HOW the
+  # analysis runs, not whether the VLM runs (analysis.vlm.enabled / --vlm). A profile here named
+  # like a built-in is merged ON TOP of it. Example (kept commented):
+  #   profiles:
+  #     scenes_only:
+  #       vlm:
+  #         scope: scenes
+  #         detail: standard
+  #     quick:                    # tweak one key of the built-in, keep the rest
+  #       vlm:
+  #         sampling:
+  #           max_frames: 3
+  profiles: {}
+
   # Print a per-call table (endpoint, model, wall time, input/output/reasoning tokens, tokens/s,
   # images, status) and run totals in `avf analyze`. Always logged regardless (one INFO line per
   # call, raw server usage at DEBUG), and always written by `avf analyze --json PATH` and the
@@ -1484,6 +1559,13 @@ analysis:
     # Higher levels generate more tokens; raise the endpoint's max_tokens with them (a reply cut
     # off mid-JSON falls back to being treated as the summary).
     detail: brief
+
+    # What the VLM describes (docs/REQUIREMENTS.md § 28): video = one call over the whole video
+    # (the long-standing behaviour), scenes = one call per detected scene (cross-check applies per
+    # scene), both. `avf analyze` shows per-scene results in the scene list (--full: a panel
+    # each), --json and the CSV scene_vlm column; one call per scene means n calls -- see
+    # `avf analyze --scope`.
+    scope: video
 
     # Frame sampling for EVERY VLM call: the whole video (`avf analyze`) and each scene (scene
     # mode with scenes.drop_non_content). One planner/sampler serves both (REQUIREMENTS.md

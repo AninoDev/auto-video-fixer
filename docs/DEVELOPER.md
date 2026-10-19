@@ -62,7 +62,9 @@ Platform-aware configuration with YAML storage:
 
 The optimal processing order is:
 
-1. **detect** - Analyze input properties
+1. **detect** - Analyze input properties (the full order, including `retime`, `crop`, the opt-in
+   `analyze` after `crop` and `scene_subtitles` / `analysis_sidecar` before `encode`, is
+   `pipeline.default_order`)
 2. **stabilize** - Correct camera shake (before enhancement)
 3. **deblock** - Remove compression artifacts
 4. **denoise_video** - Reduce noise (before upscaling)
@@ -149,6 +151,116 @@ Add to `DEFAULTS["stages"]` in `src/autovideofixer/config.py`:
 ### Step 5: Set Stage Order
 
 **CRITICAL**: The pipeline does **not** use `DEFAULTS["pipeline"]["default_order"]`. The actual ordering is hardcoded in `Pipeline.optimize_stage_order()` in `pipeline.py:232`. To change order, modify that method.
+
+## Writing a stage that uses analysis
+
+(REQUIREMENTS.md § 28.) The reference implementations are `core/stages/analysis_sidecar.py` (about
+100 lines) and `core/stages/scene_subtitles.py`; this walks through what they do.
+
+### 1. The facade
+
+```python
+from autovideofixer.core.analysis_service import analyze_video
+
+result = analyze_video(path, config, profile="thorough", scope="scenes", cache=self.analysis_cache)
+doc = result.to_dict()        # JSON-serialisable: scenes[], vlm, vlm_calls, scope, profile, ...
+for sc in doc["scenes"]:
+    sc["start_time"], sc["end_time"], (sc.get("vlm") or {}).get("summary")
+```
+
+`analyze_video` applies the profile, validates (`ValueError` for an unknown profile / bad analysis
+config, before any work), runs scene detection and the VLM per `scope`, and returns an
+`AnalysisResult` (`.analysis` is the underlying `VideoAnalysis`). A VLM that is down is **not** an
+exception: the VLM fields are empty and the failed calls are in `vlm_calls`. Per-scene descriptions
+exist only when the scope includes scenes *and* the VLM is on. Keyword `overrides=` takes the
+`VideoAnalyzer.analyze` per-call overrides (`OVERRIDE_KEYS`).
+
+### 2. The cache
+
+The pipeline creates one `AnalysisCache` per job and sets `stage.analysis_cache` on every stage
+instance. Pass it as `cache=`: a call with the same file (realpath + size + mtime) and the same
+effective analysis config (profile, scope, overrides included) returns the earlier result
+(`result.cached` is True, no new VLM calls, the `VideoAnalysis` object is shared -- do not mutate
+it). Thread-safe; concurrent callers compute once. There is deliberately no module-level cache.
+Scripts outside the pipeline can make their own `AnalysisCache()`.
+
+### 3. `input_info["analysis"]`
+
+If the `analyze` stage ran, `input_info["analysis"]` already holds `to_dict()` and
+`input_info["analysis_time_scale"]` the timeline factor (below). Use the helper rather than
+re-implementing the choice:
+
+```python
+got = obtain_analysis(self.config, self.name, self._stage_config, input_path, input_info,
+                      self.analysis_cache, need_scenes=True)
+if got is None:       # no analysis and not allowed / able to make one: it already warned once
+    return StageResult(status=StageStatus.SKIPPED, skipped_reason="no analysis available")
+analysis, time_scale = got
+```
+
+`obtain_analysis` prefers the published analysis (with `need_scenes=True`, only if it has per-scene
+results, i.e. scope `scenes`/`both`; a `video`-scope publication falls through. Better: have
+`analyze` ask for what you need up front -- it reads `input_info["planned_stages"]`, the job's
+stage names in run order, and widens its scope for a later `scene_subtitles`; add your stage
+there if it needs scenes); otherwise, with `stages.<name>.analyze_if_missing`
+(default true) it runs `analyze_video` itself through the cache (so two writers share one run);
+otherwise it warns and returns None. **A stage that consumes analysis must fail open**: skip with one
+WARNING, never FAILED, unless you want a missing analysis to fail the job.
+
+### 4. Timestamp mapping
+
+Analysis times are in the timeline of the file that was analysed -- the intermediate at the
+`analyze` stage's position. `retime` keeps real timestamps and `interpolate` keeps the duration, so
+only a stage that rescales time changes them (`speed`). Such a stage reports `metadata["time_scale"]`
+(output seconds per input second; `speed` reports `1 / factor`) and the pipeline multiplies
+`input_info["analysis_time_scale"]` by it. Convert with `map_time(t, input_info)` (or multiply by the
+`time_scale` `obtain_analysis` returned), and clamp to `input_info["duration"]`. An analysis you ran
+yourself on your own input has scale 1.0. If you add a stage that changes the timeline, report
+`time_scale`; otherwise consumers downstream will be wrong.
+
+### 5. Where the stage goes, and where its output goes
+
+`encode` is always the last stage and every earlier stage is handed a temp path, so a stage that
+writes *beside the deliverable* takes the destination from `input_info["final_output_path"]` (injected
+by the pipeline, carried across re-probes). Position it with `pipeline.default_order`:
+
+- needs the picture before the final encode (`burn`) or must not be sped up: after `speed`/`hdr`, before `encode`;
+- sidecar / stream-copy mux (`soft`): same slot -- `encode` is the one that writes the file, and it
+  copies the muxed text track through (`-c:s` comes from `input_info["soft_subtitle_codec"]`);
+- only consumes analysis (`analyze` itself): early (after `crop`, before the heavy stages).
+
+Rules to copy: a stage that writes no media file returns **no** `output_path` (never
+`input_path` -- the pipeline's temp cleanup deletes recorded outputs, and it once deleted a job's
+source this way) and, if `produces_output` is True for its other modes, sets
+`self.produces_output = False` on the instance. Do not clobber silently: follow `general.overwrite`
+for files beside the output. Add `-fps_mode passthrough` (`timing_output_args()`) to any ffmpeg step
+that re-encodes; stream copy needs nothing. Filter options that embed a path need
+`scene_subtitles.escape_filter_value` (two escaping levels).
+
+### 6. Registration, config, order
+
+Same as any stage (see "Adding Custom Stages"): subclass `BaseStage`, `register_stage(MyStage)` in
+`core/stages/__init__.py`, defaults in `Config.DEFAULTS["stages"][name]` (`enabled: False` for an
+opt-in stage), add the name to `pipeline.default_order` **and** `DEFAULT_STAGE_ORDER` in
+`core/pipeline.py`, raise `pipeline.max_stages`, mirror all of it in both example configs
+(byte-identical), and -- because a bootstrapped user config pins `default_order` -- add a
+`config_migrations.py` step that inserts the stage and bump `CURRENT_CONFIG_VERSION`. If the stage
+should be planned when enabled, add it to `Pipeline.auto_determine_stages`.
+
+### 7. Testing
+
+- Fake the seams, not the stage: patch `autovideofixer.core.analysis._detect_scene_changes`,
+  `VideoAnalyzer.run_vlm_analysis` / `run_vlm_analysis_for_scene` (see `tests/unit/test_analysis_service.py`),
+  or hand the stage a ready `input_info["analysis"]` (see `test_analysis_stages.py`).
+- Assert the ffmpeg argument list with `run_ffmpeg` mocked for the degrade paths, and run real ffmpeg
+  in `tests/integration/test_analysis_stages_e2e.py`-style tests through `Pipeline.execute_job` with a
+  per-test `Config`: check `ffprobe` streams, durations and, for burn-in, a frame diff.
+- Test the timeline: a real run with `stages.speed.factor != 1` after `analyze`, compare your times
+  with the output's duration.
+- Run any ad-hoc `avf` command with all four `XDG_*` variables pointing at a scratch dir.
+
+External (out-of-package) stage plugins are not supported yet; a stage has to live in
+`core/stages/` and be registered there.
 
 ## GPU Integration
 

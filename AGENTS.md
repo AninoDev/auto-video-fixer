@@ -215,11 +215,16 @@ src/autovideofixer/
 ├── core/
 │   ├── pipeline.py         # Pipeline orchestrator
 │   ├── analysis.py         # VideoAnalyzer, VLM, scene detection, clip extraction, dedup
+│   ├── analysis_service.py # analyze_video() facade, AnalysisCache, analysis_to_dict (§ 28)
+│   ├── analysis_profiles.py# analysis.profiles + built-in quick/standard/thorough (§ 28)
 │   ├── ffmpeg_utils.py     # FFmpeg wrappers, probe, run
 │   ├── presets.py          # Preset definitions (1080p60, 4k60, etc.)
 │   └── stages/             # Processing stages
 │       ├── base.py         # BaseStage, register_stage(), StageResult
 │       ├── detect.py       # "detect" (analysis, priority=1, produces_output=False)
+│       ├── analyze.py      # "analyze" (§ 28, off by default, publishes input_info["analysis"])
+│       ├── analysis_sidecar.py # "analysis_sidecar" (§ 28, <output>.avf-analysis.json)
+│       ├── scene_subtitles.py  # "scene_subtitles" (§ 28, SRT: sidecar | soft | burn)
 │       ├── stabilize.py    # "stabilize" — pipes raw YUV420P (decode→transform)
 │       ├── retime.py       # "retime" (cadence recovery, REQUIREMENTS.md § 12)
 │       ├── normalize_codecs.py # "normalize_codecs" (VP9/AV1/Opus/Vorbis -> H.264/AAC, § 22)
@@ -311,10 +316,14 @@ one of `--output-name`/a per-file `--from-file` output may apply -- combining th
   gone -- `DEFAULTS["pipeline"]["default_order"]` (and a matching `DEFAULT_STAGE_ORDER` constant
   in `core/pipeline.py`, used only as a fallback when the config key is missing/empty) now
   **is** the actual execution order. Default order:
-  `detect, retime, normalize_codecs, deinterlace, crop, downscale, deblock, stabilize,
-  denoise_video, upscale, interpolate, normalize_volume, normalize_audio, speed, hdr, encode`
-  (16 entries; `pipeline.max_stages` is 18 = that + 2 repeats of headroom -- **bump it whenever you
-  add a stage to `default_order`**).
+  `detect, retime, normalize_codecs, deinterlace, crop, analyze, downscale, deblock, stabilize,
+  denoise_video, upscale, interpolate, normalize_volume, normalize_audio, speed, hdr,
+  scene_subtitles, analysis_sidecar, encode`
+  (19 entries; `pipeline.max_stages` is 21 = that + 2 repeats of headroom -- **bump it whenever you
+  add a stage to `default_order`**, and ship a config migration that inserts it into pinned orders:
+  the bootstrapped user config pins `default_order` and `max_stages`, see § 28 / v2 -> v3).
+  `analyze`, `scene_subtitles` and `analysis_sidecar` are the opt-in analysis stages (§ 28; see
+  "Analysis profiles, scope and the analysis stages" under Configuration).
   - `retime` runs **immediately after `detect`** (REQUIREMENTS.md § 12): it recovers the input's
     TRUE content cadence (as opposed to the encoded/container framerate) via a single decode-only
     `mpdecimate`+`metadata=print` pass (`core/cadence.py`) and drops padding/duplicate frames
@@ -1352,9 +1361,9 @@ stages means they never spend compute on pixels that would just be discarded dow
 
 ### Config schema versioning, migrations, first-run bootstrap (REQUIREMENTS.md § 24.1-24.3)
 
-- **`config_version`** (top-level int; absent = 1; current = 2, `config_migrations.CURRENT_CONFIG_VERSION`)
+- **`config_version`** (top-level int; absent = 1; current = 3, `config_migrations.CURRENT_CONFIG_VERSION`)
   is in `Config.DEFAULTS` and both example configs. `src/autovideofixer/config_migrations.py` holds an
-  ordered registry (`MIGRATIONS = {1: _migrate_v1_to_v2}`); each migration edits a ruamel
+  ordered registry (`MIGRATIONS = {1: _migrate_v1_to_v2, 2: _migrate_v2_to_v3}`; v2 -> v3 = insert the § 28 analysis stages into a pinned `default_order` + `max_stages` 18 -> 21); each migration edits a ruamel
   `CommentedMap` (file path, comments preserved) or a plain `dict` (in-memory path) in place and
   appends human-readable notes. They must be **idempotent** and **must not invent keys** the user
   didn't have (an absent key stays absent so DEFAULTS apply). v1->v2 does exactly four things:
@@ -1481,6 +1490,43 @@ Gotchas:
   compatibility); the process report gets them through the collector.
 - **CLI overrides** (`--vlm-endpoint/-model/-url`) apply to the primary only; `avf analyze` skips
   resolving `analysis.vlm.endpoint` when the cross-check is enabled.
+
+### Analysis profiles, scope and the analysis stages (REQUIREMENTS.md § 28)
+
+- **Profiles** (`core/analysis_profiles.py`): `analysis.profiles` + built-ins `quick`/`standard`/
+  `thorough`; user profile with a built-in's name merges ON TOP of it. `apply_profile(config, name)`
+  = `Config.with_layer({"analysis": overlay}, ...)` (a copy; same `deep_merge` as presets, lists
+  replace). `thorough` adds `cross_check.enabled` only if a trial validation of the configured
+  cross-check passes. Never read `analysis.*` from the original config when a profile is in play --
+  use the effective copy (`resolve_analysis_config`).
+- **Scope**: `analysis.vlm.scope` `video` (default = the original path, pinned by tests) | `scenes` |
+  `both`; `VideoAnalyzer.analyze(scope=)` -> `describe_scenes` -> `run_vlm_analysis_for_scene`
+  (cross-check per scene comes for free). Per-scene records are `analysis.scene_vlm`
+  (`scene_vlm_record`, shared with scene mode); JSON/CSV keys for it are added only when scope !=
+  `video` (CSV columns are appended, never reordered -- pinned). A connection/timeout failure stops
+  the scene loop after one WARNING.
+- **Facade** (`core/analysis_service.py`): `analyze_video(path, config, *, profile, scope, cache,
+  progress_callback, overrides)`. `AnalysisCache` is per JOB (`Pipeline._execute_job` creates it and
+  sets `stage.analysis_cache`), thread-safe, keyed on (realpath, size, mtime_ns, config hash incl.
+  profile/scope/overrides). No module-level cache on purpose. `avf analyze` shares
+  `resolve_analysis_config`/`validate_vlm_setup`/`analysis_to_dict` with it but is not built on it
+  (live status line, `--classify`, `--clip`).
+- **Stages**: `analyze` publishes `input_info["analysis"]` + `analysis_time_scale` (both in
+  `_INJECTED_INPUT_INFO_KEYS`, so they survive re-probes; popped from `output_info`). The two writers
+  call `obtain_analysis` (published analysis -> else run it via the cache when `analyze_if_missing`
+  -> else WARNING + SKIPPED) and take the deliverable's path from `input_info["final_output_path"]`.
+  All three fail open. `scene_subtitles` `soft` publishes `input_info["soft_subtitle_codec"]` which
+  `encode` turns into `-c:s`; `burn` degrades to `soft` without the `subtitles` filter, `soft`
+  degrades to `sidecar` outside MP4/M4V/MOV/MKV.
+- **Gotchas**: (1) A stage that wrote no media file must return NO `output_path` -- returning its
+  input path made the temp cleanup delete the job's SOURCE (fixed; `_cleanup_temp_files` also
+  refuses `job.input_path` now). A class-level `produces_output = True` stage that sometimes writes
+  nothing sets `self.produces_output = False` on the instance. (2) Analysis times are in the
+  analysed file's timeline: a stage that rescales time must report `metadata["time_scale"]`
+  (`speed` does), consumers use `map_time`. (3) Paths inside `-vf` need two escaping levels
+  (`scene_subtitles.escape_filter_value`). (4) `max_stages`/`default_order` pinned in user configs:
+  any new stage in the default order needs a migration (done for v3). (5) `tests/unit/
+  test_test_isolation.py` pins `config_version`; bump it with `CURRENT_CONFIG_VERSION`.
 
 ### Config cascade
 

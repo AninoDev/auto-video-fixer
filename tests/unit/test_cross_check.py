@@ -975,6 +975,10 @@ class TestOutput:
             "cross_check_arbiter_ran",
             "cross_check_final_source",
             "cross_check_disagreement",
+            # § 28 columns, appended after these (never reordering anything before them).
+            "analysis_profile",
+            "analysis_scope",
+            "scene_vlm",
         ]
 
     def test_csv_row_values(self, tmp_path):

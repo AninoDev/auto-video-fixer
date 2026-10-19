@@ -33,7 +33,12 @@ from typing import Any
 
 from autovideofixer.ai.torch_utils import get_gpu_inference_semaphore
 from autovideofixer.config import Config, resolve_timeout
-from autovideofixer.core.analysis import SceneEvent, VideoAnalyzer, run_scene_coordinator
+from autovideofixer.core.analysis import (
+    SceneEvent,
+    VideoAnalyzer,
+    run_scene_coordinator,
+    scene_vlm_record,
+)
 from autovideofixer.core.ffmpeg_utils import probe, run_ffmpeg
 from autovideofixer.core.stages.base import StageStatus
 from autovideofixer.core.stages.interpolate import InterpolateStage
@@ -441,30 +446,7 @@ def _collect_scene_vlm_summaries(
     summaries = []
     for idx, scene in enumerate(scenes):
         vlm_result = analyzer.run_vlm_analysis_for_scene(input_path, scene)
-        summaries.append(
-            {
-                "index": idx,
-                "start_time": scene.start_time,
-                "end_time": scene.end_time,
-                "duration": scene.duration,
-                "summary": vlm_result.get("summary", ""),
-                "tags": vlm_result.get("tags", []),
-                # § 26.1 structured fields for this scene (the coordinator prompt only uses
-                # summary/tags; these are for callers and logs).
-                "objects": vlm_result.get("objects", []),
-                "media_type": vlm_result.get("media_type"),
-                "rating": vlm_result.get("rating"),
-                "rating_reasoning": vlm_result.get("rating_reasoning"),
-                "extra": vlm_result.get("extra") or {},
-                # § 26.2 this scene's CallStats.to_dict() (also in JobResult.vlm_calls).
-                "call": vlm_result.get("call"),
-                # § 25.4: what was actually sent for this scene (frames, duplicates
-                # dropped, size, est. tiles/tokens); absent if sampling failed.
-                "sampling": vlm_result.get("sampling"),
-                # § 27 cross-check block (every leg's output + the verdict) when enabled.
-                "cross_check": vlm_result.get("cross_check"),
-            }
-        )
+        summaries.append(scene_vlm_record(idx, scene, vlm_result))
     return summaries
 
 

@@ -8,6 +8,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Analysis profiles, scope, reusable analysis module and analysis stages** (REQUIREMENTS.md
+  § 28). `analysis.profiles` (named partial `analysis` configs) with built-ins `quick`, `standard`
+  and `thorough`: `avf analyze --profile NAME` / `stages.analyze.profile` deep-merge one onto
+  `analysis` like a preset (explicit flags still win; an unknown name exits 2 listing the available
+  ones; a profile named like a built-in is merged on top of it). `analysis.vlm.scope` (`video`
+  default, unchanged | `scenes` | `both`, `avf analyze --scope`) runs the per-scene VLM from
+  `avf analyze`; per-scene results appear in the scene list (`--full`: a panel each), `--json`
+  (`scenes[].vlm`, `scope`, `profile`) and new CSV columns `analysis_profile`, `analysis_scope`,
+  `scene_vlm`. New `core/analysis_service.py`: `analyze_video(path, config, profile=, scope=)` ->
+  `AnalysisResult` (`to_dict()`), with a per-job thread-safe cache keyed on realpath/size/mtime/
+  effective config. New off-by-default stages: `analyze` (after `crop`; publishes
+  `input_info["analysis"]`, also in `--report-json`), `analysis_sidecar` (`<output>.avf-analysis.json`)
+  and `scene_subtitles` (`mode: sidecar | soft | burn`; soft = `mov_text` in MP4 / `srt` in MKV by
+  stream copy, burn = libass `subtitles` filter, degrading to soft/sidecar with a WARNING). Scene
+  times are mapped through `speed` (`input_info["analysis_time_scale"]`). A failing or unreachable
+  VLM never fails the job, and an unreachable server now stops the per-scene loop after one warning.
+  Documented in `docs/DEVELOPER.md` ("Writing a stage that uses analysis").
 - **Multi-VLM cross-check** (REQUIREMENTS.md § 27). `analysis.cross_check` (`enabled` false by
   default, `mode` `refine` | `judge`, `endpoints`, `judge_endpoint`, `arbiter_endpoint`,
   `agreement_threshold` 0.75, `max_parallel` 1) lets several VLM endpoints analyze the same video
@@ -62,6 +79,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `avf analyze --min-sample-frames`.
 
 ### Changed
+- **`config_version` is now 3** (REQUIREMENTS.md § 28). The migration inserts `analyze` (after
+  `crop`) and `scene_subtitles` / `analysis_sidecar` (before `encode`) into a pinned
+  `pipeline.default_order` -- only relative to entries the list already has, never reordering it --
+  and raises `pipeline.max_stages` from 18 to 21 (the default order now has 19 stages). Default-path
+  configs are backed up and rewritten with comments kept, as for v2. Without it a bootstrapped
+  config (which pins the order) would never place the new stages.
+- `Pipeline` injects `input_info["final_output_path"]`, and a stage that reports `metadata
+  ["time_scale"]` (`speed`: `1 / factor`) scales `input_info["analysis_time_scale"]`. `encode` honours
+  `input_info["soft_subtitle_codec"]` (`-c:s`). The temp-file cleanup never removes the job's source
+  file.
 - The default VLM prompt now also asks for `media_type` (`analysis.vlm.outputs.media_type: false`
   restores the old prompt exactly). Provider functions (`_call_ollama`, `_call_openai`,
   `_call_custom_api`, `_call_provider_raw`) return a `ProviderResponse(text, stats)` instead of a
